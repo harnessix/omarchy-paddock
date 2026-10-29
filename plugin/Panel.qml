@@ -72,6 +72,9 @@ Panel {
   // $HOME is expanded by the shell at run time; no user path is stored here.
   readonly property string findPaddock: "pd() { for p in \"$(command -v paddock)\" \"$HOME/.local/bin/paddock\" \"$HOME/.cargo/bin/paddock\"; do if [ -n \"$p\" ] && [ -x \"$p\" ]; then \"$p\" \"$@\"; return; fi; done; return 127; }"
   readonly property string launcher: findPaddock + "; pd \"$@\""
+  // Starts an app sandbox without a terminal: the app has its own windows.
+  // Arguments: app name, project folder. paddock shows errors as a notification.
+  readonly property string appLauncher: "for p in \"$(command -v paddock)\" \"$HOME/.local/bin/paddock\" \"$HOME/.cargo/bin/paddock\"; do [ -n \"$p\" ] && [ -x \"$p\" ] && break; p=; done; [ -n \"$p\" ] || exit 127; if command -v uwsm-app >/dev/null 2>&1; then exec setsid uwsm-app -- \"$p\" app run \"$1\" \"$2\"; else exec setsid \"$p\" app run \"$1\" \"$2\"; fi"
 
   // Logging, as the Omarchy shell does it: silent normally, console.warn on
   // a real fallback (once per message, the polls repeat every few seconds),
@@ -335,6 +338,13 @@ Panel {
     for (var j = 0; j < list.length; j++) if (list[j].name === last) root.selectedIndex = j
   }
   function launch(harness) {
+    var entry = harnesses.filter(function(h) { return h.name === harness })[0]
+    if (entry && entry.app) {
+      // An app is not a terminal program: `paddock NAME` refuses it.
+      Quickshell.execDetached(["sh", "-c", root.appLauncher, "paddock-app", harness, root.chosenProject])
+      root.close()
+      return
+    }
     Quickshell.execDetached(["sh", "-c", root.terminal, "paddock-terminal", root.chosenProject, "paddock · " + harness + " · " + root.baseName(root.chosenProject), "sh", "-c", root.launcher, "paddock", harness])
     root.close()
   }
@@ -517,7 +527,7 @@ Panel {
         var p = JSON.parse(buffer)
         var raw = p && p.api_version === "paddock.list/v1" && Array.isArray(p.harnesses) ? p.harnesses.slice(0, 32) : []
         root.harnesses = raw.map(function(h) {
-          return { name: root.plain(h.name, 24), description: root.plain(h.description, 60), installed: h.installed === true }
+          return { name: root.plain(h.name, 24), description: root.plain(h.description, 60), installed: h.installed === true, app: h.app === true }
         })
       } catch (e) { root.harnesses = [] }
     }
@@ -970,7 +980,7 @@ Panel {
                 required property var modelData
                 required property int index
                 rowIndex: index
-                glyph: "󰚩"
+                glyph: modelData.app ? "󰀻" : "󰚩"
                 title: modelData.name
                 caption: modelData.description
                 onActivated: root.launch(modelData.name)
