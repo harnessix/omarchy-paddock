@@ -144,6 +144,7 @@ pub fn run(
     if let Some(sock) = backend::relay_socket(env, backend.name(), &built.spec) {
         let mut cfg = crate::proxy::HostProxy::from_vars(|k| env.var(k).map(str::to_string));
         cfg.allow_loopback = built.spec.host_ports.iter().map(|(p, _)| *p).collect();
+        cfg.allow_lan = built.spec.lan;
         crate::proxy::serve(&sock, cfg)?;
     }
     // The provision step: shared tool installs are writable only here.

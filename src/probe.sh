@@ -93,6 +93,17 @@ if [ "$PADDOCK_PROBE_NETWORK" != host ] && has bash; then
   if [ -z "$reached" ]; then ok host-addresses-unreachable; else fail host-addresses-unreachable "reached a host service at:$reached"; fi
 fi
 
+# The LAN (here the default gateway): blocked unless [network] lan = true.
+# A refused connection means the packet arrived, so it fails the check too.
+if [ -n "$PADDOCK_PROBE_LAN" ] && [ -z "$PADDOCK_PROBE_RELAY" ] && [ "$PADDOCK_PROBE_NETWORK" != host ] && has bash; then
+  err=$(timeout 5 bash -c "exec 3<>/dev/tcp/$PADDOCK_PROBE_LAN/80" 2>&1); rc=$?
+  case "$rc:$err" in
+    0:*|*refused*) fail lan-unreachable "reached $PADDOCK_PROBE_LAN" ;;
+    124:*) skip lan-unreachable "no answer from $PADDOCK_PROBE_LAN within 5 seconds" ;;
+    *) ok lan-unreachable ;;
+  esac
+fi
+
 if [ -n "$PADDOCK_PROBE_RELAY" ]; then
   if has curl; then
     if curl -sS -o /dev/null --max-time 5 --noproxy '*' https://example.com 2>/dev/null; then
@@ -111,6 +122,10 @@ if [ -n "$PADDOCK_PROBE_RELAY" ]; then
       if curl -s -o /dev/null --max-time 5 -p -x "$HTTPS_PROXY" "http://$a:$PADDOCK_PROBE_ANYPORT/" 2>/dev/null; then reached="$reached $a"; fi
     done
     if [ -z "$reached" ]; then ok proxy-refuses-host-addresses; else fail proxy-refuses-host-addresses "reached:$reached"; fi
+    if [ -n "$PADDOCK_PROBE_LAN" ]; then
+      code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 -p -x "$HTTPS_PROXY" "http://$PADDOCK_PROBE_LAN/" 2>/dev/null)
+      case "$code" in 2*|3*|401|404) fail proxy-refuses-lan "reached $PADDOCK_PROBE_LAN (HTTP $code)" ;; *) ok proxy-refuses-lan ;; esac
+    fi
   else
     skip direct-egress-blocked "curl is not installed"
   fi

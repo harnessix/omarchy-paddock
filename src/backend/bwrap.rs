@@ -336,6 +336,34 @@ pub fn pasta_prefix(env: &HostEnv, spec: &SandboxSpec) -> Result<(PathBuf, Vec<S
             _ => {}
         }
     }
+    // Block private and link-local networks (the LAN) unless network.lan is
+    // set. Policy rules match the destination only, so the gateway that
+    // carries internet traffic still works. pasta's DNS address and a host
+    // proxy on the LAN stay reachable.
+    if !spec.lan {
+        let proxy = crate::proxy::HostProxy::from_vars(|k| env.var(k).map(str::to_string));
+        let mut keep: Vec<std::net::IpAddr> = crate::proxy::proxy_addrs(&proxy)
+            .into_iter()
+            .filter(crate::proxy::is_lan)
+            .collect();
+        keep.push(DNS_FORWARD.parse().expect("DNS_FORWARD is an address"));
+        for k in keep {
+            let (fam, len) = if k.is_ipv4() { ("-4", 32) } else { ("-6", 128) };
+            script.push_str(&format!(
+                "\"$PADDOCK_IP\" {fam} rule add to {k}/{len} lookup main priority 100\n"
+            ));
+        }
+        for net in crate::proxy::LAN_V4 {
+            script.push_str(&format!(
+                "\"$PADDOCK_IP\" -4 rule add to {net} prohibit priority 110\n"
+            ));
+        }
+        for net in crate::proxy::LAN_V6 {
+            script.push_str(&format!(
+                "\"$PADDOCK_IP\" -6 rule add to {net} prohibit priority 110 || true\n"
+            ));
+        }
+    }
     script.push_str("exec \"$@\"");
     pa.push("--".into());
     pa.extend([

@@ -306,6 +306,7 @@ pub fn build_with(env: &HostEnv, opts: &Options, harness: Harness) -> Result<Bui
             .with_context(|| format!("detector {}", d.name()))?;
     }
     spec.setup.extend(m.setup.run.iter().cloned());
+    spec.lan = m.network.lan == Some(true);
     if spec.network != Network::None {
         for p in &m.network.host_ports {
             spec.add_host_port(*p, "manifest network.host_ports");
