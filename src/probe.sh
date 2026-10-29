@@ -185,6 +185,29 @@ fi
 if touch "$P/paddock-write-probe" 2>/dev/null; then ok project-writable; rm -f "$P/paddock-write-probe"; else fail project-writable "cannot write the project"; fi
 if git -C "$P" -c user.name=probe -c user.email=probe@localhost commit -q --allow-empty -m probe 2>/dev/null; then ok git-commit-works; else fail git-commit-works "git commit failed"; fi
 
+# mise: the shared installs are read-only here, and with network a plain
+# registry tool from mise.toml installed into them before the harness started.
+# srt has no shared installs, and its allowlist blocks the download.
+if [ -n "$PADDOCK_PROBE_MISE" ]; then
+  if [ "$PADDOCK_PROBE_BACKEND" = srt ]; then
+    skip mise-shared-installs-read-only "srt has no shared installs"
+  elif [ -n "$MISE_SYSTEM_INSTALLS_DIR" ] && (: > "$MISE_SYSTEM_INSTALLS_DIR/paddock-probe-hook") 2>/dev/null; then
+    rm -f "$MISE_SYSTEM_INSTALLS_DIR/paddock-probe-hook"
+    fail mise-shared-installs-read-only "wrote into $MISE_SYSTEM_INSTALLS_DIR"
+  else
+    ok mise-shared-installs-read-only
+  fi
+  if [ -n "$PADDOCK_PROBE_ONLINE" ] && [ "$PADDOCK_PROBE_BACKEND" != srt ]; then
+    v=$(cd "$P" && jq --version 2>/dev/null)
+    if [ "$v" = jq-1.7.1 ]; then ok mise-tools-provisioned; else fail mise-tools-provisioned "jq from mise.toml: $v"; fi
+    w=$(cd "$P" && mise which jq 2>/dev/null)
+    case "$w" in
+      "$MISE_SYSTEM_INSTALLS_DIR"/*) ok mise-tools-shared ;;
+      *) fail mise-tools-shared "jq is not in the shared installs: $w" ;;
+    esac
+  fi
+fi
+
 if [ -n "$PADDOCK_PROBE_APP" ]; then
   if [ -S "$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY" ]; then ok app-display-socket; else fail app-display-socket "no socket at $XDG_RUNTIME_DIR/$WAYLAND_DISPLAY"; fi
   if has wayland-info; then

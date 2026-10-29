@@ -168,22 +168,36 @@ impl Detector for Mise {
             return Ok(());
         }
         let origin = "detector mise";
+        // The mise data directory belongs to this sandbox home: tools that only
+        // this project uses install there. The shared installs hold registry
+        // tools for every project. They are read-only in every sandbox. Only a
+        // clean install step without the project writes them (mise.rs).
         let data = spec.home.join(".local/share/mise");
-        // The mise data directory (locks, shims) belongs to this sandbox home.
-        // The installed tools are shared by every sandbox: writable only in the
-        // provision step before the harness starts, and read-only while it runs,
-        // so one project's agent cannot change the tools of another.
-        let installs = data.join("installs");
+        let shared = spec.home.join(crate::spec::MISE_SHARED_INSTALLS);
         let mut m = cache_mount(
             cx.env,
-            "mise-installs",
-            installs.clone(),
-            "detector mise: shared installs, read-only while the harness runs",
+            crate::mise::SHARED_CACHE,
+            shared.clone(),
+            "detector mise: shared installs, read-only",
         )?;
         m.kind = crate::spec::MountKind::Ro;
         spec.add_mount(m);
-        spec.provision_rw.push(installs);
         spec.set_env("MISE_DATA_DIR", data.display().to_string(), origin);
+        spec.set_env(
+            "MISE_SYSTEM_INSTALLS_DIR",
+            shared.display().to_string(),
+            origin,
+        );
+        // Shims for the shared tools, and for the lazy tools of the host's
+        // /etc/mise config, go to their own private directory. It comes after
+        // paddock's host tools on PATH, so a `gh` shim cannot hide paddock's `gh`.
+        let system_shims = data.join("system-shims");
+        spec.set_env(
+            "MISE_SYSTEM_SHIMS_DIR",
+            system_shims.display().to_string(),
+            origin,
+        );
+        spec.tool_path.push(system_shims);
         spec.set_env(
             "MISE_TRUSTED_CONFIG_PATHS",
             cx.project.display().to_string(),
@@ -191,17 +205,22 @@ impl Detector for Mise {
         );
         spec.set_env("MISE_YES", "1", origin);
         spec.add_path(data.join("shims"));
-        match cx
+        let exe = cx
             .env
             .which("mise")
-            .and_then(|p| std::fs::canonicalize(p).ok())
-        {
-            Some(exe) => spec.add_tool("mise", exe, origin),
+            .and_then(|p| std::fs::canonicalize(p).ok());
+        match &exe {
+            Some(exe) => spec.add_tool("mise", exe.clone(), origin),
             None => spec
                 .warnings
                 .push("the project has a mise file, but mise is not installed on the host".into()),
         }
         if cx.manifest.setup.mise_install.unwrap_or(true) {
+            if let Some(exe) = &exe {
+                let registry = crate::mise::Registry::load(exe);
+                spec.mise_shared = crate::mise::shared_installs(cx.project, &registry);
+            }
+            spec.provision.push("mise reshim --system".into());
             spec.provision.push("mise install".into());
         }
         Ok(())

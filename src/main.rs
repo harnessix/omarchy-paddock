@@ -632,6 +632,18 @@ fn explain(env: &HostEnv, a: &RunArgs, json: bool) -> Result<()> {
             println!("  {}", l.lines().next().unwrap_or_default());
         }
     }
+    if !s.mise_shared.is_empty() {
+        println!(
+            "\nshared install step (no project): mise install {}",
+            s.mise_shared.join(" ")
+        );
+    }
+    if !s.provision.is_empty() {
+        println!("\nprovision step inside the sandbox:");
+        for l in &s.provision {
+            println!("  {l}");
+        }
+    }
     println!(
         "\ncommand   {}",
         s.command

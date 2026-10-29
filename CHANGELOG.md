@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- Security: a project's mise config was able to change tools that other projects run. The provision step ran `mise install` with the project mounted, and the shared mise installs were writable in that step. A hook, an `[env]` script or a plugin backend in `mise.toml` was able to replace a tool in them, and the agent can edit `mise.toml` for the next start. Now paddock reads the tool list on the host. A clean sandbox without the project installs only registry tools (`core` and `aqua` backends, plain versions) into the shared installs. Other tools install into the private sandbox home. The shared installs are read-only in every project sandbox. They moved to a new folder, `~/.cache/paddock/shared/mise-tools`. You can delete the old folder, `~/.cache/paddock/shared/mise-installs`.
+- srt backend: a host tool in a system folder, such as mise in `/usr/bin`, no longer comes first on PATH. Before, `gh` in a project with a mise file ran the host `gh` instead of paddock's `gh`, which goes through the host.
+- `paddock doctor --escape` gives its test project a `mise.toml` whose `[env]` script and hooks try to write into the shared installs, and checks that they cannot. With `--online`, it checks that a registry tool from `mise.toml` installs into the shared installs.
+
 ## 0.1.2
 
 - The bar panel starts apps again. Its New flow ran every entry in a terminal as `paddock NAME`, which refuses apps, so the terminal closed at once. Apps now start with `paddock app run` and no terminal, and the list marks them with the app icon. `paddock list --json` has an `app` field.

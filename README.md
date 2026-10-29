@@ -157,10 +157,20 @@ A sandbox uses your existing login of the harness. See [Logins and MCP](#logins-
 | Credential files of the harness | copied from your home directory, or from an isolated store |
 | Harness settings and skills, read-only | the files that the harness profile lists in `import_ro` |
 | The harness program, read-only | its install directory, found through PATH or mise |
-| Package caches (cargo, npm, uv, go, mise) | shared caches under `$XDG_CACHE_HOME/paddock/shared` |
+| Package caches (cargo, npm, uv, go) | shared caches under `$XDG_CACHE_HOME/paddock/shared` |
+| mise tools from the registry, read-only | `$XDG_CACHE_HOME/paddock/shared/mise-tools` |
 | `/usr`, `/etc`, read-only (bwrap backend) | the host system |
 
 The sandbox never contains your real home directory, `~/.ssh`, `~/.gnupg`, cloud credentials, browser profiles, the container runtime socket, or the session bus. Files with credential-shaped names in the project (`.env`, `*.pem`, `*.key`) are hidden. The policy engine refuses any configuration that breaks these rules, and names the line that asked for it.
+
+### mise toolchains
+
+If the project has a `mise.toml` or `.tool-versions` file, paddock installs its tools before the harness starts. This happens in two steps.
+
+1. paddock reads the tool list on the host. Tools from mise's registry that use the `core` or `aqua` backends, with a plain version, go to the shared installs. Examples are `node = "22"`, `python = "3.12"` and `jq = "1.7.1"`. A clean sandbox installs them. That sandbox has no project, no project config and no sandbox home, so hooks, `[env]` scripts and tasks cannot run while the shared installs are writable.
+2. `mise install` runs in the project sandbox with the project config. It installs every other tool into the private sandbox home, for example `cargo:`, `npm:`, `ubi:` or plugin tools, and tools with options. The shared installs are read-only in this step, and also while the harness runs.
+
+If the shared installs already hold every version, paddock skips the first step. This does not apply to `latest`. Every project uses the shared tools. A tool in the sandbox home belongs to one project and its harness. If you set `mise_install = false` in `[setup]` of `paddock.toml`, paddock skips both steps. The srt backend cannot mount the shared installs, so it installs every tool in the sandbox home.
 
 ## Files outside the project
 
@@ -466,7 +476,7 @@ The agent can read its own API token and the variables that it inherits. With ne
 
 pasta hides the host addresses that exist when the sandbox starts. If the host gets a new address while a sandbox runs, for example from a VPN that starts later, services on it are reachable from that sandbox until the next start. paddock watches for new addresses, shows a warning in the bar panel, and prints it at exit.
 
-Shared package caches connect the sandboxes of different projects. Tools that mise installs are writable only in a short provision step before the harness starts, and read-only while it runs. The cargo, npm, uv and go caches stay writable, because builds write them. Those caches check the hashes of what they download.
+Shared package caches connect the sandboxes of different projects. The shared mise installs are read-only in every project sandbox, and no project file runs while paddock writes them (see mise toolchains). The cargo, npm, uv and go caches stay writable, because builds write them. Those caches check the hashes of what they download.
 
 Some profile entries come from documentation, not from a test on a real install. `paddock doctor` lists them for each installed harness.
 
