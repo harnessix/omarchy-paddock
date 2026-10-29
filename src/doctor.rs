@@ -219,6 +219,13 @@ pub fn report(env: &HostEnv) -> Result<bool> {
             Err(_) => println!("  absent   {name}"),
         }
     }
+
+    println!("\nShell commands:");
+    if crate::shims::installed(env) {
+        println!("  on       typing a harness command starts it in a sandbox (paddock shims remove turns this off)");
+    } else {
+        println!("  off      harness commands run without a sandbox; paddock shims install makes the sandbox the default");
+    }
     Ok(missing_required.is_empty())
 }
 

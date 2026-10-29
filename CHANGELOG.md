@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- `paddock shims install` makes the sandbox the default: typing `claude`, `codex` and the other harness commands in bash or zsh starts them in a sandbox. `paddock shims remove` undoes it, and nothing breaks if paddock is removed first.
+- A `paddock` agent skill for the host, next to `paddock-host`. Install both with `npx skills add harnessix/omarchy-paddock`.
+
 ## 0.1.0
 
 The first public release.
