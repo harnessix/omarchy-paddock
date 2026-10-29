@@ -162,6 +162,7 @@ fn inventory(homes: Vec<Home>) -> Inventory {
         notes: vec![],
         old_caches: vec![],
         any_running: false,
+        build_cache: vec![],
     }
 }
 
@@ -246,6 +247,7 @@ fn images_sessions_keyrings_and_worktrees() {
         id: tag.into(),
         tags: vec![tag.into()],
         bytes: 5,
+        unique: None,
         created: String::new(),
         current,
         in_use,
@@ -654,4 +656,65 @@ fn the_old_mise_cache_goes_unless_a_sandbox_runs() {
     assert!(!old.exists());
     assert!(shared.join("cargo-registry").exists());
     assert!(shared.join("mise-tools").exists());
+}
+
+#[test]
+fn docker_sizes_parse() {
+    assert_eq!(parse_size("1.509GB"), Some(1_509_000_000));
+    assert_eq!(parse_size("807.8MB"), Some(807_800_000));
+    assert_eq!(parse_size("4.096kB"), Some(4_096));
+    assert_eq!(parse_size("98B"), Some(98));
+    assert_eq!(parse_size("0B"), Some(0));
+    assert_eq!(parse_size("lots"), None);
+}
+
+#[test]
+fn image_items_count_only_the_unique_part() {
+    let mut inv = inventory(vec![]);
+    inv.images = vec![Image {
+        cli: "docker".into(),
+        id: "abc".into(),
+        tags: vec!["paddock-base:old".into()],
+        bytes: 2_000,
+        unique: Some(300),
+        created: String::new(),
+        current: false,
+        in_use: false,
+    }];
+    let items = plan(&inv, &opts(), 1_000 * DAY);
+    let img = items.iter().find(|i| i.what.starts_with("image")).unwrap();
+    assert_eq!(img.bytes, 300);
+}
+
+#[test]
+fn build_cache_keeps_other_builds() {
+    let du = [
+        r#"{"Description":"mount / from exec /bin/sh -c : paddock-base core && pacman -Syu","ID":"aaa111","Reclaimable":true,"Shared":false,"Size":"807.8MB"}"#,
+        r#"{"Description":"mount / from exec /bin/sh -c pacman -Syu --noconfirm --needed base-devel git curl ca-certificates  && rm","ID":"bbb222","Reclaimable":true,"Shared":true,"Size":"568MB"}"#,
+        r#"{"Description":"mount / from exec /bin/sh -c useradd someone","ID":"ccc333","Reclaimable":true,"Shared":false,"Size":"65kB"}"#,
+        r#"{"Description":"[1/2] RUN : paddock-base desktop && x","ID":"ddd;rm","Reclaimable":true,"Shared":false,"Size":"1MB"}"#,
+    ]
+    .join("\n");
+    let c = FakeContainers::default().reply("docker", "buildx du --format json", &du);
+    let host = host(&c, &[]);
+    let recs = scan_build_cache(&host, "docker");
+    let ids: Vec<&str> = recs.iter().map(|r| r.id.as_str()).collect();
+    assert_eq!(ids, vec!["aaa111", "bbb222"]);
+    // A shared record frees nothing by itself.
+    assert_eq!(recs[0].bytes, 807_800_000);
+    assert_eq!(recs[1].bytes, 0);
+    assert!(scan_build_cache(&host, "podman").is_empty());
+}
+
+#[test]
+fn podman_df_table_parses() {
+    let t = "Images space usage:\n\nREPOSITORY                   TAG           IMAGE ID      CREATED     SIZE        SHARED SIZE  UNIQUE SIZE  CONTAINERS\ndocker.io/library/archlinux  latest        bf2533a05fd2  2 days      410.8MB     410.7MB      8.78kB       0\nlocalhost/paddock-base       ba4127c06f76  8f76cb6270bc  22 hours    1.597GB     1.004GB      593.1MB      0\n\nContainers space usage:\n";
+    let v = parse_podman_df(t);
+    assert_eq!(
+        v,
+        vec![
+            ("bf2533a05fd2".to_string(), 8_780),
+            ("8f76cb6270bc".to_string(), 593_100_000)
+        ]
+    );
 }
