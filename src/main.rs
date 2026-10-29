@@ -141,9 +141,13 @@ enum Cmd {
         /// Test the nested compositor window instead of the headless display.
         #[arg(long)]
         window: bool,
-        /// Test app mode: the restricted Wayland socket and the portal-only bus.
+        /// Test app mode: the restricted Wayland socket and the session bus.
         #[arg(long)]
         app: bool,
+        /// With --app: the session bus to test, private (the default) or
+        /// host-filtered.
+        #[arg(long, requires = "app", value_parser = ["private", "host-filtered"])]
+        bus: Option<String>,
         /// inherit (the default) or clean.
         #[arg(long, default_value = "inherit", value_parser = ["inherit", "clean"])]
         env: String,
@@ -217,6 +221,9 @@ enum Cmd {
     /// Inside an app sandbox: start the app with links that the host hands over.
     #[command(hide = true)]
     Inbound,
+    /// Inside an app sandbox: the link and notification services on its private bus.
+    #[command(hide = true)]
+    Portal,
     /// Inside a container sandbox: pass connections to the host proxy socket.
     #[command(hide = true)]
     Relay {
@@ -314,9 +321,12 @@ enum AppCmd {
 const APP_HELP: &str = "App mode runs a desktop agent app in a sandbox. Its windows are normal
 windows on your desktop, but through a restricted Wayland socket: the app
 cannot capture the screen, read the clipboard in the background, type into
-other windows, or list them. Its session bus passes only the desktop portals
-(open a URL in your browser, choose a file), notifications and the tray. It
-sees only its workspace folders, with the same git hook, secrets and network
+other windows, or list them. Its session bus is private, inside the sandbox,
+with a private keyring for its logins. Links that it opens go to your browser
+after your approval, and its notifications appear on your desktop. With
+`[apps.NAME] bus = \"host-filtered\"` in ~/.config/paddock/config.toml, its
+bus is the host bus, filtered to the desktop portals, notifications and the
+tray, without a keyring. It sees only its workspace folders, with the same git hook, secrets and network
 rules as `paddock <harness>`. The host passthrough (paddock-host) works too.
 
 Examples:
@@ -503,6 +513,7 @@ impl RunArgs {
             no_yolo: self.no_yolo,
             worktree: self.worktree,
             allow_domains: self.allow.clone(),
+            app_bus: None,
             inherit_env: self.env.as_deref().map(|e| e == "inherit"),
             auth: self.auth.clone(),
             shell,
@@ -695,6 +706,10 @@ fn real_main() -> Result<i32> {
         paddock::app::inbound_serve()?;
         return Ok(0);
     }
+    if let Cmd::Portal = &cli.cmd {
+        paddock::portal::serve()?;
+        return Ok(0);
+    }
     if let Cmd::Host { args } = &cli.cmd {
         return Ok(paddock::hostcli::main(args));
     }
@@ -710,7 +725,7 @@ fn real_main() -> Result<i32> {
     }
     let env = HostEnv::detect()?;
     match cli.cmd {
-        Cmd::Relay { .. } | Cmd::Host { .. } | Cmd::Inbound => unreachable!(),
+        Cmd::Relay { .. } | Cmd::Host { .. } | Cmd::Inbound | Cmd::Portal => unreachable!(),
         Cmd::Approvals { json, cmd } => {
             use paddock::broker;
             if let Some(ApprovalsCmd::Answer { id, answer }) = cmd {
@@ -1191,6 +1206,7 @@ fn real_main() -> Result<i32> {
             gui,
             window,
             app,
+            bus,
             online,
             env: env_mode,
             report,
@@ -1228,6 +1244,11 @@ fn real_main() -> Result<i32> {
                         display,
                         online,
                         inherit: env_mode == "inherit",
+                        app_bus: if bus.as_deref() == Some("host-filtered") {
+                            paddock::manifest::AppBus::HostFiltered
+                        } else {
+                            paddock::manifest::AppBus::Private
+                        },
                     },
                 )?;
                 Ok(if failed == 0 { 0 } else { 1 })

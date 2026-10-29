@@ -32,6 +32,8 @@ pub struct Options {
     pub worktree: bool,
     /// Extra domains for network mode `allowlist`.
     pub allow_domains: Vec<String>,
+    /// App mode: the session bus, instead of `[apps.NAME] bus`.
+    pub app_bus: Option<crate::manifest::AppBus>,
 }
 
 /// A worktree that paddock created for one run.
@@ -388,8 +390,14 @@ pub fn build_with(env: &HostEnv, opts: &Options, harness: Harness) -> Result<Bui
     }
     // The keyring wrapper goes inside the display's private bus, so it is
     // applied first: gui::apply wraps whatever command it finds.
-    if profile.launch.keyring {
-        crate::keyring::apply(env, &mut spec)?;
+    // In app mode it decides between the private bus with a keyring and the
+    // filtered host bus.
+    if profile.launch.keyring || spec.gui.mode == GuiMode::App {
+        let bus = match opts.app_bus {
+            Some(b) => b,
+            None => crate::app::bus_mode(env, &spec.harness)?,
+        };
+        crate::keyring::apply(env, &mut spec, bus)?;
     }
     gui::apply(env, &mut spec)?;
 

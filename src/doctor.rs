@@ -3,6 +3,7 @@
 use crate::backend;
 use crate::build::{self, Options};
 use crate::env::HostEnv;
+use crate::manifest::AppBus;
 use crate::policy::DENIED_HOME;
 use crate::profile::{Harness, HarnessFactory, Profile};
 use crate::run;
@@ -77,7 +78,7 @@ pub const DEPS: &[Dep] = &[
         cmd: "gnome-keyring-daemon",
         pkg: ["gnome-keyring", "gnome-keyring", "gnome-keyring"],
         required: false,
-        why: "a private keyring in sandboxes of harnesses that need one (copilot)",
+        why: "a private keyring for app sandboxes and harnesses that need one (copilot)",
     },
     Dep {
         cmd: "docker",
@@ -230,6 +231,16 @@ pub fn report(env: &HostEnv) -> Result<bool> {
 }
 
 /// The IPv4 default gateway, from /proc/net/route.
+/// The id of the host session bus, if there is one.
+fn host_bus_id() -> Option<String> {
+    let c = zbus::blocking::Connection::session().ok()?;
+    let id = zbus::blocking::fdo::DBusProxy::new(&c)
+        .ok()?
+        .get_id()
+        .ok()?;
+    Some(id.to_string())
+}
+
 fn default_gateway() -> Option<std::net::IpAddr> {
     let text = std::fs::read_to_string("/proc/net/route").ok()?;
     text.lines().skip(1).find_map(|l| {
@@ -262,6 +273,8 @@ pub struct EscapeOpts {
     pub online: bool,
     /// Test the default (inherit) or the clean environment mode.
     pub inherit: bool,
+    /// App mode: the session bus to test.
+    pub app_bus: AppBus,
 }
 
 /// Run the probe in a real sandbox. Returns the number of failed checks.
@@ -325,9 +338,12 @@ pub fn escape(env: &HostEnv, o: &EscapeOpts) -> Result<usize> {
         .collect();
 
     // `.gitconfig` inside the sandbox is the identity-only file paddock writes.
+    // On the private bus, the sandbox home holds the app's own keyring.
+    let private_bus = o.display == GuiMode::App && o.app_bus == AppBus::Private;
     let mut denied: Vec<String> = DENIED_HOME
         .iter()
         .filter(|p| **p != ".gitconfig")
+        .filter(|p| !(private_bus && **p == ".local/share/keyrings"))
         .map(|p| env.home.join(p).display().to_string())
         .collect();
     if let Some(rt) = &env.runtime_dir {
@@ -350,6 +366,7 @@ pub fn escape(env: &HostEnv, o: &EscapeOpts) -> Result<usize> {
         assume_yes: true,
         inherit_env: Some(o.inherit),
         args: vec!["-c".into(), PROBE.into()],
+        app_bus: Some(o.app_bus),
         allow_domains: if o.network == Network::Allowlist {
             vec!["example.com".into()]
         } else {
@@ -359,6 +376,10 @@ pub fn escape(env: &HostEnv, o: &EscapeOpts) -> Result<usize> {
     };
     let mut built = build::build_with(env, &opts, doctor_harness()?)?;
     std::fs::write(built.spec.home_src.join(".paddock-doctor-canary"), "x")?;
+    // The private bus test leaves its keyring in the doctor's home, which the
+    // other tests share. Remove it before and after.
+    let keyrings = built.spec.home_src.join(".local/share/keyrings");
+    let _ = std::fs::remove_dir_all(&keyrings);
     let s = &mut built.spec;
     s.set_env(
         "PADDOCK_PROBE_PROJECT",
@@ -394,6 +415,13 @@ pub fn escape(env: &HostEnv, o: &EscapeOpts) -> Result<usize> {
     );
     if o.display == GuiMode::App {
         s.set_env("PADDOCK_PROBE_APP", "1", "doctor");
+        if private_bus {
+            s.set_env("PADDOCK_PROBE_APP_BUS", "private", "doctor");
+            // The probe compares it with the id of its own bus.
+            if let Some(id) = host_bus_id() {
+                s.set_env("PADDOCK_PROBE_HOST_BUS_ID", id, "doctor");
+            }
+        }
     } else if gui {
         s.set_env("PADDOCK_PROBE_GUI", "1", "doctor");
     }
@@ -471,6 +499,7 @@ pub fn escape(env: &HostEnv, o: &EscapeOpts) -> Result<usize> {
         let _ = std::fs::remove_file(o);
     }
     let outcome = run::run(&env2, built, b.as_ref(), true, true)?;
+    let _ = std::fs::remove_dir_all(&keyrings);
     let _ = std::fs::remove_file(&host_tmp);
     let _ = std::fs::remove_file(&host_sock);
     if timed_out.load(std::sync::atomic::Ordering::SeqCst) {

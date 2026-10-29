@@ -10,9 +10,9 @@ paths = ["/usr/lib/chatgpt/ChatGPT", "/opt/ChatGPT/ChatGPT"]
 
 [launch]
 # Chromium's own sandbox needs nested user namespaces, which paddock blocks;
-# paddock is the boundary. The basic password store keeps logins in the
-# sandbox home instead of the host keyring.
-args = ["--ozone-platform=wayland", "--no-sandbox", "--password-store=basic"]
+# paddock is the boundary. Logins go to the sandbox's private keyring, never
+# the host keyring.
+args = ["--ozone-platform=wayland", "--no-sandbox", "--password-store=gnome-libsecret"]
 
 [app]
 display_name = "ChatGPT"

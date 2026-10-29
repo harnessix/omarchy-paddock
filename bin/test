@@ -37,7 +37,10 @@ if "$bin" doctor 2>/dev/null | grep "^  ok       srt$" >/dev/null; then
   "$bin" doctor --escape --backend srt --network none --app
 fi
 # App mode needs a Wayland session with wp_security_context_v1.
-if [ -n "${WAYLAND_DISPLAY:-}" ] && command -v xdg-dbus-proxy >/dev/null; then
+if [ -n "${WAYLAND_DISPLAY:-}" ]; then
   "$bin" doctor --escape --backend bwrap --network egress --app
+  if command -v xdg-dbus-proxy >/dev/null; then
+    "$bin" doctor --escape --backend bwrap --network egress --app --bus host-filtered
+  fi
 fi
 echo "All checks passed."

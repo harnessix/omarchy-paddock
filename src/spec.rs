@@ -217,6 +217,9 @@ pub struct SandboxSpec {
     pub lan: bool,
     /// A private keyring starts with the command (keyring.rs).
     pub keyring: bool,
+    /// App mode: the session bus is a dbus-daemon inside the sandbox
+    /// (keyring.rs), not the filtered host bus.
+    pub private_bus: bool,
     pub gui: Gui,
     /// Shell lines that run inside the sandbox before the command.
     pub setup: Vec<String>,
@@ -274,6 +277,7 @@ impl SandboxSpec {
             allow_domains: Vec::new(),
             lan: false,
             keyring: false,
+            private_bus: false,
             gui: Gui::default(),
             setup: Vec::new(),
             command: Vec::new(),

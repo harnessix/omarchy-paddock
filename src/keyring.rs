@@ -8,9 +8,16 @@
 //! private session bus. Its files live in the sandbox home, encrypted with a
 //! random password that paddock keeps on the host, outside the sandbox.
 //! The sandbox logs in once; the token is then stored encrypted at rest.
+//!
+//! In app mode the keyring runs on the app's own session bus: a
+//! `dbus-daemon` inside the sandbox, without service activation, so that no
+//! host service starts in there. `paddock portal` (portal.rs) joins the same
+//! bus and passes links and notifications to the host. The app never touches
+//! the host bus. `[apps.NAME] bus = "host-filtered"` keeps the older filtered
+//! host bus, without a keyring.
 
 use crate::env::HostEnv;
-use crate::manifest::hex;
+use crate::manifest::{hex, AppBus};
 use crate::spec::{GuiMode, SandboxSpec};
 use anyhow::Result;
 use sha2::{Digest, Sha256};
@@ -44,6 +51,65 @@ unset pw
 exec "$@"
 "#;
 
+/// The app's session bus. The bus configuration has no service folders: a
+/// name is there only when a process in the sandbox owns it.
+const APP_WRAPPER: &str = r#"#!/bin/sh
+# paddock: the app's private session bus, with a private keyring (Secret
+# Service) and paddock portal (links and notifications to the host). The
+# keyring is encrypted with a password that paddock keeps on the host.
+if [ -z "$PADDOCK_APP_BUS" ]; then
+  PADDOCK_APP_BUS=1
+  export PADDOCK_APP_BUS
+  if ! command -v dbus-run-session >/dev/null 2>&1; then
+    echo "paddock: dbus is not installed in the sandbox; the app has no session bus and no keyring" >&2
+    unset PADDOCK_KEYRING_PW
+    exec "$@"
+  fi
+  conf="$XDG_RUNTIME_DIR/paddock-bus.conf"
+  # A socket that an earlier run left behind would block the new bus.
+  rm -f "$XDG_RUNTIME_DIR/bus"
+  cat > "$conf" <<END
+<!DOCTYPE busconfig PUBLIC "-//freedesktop//DTD D-Bus Bus Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/dbus/1.0/busconfig.dtd">
+<busconfig>
+  <type>session</type>
+  <listen>unix:path=$XDG_RUNTIME_DIR/bus</listen>
+  <auth>EXTERNAL</auth>
+  <policy context="default">
+    <allow send_destination="*" eavesdrop="true"/>
+    <allow eavesdrop="true"/>
+    <allow own="*"/>
+  </policy>
+</busconfig>
+END
+  exec dbus-run-session --config-file="$conf" -- "$0" "$@"
+fi
+pw="$PADDOCK_KEYRING_PW"
+unset PADDOCK_KEYRING_PW
+if command -v gnome-keyring-daemon >/dev/null 2>&1; then
+  printf %s "$pw" | gnome-keyring-daemon --replace --unlock --components=secrets --daemonize >/dev/null 2>&1 \
+    || echo "paddock: the private keyring did not start" >&2
+else
+  echo "paddock: gnome-keyring is not installed in the sandbox; the app has no keyring" >&2
+fi
+unset pw
+paddock portal &
+# Wait until the keyring and the portal are on the bus: there is no service
+# activation, so an app that starts first finds neither.
+i=0
+while [ $i -lt 100 ]; do
+  ok=1
+  for n in org.freedesktop.secrets org.freedesktop.portal.Desktop; do
+    dbus-send --session --print-reply --dest=org.freedesktop.DBus /org/freedesktop/DBus \
+      org.freedesktop.DBus.NameHasOwner "string:$n" 2>/dev/null | grep -q "boolean true" || ok=
+  done
+  [ -n "$ok" ] && break
+  sleep 0.05
+  i=$((i+1))
+done
+exec "$@"
+"#;
+
 /// The password of one sandbox home's keyring, created on first use. It is
 /// kept under the paddock state folder, which no sandbox can see.
 pub fn password(env: &HostEnv, home_src: &std::path::Path) -> Result<String> {
@@ -70,22 +136,36 @@ pub fn password(env: &HostEnv, home_src: &std::path::Path) -> Result<String> {
 /// Wrap the command so that the private keyring starts first. Call it before
 /// the display is applied, so that the keyring joins the display's private
 /// bus when there is one.
-pub fn apply(env: &HostEnv, spec: &mut SandboxSpec) -> Result<()> {
-    if spec.gui.mode == GuiMode::App {
-        spec.warnings.push(
-            "the private keyring is off in app mode: apps use the filtered host bus; most desktop apps store their login in a file instead".into(),
-        );
+pub fn apply(env: &HostEnv, spec: &mut SandboxSpec, bus: AppBus) -> Result<()> {
+    let app = spec.gui.mode == GuiMode::App;
+    if app && bus == AppBus::HostFiltered {
+        spec.warnings.push(format!(
+            "{} uses the filtered host bus (bus = \"host-filtered\"): it has no keyring, so it may keep its login in a plain file",
+            spec.harness
+        ));
+        // Without a keyring, Chromium-based apps keep the basic store they
+        // had before the private bus.
+        for a in &mut spec.command {
+            if a == "--password-store=gnome-libsecret" {
+                *a = "--password-store=basic".into();
+            }
+        }
         return Ok(());
     }
-    let origin = "keyring: private Secret Service";
+    let origin = if app {
+        "app mode: private session bus and keyring"
+    } else {
+        "keyring: private Secret Service"
+    };
     let script = env.paddock_run().join(&spec.id).join(TOOL);
-    crate::gui::write_file(&script, WRAPPER, 0o755)?;
+    crate::gui::write_file(&script, if app { APP_WRAPPER } else { WRAPPER }, 0o755)?;
     spec.add_tool(TOOL, script, origin);
     spec.set_secret_env("PADDOCK_KEYRING_PW", password(env, &spec.home_src)?, origin);
     let mut cmd = vec![TOOL.to_string()];
     cmd.append(&mut spec.command);
     spec.command = cmd;
     spec.keyring = true;
+    spec.private_bus = app;
     Ok(())
 }
 
@@ -93,6 +173,50 @@ pub fn apply(env: &HostEnv, spec: &mut SandboxSpec) -> Result<()> {
 mod tests {
     use super::*;
     use std::collections::BTreeMap;
+
+    fn app_spec(env: &HostEnv) -> SandboxSpec {
+        let mut s = SandboxSpec::new(
+            "app-1".into(),
+            "claude-desktop",
+            std::path::Path::new("/w/p"),
+            env.home.join("sandbox-home"),
+            &env.home,
+            1,
+            1,
+            "u",
+        );
+        s.gui.mode = GuiMode::App;
+        s.command = vec!["/app".into(), "--password-store=gnome-libsecret".into()];
+        s
+    }
+
+    #[test]
+    fn apps_get_a_private_bus_with_a_keyring() {
+        let tmp = tempfile::tempdir().unwrap();
+        let env = HostEnv::from_parts(tmp.path().to_path_buf(), "u".into(), 1, 1, BTreeMap::new());
+        let mut s = app_spec(&env);
+        apply(&env, &mut s, AppBus::Private).unwrap();
+        assert!(s.keyring && s.private_bus);
+        assert_eq!(s.command[0], TOOL);
+        assert_eq!(s.command[2], "--password-store=gnome-libsecret");
+        let script =
+            std::fs::read_to_string(&s.host_tools.iter().find(|t| t.name == TOOL).unwrap().src)
+                .unwrap();
+        // No service activation: nothing from the host starts on this bus.
+        assert!(script.contains("dbus-run-session --config-file="));
+        assert!(!script.contains("servicedir"));
+        assert!(script.contains("paddock portal &"));
+    }
+
+    #[test]
+    fn host_filtered_apps_keep_the_basic_store() {
+        let tmp = tempfile::tempdir().unwrap();
+        let env = HostEnv::from_parts(tmp.path().to_path_buf(), "u".into(), 1, 1, BTreeMap::new());
+        let mut s = app_spec(&env);
+        apply(&env, &mut s, AppBus::HostFiltered).unwrap();
+        assert!(!s.keyring && !s.private_bus);
+        assert_eq!(s.command, ["/app", "--password-store=basic"]);
+    }
 
     #[test]
     fn password_is_stable_per_home_and_private() {

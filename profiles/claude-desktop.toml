@@ -9,7 +9,7 @@ unverified = [
 paths = ["/usr/lib/claude-desktop/claude-desktop"]
 
 [launch]
-args = ["--ozone-platform=wayland", "--no-sandbox", "--password-store=basic"]
+args = ["--ozone-platform=wayland", "--no-sandbox", "--password-store=gnome-libsecret"]
 
 [app]
 display_name = "Claude"

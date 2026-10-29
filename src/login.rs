@@ -99,6 +99,16 @@ echo "paddock: only http and https links can be opened from the sandbox" >&2
 exit 1
 "#;
 
+/// `xdg-open` and `$BROWSER` in the sandbox: http and https links go to the
+/// host browser through the host passthrough channel.
+pub fn open_shim(env: &HostEnv, spec: &mut SandboxSpec, origin: &str) -> Result<()> {
+    let shim = env.paddock_run().join(&spec.id).join("xdg-open");
+    crate::gui::write_file(&shim, OPEN_SHIM, 0o755)?;
+    spec.add_tool("xdg-open", shim, origin);
+    spec.set_env("BROWSER", "xdg-open", origin);
+    Ok(())
+}
+
 /// Wire login callbacks into a sandbox. Returns the forwarder, which lives as
 /// long as the sandbox runs.
 pub fn prepare(
@@ -108,10 +118,7 @@ pub fn prepare(
 ) -> Result<Option<crate::app::ports::Forwarder>> {
     let origin = "login callbacks";
     let run = env.paddock_run().join(&spec.id);
-    let shim = run.join("xdg-open");
-    crate::gui::write_file(&shim, OPEN_SHIM, 0o755)?;
-    spec.add_tool("xdg-open", shim.clone(), origin);
-    spec.set_env("BROWSER", "xdg-open", origin);
+    open_shim(env, spec, origin)?;
 
     // srt cannot place the shared folder that the forwarder uses.
     if srt {
