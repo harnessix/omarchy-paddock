@@ -1,7 +1,7 @@
 # Builds paddock from this source tree: run `makepkg -si` in this directory,
 # or `bin/install` from the repository root.
 pkgname=omarchy-paddock
-pkgver=0.1.1
+pkgver=0.1.2
 pkgrel=1
 pkgdesc='Run coding-agent harnesses with full auto-approval inside an isolated sandbox'
 conflicts=('paddock-git')
