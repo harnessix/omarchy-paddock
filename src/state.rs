@@ -335,8 +335,13 @@ pub fn json_import(
 }
 
 /// A minimal git configuration with only the identity, so commits work but
-/// host credential helpers, aliases and includes stay outside.
-pub fn write_gitconfig(env: &HostEnv, home_src: &Path) -> Result<()> {
+/// host credential helpers, aliases and includes stay outside. Pushes go to
+/// the host through the `paddock::` remote helper (see broker/git.rs).
+pub fn write_gitconfig(
+    env: &HostEnv,
+    home_src: &Path,
+    repo: Option<&crate::broker::git::Repo>,
+) -> Result<()> {
     let (name, email) = env.git_identity();
     let mut text = String::from("# Written by paddock on each start. Edits are lost.\n[user]\n");
     if let Some(n) = name {
@@ -346,6 +351,7 @@ pub fn write_gitconfig(env: &HostEnv, home_src: &Path) -> Result<()> {
         text.push_str(&format!("\temail = {e}\n"));
     }
     text.push_str("[init]\n\tdefaultBranch = main\n");
+    text.push_str(&crate::broker::git::sandbox_gitconfig(repo));
     std::fs::write(home_src.join(".gitconfig"), text)?;
     Ok(())
 }

@@ -31,6 +31,7 @@ fn setup(answer: Option<Answer>, policy: HostPolicy) -> (tempfile::TempDir, Brok
         id: "t-1".into(),
         harness: "claude".into(),
         project,
+        repo: None,
     };
     (tmp, Broker::new(env, ctx, policy, fixed.clone()), fixed)
 }
@@ -288,4 +289,132 @@ fn a_fresh_heartbeat_from_the_panel_silences_the_notification() {
     );
     std::fs::write(approval_ui_file(&env), "garbage").unwrap();
     assert!(!approval_ui_active(&env));
+}
+
+fn git_in(dir: &Path, args: &[&str]) -> String {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(["-c", "user.name=t", "-c", "user.email=t@localhost"])
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+/// A broker whose project is a git repository with a bare `origin`.
+fn setup_repo(
+    answer: Option<Answer>,
+    policy: HostPolicy,
+) -> (tempfile::TempDir, Broker, Arc<Fixed>, String) {
+    let (tmp, mut b, fixed) = setup(answer, policy);
+    let remote = tmp.path().join("remote.git");
+    git_in(
+        tmp.path(),
+        &["init", "-q", "--bare", remote.to_str().unwrap()],
+    );
+    let p = b.ctx.project.clone();
+    git_in(&p, &["init", "-q", "-b", "main"]);
+    git_in(&p, &["commit", "-q", "--allow-empty", "-m", "one"]);
+    git_in(&p, &["remote", "add", "origin", remote.to_str().unwrap()]);
+    git_in(
+        &p,
+        &[
+            "config",
+            "remote.upstream.url",
+            "https://github.com/demo/app.git",
+        ],
+    );
+    b.ctx.repo = git::Repo::snapshot(&p);
+    let sha = git_in(&p, &["rev-parse", "HEAD"]);
+    (tmp, b, fixed, sha)
+}
+
+fn push_req(remote: &str, sha: &str, dst: &str, force: bool) -> Request {
+    req(
+        "git-push",
+        serde_json::json!({ "remote": remote, "url": remote,
+            "refs": [{ "src": "HEAD", "sha": sha, "dst": dst, "force": force }] }),
+    )
+}
+
+#[test]
+fn a_push_session_grant_covers_the_same_branch_only() {
+    let (_t, b, fixed, sha) = setup_repo(Some(Answer::Session), HostPolicy::default());
+    let r = b.handle(&push_req("origin", &sha, "refs/heads/a", false));
+    assert_eq!(r.status, Status::Done, "{}", r.message);
+    assert_eq!(r.result["refs"][0]["ok"], true);
+    b.handle(&push_req("origin", &sha, "refs/heads/a", false));
+    assert_eq!(fixed.asked.load(Ordering::SeqCst), 1);
+    b.handle(&push_req("origin", &sha, "refs/heads/b", false));
+    assert_eq!(fixed.asked.load(Ordering::SeqCst), 2);
+}
+
+#[test]
+fn force_and_default_branch_pushes_ask_every_time_even_when_allowed() {
+    let mut p = HostPolicy::default();
+    p.modes.insert("git-push".into(), Mode::Allow);
+    let (_t, b, fixed, sha) = setup_repo(Some(Answer::Session), p);
+    for _ in 0..2 {
+        assert_eq!(
+            b.handle(&push_req("origin", &sha, "refs/heads/f", true))
+                .status,
+            Status::Done
+        );
+    }
+    assert_eq!(fixed.asked.load(Ordering::SeqCst), 2);
+    b.handle(&push_req("origin", &sha, "refs/heads/main", false));
+    b.handle(&push_req("origin", &sha, "refs/heads/main", false));
+    assert_eq!(fixed.asked.load(Ordering::SeqCst), 4);
+    // An ordinary branch follows the configuration.
+    b.handle(&push_req("origin", &sha, "refs/heads/x", false));
+    assert_eq!(fixed.asked.load(Ordering::SeqCst), 4);
+}
+
+#[test]
+fn a_denied_push_reports_denied_and_a_bad_ref_is_invalid() {
+    let (_t, b, _, sha) = setup_repo(Some(Answer::Deny), HostPolicy::default());
+    assert_eq!(
+        b.handle(&push_req("origin", &sha, "refs/heads/a", false))
+            .status,
+        Status::Denied
+    );
+    assert_eq!(Status::Denied.exit_code(), 3);
+    assert_eq!(
+        b.handle(&push_req("origin", &sha, "HEAD", false)).status,
+        Status::Invalid
+    );
+}
+
+#[test]
+fn forge_reads_skip_the_question_and_writes_ask() {
+    let (_t, mut b, fixed, _) = setup_repo(Some(Answer::Deny), HostPolicy::default());
+    // No gh: the test must not reach a real forge with the user's login.
+    b.env.path.clear();
+    let forge = |argv: &[&str]| {
+        req(
+            "forge",
+            serde_json::json!({ "tool": "gh", "argv": argv, "branch": "fix" }),
+        )
+    };
+    // Without gh on the host the read fails, but it is never asked.
+    let r = b.handle(&forge(&["pr", "list"]));
+    assert_eq!(r.status, Status::Failed);
+    assert!(r.message.contains("not installed"), "{}", r.message);
+    assert_eq!(fixed.asked.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        b.handle(&forge(&["pr", "create", "--title", "x"])).status,
+        Status::Denied
+    );
+    assert_eq!(fixed.asked.load(Ordering::SeqCst), 1);
+    assert_eq!(b.handle(&forge(&["api", "user"])).status, Status::Invalid);
+    let mut p = HostPolicy::default();
+    p.modes.insert("forge".into(), Mode::Deny);
+    let (_t, b, _, _) = setup_repo(None, p);
+    assert_eq!(b.handle(&forge(&["pr", "list"])).status, Status::Disabled);
 }
