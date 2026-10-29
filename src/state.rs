@@ -588,10 +588,20 @@ pub fn set_app_roots(env: &HostEnv, name: &str, roots: &[PathBuf]) -> Result<()>
 
 /// Apply `toml_set` entries to files in the sandbox home, keeping the rest of
 /// each file as it is.
+///
+/// The sandbox home is sandbox-controlled: the file is read and replaced
+/// through `safefs`, so a symlink left there is never followed.
 pub fn toml_set(profile: &Profile, home_src: &Path, project: &Path) -> Result<()> {
+    let home = crate::safefs::Root::open(home_src)?;
     for t in &profile.state.toml_set {
         let file = home_src.join(&t.file);
-        let text = std::fs::read_to_string(&file).unwrap_or_default();
+        let rel = Path::new(&t.file);
+        let text = match home.read(rel, crate::safefs::MAX_READ)? {
+            Some(b) => {
+                String::from_utf8(b).with_context(|| format!("{} is not UTF-8", file.display()))?
+            }
+            None => String::new(),
+        };
         let mut doc: toml_edit::DocumentMut = text
             .parse()
             .with_context(|| format!("{} is invalid", file.display()))?;
@@ -610,10 +620,7 @@ pub fn toml_set(profile: &Profile, home_src: &Path, project: &Path) -> Result<()
                 .with_context(|| format!("{k} in {} is not a table", file.display()))?;
         }
         table.insert(last, toml_edit::value(t.value.as_str()));
-        if let Some(d) = file.parent() {
-            std::fs::create_dir_all(d)?;
-        }
-        std::fs::write(&file, doc.to_string())?;
+        home.write(rel, doc.to_string().as_bytes(), 0o600)?;
     }
     Ok(())
 }
@@ -718,5 +725,35 @@ mod auth_sync_tests {
         assert!(std::fs::read_to_string(sb.join(".gitconfig"))
             .unwrap()
             .contains("[init]"));
+    }
+}
+
+#[cfg(test)]
+mod toml_set_link_tests {
+    use super::*;
+    use std::os::unix::fs::symlink;
+
+    #[test]
+    fn never_writes_through_a_planted_link() {
+        let t = tempfile::tempdir().unwrap();
+        let home = t.path().join("home");
+        let outside = t.path().join("outside");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let profile: Profile = toml::from_str(
+            "name = \"c\"\n[[state.toml_set]]\nfile = \".codex/config.toml\"\npath = [\"projects\", \"{project}\", \"trust_level\"]\nvalue = \"trusted\"\n",
+        )
+        .unwrap();
+        // A folder link: refused, nothing created outside.
+        symlink(&outside, home.join(".codex")).unwrap();
+        assert!(toml_set(&profile, &home, Path::new("/w/app")).is_err());
+        assert!(std::fs::read_dir(&outside).unwrap().next().is_none());
+        // A file link: refused to read; the host file stays as it was.
+        std::fs::remove_file(home.join(".codex")).unwrap();
+        std::fs::create_dir_all(home.join(".codex")).unwrap();
+        std::fs::write(outside.join("rc"), "keep").unwrap();
+        symlink(outside.join("rc"), home.join(".codex/config.toml")).unwrap();
+        assert!(toml_set(&profile, &home, Path::new("/w/app")).is_err());
+        assert_eq!(std::fs::read_to_string(outside.join("rc")).unwrap(), "keep");
     }
 }
