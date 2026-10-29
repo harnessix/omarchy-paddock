@@ -126,7 +126,7 @@ Then ask your agent, for example: "Install paddock and make the sandbox the defa
 
    If you set `XDG_DATA_HOME`, `XDG_CACHE_HOME`, `XDG_STATE_HOME` or `XDG_CONFIG_HOME`, the directories are under those paths instead.
 
-6. Optional: if you used the docker or podman backend, remove the images: `docker image rm $(docker image ls -q paddock-base)`. Run the same command with `podman` for podman.
+6. Optional: if you used the docker or podman backend, run `paddock gc --yes` before you remove the command. It removes the old paddock images and paddock's build cache. To remove the current images too, run `docker image rm $(docker image ls -q paddock-base)`, and the same command with `podman`.
 
 paddock does not change any file outside these directories, except the files that you name in `paddock env hide` (in `~/.config/paddock/config.toml`), the git worktrees that `--worktree` creates, and the files that `paddock shims install` and `paddock launchers install` change. Step 2 undoes those two. To remove a worktree, use the commands that paddock prints when the sandbox exits.
 
@@ -230,7 +230,8 @@ paddock gc --homes --yes                    # remove them
 
 `--yes` alone removes these items:
 
-- Paddock images that are not current and that no container uses.
+- Paddock images that are not current and that no container uses. Images share layers, so `gc` counts only the part that belongs to one image alone.
+- paddock's own records in the docker build cache. paddock marks its build steps, so the build cache of your other projects stays. A current image keeps its own layers, so this only makes the next image build slower.
 - Keyring passwords whose home is gone.
 - Session records that ended more than 30 days ago.
 - Homes of harnesses whose profile no longer exists.

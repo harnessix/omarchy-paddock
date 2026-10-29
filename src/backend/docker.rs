@@ -129,55 +129,85 @@ pub fn dockerfile(cfg: &ImageCfg) -> Result<String> {
     } else {
         ""
     };
-    let mut pkgs: Vec<String> = cfg.packages.clone();
-    if cfg.keyring {
+    // Layers, so that variants share most of their data: the core tools,
+    // then one desktop layer for every display, app and keyring variant, then
+    // the project's own packages. Each RUN starts with a marker, so that
+    // `paddock gc` can find paddock's records in the build cache.
+    let mut desktop: Vec<String> = Vec::new();
+    if cfg.keyring || cfg.app || cfg.gui {
         let k: &[&str] = match fam {
             "arch" => &["gnome-keyring", "libsecret", "dbus"],
             "debian" => &["gnome-keyring", "libsecret-tools", "dbus"],
             "fedora" => &["gnome-keyring", "libsecret", "dbus-daemon"],
             _ => &[],
         };
-        pkgs.extend(k.iter().map(|s| s.to_string()));
+        for p in k.iter().chain(app_packages(fam)).chain(gui_packages(fam)) {
+            if !desktop.iter().any(|d| d == p) {
+                desktop.push(p.to_string());
+            }
+        }
     }
-    if cfg.app {
-        pkgs.extend(app_packages(fam).iter().map(|s| s.to_string()));
-    }
-    if cfg.gui {
-        pkgs.extend(gui_packages(fam).iter().map(|s| s.to_string()));
-    }
-    let extra = pkgs.join(" ");
-    let (from, install) = if let Some(img) = &cfg.image {
+    let layer = |what: &str, pkgs: &[String]| -> String {
+        let list = pkgs.join(" ");
+        match fam {
+            "arch" => format!("RUN : {BUILD_MARKER} {what} && pacman -S --noconfirm --needed {list} && rm -rf /var/cache/pacman/pkg/*"),
+            "debian" => format!("RUN : {BUILD_MARKER} {what} && apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends {list} && rm -rf /var/lib/apt/lists/*"),
+            _ => format!("RUN : {BUILD_MARKER} {what} && dnf install -y {list} && dnf clean all"),
+        }
+    };
+    let (from, core) = if let Some(img) = &cfg.image {
         (img.clone(), String::new())
-    } else if family("arch") {
+    } else if fam == "arch" {
         ("docker.io/library/archlinux:latest".to_string(), format!(
-            "RUN pacman -Syu --noconfirm --needed base-devel git curl ca-certificates {extra} && rm -rf /var/cache/pacman/pkg/*"
+            "RUN : {BUILD_MARKER} core && pacman -Syu --noconfirm --needed base-devel git curl ca-certificates && rm -rf /var/cache/pacman/pkg/*"
         ))
-    } else if family("debian") || family("ubuntu") {
+    } else if fam == "debian" {
         let base = if id == "ubuntu" || id == "debian" {
             format!("docker.io/library/{id}:{ver}")
         } else {
             "docker.io/library/debian:stable".into()
         };
         (base, format!(
-            "RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends build-essential git curl ca-certificates {extra} && rm -rf /var/lib/apt/lists/*"
+            "RUN : {BUILD_MARKER} core && apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends build-essential git curl ca-certificates && rm -rf /var/lib/apt/lists/*"
         ))
-    } else if family("fedora") {
-        (format!("registry.fedoraproject.org/fedora:{ver}"), format!("RUN dnf install -y gcc gcc-c++ make git curl ca-certificates {extra} && dnf clean all"))
+    } else if fam == "fedora" {
+        (format!("registry.fedoraproject.org/fedora:{ver}"), format!("RUN : {BUILD_MARKER} core && dnf install -y gcc gcc-c++ make git curl ca-certificates && dnf clean all"))
     } else {
         bail!(
             "cannot pick a base image for distribution '{id}'. Set [docker] image in paddock.toml"
         );
     };
     let mut df = format!("FROM {from}\n");
-    if !install.is_empty() {
-        df.push_str(&install);
+    if core.is_empty() {
+        if !desktop.is_empty() || !cfg.packages.is_empty() {
+            bail!("[docker] packages and desktop support need a known distribution; with a custom image, install them in your own image");
+        }
+    } else {
+        df.push_str(&core);
         df.push('\n');
-    } else if !extra.is_empty() {
-        bail!("[docker] packages and desktop support need a known distribution; with a custom image, install them in your own image");
+        if !desktop.is_empty() {
+            df.push_str(&layer("desktop", &desktop));
+            df.push('\n');
+        }
+        if !cfg.packages.is_empty() {
+            df.push_str(&layer("packages", &cfg.packages));
+            df.push('\n');
+        }
     }
     df.push_str("LABEL io.paddock.base=1\n");
     Ok(df)
 }
+
+/// Starts every RUN line of paddock's base images, so that `paddock gc` can
+/// tell paddock's build-cache records from other builds.
+pub const BUILD_MARKER: &str = "paddock-base";
+
+/// Commands of base images that paddock built before the marker existed.
+pub const OLD_BUILD_COMMANDS: &[&str] = &[
+    "pacman -Syu --noconfirm --needed base-devel git curl ca-certificates",
+    "apt-get install -y --no-install-recommends build-essential git curl ca-certificates",
+    "dnf install -y gcc gcc-c++ make git curl ca-certificates",
+];
 
 pub fn image_tag(df: &str) -> String {
     format!(
@@ -621,6 +651,38 @@ pub fn precreate_mount_points(spec: &SandboxSpec) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn image_variants_share_layers() {
+        let cfg = |gui, app, keyring| ImageCfg {
+            image: None,
+            packages: vec![],
+            gui,
+            app,
+            keyring,
+        };
+        // Hosts that paddock cannot map to a base image have nothing to share.
+        let Ok(plain) = dockerfile(&cfg(false, false, false)) else {
+            return;
+        };
+        let desktop = dockerfile(&cfg(true, false, false)).unwrap();
+        // Every desktop variant is one image.
+        assert_eq!(desktop, dockerfile(&cfg(false, true, false)).unwrap());
+        assert_eq!(desktop, dockerfile(&cfg(false, false, true)).unwrap());
+        assert_eq!(desktop, dockerfile(&cfg(true, true, true)).unwrap());
+        // The desktop image starts with the plain image's core layer.
+        let core = plain.lines().nth(1).unwrap();
+        assert!(core.starts_with("RUN : paddock-base core"));
+        assert_eq!(desktop.lines().nth(1).unwrap(), core);
+        assert!(desktop.contains(": paddock-base desktop"));
+        let with_pkgs = dockerfile(&ImageCfg {
+            packages: vec!["jq".into()],
+            ..cfg(false, false, false)
+        })
+        .unwrap();
+        assert_eq!(with_pkgs.lines().nth(1).unwrap(), core);
+        assert!(with_pkgs.contains(": paddock-base packages"));
+    }
 
     #[test]
     fn derived_seccomp_blocks_only_new_user_namespaces() {

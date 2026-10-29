@@ -180,6 +180,9 @@ pub struct Image {
     pub id: String,
     pub tags: Vec<String>,
     pub bytes: u64,
+    /// The bytes that only this image holds, which removing it frees.
+    /// None when the container CLI does not report it.
+    pub unique: Option<u64>,
     pub created: String,
     /// The tag of a current configuration, or the image just built.
     pub current: bool,
@@ -244,6 +247,135 @@ pub struct Inventory {
     /// Some sandbox runs. A sandbox of an older paddock can still mount an
     /// old cache, so gc keeps them while any sandbox runs.
     pub any_running: bool,
+    /// Records of paddock's base image builds in the docker build cache.
+    pub build_cache: Vec<BuildRecord>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct BuildRecord {
+    pub cli: String,
+    pub id: String,
+    /// Bytes that no image or other record shares.
+    pub bytes: u64,
+    pub description: String,
+}
+
+/// "1.509GB", "807.8MB", "4.096kB", "98B": docker's decimal sizes.
+pub fn parse_size(s: &str) -> Option<u64> {
+    let s = s.trim();
+    let i = s.find(|c: char| !(c.is_ascii_digit() || c == '.'))?;
+    let (num, unit) = s.split_at(i);
+    let n: f64 = num.parse().ok()?;
+    let mult = match unit.trim() {
+        "B" => 1.0,
+        "kB" | "KB" => 1e3,
+        "MB" => 1e6,
+        "GB" => 1e9,
+        "TB" => 1e12,
+        "KiB" => 1024.0,
+        "MiB" => 1048576.0,
+        "GiB" => 1073741824.0,
+        _ => return None,
+    };
+    Some((n * mult) as u64)
+}
+
+/// paddock's records in the docker build cache: their RUN lines carry the
+/// marker, or the commands of base images built before it existed. Only the
+/// bytes that nothing else shares count.
+fn scan_build_cache(host: &Host, cli: &str) -> Vec<BuildRecord> {
+    use crate::backend::docker::{BUILD_MARKER, OLD_BUILD_COMMANDS};
+    if cli != "docker" {
+        return vec![];
+    }
+    let Ok(text) = host
+        .containers
+        .run(cli, &["buildx", "du", "--format", "json"])
+    else {
+        return vec![];
+    };
+    let marker = format!(": {BUILD_MARKER} ");
+    text.lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .filter(|v| v["Reclaimable"].as_bool() == Some(true))
+        .filter_map(|v| {
+            let d = v["Description"].as_str().unwrap_or_default();
+            let ours = d.contains(&marker) || OLD_BUILD_COMMANDS.iter().any(|c| d.contains(c));
+            let id = v["ID"].as_str().unwrap_or_default();
+            (ours && !id.is_empty() && id.chars().all(|c| c.is_ascii_alphanumeric())).then(|| {
+                BuildRecord {
+                    cli: cli.to_string(),
+                    id: id.to_string(),
+                    bytes: if v["Shared"].as_bool() == Some(true) {
+                        0
+                    } else {
+                        parse_size(v["Size"].as_str().unwrap_or("0B")).unwrap_or(0)
+                    },
+                    description: d.chars().take(120).collect(),
+                }
+            })
+        })
+        .collect()
+}
+
+/// The image table of `podman system df -v`: columns are separated by two
+/// or more spaces; IMAGE ID is short. Returns (short id, unique bytes).
+pub fn parse_podman_df(text: &str) -> Vec<(String, u64)> {
+    let mut out = Vec::new();
+    let mut in_images = false;
+    for line in text.lines() {
+        if line.starts_with("Images space usage") {
+            in_images = true;
+            continue;
+        }
+        if in_images && line.trim().is_empty() && !out.is_empty() {
+            break;
+        }
+        if !in_images || line.starts_with("REPOSITORY") || line.trim().is_empty() {
+            continue;
+        }
+        let cols: Vec<&str> = line
+            .split("  ")
+            .map(str::trim)
+            .filter(|c| !c.is_empty())
+            .collect();
+        if cols.len() >= 8 {
+            if let Some(u) = parse_size(cols[6]) {
+                out.push((cols[2].to_string(), u));
+            }
+        }
+    }
+    out
+}
+
+/// Unique sizes of images, from `docker system df -v` or `podman system df -v`.
+fn unique_sizes(host: &Host, cli: &str) -> BTreeMap<String, u64> {
+    let mut out = BTreeMap::new();
+    if cli == "podman" {
+        if let Ok(text) = host.containers.run(cli, &["system", "df", "-v"]) {
+            out.extend(parse_podman_df(&text));
+        }
+        return out;
+    }
+    if cli != "docker" {
+        return out;
+    }
+    if let Ok(text) = host
+        .containers
+        .run(cli, &["system", "df", "-v", "--format", "json"])
+    {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
+            for i in v["Images"].as_array().into_iter().flatten() {
+                if let (Some(id), Some(u)) = (
+                    i["ID"].as_str(),
+                    i["UniqueSize"].as_str().and_then(parse_size),
+                ) {
+                    out.insert(strip_sha(id).to_string(), u);
+                }
+            }
+        }
+    }
+    out
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -675,6 +807,7 @@ fn scan_images(host: &Host, cli: &str, notes: &mut Vec<String>) -> Vec<Image> {
             return vec![];
         }
     }
+    let unique = unique_sizes(host, cli);
     let mut out = Vec::new();
     for v in list {
         let id = strip_sha(v["Id"].as_str().unwrap_or_default()).to_string();
@@ -703,6 +836,13 @@ fn scan_images(host: &Host, cli: &str, notes: &mut Vec<String>) -> Vec<Image> {
                 .any(|t| host.current_tags.contains(strip_registry(t))),
             in_use: used.contains(&id),
             bytes: v["Size"].as_u64().unwrap_or(0),
+            // podman reports short ids.
+            unique: unique.get(&id).copied().or_else(|| {
+                unique
+                    .iter()
+                    .find(|(k, _)| k.len() >= 12 && id.starts_with(k.as_str()))
+                    .map(|(_, v)| *v)
+            }),
             created: v["Created"]
                 .as_str()
                 .unwrap_or_default()
@@ -887,8 +1027,10 @@ pub fn scan(env: &HostEnv, host: &Host, with_sizes: bool) -> Inventory {
     keyrings.sort_by(|a, b| a.path.cmp(&b.path));
 
     let mut images = Vec::new();
+    let mut build_cache = Vec::new();
     for cli in host.containers.clis() {
         images.extend(scan_images(host, &cli, &mut notes));
+        build_cache.extend(scan_build_cache(host, &cli));
     }
 
     let old_caches = OLD_CACHES
@@ -912,6 +1054,7 @@ pub fn scan(env: &HostEnv, host: &Host, with_sizes: bool) -> Inventory {
         notes,
         old_caches,
         any_running: !running.is_empty(),
+        build_cache,
     };
     if with_sizes {
         measure(&mut inv, |_| true);
@@ -975,6 +1118,10 @@ pub enum Action {
     Image {
         cli: String,
         tags: Vec<String>,
+    },
+    BuildCache {
+        cli: String,
+        ids: Vec<String>,
     },
     Path {
         path: PathBuf,
@@ -1049,13 +1196,35 @@ pub fn plan(inv: &Inventory, o: &GcOptions, now: u64) -> Vec<Item> {
         items.push(Item {
             what: format!("image {} ({})", i.tags.join(", "), i.cli),
             tier: Tier::Auto,
-            bytes: i.bytes,
+            // Images share layers: only the unique part is freed.
+            bytes: i.unique.unwrap_or(i.bytes),
             reason: "not a current paddock image, and no container uses it".into(),
             warning: None,
             needs: vec![],
             action: Action::Image {
                 cli: i.cli.clone(),
                 tags: i.tags.clone(),
+            },
+        });
+    }
+    // paddock's base image builds in the docker build cache. They hold the
+    // layers of removed images; current images keep their own layers, so a
+    // removed record only costs time at the next build.
+    let mut by_cli: BTreeMap<&str, Vec<&BuildRecord>> = BTreeMap::new();
+    for r in &inv.build_cache {
+        by_cli.entry(&r.cli).or_default().push(r);
+    }
+    for (cli, recs) in by_cli {
+        items.push(Item {
+            what: format!("paddock build cache ({cli}, {} records)", recs.len()),
+            tier: Tier::Auto,
+            bytes: recs.iter().map(|r| r.bytes).sum(),
+            reason: "build steps of paddock base images; images keep their own layers".into(),
+            warning: None,
+            needs: vec![],
+            action: Action::BuildCache {
+                cli: cli.to_string(),
+                ids: recs.iter().map(|r| r.id.clone()).collect(),
             },
         });
     }
@@ -1378,6 +1547,13 @@ pub fn apply(env: &HostEnv, containers: &dyn Containers, items: &[Item]) -> Vec<
             Action::Image { cli, tags } => tags
                 .iter()
                 .try_for_each(|t| containers.run(cli, &["rmi", t]).map(|_| ())),
+            // Only the records that paddock found: one id filter each.
+            Action::BuildCache { cli, ids } => ids.iter().try_for_each(|id| {
+                let f = format!("id={id}");
+                containers
+                    .run(cli, &["builder", "prune", "--force", "--filter", &f])
+                    .map(|_| ())
+            }),
             Action::Path { path }
                 if !running.is_empty() && path.parent() == Some(shared_cache(env).as_path()) =>
             {
@@ -1554,9 +1730,9 @@ pub fn render_du(env: &HostEnv, inv: &Inventory, now: u64) -> String {
             h.loses
         ));
     }
-    let total_images: u64 = inv.images.iter().map(|i| i.bytes).sum();
+    let total_images: u64 = inv.images.iter().map(|i| i.unique.unwrap_or(i.bytes)).sum();
     t.push_str(&format!(
-        "\nImages: {} in {} (images share layers, so removing one can free less)\n",
+        "\nImages: {} in {} (the first number is each image's own part, which removing it frees)\n",
         human(total_images),
         inv.images.len()
     ));
@@ -1568,11 +1744,20 @@ pub fn render_du(env: &HostEnv, inv: &Inventory, now: u64) -> String {
             (false, false) => "old, unused",
         };
         t.push_str(&format!(
-            "  {:>9}  {:<12}  {} {}  ({state})\n",
-            human(i.bytes),
+            "  {:>9}  {:<12}  {} {}  ({state}, {} in all)\n",
+            human(i.unique.unwrap_or(i.bytes)),
             i.created,
             i.cli,
-            i.tags.join(", ")
+            i.tags.join(", "),
+            human(i.bytes)
+        ));
+    }
+    let cache: u64 = inv.build_cache.iter().map(|r| r.bytes).sum();
+    if !inv.build_cache.is_empty() {
+        t.push_str(&format!(
+            "\nBuild cache: {} in {} records of paddock base image builds\n",
+            human(cache),
+            inv.build_cache.len()
         ));
     }
     let total_wt: u64 = inv.worktrees.iter().map(|w| w.bytes).sum();
@@ -1671,9 +1856,15 @@ pub fn render_plan(items: &[Item], yes: bool) -> String {
     }
     if !yes {
         t.push_str(&format!(
-            "\n`paddock gc --yes` removes {}.",
+            "\n`paddock gc --yes` frees at least {}.",
             human(selected)
         ));
+        if items
+            .iter()
+            .any(|i| matches!(i.action, Action::BuildCache { .. }))
+        {
+            t.push_str(" Build cache records that removed images still share free more space after the images are gone.");
+        }
         if more > 0 {
             t.push_str(&format!(
                 " The items that need more flags hold {} more.",
