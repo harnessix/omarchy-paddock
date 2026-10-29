@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Network mode `egress` blocks the LAN by default: private, link-local and CGNAT ranges, on every backend. `[network] lan = true` allows it again. `paddock doctor --escape` checks it.
 - Logging with levels. `-v` and `-q` change how much paddock prints, and `PADDOCK_LOG=debug` or `PADDOCK_LOG=broker=debug` sets the level for everything or for one part. The broker, the proxy, the login callback forwarder and the window border also write to the systemd journal: `journalctl -t paddock -p warning`.
 - `paddock doctor --report` prints a diagnostic report for bug reports, without user names, paths, variable values or tokens.
 - The bar plugin writes a warning to the shell log when it cannot read paddock's output. `PADDOCK_DEBUG=true` shows more.

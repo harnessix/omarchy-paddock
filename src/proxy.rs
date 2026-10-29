@@ -130,6 +130,8 @@ pub struct HostProxy {
     pub no_proxy: Option<String>,
     /// Host loopback ports that the sandbox can reach through the proxy.
     pub allow_loopback: Vec<u16>,
+    /// Private and link-local networks are reachable (network.lan).
+    pub allow_lan: bool,
     /// A tunnel with no traffic in either direction for this long is closed.
     pub idle: Duration,
     /// Connections handled at the same time.
@@ -143,6 +145,7 @@ impl Default for HostProxy {
             http: None,
             no_proxy: None,
             allow_loopback: Vec::new(),
+            allow_lan: false,
             idle: Duration::from_secs(15 * 60),
             max_conns: 512,
         }
@@ -168,6 +171,53 @@ impl HostProxy {
             .as_deref()
             .is_some_and(|n| NoProxy::from(n).matches(host))
     }
+}
+
+/// Private and link-local networks: the LAN, VPN peers (CGNAT range) and
+/// IPv6 unique-local and link-local addresses. A sandbox reaches them only
+/// with `[network] lan = true`.
+pub const LAN_V4: &[&str] = &[
+    "10.0.0.0/8",
+    "172.16.0.0/12",
+    "192.168.0.0/16",
+    "169.254.0.0/16",
+    "100.64.0.0/10",
+];
+pub const LAN_V6: &[&str] = &["fc00::/7", "fe80::/10"];
+
+pub fn is_lan(ip: &IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            let o = v4.octets();
+            v4.is_private() || v4.is_link_local() || (o[0] == 100 && (o[1] & 0xc0) == 64)
+        }
+        IpAddr::V6(v6) => {
+            let s = v6.segments()[0];
+            (s & 0xfe00) == 0xfc00 || (s & 0xffc0) == 0xfe80
+        }
+    }
+}
+
+impl Upstream {
+    pub fn host(&self) -> &str {
+        match self {
+            Upstream::Http { host, .. } | Upstream::Socks5 { host, .. } => host,
+        }
+    }
+}
+
+/// The addresses of the host's upstream proxies. A proxy on the LAN stays
+/// reachable when the LAN is blocked, because all traffic goes through it.
+pub fn proxy_addrs(cfg: &HostProxy) -> Vec<IpAddr> {
+    let mut out = Vec::new();
+    for u in [&cfg.https, &cfg.http].into_iter().flatten() {
+        if let Ok(it) = (u.host(), 0u16).to_socket_addrs() {
+            out.extend(it.map(|a| a.ip()));
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
 }
 
 /// Every address of a local interface. A connection to one of them reaches
@@ -221,6 +271,8 @@ fn check_target(cfg: &HostProxy, host: &str, port: u16) -> Result<()> {
             }
         } else if ip.is_unspecified() || local.contains(&ip) {
             bail!("refused: {host}:{port} is an address of this host");
+        } else if !cfg.allow_lan && is_lan(&ip) {
+            bail!("refused: {host}:{port} is on a private network; set [network] lan = true to allow it");
         }
     }
     Ok(())
