@@ -319,7 +319,7 @@ Windows of app sandboxes get a sage green border, so you can tell a protected ap
 
 Known limits:
 
-- Desktop apps log in again inside the sandbox. They keep their login in the sandbox home, because your keyring is out of reach.
+- Desktop apps log in again inside the sandbox. They keep their login in the sandbox home, because your keyring is out of reach. Some apps say so: Claude, for example, warns that no system keyring is available and that it stores secrets without encryption. The secrets stay in the sandbox home, which only your user can read.
 - A new window that gets focus can read the clipboard once. This is how Wayland clipboards work, and Flatpak has the same gap.
 - Tray icons may not appear.
 - Apps cannot update themselves inside the sandbox. Update them on the host, with your package manager or the app's own installer outside paddock.
@@ -351,7 +351,7 @@ After `install`, typing `claude` in a new shell runs `paddock run claude` in the
 - In menus that follow the XDG menu standard (GNOME, KDE, Xfce), a Paddock folder.
 - In any app launcher, search for "paddock".
 
-A terminal harness entry opens a terminal with `paddock pick <harness>`: pick a recent project or type a path, and the harness starts there. An app entry runs `paddock app run`.
+A terminal harness entry opens a terminal with `paddock pick <harness>`: pick a recent project or type a path, and the harness starts there. An app entry runs `paddock app run`. If you did not save workspace folders for the app (`[apps.NAME] roots`), a dialog asks for one: pick a recent project or any other folder. The dialog needs zenity. Without it, a desktop notification says how to name the folders.
 
 Logins work from these entries too. When a harness opens its login page, the approval card asks "Open the login page of claude in your browser?" and shows the link. After you allow it, the page opens in your browser on the host, and paddock forwards the one localhost port that the login returns to, for ten minutes and only while the sandbox listens on it. Login callbacks are on by default for claude, codex, copilot, gemini, opencode and agy (`[launch] login_callback` in the profile). They work on the bwrap, docker and podman backends; on srt, paddock prints a warning instead.
 
