@@ -142,7 +142,8 @@ Panel {
   }
 
   function rowCount() {
-    if (view === "project") return recentProjects.length
+    // The last row of the project step opens a folder dialog.
+    if (view === "project") return recentProjects.length + 1
     if (view === "harness") return installedHarnesses().length
     return approvals.length + sandboxes.length + artifacts.length
   }
@@ -328,6 +329,14 @@ Panel {
     root.confirmId = ""
     loadStartData()
   }
+  // Any folder, not only recent ones. The panel steps aside while the
+  // dialog is open and comes back at the harness step.
+  function pickFolder() {
+    if (folderProc.running) return
+    root.controller.hide()
+    folderProc.buffer = ""
+    folderProc.running = true
+  }
   function chooseProject(path) {
     root.chosenProject = path
     root.view = "harness"
@@ -385,7 +394,8 @@ Panel {
   }
   function activate() {
     if (view === "project") {
-      if (recentProjects.length) chooseProject(recentProjects[selectedIndex].project)
+      if (selectedIndex < recentProjects.length) chooseProject(recentProjects[selectedIndex].project)
+      else pickFolder()
       return
     }
     if (view === "harness") {
@@ -421,6 +431,18 @@ Panel {
     property string buffer: ""
     stdout: SplitParser {
       onRead: function(line) { if (proc.buffer.length < 262144) proc.buffer += line }
+    }
+  }
+
+  JsonProc {
+    id: folderProc
+    command: ["sh", "-c", "command -v zenity >/dev/null 2>&1 || exit 127; exec zenity --file-selection --directory --title=\"$1\" --filename=\"$HOME/\"", "paddock-folder", strings.t("new.chooseFolderTitle")]
+    onExited: function(exitCode) {
+      var path = buffer.trim()
+      if (exitCode === 127) { root.controller.show(); root.say(strings.t("new.noZenity")); return }
+      if (exitCode !== 0 || path === "") { root.controller.show(); return }
+      root.chooseProject(path)
+      root.controller.show()
     }
   }
 
@@ -966,6 +988,13 @@ Panel {
                 caption2: strings.t("new.lastUsed").arg(modelData.harness)
                 onActivated: root.chooseProject(modelData.project)
               }
+            }
+            ListRow {
+              rowIndex: root.recentProjects.length
+              glyph: "󰉖"
+              title: strings.t("new.otherFolder")
+              caption: strings.t("new.otherFolderHint")
+              onActivated: root.pickFolder()
             }
           }
 

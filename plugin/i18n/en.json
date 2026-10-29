@@ -43,7 +43,7 @@
   "new.back": "Back",
   "new.stepProject": "New sandbox · step 1 of 2",
   "new.stepHarness": "New sandbox · step 2 of 2",
-  "new.noRecent": "No recent projects yet. Projects appear here after you start a sandbox in them with paddock <harness>.",
+  "new.noRecent": "No recent projects yet. Choose a folder below, or start a sandbox with paddock <harness> in a project.",
   "new.lastUsed": "last used with %1",
   "keys.list": "↵ terminal · ←→ actions · Del stop · N new",
   "keys.new": "↵ choose · Esc back",
@@ -129,5 +129,9 @@
     "one": "%1 saved %2 file outside the project. Open the Paddock panel to recover it.",
     "other": "%1 saved %2 files outside the project. Open the Paddock panel to recover them."
   },
-  "keys.files": "↵ recover · → open folder"
+  "keys.files": "↵ recover · → open folder",
+  "new.otherFolder": "Choose another folder…",
+  "new.otherFolderHint": "Any project folder on this computer",
+  "new.chooseFolderTitle": "Choose a project folder for paddock",
+  "new.noZenity": "Install zenity to choose any folder"
 }
