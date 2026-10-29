@@ -47,4 +47,4 @@ Keep one change per pull request. Do not commit build output, local configuratio
 
 ## Reports
 
-To report a bug, use the issue form. It asks for the output of `paddock doctor`. To report a security problem, do not open a public issue. Follow [SECURITY.md](SECURITY.md).
+To report a bug, use the issue form. It asks for the output of `paddock doctor --report`. The report removes your user name, paths and tokens, but read it before you paste it. To report a security problem, do not open a public issue. Follow [SECURITY.md](SECURITY.md).

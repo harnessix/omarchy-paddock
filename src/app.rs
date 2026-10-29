@@ -750,9 +750,14 @@ pub mod ports {
                     continue;
                 }
                 // Loopback only, never another address of the host.
-                let Ok(l) = TcpListener::bind(("127.0.0.1", p)) else {
-                    continue;
+                let l = match TcpListener::bind(("127.0.0.1", p)) {
+                    Ok(l) => l,
+                    Err(e) => {
+                        log::debug!("cannot forward port {p}: {e}");
+                        continue;
+                    }
                 };
+                log::debug!("forwarding port {p} into the sandbox");
                 let _ = l.set_nonblocking(true);
                 let flag = Arc::new(AtomicBool::new(false));
                 open.insert(p, flag.clone());
@@ -764,8 +769,12 @@ pub mod ports {
                                 let _ = tcp.set_nonblocking(false);
                                 let sock = sock.clone();
                                 std::thread::spawn(move || {
-                                    let Ok(mut u) = UnixStream::connect(&sock) else {
-                                        return;
+                                    let mut u = match UnixStream::connect(&sock) {
+                                        Ok(u) => u,
+                                        Err(e) => {
+                                            log::warn!("port {p}: cannot reach the sandbox: {e}");
+                                            return;
+                                        }
                                     };
                                     if writeln!(u, "{p}").is_err() {
                                         return;

@@ -66,6 +66,19 @@ Panel {
   // $HOME is expanded by the shell at run time; no user path is stored here.
   readonly property string findPaddock: "pd() { for p in \"$(command -v paddock)\" \"$HOME/.local/bin/paddock\" \"$HOME/.cargo/bin/paddock\"; do if [ -n \"$p\" ] && [ -x \"$p\" ]; then \"$p\" \"$@\"; return; fi; done; return 127; }"
   readonly property string launcher: findPaddock + "; pd \"$@\""
+
+  // Logging, as the Omarchy shell does it: silent normally, console.warn on
+  // a real fallback (once per message, the polls repeat every few seconds),
+  // and console.log only with PADDOCK_DEBUG=true in the shell's environment.
+  // Read the output with: journalctl -t omarchy-shell
+  readonly property bool debug: Quickshell.env("PADDOCK_DEBUG") === "true"
+  property string lastWarning: ""
+  function warnOnce(msg) {
+    if (msg === lastWarning) return
+    lastWarning = msg
+    console.warn("paddock: " + msg)
+  }
+  function debugLog(msg) { if (debug) console.log("paddock: " + msg) }
   // Opens a terminal. Arguments: directory, title, then the command to run in it.
   readonly property string terminal: "dir=\"$1\"; title=\"$2\"; shift 2; if command -v uwsm-app >/dev/null 2>&1; then exec setsid uwsm-app -- xdg-terminal-exec --dir=\"$dir\" --title=\"$title\" -e \"$@\"; else exec setsid xdg-terminal-exec --dir=\"$dir\" --title=\"$title\" -e \"$@\"; fi"
   // Keeps a terminal open after a command ends.
@@ -377,8 +390,10 @@ Panel {
         root.sandboxes = clean
         root.runningCount = clean.length
         root.pluginState = "ok"
+        root.lastWarning = ""
         if (root.view === "list" && root.selectedIndex >= clean.length) root.selectedIndex = Math.max(0, clean.length - 1)
       } catch (e) {
+        root.warnOnce("cannot read paddock ps --json (exit " + exitCode + "), showing an error: " + e)
         root.pluginState = "error"
       }
     }
@@ -478,7 +493,9 @@ Panel {
             decision: d,
             time: Number(r.time || 0)
           })
-        } catch (e) {}
+        } catch (e) {
+          root.debugLog("skipped an audit log line: " + e)
+        }
       }
       root.recent = out
       lines = []
