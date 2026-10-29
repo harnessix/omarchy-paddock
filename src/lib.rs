@@ -20,6 +20,7 @@ pub mod mcp;
 pub mod policy;
 pub mod profile;
 pub mod proxy;
+pub mod recover;
 pub mod report;
 pub mod run;
 pub mod shims;

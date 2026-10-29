@@ -45,6 +45,10 @@ pub struct Manifest {
     /// Desktop apps (`paddock app`). Read from the user configuration only.
     #[serde(default)]
     pub apps: BTreeMap<String, AppCfg>,
+    /// Recovery folders and ignore rules. Read by recover.rs from the user
+    /// configuration only; a project file cannot set them.
+    #[serde(default, skip_serializing)]
+    pub recovery: Option<toml::Value>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -196,8 +200,8 @@ impl Manifest {
 
     fn merge(&mut self, o: Manifest) {
         // [host] and [apps] are trusted only from the user configuration.
-        if o.host.is_some() || !o.apps.is_empty() {
-            log::warn!("[host] and [apps] in a project paddock.toml are ignored");
+        if o.host.is_some() || !o.apps.is_empty() || o.recovery.is_some() {
+            log::warn!("[host], [apps] and [recovery] in a project paddock.toml are ignored");
         }
         if o.default_harness.is_some() {
             self.default_harness = o.default_harness;
