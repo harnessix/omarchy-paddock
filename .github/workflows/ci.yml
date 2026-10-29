@@ -42,6 +42,11 @@ jobs:
             sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
           fi
           bwrap --unshare-all --ro-bind / / true
+      # With mise, the probe also checks that a project's mise config cannot
+      # write the shared tool installs.
+      - uses: jdx/mise-action@v2
+        with:
+          install: false
       - run: cargo build --locked
       - name: Probe, network none
         run: target/debug/paddock doctor --escape --backend bwrap --network none

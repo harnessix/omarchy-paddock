@@ -311,12 +311,20 @@ impl Backend for Srt {
         }
         vars.insert("CLAUDE_CODE_TMPDIR".into(), s(&tmp));
         // Host tools appear in their own directories, not under /run/paddock/bin.
-        let mut path: Vec<String> = spec
-            .host_tools
-            .iter()
-            .filter_map(|t| t.src.parent().map(s))
-            .collect();
+        // paddock's own wrappers in the run folder come first. Other tools,
+        // such as mise in /usr/bin, come last: their directory would otherwise
+        // hide the wrappers (gh) behind the host programs of the same name.
+        let run = run_dir.as_path();
+        let dirs = |own: bool| {
+            spec.host_tools
+                .iter()
+                .filter_map(|t| t.src.parent())
+                .filter(move |d| d.starts_with(run) == own)
+                .map(s)
+        };
+        let mut path: Vec<String> = dirs(true).collect();
         path.push(vars.get("PATH").cloned().unwrap_or_default());
+        path.extend(dirs(false));
         vars.insert("PATH".into(), path.join(":"));
         let mut setup = vec!["mkdir -p \"${TMPDIR:-/tmp}\"".to_string()];
         if spec.gui.enabled() {

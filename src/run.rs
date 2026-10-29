@@ -5,7 +5,7 @@ use crate::build::Built;
 use crate::env::HostEnv;
 use crate::gui::{self, WindowCompositor};
 use crate::manifest::hex;
-use crate::spec::GuiMode;
+use crate::spec::{GuiMode, SandboxSpec};
 use crate::state::{self, AuthSync, Running};
 use anyhow::{bail, Context, Result};
 use sha2::{Digest, Sha256};
@@ -147,30 +147,37 @@ pub fn run(
         cfg.allow_lan = built.spec.lan;
         crate::proxy::serve(&sock, cfg)?;
     }
-    // The provision step: shared tool installs are writable only here.
-    if let Some(p) = built.spec.provision_spec() {
-        let l = backend.render(env, &p, false)?;
-        write_files(&l)?;
-        if !quiet {
-            eprintln!("paddock: provisioning: {}", built.spec.provision.join("; "));
-        }
-        let mut cmd = Command::new(&l.program);
-        cmd.args(&l.args)
-            .env_clear()
-            .envs(&l.env)
-            .stdin(Stdio::null());
-        if quiet {
-            cmd.stdout(Stdio::null()).stderr(Stdio::null());
-        } else {
-            cmd.stdout(Stdio::from(std::io::stderr()));
-        }
-        let status = cmd
-            .status()
-            .with_context(|| format!("cannot start {}", l.program.display()))?;
-        if !status.success() && !quiet {
+    // The shared install step: a clean sandbox without the project installs
+    // registry tools into the shared mise installs. srt cannot mount the
+    // shared installs, so its sandboxes install everything privately.
+    let scratch = env.paddock_cache().join("provision").join(&built.spec.id);
+    let shared_dir = env
+        .paddock_cache()
+        .join("shared")
+        .join(crate::mise::SHARED_CACHE);
+    let shared = if backend.name() == "srt"
+        || crate::mise::all_installed(&shared_dir, &built.spec.mise_shared)
+    {
+        None
+    } else {
+        built.spec.mise_shared_spec(scratch.clone())
+    };
+    if let Some(p) = shared {
+        std::fs::create_dir_all(&scratch)?;
+        let what = built.spec.mise_shared.join(" ");
+        let result = provision(env, backend, &p, quiet, &format!("shared tools: {what}"));
+        let _ = std::fs::remove_dir_all(&scratch);
+        if !result? && !quiet {
             eprintln!(
-                "paddock: warning: provisioning failed ({status}); the harness starts anyway"
+                "paddock: warning: the shared install failed; the project installs the tools in its own home"
             );
+        }
+    }
+    // The provision step, in the project sandbox with the harness's rights.
+    if let Some(p) = built.spec.provision_spec() {
+        let what = built.spec.provision.join("; ");
+        if !provision(env, backend, &p, quiet, &what)? && !quiet {
+            eprintln!("paddock: warning: provisioning failed; the harness starts anyway");
         }
     }
     let launch = backend.render(env, &built.spec, interactive)?;
@@ -477,4 +484,34 @@ fn start_broker(
     gui::write_file(&gh, "#!/bin/sh\nexec paddock host gh \"$@\"\n", 0o755)?;
     built.spec.add_tool("gh", gh, "gh through the host");
     Ok(repo)
+}
+
+/// Run one provision sandbox to the end. Its output goes to stderr. Returns
+/// whether it succeeded.
+fn provision(
+    env: &HostEnv,
+    backend: &dyn Backend,
+    spec: &SandboxSpec,
+    quiet: bool,
+    what: &str,
+) -> Result<bool> {
+    let l = backend.render(env, spec, false)?;
+    write_files(&l)?;
+    if !quiet {
+        eprintln!("paddock: provisioning: {what}");
+    }
+    let mut cmd = Command::new(&l.program);
+    cmd.args(&l.args)
+        .env_clear()
+        .envs(&l.env)
+        .stdin(Stdio::null());
+    if quiet {
+        cmd.stdout(Stdio::null()).stderr(Stdio::null());
+    } else {
+        cmd.stdout(Stdio::from(std::io::stderr()));
+    }
+    let status = cmd
+        .status()
+        .with_context(|| format!("cannot start {}", l.program.display()))?;
+    Ok(status.success())
 }

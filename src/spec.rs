@@ -110,6 +110,10 @@ pub struct HostTool {
     pub origin: String,
 }
 
+/// Where the shared mise installs appear, relative to the sandbox home. mise
+/// finds them as its "system" installs, read-only.
+pub const MISE_SHARED_INSTALLS: &str = ".local/share/paddock-mise/installs";
+
 /// Directory inside the sandbox where host tools (for example `mise`) appear.
 pub const TOOL_DIR: &str = "/run/paddock/bin";
 
@@ -204,6 +208,9 @@ pub struct SandboxSpec {
     pub mounts: Vec<Mount>,
     pub env: BTreeMap<String, EnvVar>,
     pub path: Vec<PathBuf>,
+    /// PATH entries after the host tools and before the system directories,
+    /// so they cannot shadow a host tool such as paddock's `gh`.
+    pub tool_path: Vec<PathBuf>,
     pub host_tools: Vec<HostTool>,
     pub network: Network,
     pub publish: Vec<u16>,
@@ -228,10 +235,12 @@ pub struct SandboxSpec {
     /// Project files that host tools run automatically. Paddock warns when they change.
     pub watch: Vec<PathBuf>,
     pub warnings: Vec<String>,
-    /// Shell lines for the provision step, a short run before the harness in
-    /// which the `provision_rw` mounts are writable.
+    /// Shell lines for the provision step, a short run in this sandbox before
+    /// the harness starts. It has the same rights as the harness.
     pub provision: Vec<String>,
-    pub provision_rw: Vec<PathBuf>,
+    /// `tool@version` pairs that a clean sandbox installs into the shared mise
+    /// installs before the provision step (see `mise_shared_spec`).
+    pub mise_shared: Vec<String>,
     /// A filtered session bus socket on the host (app mode). Backends bind it
     /// to $XDG_RUNTIME_DIR/bus inside.
     pub bus_socket: Option<PathBuf>,
@@ -270,6 +279,7 @@ impl SandboxSpec {
             mounts: Vec::new(),
             env: BTreeMap::new(),
             path: Vec::new(),
+            tool_path: Vec::new(),
             host_tools: Vec::new(),
             network: Network::Egress,
             publish: Vec::new(),
@@ -285,7 +295,7 @@ impl SandboxSpec {
             watch: Vec::new(),
             warnings: Vec::new(),
             provision: Vec::new(),
-            provision_rw: Vec::new(),
+            mise_shared: Vec::new(),
             bus_socket: None,
             host_socket: None,
             notices: Vec::new(),
@@ -346,18 +356,13 @@ impl SandboxSpec {
         });
     }
 
-    /// The spec for the provision step: same sandbox, provision mounts
-    /// writable, no display, and the provision lines as the command.
+    /// The spec for the provision step: same sandbox and mounts, no display,
+    /// and the provision lines as the command.
     pub fn provision_spec(&self) -> Option<SandboxSpec> {
         if self.provision.is_empty() {
             return None;
         }
         let mut p = self.clone();
-        for m in p.mounts.iter_mut() {
-            if self.provision_rw.contains(&m.dst) {
-                m.kind = MountKind::Rw;
-            }
-        }
         p.gui = Gui::default();
         p.setup.clear();
         p.command = vec![
@@ -365,6 +370,63 @@ impl SandboxSpec {
             "-c".into(),
             format!("set -e\n{}", self.provision.join("\n")),
         ];
+        Some(p)
+    }
+
+    /// The spec that installs `mise_shared` into the shared mise installs. It
+    /// is a new sandbox, not a copy of this one: the home is the empty
+    /// directory `scratch`, and the project, its mise files, the sandbox home,
+    /// the manifest settings and the other caches are absent. The shared
+    /// installs are the one writable mount, and mise gets the tool list on its
+    /// command line, so no project file can run code while they are writable.
+    pub fn mise_shared_spec(&self, scratch: PathBuf) -> Option<SandboxSpec> {
+        if self.mise_shared.is_empty() {
+            return None;
+        }
+        let dst = self.home.join(MISE_SHARED_INSTALLS);
+        let shared = self
+            .mounts
+            .iter()
+            .find(|m| m.dst == dst && m.is_bind())?
+            .src
+            .clone()?;
+        let mise = self.host_tools.iter().find(|t| t.name == "mise")?;
+        let mut p = SandboxSpec::new(
+            self.id.clone(),
+            &self.harness,
+            &self.home,
+            scratch,
+            &self.home,
+            self.uid,
+            self.gid,
+            &self.user,
+        );
+        p.network = self.network;
+        p.allow_domains = self.allow_domains.clone();
+        // The host proxy is the only host service the downloads need.
+        for (k, v) in &self.env {
+            if v.origin.starts_with("network: host proxy") {
+                p.env.insert(k.clone(), v.clone());
+            }
+        }
+        for (port, origin) in &self.host_ports {
+            if origin.starts_with("network: host proxy") {
+                p.add_host_port(*port, origin);
+            }
+        }
+        p.add_tool("mise", mise.src.clone(), &mise.origin);
+        p.add_mount(Mount::bind(shared, &dst, true, "mise shared install step"));
+        let origin = "mise shared install step";
+        let data = dst.parent().unwrap_or(&dst).display().to_string();
+        p.set_env("MISE_DATA_DIR", data, origin);
+        p.set_env("MISE_YES", "1", origin);
+        p.set_env(
+            "MISE_DISABLE_BACKENDS",
+            crate::mise::DISABLED_BACKENDS.join(","),
+            origin,
+        );
+        p.command = vec![format!("{TOOL_DIR}/mise"), "install".into()];
+        p.command.extend(self.mise_shared.iter().cloned());
         Some(p)
     }
 
@@ -394,6 +456,7 @@ impl SandboxSpec {
     pub fn path_value(&self) -> String {
         let mut dirs: Vec<String> = self.path.iter().map(|p| p.display().to_string()).collect();
         dirs.push(TOOL_DIR.to_string());
+        dirs.extend(self.tool_path.iter().map(|p| p.display().to_string()));
         for d in [
             "/usr/local/sbin",
             "/usr/local/bin",
@@ -411,5 +474,74 @@ impl SandboxSpec {
             }
         }
         dirs.join(":")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mise_shared_spec_has_no_project() {
+        let home = PathBuf::from("/home/demo");
+        let project = PathBuf::from("/home/demo/src/app");
+        let mut s = SandboxSpec::new(
+            "id".into(),
+            "claude",
+            &project,
+            "/data/homes/x".into(),
+            &home,
+            1000,
+            1000,
+            "demo",
+        );
+        let dst = home.join(MISE_SHARED_INSTALLS);
+        s.add_mount(Mount::same(&project, true, "project"));
+        s.add_mount(Mount::bind(
+            "/cache/shared/npm",
+            home.join(".npm"),
+            true,
+            "npm",
+        ));
+        s.add_mount(Mount::bind("/cache/shared/mise-tools", &dst, false, "mise"));
+        s.add_tool("mise", "/usr/bin/mise".into(), "detector mise");
+        s.set_env("MISE_TRUSTED_CONFIG_PATHS", "/home/demo/src/app", "mise");
+        s.set_env("PROJECT_VAR", "1", "manifest env.set");
+        s.set_secret_env(
+            "HTTPS_PROXY",
+            "http://127.0.0.1:3128",
+            "network: host proxy",
+        );
+        s.add_host_port(3128, "network: host proxy in HTTPS_PROXY");
+        s.add_host_port(5432, "manifest network.host_ports");
+        s.setup.push("echo setup".into());
+        s.provision.push("mise install".into());
+        assert!(s.mise_shared_spec("/scratch".into()).is_none());
+
+        s.mise_shared = vec!["node@22".into(), "jq@1.7.1".into()];
+        let p = s.mise_shared_spec("/scratch".into()).unwrap();
+        assert_eq!(p.home_src, PathBuf::from("/scratch"));
+        assert_eq!(p.workdir, home);
+        assert_eq!(p.mounts.len(), 1);
+        assert_eq!(p.mounts[0].dst, dst);
+        assert_eq!(p.mounts[0].kind, MountKind::Rw);
+        assert!(p.setup.is_empty() && p.provision.is_empty());
+        assert!(!p.env.contains_key("MISE_TRUSTED_CONFIG_PATHS"));
+        assert!(!p.env.contains_key("PROJECT_VAR"));
+        assert!(p.env.contains_key("HTTPS_PROXY"));
+        assert_eq!(p.host_ports.len(), 1);
+        assert_eq!(
+            p.env["MISE_DATA_DIR"].value,
+            "/home/demo/.local/share/paddock-mise"
+        );
+        assert_eq!(
+            p.command,
+            ["/run/paddock/bin/mise", "install", "node@22", "jq@1.7.1"]
+        );
+
+        // The project's own provision step keeps the shared installs read-only.
+        let own = s.provision_spec().unwrap();
+        let m = own.mounts.iter().find(|m| m.dst == dst).unwrap();
+        assert_eq!(m.kind, MountKind::Ro);
     }
 }

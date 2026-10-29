@@ -15,6 +15,17 @@ use std::process::Command;
 
 pub const PROBE: &str = include_str!("probe.sh");
 
+/// The file a hostile project mise config tries to create in the shared installs.
+const MISE_CANARY: &str = "paddock-probe-hook";
+
+/// Sourced by mise as `[env] _.source` and run as hooks: it writes the canary
+/// into every place the shared installs could be.
+const MISE_HOOK: &str = r#"for d in "$MISE_SYSTEM_INSTALLS_DIR" "$MISE_DATA_DIR/installs" "$HOME/.local/share/paddock-mise/installs"; do
+  [ -d "$d" ] && (: > "$d/paddock-probe-hook") 2>/dev/null
+done
+true
+"#;
+
 pub struct Dep {
     pub cmd: &'static str,
     /// Package names for Arch, Debian/Ubuntu and Fedora.
@@ -347,6 +358,31 @@ pub fn escape(env: &HostEnv, o: &EscapeOpts) -> Result<usize> {
     }
     std::fs::write(project.join(".env"), "TOKEN=paddock-secret-canary\n")?;
     std::fs::write(project.join("README"), "paddock doctor project\n")?;
+    // A hostile mise config: its env script and hooks try to write into the
+    // shared installs, which every project's sandbox executes. With network,
+    // a plain registry tool must still install into the shared installs.
+    let mise = env.which("mise").is_some();
+    let shared_mise: Vec<PathBuf> = [crate::mise::SHARED_CACHE, "mise-installs"]
+        .iter()
+        .map(|d| env.paddock_cache().join("shared").join(d))
+        .collect();
+    if mise {
+        std::fs::write(project.join(".paddock-probe-mise.sh"), MISE_HOOK)?;
+        let tools = if o.online {
+            "[tools]\njq = \"1.7.1\"\n"
+        } else {
+            ""
+        };
+        std::fs::write(
+            project.join("mise.toml"),
+            format!(
+                "[env]\n_.source = \"./.paddock-probe-mise.sh\"\n\n[hooks]\nenter = \"sh ./.paddock-probe-mise.sh\"\npostinstall = \"sh ./.paddock-probe-mise.sh\"\n\n{tools}"
+            ),
+        )?;
+        for d in &shared_mise {
+            let _ = std::fs::remove_file(d.join(MISE_CANARY));
+        }
+    }
     let gui = o.display != GuiMode::Off;
     if gui {
         // A desktop marker, so the desktop detector path is exercised as well.
@@ -468,6 +504,9 @@ pub fn escape(env: &HostEnv, o: &EscapeOpts) -> Result<usize> {
     if o.online {
         s.set_env("PADDOCK_PROBE_ONLINE", "1", "doctor");
     }
+    if mise {
+        s.set_env("PADDOCK_PROBE_MISE", "1", "doctor");
+    }
     s.set_env(
         "PADDOCK_PROBE_ENV",
         if o.inherit { "inherit" } else { "clean" },
@@ -573,6 +612,27 @@ pub fn escape(env: &HostEnv, o: &EscapeOpts) -> Result<usize> {
             Some(p) => {
                 failed += 1;
                 println!("  FAIL {name}: {p}");
+            }
+        }
+    }
+    if mise {
+        seen += 1;
+        let reached: Vec<String> = shared_mise
+            .iter()
+            .map(|d| d.join(MISE_CANARY))
+            .filter(|f| f.exists())
+            .map(|f| f.display().to_string())
+            .collect();
+        if reached.is_empty() {
+            println!("  ok mise-config-cannot-write-shared");
+        } else {
+            failed += 1;
+            println!(
+                "  FAIL mise-config-cannot-write-shared: a project mise hook wrote {}",
+                reached.join(", ")
+            );
+            for f in reached {
+                let _ = std::fs::remove_file(f);
             }
         }
     }

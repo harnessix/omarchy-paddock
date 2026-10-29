@@ -17,6 +17,7 @@ pub mod logging;
 pub mod login;
 pub mod manifest;
 pub mod mcp;
+pub mod mise;
 pub mod policy;
 pub mod portal;
 pub mod profile;
