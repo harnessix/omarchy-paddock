@@ -53,6 +53,11 @@ enum Cmd {
     Pick { harness: String },
     /// Create or remove launcher entries for every installed harness and app,
     /// in a "Paddock" folder of the menu.
+    /// Make `claude`, `codex` and the other harness commands start in a sandbox in your shell
+    Shims {
+        #[command(subcommand)]
+        cmd: ShimsCmd,
+    },
     Launchers {
         #[command(subcommand)]
         cmd: LaunchersCmd,
@@ -179,6 +184,16 @@ enum Cmd {
     },
     #[command(external_subcommand)]
     External(Vec<String>),
+}
+
+#[derive(Subcommand)]
+enum ShimsCmd {
+    /// Write the shell functions, and source them from ~/.bashrc and ~/.zshrc.
+    Install,
+    /// Remove the functions and the lines that `install` added.
+    Remove,
+    /// Show the commands that `install` would cover, and whether they are on.
+    List,
 }
 
 #[derive(Subcommand)]
@@ -876,6 +891,39 @@ fn real_main() -> Result<i32> {
             Ok(0)
         }
         Cmd::Pick { harness } => pick(&env, &harness),
+        Cmd::Shims { cmd } => {
+            use paddock::shims;
+            match cmd {
+                ShimsCmd::List => {
+                    let on = shims::installed(&env);
+                    for (harness, cmd) in shims::detect(&env)? {
+                        println!("{cmd:<10} paddock run {harness}");
+                    }
+                    println!("\nShims are {}.", if on { "on" } else { "off" });
+                }
+                ShimsCmd::Install => {
+                    let r = shims::install(&env)?;
+                    for (harness, cmd) in &r.shims {
+                        println!("{cmd:<10} paddock run {harness}");
+                    }
+                    if r.rc_files.is_empty() {
+                        println!("\nNo ~/.bashrc or ~/.zshrc found. Source {} from your shell configuration.", shims::script_file(&env).display());
+                    } else {
+                        for rc in &r.rc_files {
+                            println!("\nAdded one line to {}.", rc.display());
+                        }
+                        println!("Open a new shell to use them. Run a command without the sandbox with PADDOCK_BYPASS=1. Undo with: paddock shims remove");
+                    }
+                }
+                ShimsCmd::Remove => {
+                    for p in shims::remove(&env)? {
+                        println!("removed {}", p.display());
+                    }
+                    println!("Open a new shell, or run `unset -f` on the commands, to stop using them in this shell.");
+                }
+            }
+            Ok(0)
+        }
         Cmd::Launchers { cmd } => {
             use paddock::launchers::{self, Kind};
             match cmd {
