@@ -262,7 +262,7 @@ fn xdg_menu(entries: &[Entry]) -> String {
 
 /// The paddock path to write into entries: the one on PATH when it is this
 /// same program (so an upgrade keeps the entries working), else this program.
-fn launcher_exe(env: &HostEnv) -> Result<PathBuf> {
+pub fn launcher_exe(env: &HostEnv) -> Result<PathBuf> {
     let me = std::env::current_exe()
         .and_then(std::fs::canonicalize)
         .context("cannot find the paddock executable")?;

@@ -20,6 +20,7 @@ pub mod policy;
 pub mod profile;
 pub mod proxy;
 pub mod run;
+pub mod shims;
 pub mod spec;
 pub mod state;
 pub mod wlsec;

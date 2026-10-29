@@ -75,6 +75,19 @@ omarchy plugin add https://github.com/harnessix/omarchy-paddock --enable
 
 The widget lists running sandboxes with their backend, network, display and login. Press Enter on a sandbox to go to the terminal that runs it (Hyprland). The row actions open the project folder, copy its path, show the display window of a sandbox in `window` mode, and stop the sandbox after a second press. The New button starts a sandbox in two steps: pick a recent project, then a harness that is installed on this machine, and paddock opens a terminal that runs it. The Checks button runs `paddock doctor`. Every action has a key, and the panel footer lists them.
 
+### Let your agent set it up
+
+paddock ships two agent skills. Install them with the [skills](https://github.com/vercel-labs/skills) command, which supports Claude Code, Codex, Copilot, Gemini CLI, opencode and other agents:
+
+```sh
+npx skills add harnessix/omarchy-paddock
+```
+
+- `paddock` is for an agent on the host. It covers install, `paddock doctor`, shell commands, launchers, configuration and removal. It tells the agent to leave every change that weakens the sandbox to you: approvals, `[host]` modes set to `allow`, host network, and agent approvers.
+- `paddock-host` is for an agent inside a sandbox. It explains how to ask the host for a screenshot, a file or a command. `paddock skill install` installs this one too.
+
+Then ask your agent, for example: "Install paddock and make the sandbox the default for my agents."
+
 ## Remove
 
 1. Remove the bar widget:
@@ -83,9 +96,18 @@ The widget lists running sandboxes with their backend, network, display and logi
    omarchy plugin remove harnessix.paddock
    ```
 
-2. Remove the command. If you installed the Arch package (`bin/install` does this on Arch Linux), run `sudo pacman -R omarchy-paddock`. Otherwise, delete `~/.local/bin/paddock`.
+2. If you turned them on, remove the shell commands and the launchers. Do this before you remove the command:
 
-3. Optional: delete the data that paddock keeps. These directories hold the sandbox homes, isolated logins, shared caches, worktrees and settings. Your own logins and files are not in them.
+   ```sh
+   paddock shims remove
+   paddock launchers remove
+   ```
+
+   If you forget this step, nothing breaks. The line in `~/.bashrc` runs only when its script exists, and each command falls back to the real program when paddock is gone. The launcher entries stay in the menu until you delete them.
+
+3. Remove the command. If you installed the Arch package (`bin/install` does this on Arch Linux), run `sudo pacman -R omarchy-paddock`. Otherwise, delete `~/.local/bin/paddock`.
+
+4. Optional: delete the data that paddock keeps. These directories hold the sandbox homes, isolated logins, shared caches, worktrees and settings. Your own logins and files are not in them.
 
    ```sh
    rm -rf ~/.local/share/paddock ~/.cache/paddock ~/.local/state/paddock ~/.config/paddock
@@ -93,9 +115,9 @@ The widget lists running sandboxes with their backend, network, display and logi
 
    If you set `XDG_DATA_HOME`, `XDG_CACHE_HOME`, `XDG_STATE_HOME` or `XDG_CONFIG_HOME`, the directories are under those paths instead.
 
-4. Optional: if you used the docker or podman backend, remove the images: `docker image rm $(docker image ls -q paddock-base)`.
+5. Optional: if you used the docker or podman backend, remove the images: `docker image rm $(docker image ls -q paddock-base)`.
 
-paddock does not change any file outside these directories, except the files that you name in `paddock env hide` (in `~/.config/paddock/config.toml`) and the git worktrees that `--worktree` creates. To remove a worktree, use the commands that paddock prints when the sandbox exits.
+paddock does not change any file outside these directories, except the files that you name in `paddock env hide` (in `~/.config/paddock/config.toml`), the git worktrees that `--worktree` creates, and the files that `paddock shims install` and `paddock launchers install` change. Step 2 undoes those two. To remove a worktree, use the commands that paddock prints when the sandbox exits.
 
 ## Use
 
@@ -270,6 +292,23 @@ Known limits:
 - Apps cannot update themselves inside the sandbox. Update them on the host, with your package manager or the app's own installer outside paddock.
 - To add a folder, restart the app. A running sandbox cannot get new mounts.
 - Custom links (`claude://`, `codex://`, `vscode://`) reach the app in its sandbox after `paddock app install`, which makes paddock their handler. `paddock app uninstall` gives them back to the old handler. Logins that return to `http://127.0.0.1:PORT` reach the app only with `[apps.NAME] login_ports = true` in `~/.config/paddock/config.toml`. Then the ports the app listens on are open on 127.0.0.1 of your machine while it listens, for any local program.
+
+## Sandbox by default
+
+An agent reads files with the same commands that you use. One wrong `grep -r` or `find ~` outside a sandbox sends your SSH keys, other projects and personal files into the agent's context, and to the vendor. `paddock shims install` makes the sandbox the default, so that you do not have to remember `paddock`:
+
+```sh
+paddock shims install    # claude, codex, copilot and the others now start in a sandbox
+paddock shims list       # the commands it covers, and whether they are on
+paddock shims remove     # takes everything away again
+```
+
+After `install`, typing `claude` in a new shell runs `paddock run claude` in the current project. Arguments pass through: `claude --resume` runs `paddock run claude -- --resume`. paddock writes one script, `~/.local/share/paddock/shims.sh`, with a shell function for each command of each installed harness. It adds one marked line to `~/.bashrc` and `~/.zshrc`, where they exist, that loads the script.
+
+- To run a command without the sandbox once, prefix it: `PADDOCK_BYPASS=1 claude`.
+- In your home directory, the command stops with an error, because paddock does not use the home directory as a project. Go to a project first.
+- Shell functions win over PATH, so version managers such as mise do not bypass them. Scripts and programs that start `claude` themselves are not covered: only interactive bash and zsh shells.
+- If paddock or the script is gone, each function runs the real program, and the line in the rc file does nothing.
 
 ## Launchers
 
