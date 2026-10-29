@@ -1,0 +1,20 @@
+name = "chatgpt-desktop"
+description = "ChatGPT desktop app, with Codex"
+unverified = [
+  "a login inside the sandbox",
+  "the approval setting of Codex in the app: set it inside the app",
+]
+
+[locate]
+paths = ["/usr/lib/chatgpt/ChatGPT", "/opt/ChatGPT/ChatGPT"]
+
+[launch]
+# Chromium's own sandbox needs nested user namespaces, which paddock blocks;
+# paddock is the boundary. The basic password store keeps logins in the
+# sandbox home instead of the host keyring.
+args = ["--ozone-platform=wayland", "--no-sandbox", "--password-store=basic"]
+
+[app]
+display_name = "ChatGPT"
+icon = "chatgpt"
+schemes = ["codex"]

@@ -1,0 +1,17 @@
+name = "claude-desktop"
+description = "Claude desktop app"
+unverified = [
+  "a login inside the sandbox",
+  "the permission setting of Claude Code in the app: set it inside the app",
+]
+
+[locate]
+paths = ["/usr/lib/claude-desktop/claude-desktop"]
+
+[launch]
+args = ["--ozone-platform=wayland", "--no-sandbox", "--password-store=basic"]
+
+[app]
+display_name = "Claude"
+icon = "claude-desktop"
+schemes = ["claude"]

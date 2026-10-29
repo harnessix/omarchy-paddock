@@ -1,0 +1,1590 @@
+use anyhow::{bail, Result};
+use clap::{Args, Parser, Subcommand};
+use paddock::build::{self, Options};
+use paddock::doctor;
+use paddock::env::HostEnv;
+use paddock::manifest::{self, Manifest};
+use paddock::profile::HarnessFactory;
+use paddock::run;
+use paddock::spec::{GuiMode, MountKind, Network};
+use paddock::state::{self, Running};
+use std::os::unix::fs::PermissionsExt;
+use std::path::PathBuf;
+
+#[derive(Parser)]
+#[command(
+    name = "paddock",
+    version,
+    about = "Run a coding-agent harness with full auto-approval inside an isolated sandbox",
+    long_about = None,
+    after_help = "Examples:\n  paddock claude              start Claude Code in the current project\n  paddock codex ~/src/app     start Codex in another project\n  paddock explain claude      show every mount, variable and rule, and why\n  paddock doctor --escape     try to escape the sandbox and report the result"
+)]
+struct Cli {
+    #[command(subcommand)]
+    cmd: Cmd,
+}
+
+#[derive(Subcommand)]
+enum Cmd {
+    /// Start a harness in a sandbox (the same as `paddock <harness>`).
+    Run(RunArgs),
+    /// Print the sandbox that `run` would start, with the origin of each entry.
+    Explain {
+        #[command(flatten)]
+        run: RunArgs,
+        /// Print JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Open a shell in the sandbox that a harness would get.
+    Shell(RunArgs),
+    /// List the known harnesses and where they are installed.
+    List {
+        #[arg(long)]
+        json: bool,
+    },
+    /// List the projects where sandboxes started recently.
+    Recent {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Focus the terminal window that runs a sandbox (Hyprland).
+    /// Choose a recent project in the terminal, then start a harness there.
+    Pick { harness: String },
+    /// Create or remove launcher entries for every installed harness and app,
+    /// in a "Paddock" folder of the menu.
+    Launchers {
+        #[command(subcommand)]
+        cmd: LaunchersCmd,
+    },
+    /// List the host windows of app sandboxes; --mark gives them paddock's border (Hyprland).
+    Windows {
+        #[arg(long)]
+        json: bool,
+        #[arg(long)]
+        mark: bool,
+    },
+    /// Focus the terminal window, or the display window with --display, of a running sandbox (Hyprland).
+    Focus {
+        id: String,
+        /// Focus the nested display window of a sandbox in window mode instead.
+        #[arg(long)]
+        display: bool,
+    },
+    /// Show the MCP servers of a harness and whether each one runs in the sandbox.
+    Mcp {
+        harness: String,
+        path: Option<PathBuf>,
+    },
+    /// List running sandboxes.
+    Ps {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Stop a running sandbox.
+    Stop { id: String },
+    /// Check dependencies, or try to escape the sandbox with --escape.
+    Doctor {
+        #[arg(long)]
+        escape: bool,
+        #[arg(long, default_value = "auto")]
+        backend: String,
+        #[arg(long, default_value = "none")]
+        network: Network,
+        /// Also test the headless display and screenshots.
+        #[arg(long)]
+        gui: bool,
+        /// Test the nested compositor window instead of the headless display.
+        #[arg(long)]
+        window: bool,
+        /// Test app mode: the restricted Wayland socket and the portal-only bus.
+        #[arg(long)]
+        app: bool,
+        /// inherit (the default) or clean.
+        #[arg(long, default_value = "inherit", value_parser = ["inherit", "clean"])]
+        env: String,
+        /// Also check that DNS and HTTPS work from inside.
+        #[arg(long)]
+        online: bool,
+    },
+    /// Show or change which host environment variables a sandbox inherits.
+    Env {
+        #[command(subcommand)]
+        cmd: EnvCmd,
+    },
+    /// Manage the credentials that sandboxes use.
+    Auth {
+        #[command(subcommand)]
+        cmd: AuthCmd,
+    },
+    /// Approve the access that a project's paddock.toml asks for.
+    Approve { path: Option<PathBuf> },
+    /// Write a commented paddock.toml into a project.
+    Init { path: Option<PathBuf> },
+    /// Inside a sandbox: ask the host to do something (see `paddock-host --help`).
+    #[command(hide = true, disable_help_flag = true)]
+    Host {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+    /// List or answer requests that sandboxes sent to the host.
+    #[command(after_help = APPROVALS_HELP)]
+    Approvals {
+        /// Print JSON (api_version paddock.approvals/v1).
+        #[arg(long)]
+        json: bool,
+        #[command(subcommand)]
+        cmd: Option<ApprovalsCmd>,
+    },
+    /// Show the audit log of host requests.
+    Log {
+        /// Print one JSON object per line.
+        #[arg(long)]
+        json: bool,
+        /// How many recent entries to show.
+        #[arg(short = 'n', long, default_value_t = 20)]
+        lines: usize,
+    },
+    /// Run desktop agent apps (ChatGPT/Codex, Claude, VS Code, flatpak apps) in a sandbox.
+    #[command(after_help = APP_HELP)]
+    App {
+        #[command(subcommand)]
+        cmd: AppCmd,
+    },
+    /// Configure an agent that answers host requests in your place.
+    #[command(after_help = APPROVER_HELP)]
+    Approver {
+        #[command(subcommand)]
+        cmd: ApproverCmd,
+    },
+    /// Print the paddock-host skill for agents, or install it.
+    Skill {
+        #[command(subcommand)]
+        cmd: Option<SkillCmd>,
+    },
+    /// Inside an app sandbox: start the app with links that the host hands over.
+    #[command(hide = true)]
+    Inbound,
+    /// Inside a container sandbox: pass connections to the host proxy socket.
+    #[command(hide = true)]
+    Relay {
+        #[arg(long)]
+        listen: String,
+        #[arg(long)]
+        socket: PathBuf,
+        #[arg(long)]
+        forward: Vec<u16>,
+        #[arg(long)]
+        ready_file: Option<PathBuf>,
+    },
+    #[command(external_subcommand)]
+    External(Vec<String>),
+}
+
+#[derive(Subcommand)]
+enum LaunchersCmd {
+    /// Write the entries, the icon and the Paddock folder.
+    Install,
+    /// Remove everything that `install` wrote.
+    Remove,
+    /// Show what `install` would create.
+    List,
+}
+
+#[derive(Subcommand)]
+enum EnvCmd {
+    /// List host variables by what a sandbox does with them. Names only.
+    Show { path: Option<PathBuf> },
+    /// Stop passing these variables (saved in the user configuration).
+    Hide { names: Vec<String> },
+    /// Pass these variables again.
+    Unhide { names: Vec<String> },
+}
+
+#[derive(Subcommand)]
+enum ApprovalsCmd {
+    /// Answer one request: once, session (same request again in this sandbox), or deny.
+    Answer { id: String, answer: String },
+}
+
+#[derive(Subcommand)]
+enum AppCmd {
+    /// Start an app. Its windows appear on your desktop; it sees only the workspace folders.
+    Run {
+        name: String,
+        /// Workspace folders, read-write. Default: [apps.NAME] roots in the user configuration.
+        roots: Vec<PathBuf>,
+        /// Bind GPU render nodes (faster rendering).
+        #[arg(long)]
+        gpu: bool,
+        /// none, egress (default) or allowlist.
+        #[arg(long, short)]
+        network: Option<Network>,
+        /// inherit (default) or clean.
+        #[arg(long, value_parser = ["inherit", "clean"])]
+        env: Option<String>,
+        /// shared (default), isolated or isolated:NAME. Most desktop apps keep
+        /// their login in the host keyring, which a sandbox cannot use, so they
+        /// log in again inside the sandbox in any mode.
+        #[arg(long)]
+        auth: Option<String>,
+        /// bwrap (default), docker, podman or srt. srt needs --network allowlist or none.
+        #[arg(long, short)]
+        backend: Option<String>,
+    },
+    /// Add a launcher entry (Super+Space) that starts the app in a sandbox.
+    Install {
+        name: String,
+        /// Workspace folders to save in the user configuration.
+        roots: Vec<PathBuf>,
+        /// Do not make paddock the handler of the app's links.
+        #[arg(long)]
+        no_links: bool,
+    },
+    /// Remove the launcher entry, and give the app's links back to their old handler.
+    Uninstall { name: String },
+    /// Give a link (for example claude://...) to the running app sandbox, or start the app with it.
+    Open { name: String, link: String },
+    /// List the app profiles, whether each is installed, and its folders.
+    List,
+}
+
+const APP_HELP: &str = "App mode runs a desktop agent app in a sandbox. Its windows are normal
+windows on your desktop, but through a restricted Wayland socket: the app
+cannot capture the screen, read the clipboard in the background, type into
+other windows, or list them. Its session bus passes only the desktop portals
+(open a URL in your browser, choose a file), notifications and the tray. It
+sees only its workspace folders, with the same git hook, secrets and network
+rules as `paddock <harness>`. The host passthrough (paddock-host) works too.
+
+Examples:
+  paddock app run chatgpt-desktop ~/src/api ~/src/web
+  paddock app install claude-desktop ~/src/api
+  paddock app list
+
+Electron apps run with --no-sandbox: their own sandbox needs nested user
+namespaces, which paddock blocks, so paddock is the boundary. Flatpak apps
+(profiles with [app] flatpak = \"ID\") run with flatpak run --sandbox inside
+the same network isolation. To add folders later, change [apps.NAME] roots
+and start the app again.";
+
+#[derive(Subcommand)]
+enum ApproverCmd {
+    /// Show the configured approver and whether it is trusted.
+    Show,
+    /// Turn the approver on. Without --system it is protected by a password.
+    Enable {
+        /// Capabilities it may answer, comma-separated, for example screenshot,open-url.
+        #[arg(long, value_delimiter = ',', required = true)]
+        capabilities: Vec<String>,
+        /// Seconds before it counts as abstaining.
+        #[arg(long, default_value_t = 60)]
+        timeout: u64,
+        /// Write the root-owned system file (run with sudo).
+        #[arg(long)]
+        system: bool,
+        /// With --system: the user it applies to (default: the user who ran sudo).
+        #[arg(long)]
+        user: Option<String>,
+        /// The command, with an absolute path, after --.
+        #[arg(last = true, required = true)]
+        command: Vec<String>,
+    },
+    /// Turn the approver off.
+    Disable {
+        #[arg(long)]
+        system: bool,
+        #[arg(long)]
+        user: Option<String>,
+    },
+    /// Send a sample request to the approver and print its answer.
+    Test {
+        /// The capability of the sample request.
+        #[arg(long, default_value = "screenshot")]
+        capability: String,
+    },
+}
+
+const APPROVER_HELP: &str =
+    "The agent approver is a command on the host, usually a reviewing agent,
+that answers host requests (paddock-host) in your place. It reads one request
+as JSON on stdin:
+  {\"api_version\":\"paddock.approval-request/v1\",\"request\":{id, harness, project,
+   capability, summary, detail, reason, session_allowed, ...}}
+and prints one JSON line on stdout:
+  {\"answer\":\"once|session|deny|abstain\",\"note\":\"why\"}
+abstain, a crash, other output or a timeout pass the request to you. The fixed
+rules still hold: exec is never allowed in advance, session covers only the
+identical command, and protected paths are refused before anybody is asked.
+
+Turning it on needs one of:
+  sudo paddock approver enable --system --capabilities screenshot,open-url -- /usr/local/bin/review
+      writes /etc/paddock/approver.d/USER.toml, owned by root. Processes of your
+      own user cannot change it.
+  paddock approver enable --capabilities screenshot,open-url -- /usr/local/bin/review
+      signs ~/.config/paddock/approver.toml with an application password. paddock
+      asks for the password when a sandbox starts; Enter skips the approver for
+      that run. A changed file or a wrong password turns it off.
+
+Every answer of the approver is in the audit log (paddock log) and in
+~/.local/state/paddock/approver-decisions.jsonl with its note.";
+
+#[derive(Subcommand)]
+enum SkillCmd {
+    /// Copy the skill into ~/.claude/skills and ~/.agents/skills on the host.
+    Install,
+}
+
+const APPROVALS_HELP: &str =
+    "A sandbox asks the host for help with paddock-host (screenshots, one host
+command, one host file, the clipboard, a URL). Requests in \"ask\" mode wait
+here, in the bar panel and in a desktop notification, until you answer one of
+them. The first answer wins.
+
+Modes come only from [host] in ~/.config/paddock/config.toml:
+  [host]
+  screenshot = \"ask\"       # deny | ask | allow
+  exec = \"ask\"             # deny | ask (allow is read as ask)
+  fetch = \"ask\"
+  clipboard-read = \"ask\"
+  clipboard-write = \"ask\"
+  open-url = \"ask\"
+  notify = \"allow\"
+  wait = 120                 # seconds before a request times out
+
+Examples:
+  paddock approvals
+  paddock approvals answer r-1793321234-1a2b3c4d once
+  paddock approvals --json";
+
+#[derive(Subcommand)]
+enum AuthCmd {
+    /// Copy a harness's credential files from your home directory into an isolated store.
+    Import {
+        harness: String,
+        /// isolated or isolated:NAME.
+        #[arg(long, default_value = "isolated")]
+        auth: String,
+    },
+}
+
+#[derive(Args, Clone)]
+struct RunArgs {
+    /// Harness name, for example claude or codex. Defaults to default_harness in paddock.toml.
+    harness: Option<String>,
+    /// Project directory. Defaults to the current directory, widened to its git root.
+    path: Option<PathBuf>,
+    /// auto, bwrap, docker or podman.
+    #[arg(long, short)]
+    backend: Option<String>,
+    /// none, egress or host.
+    #[arg(long, short)]
+    network: Option<Network>,
+    /// off, headless, window or host.
+    #[arg(long)]
+    gui: Option<GuiMode>,
+    /// Bind GPU render nodes.
+    #[arg(long)]
+    gpu: bool,
+    /// inherit (default) passes the host environment; clean passes only the allowlist.
+    #[arg(long, value_parser = ["inherit", "clean"])]
+    env: Option<String>,
+    /// shared (default) reuses your login; isolated or isolated:NAME uses a separate one.
+    #[arg(long)]
+    auth: Option<String>,
+    /// A domain the sandbox can reach in network mode allowlist (repeatable).
+    #[arg(long)]
+    allow: Vec<String>,
+    /// Work in a new git worktree on its own branch, and review the diff afterwards.
+    #[arg(long)]
+    worktree: bool,
+    /// Start the harness without its auto-approval flags.
+    #[arg(long)]
+    no_yolo: bool,
+    /// Approve the project's paddock.toml without asking.
+    #[arg(long, short = 'y')]
+    yes: bool,
+    /// Arguments for the harness, after `--`.
+    #[arg(last = true)]
+    args: Vec<String>,
+}
+
+impl RunArgs {
+    fn options(&self, env: &HostEnv, shell: bool) -> Result<Options> {
+        let mut harness = self.harness.clone();
+        let mut path = self.path.clone();
+        // `paddock ./dir` with a default harness in the manifest.
+        if let Some(h) = &harness {
+            if path.is_none() && (h.contains('/') || h == ".") {
+                path = Some(PathBuf::from(h));
+                harness = None;
+            }
+        }
+        let harness = match harness {
+            Some(h) => h,
+            None => {
+                let project = build::resolve_project(path.as_deref())?;
+                let loaded = Manifest::load(env, &project)?;
+                match loaded.merged.default_harness {
+                    Some(h) => h,
+                    None => bail!("name a harness, for example `paddock claude`, or set default_harness in paddock.toml"),
+                }
+            }
+        };
+        Ok(Options {
+            harness,
+            project: path,
+            backend: self.backend.clone(),
+            network: self.network,
+            gui: self.gui,
+            gpu: self.gpu,
+            no_yolo: self.no_yolo,
+            worktree: self.worktree,
+            allow_domains: self.allow.clone(),
+            inherit_env: self.env.as_deref().map(|e| e == "inherit"),
+            auth: self.auth.clone(),
+            shell,
+            assume_yes: self.yes,
+            args: self.args.clone(),
+        })
+    }
+}
+
+fn start(env: &HostEnv, a: &RunArgs, shell: bool) -> Result<i32> {
+    let opts = a.options(env, shell)?;
+    let built = build::build(env, &opts)?;
+    if !shell && !opts.no_yolo {
+        run::probe_flags(env, &built)?;
+    }
+    let backend = run::select_backend(env, &built)?;
+    let wt = built.worktree.clone();
+    let code = run::run(env, built, backend.as_ref(), false, false)?.code;
+    if let Some(w) = wt {
+        report_worktree(&w);
+    }
+    Ok(code)
+}
+
+fn report_worktree(w: &build::Worktree) {
+    let git = |dir: &std::path::Path, args: &[&str]| {
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim_end().to_string())
+            .unwrap_or_default()
+    };
+    let range = format!("{}..{}", w.base, w.branch);
+    let commits = git(&w.repo, &["log", "--oneline", &range]);
+    let stat = git(
+        &w.repo,
+        &["diff", "--stat", &format!("{}...{}", w.base, w.branch)],
+    );
+    let dirty = git(&w.path, &["status", "--short"]);
+    eprintln!(
+        "\npaddock: the agent worked in {} on branch {}.",
+        w.path.display(),
+        w.branch
+    );
+    if commits.is_empty() && dirty.is_empty() {
+        eprintln!("paddock: it made no changes. Remove the worktree:\n  git -C {} worktree remove {} && git -C {0} branch -D {}", w.repo.display(), w.path.display(), w.branch);
+        return;
+    }
+    if !commits.is_empty() {
+        eprintln!("commits:\n{commits}\n{stat}");
+    }
+    if !dirty.is_empty() {
+        eprintln!("uncommitted changes in the worktree:\n{dirty}");
+    }
+    eprintln!(
+        "review:  git -C {r} diff {b}...{br}\nmerge:   git -C {r} merge {br}\nremove:  git -C {r} worktree remove --force {p} && git -C {r} branch -D {br}",
+        r = w.repo.display(),
+        b = &w.base[..w.base.len().min(12)],
+        br = w.branch,
+        p = w.path.display()
+    );
+}
+
+fn explain(env: &HostEnv, a: &RunArgs, json: bool) -> Result<()> {
+    let opts = a.options(env, false)?;
+    let built = build::build(env, &opts)?;
+    let backend = run::select_backend(env, &built);
+    let s = &built.spec;
+    let cleanup = || {
+        let _ = std::fs::remove_dir_all(env.paddock_run().join(&s.id));
+    };
+    if json {
+        let mut v = serde_json::to_value(s)?;
+        if let Some(obj) = v.get_mut("env").and_then(|e| e.as_object_mut()) {
+            for (_, var) in obj.iter_mut() {
+                if var["secret"] == true {
+                    var["value"] = "(hidden)".into();
+                }
+            }
+        }
+        v["backend"] = match &backend {
+            Ok(b) => b.name().into(),
+            Err(e) => format!("unavailable: {e}").into(),
+        };
+        println!("{}", serde_json::to_string_pretty(&v)?);
+        cleanup();
+        return Ok(());
+    }
+    println!("harness   {}  ({})", s.harness, built.harness_exe.display());
+    println!("project   {}", s.project.display());
+    println!(
+        "home      {}  (from {})",
+        s.home.display(),
+        s.home_src.display()
+    );
+    match &backend {
+        Ok(b) => println!("backend   {}", b.name()),
+        Err(e) => println!("backend   unavailable: {e}"),
+    }
+    println!(
+        "network   {:?}{}",
+        s.network,
+        if s.publish.is_empty() {
+            String::new()
+        } else {
+            format!(", publish {:?}", s.publish)
+        }
+    );
+    println!(
+        "display   {:?}  ({}){}",
+        s.gui.mode,
+        s.gui.origin,
+        if s.gui.gpu { ", gpu" } else { "" }
+    );
+    println!("\nmounts (everything else on the host is absent):");
+    for m in s.ordered_mounts() {
+        let kind = match m.kind {
+            MountKind::Ro => "ro    ",
+            MountKind::Rw => "rw    ",
+            MountKind::Tmpfs => "tmpfs ",
+            MountKind::MaskFile | MountKind::MaskDir => "hidden",
+        };
+        let src = match &m.src {
+            Some(src) if *src != m.dst => format!("  <- {}", src.display()),
+            _ => String::new(),
+        };
+        println!("  {kind} {}{src}\n         {}", m.dst.display(), m.origin);
+    }
+    for t in &s.host_tools {
+        println!(
+            "  tool   {}/{}  <- {}\n         {}",
+            paddock::spec::TOOL_DIR,
+            t.name,
+            t.src.display(),
+            t.origin
+        );
+    }
+    println!("\nenvironment (besides HOME, PATH, TERM and locale):");
+    for (k, v) in &s.env {
+        let val = if v.secret {
+            "(hidden)".to_string()
+        } else {
+            v.value.clone()
+        };
+        println!("  {k}={val}\n         {}", v.origin);
+    }
+    if !s.setup.is_empty() {
+        println!("\nsetup inside the sandbox:");
+        for l in &s.setup {
+            println!("  {}", l.lines().next().unwrap_or_default());
+        }
+    }
+    println!(
+        "\ncommand   {}",
+        s.command
+            .iter()
+            .map(|c| if c.len() > 60 {
+                format!("{}…", &c[..60])
+            } else {
+                c.clone()
+            })
+            .collect::<Vec<_>>()
+            .join(" ")
+    );
+    for w in &s.warnings {
+        println!("warning   {w}");
+    }
+    cleanup();
+    Ok(())
+}
+
+fn main() {
+    match real_main() {
+        Ok(code) => std::process::exit(code),
+        Err(e) => {
+            eprintln!("paddock: {e:#}");
+            std::process::exit(2);
+        }
+    }
+}
+
+fn real_main() -> Result<i32> {
+    // Exit quietly when stdout is closed, for example by `| head`.
+    unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL) };
+    let cli = Cli::parse();
+    if let Cmd::Inbound = &cli.cmd {
+        paddock::app::inbound_serve()?;
+        return Ok(0);
+    }
+    if let Cmd::Host { args } = &cli.cmd {
+        return Ok(paddock::hostcli::main(args));
+    }
+    if let Cmd::Relay {
+        listen,
+        socket,
+        forward,
+        ready_file,
+    } = &cli.cmd
+    {
+        paddock::proxy::relay(listen, socket, forward, ready_file.as_deref())?;
+        return Ok(0);
+    }
+    let env = HostEnv::detect()?;
+    match cli.cmd {
+        Cmd::Relay { .. } | Cmd::Host { .. } | Cmd::Inbound => unreachable!(),
+        Cmd::Approvals { json, cmd } => {
+            use paddock::broker;
+            if let Some(ApprovalsCmd::Answer { id, answer }) = cmd {
+                broker::answer(&env, &id, answer.parse()?)?;
+                println!("Answered {id}: {answer}");
+                return Ok(0);
+            }
+            let list = broker::pending(&env);
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({ "api_version": "paddock.approvals/v1", "pending": list })
+                );
+            } else if list.is_empty() {
+                println!("No requests wait for an answer.");
+            } else {
+                for p in list {
+                    println!("{}  {} in {}", p.id, p.harness, p.project.display());
+                    for l in p.detail.lines() {
+                        println!("    {l}");
+                    }
+                    if !p.reason.is_empty() {
+                        println!("    reason given by the agent: {}", p.reason);
+                    }
+                    println!(
+                        "    answer: paddock approvals answer {} once|{}deny\n",
+                        p.id,
+                        if p.session_allowed { "session|" } else { "" }
+                    );
+                }
+            }
+            Ok(0)
+        }
+        Cmd::Log { json, lines } => {
+            let text =
+                std::fs::read_to_string(paddock::broker::audit_file(&env)).unwrap_or_default();
+            let all: Vec<&str> = text.lines().collect();
+            for l in &all[all.len().saturating_sub(lines)..] {
+                if json {
+                    println!("{l}");
+                } else if let Ok(v) = serde_json::from_str::<serde_json::Value>(l) {
+                    println!(
+                        "{}  {:<8} {:<15} {:<26} {}",
+                        v["time"],
+                        v["harness"].as_str().unwrap_or(""),
+                        v["capability"].as_str().unwrap_or(""),
+                        v["decision"].as_str().unwrap_or(""),
+                        v["detail"]
+                            .as_str()
+                            .unwrap_or("")
+                            .lines()
+                            .last()
+                            .unwrap_or("")
+                    );
+                }
+            }
+            Ok(0)
+        }
+        Cmd::Approver { cmd } => approver_cmd(&env, cmd),
+        Cmd::App { cmd } => app_cmd(&env, cmd),
+        Cmd::Skill { cmd } => {
+            const SKILL: &str = include_str!("../skills/paddock-host/SKILL.md");
+            match cmd {
+                None => print!("{SKILL}"),
+                Some(SkillCmd::Install) => {
+                    for base in [".claude/skills", ".agents/skills"] {
+                        let dir = env.home.join(base).join("paddock-host");
+                        std::fs::create_dir_all(&dir)?;
+                        std::fs::write(dir.join("SKILL.md"), SKILL)?;
+                        println!("Installed {}", dir.join("SKILL.md").display());
+                    }
+                }
+            }
+            Ok(0)
+        }
+        Cmd::Run(a) => start(&env, &a, false),
+        Cmd::Shell(a) => start(&env, &a, true),
+        Cmd::Explain { run, json } => explain(&env, &run, json).map(|_| 0),
+        Cmd::External(argv) => {
+            let mut full = vec!["paddock run".to_string()];
+            full.extend(argv);
+            let a = <RunArgsCli as Parser>::try_parse_from(full).unwrap_or_else(|e| e.exit());
+            start(&env, &a.run, false)
+        }
+        Cmd::Mcp { harness, path } => {
+            use paddock::mcp::{assess, servers, Status};
+            let f = HarnessFactory::new(&env)?;
+            let Some(p) = f.profile(&harness) else {
+                bail!("unknown harness '{harness}'")
+            };
+            let project = build::resolve_project(path.as_deref())?;
+            let m = Manifest::load(&env, &project)?.merged;
+            let list = servers(&env, p, &project);
+            if list.is_empty() {
+                println!("No MCP servers found in the {harness} configuration.");
+            }
+            for s in list {
+                let status = match assess(&env, &s, &m, &project) {
+                    Status::Ready { port: Some(p), .. } => format!("ready (host port {p})"),
+                    Status::Ready { mounts, .. } if mounts.is_empty() => "ready".to_string(),
+                    Status::Ready { mounts, .. } => format!(
+                        "ready, mounts read-only: {}",
+                        mounts.iter().map(|m| m.display().to_string()).collect::<Vec<_>>().join(", ")
+                    ),
+                    Status::Remote => "remote, uses the network".to_string(),
+                    Status::NeedsAllow(paths) => format!(
+                        "off: needs host paths {}. To mount them read-only, add \"{}\" to [mcp] allow",
+                        paths.iter().map(|m| m.display().to_string()).collect::<Vec<_>>().join(", "),
+                        s.name
+                    ),
+                    Status::NeedsPort(port) => format!("off: needs host port {port}. Add it to [network] host_ports"),
+                    Status::NotFound(c) => format!("off: command {c} is not installed on the host"),
+                };
+                println!("{:<20} {status}\n{:<20} from {}", s.name, "", s.source);
+            }
+            println!("\nMCP OAuth tokens and server settings come from your host login (auth mode shared).");
+            println!(
+                "Put [mcp] and [network] settings in {} or in the project paddock.toml.",
+                env.paddock_config().join("config.toml").display()
+            );
+            Ok(0)
+        }
+        Cmd::Env { cmd } => {
+            match cmd {
+                EnvCmd::Hide { names } | EnvCmd::Unhide { names } if names.is_empty() => {
+                    bail!("name at least one variable")
+                }
+                EnvCmd::Hide { names } => {
+                    let all = state::edit_env_hide(&env, &names, &[])?;
+                    println!("Hidden from sandboxes: {}", all.join(", "));
+                }
+                EnvCmd::Unhide { names } => {
+                    let all = state::edit_env_hide(&env, &[], &names)?;
+                    println!(
+                        "Hidden from sandboxes: {}",
+                        if all.is_empty() {
+                            "(none)".into()
+                        } else {
+                            all.join(", ")
+                        }
+                    );
+                }
+                EnvCmd::Show { path } => {
+                    let project = build::resolve_project(path.as_deref())?;
+                    let m = Manifest::load(&env, &project)?.merged;
+                    let inherit = m.env.inherit.unwrap_or(true);
+                    let (mut secret, mut plain, mut hidden, mut never, mut cloud) =
+                        (vec![], vec![], vec![], vec![], vec![]);
+                    for (k, v) in &env.vars {
+                        if !paddock::policy::inheritable_var(k, v) {
+                            never.push(k.clone());
+                        } else if m.env.hide.contains(k) {
+                            hidden.push(k.clone());
+                        } else if paddock::policy::is_cloud_secret(k) && !m.env.pass.contains(k) {
+                            cloud.push(k.clone());
+                        } else if paddock::policy::looks_secret(k) {
+                            secret.push(k.clone());
+                        } else {
+                            plain.push(k.clone());
+                        }
+                    }
+                    println!(
+                        "mode: {}",
+                        if inherit {
+                            "inherit (the default)"
+                        } else {
+                            "clean: only the allowlist passes"
+                        }
+                    );
+                    if inherit {
+                        println!(
+                            "\npassed, look like secrets ({}):\n  {}",
+                            secret.len(),
+                            secret.join(" ")
+                        );
+                        println!("\npassed ({}):\n  {}", plain.len(), plain.join(" "));
+                    }
+                    println!(
+                        "\nhidden by [env] hide ({}):\n  {}",
+                        hidden.len(),
+                        hidden.join(" ")
+                    );
+                    println!(
+                        "\nnot passed: cloud credentials; add to [env] pass to allow ({}):\n  {}",
+                        cloud.len(),
+                        cloud.join(" ")
+                    );
+                    println!(
+                        "\nnever passed: host sockets and values the sandbox sets ({}):\n  {}",
+                        never.len(),
+                        never.join(" ")
+                    );
+                }
+            }
+            Ok(0)
+        }
+        Cmd::List { json: true } => {
+            let f = HarnessFactory::new(&env)?;
+            let items: Vec<serde_json::Value> = f
+                .names()
+                .into_iter()
+                .map(|name| {
+                    let desc = f.profile(&name).map(|p| p.description.clone()).unwrap_or_default();
+                    let exe = f.create(&name).ok().map(|h| h.exe.display().to_string());
+                    serde_json::json!({ "name": name, "description": desc, "installed": exe.is_some(), "exe": exe })
+                })
+                .collect();
+            println!(
+                "{}",
+                serde_json::json!({ "api_version": "paddock.list/v1", "harnesses": items })
+            );
+            Ok(0)
+        }
+        Cmd::Recent { json } => {
+            let list = state::recent(&env);
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({ "api_version": "paddock.recent/v1", "projects": list })
+                );
+            } else {
+                for r in list {
+                    println!("{:<10} {}", r.harness, r.project.display());
+                }
+            }
+            Ok(0)
+        }
+        Cmd::Pick { harness } => pick(&env, &harness),
+        Cmd::Launchers { cmd } => {
+            use paddock::launchers::{self, Kind};
+            match cmd {
+                LaunchersCmd::List => {
+                    for e in launchers::detect(&env)? {
+                        let kind = if e.kind == Kind::Cli {
+                            "terminal"
+                        } else {
+                            "app"
+                        };
+                        println!("{:<10} {:<9} {}", e.name, kind, e.label);
+                    }
+                }
+                LaunchersCmd::Install => {
+                    let r = launchers::install(&env)?;
+                    for e in &r.entries {
+                        println!("{}  {}", e.label, e.desktop_file.display());
+                    }
+                    match r.omarchy_menu {
+                        Some(f) => println!("\nThe Paddock folder is in the Omarchy menu (Super+Space), from {}.", f.display()),
+                        None => println!("\nThe Paddock folder is in the menu of desktops that follow the XDG menu standard."),
+                    }
+                    println!("Search for \"paddock\" in your app launcher to see every entry. Undo with: paddock launchers remove");
+                }
+                LaunchersCmd::Remove => {
+                    let removed = launchers::remove(&env)?;
+                    if removed.is_empty() {
+                        println!("Nothing to remove.");
+                    }
+                    for f in removed {
+                        println!("removed {}", f.display());
+                    }
+                }
+            }
+            Ok(0)
+        }
+        Cmd::Windows { json, mark } => {
+            let found = app_windows(&env);
+            if mark {
+                for (_, _, address) in &found {
+                    mark_window(address);
+                }
+            }
+            if json {
+                let items: Vec<serde_json::Value> = found
+                    .iter()
+                    .map(|(id, harness, address)| serde_json::json!({ "sandbox": id, "app": harness, "address": address }))
+                    .collect();
+                println!(
+                    "{}",
+                    serde_json::json!({ "api_version": "paddock.windows/v1", "windows": items })
+                );
+            } else if !mark {
+                for (id, harness, address) in &found {
+                    println!("{id:<28} {harness:<16} {address}");
+                }
+            }
+            Ok(0)
+        }
+        Cmd::Focus { id, display } => {
+            let Some(r) = Running::list(&env).into_iter().find(|r| r.id == id) else {
+                bail!("no running sandbox with id {id}")
+            };
+            let out = std::process::Command::new("hyprctl")
+                .args(["clients", "-j"])
+                .output()
+                .map_err(|_| anyhow::anyhow!("focus needs Hyprland (hyprctl was not found)"))?;
+            let clients: Vec<serde_json::Value> =
+                serde_json::from_slice(&out.stdout).unwrap_or_default();
+            let windows: Vec<(u32, String)> = clients
+                .iter()
+                .filter_map(|c| {
+                    Some((
+                        c["pid"].as_u64()? as u32,
+                        c["address"].as_str()?.to_string(),
+                    ))
+                })
+                .collect();
+            let address_of = |pid: u32| {
+                windows
+                    .iter()
+                    .find(|(p, _)| *p == pid)
+                    .map(|(_, a)| a.clone())
+            };
+            let host_pid = if r.host_pid > 0 { r.host_pid } else { r.pid };
+            let target = if display {
+                r.window_pid.and_then(address_of)
+            } else if r.gui == "app" {
+                // An app sandbox draws its own host windows: find the window whose
+                // process descends from this paddock process.
+                windows.iter().find_map(|(pid, address)| {
+                    let mut p = *pid;
+                    for _ in 0..64 {
+                        if p == host_pid {
+                            return Some(address.clone());
+                        }
+                        match state::parent_pid(p) {
+                            Some(q) if q > 1 => p = q,
+                            _ => return None,
+                        }
+                    }
+                    None
+                })
+            } else {
+                // Walk up from paddock to the first process that owns a window: the terminal.
+                let mut pid = host_pid;
+                let mut found = None;
+                for _ in 0..32 {
+                    if let Some(a) = address_of(pid) {
+                        found = Some(a);
+                        break;
+                    }
+                    match state::parent_pid(pid) {
+                        Some(p) if p > 1 => pid = p,
+                        _ => break,
+                    }
+                }
+                found
+            };
+            let Some(address) = target else {
+                bail!("no window found for {id}; it may run without a terminal window")
+            };
+            // Hyprland with a Lua configuration takes the hl.dsp form; older
+            // versions take the classic dispatcher. Try both, as Omarchy does.
+            let dispatch = |arg: &str| {
+                std::process::Command::new("hyprctl")
+                    .args(["dispatch", arg])
+                    .output()
+                    .map(|o| {
+                        o.status.success() && {
+                            let t = String::from_utf8_lossy(&o.stdout).to_lowercase();
+                            !t.contains("error") && !t.contains("not found")
+                        }
+                    })
+                    .unwrap_or(false)
+            };
+            let ok = dispatch(&format!(
+                "hl.dsp.focus({{ window = \"address:{address}\" }})"
+            )) || std::process::Command::new("hyprctl")
+                .args(["dispatch", "focuswindow", &format!("address:{address}")])
+                .output()
+                .map(|o| {
+                    o.status.success() && {
+                        let t = String::from_utf8_lossy(&o.stdout).to_lowercase();
+                        !t.contains("error") && !t.contains("not found")
+                    }
+                })
+                .unwrap_or(false);
+            if ok {
+                // Focus alone can leave a floating window under others: raise it.
+                let _ = dispatch(&format!(
+                    "hl.dsp.window.bring_to_top({{ window = \"address:{address}\" }})"
+                ));
+            }
+            Ok(if ok { 0 } else { 1 })
+        }
+        Cmd::List { json: false } => {
+            let f = HarnessFactory::new(&env)?;
+            for name in f.names() {
+                let desc = f
+                    .profile(&name)
+                    .map(|p| p.description.clone())
+                    .unwrap_or_default();
+                match f.create(&name) {
+                    Ok(h) => println!("{name:<10} {desc:<24} {}", h.exe.display()),
+                    Err(_) => println!("{name:<10} {desc:<24} (not installed)"),
+                }
+            }
+            Ok(0)
+        }
+        Cmd::Ps { json } => {
+            let list = Running::list(&env);
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({ "api_version": "paddock.ps/v1", "sandboxes": list })
+                );
+            } else if list.is_empty() {
+                println!("No running sandboxes.");
+            } else {
+                let now = state::now();
+                for r in list {
+                    println!(
+                        "{:<28} {:<8} {:<7} {:<7} {:>5}m  {}",
+                        r.id,
+                        r.harness,
+                        r.backend,
+                        r.gui,
+                        (now.saturating_sub(r.started)) / 60,
+                        r.project.display()
+                    );
+                }
+            }
+            Ok(0)
+        }
+        Cmd::Stop { id } => {
+            let Some(r) = Running::list(&env).into_iter().find(|r| r.id == id) else {
+                bail!("no running sandbox with id {id}")
+            };
+            unsafe { libc::kill(r.pid as i32, libc::SIGTERM) };
+            println!("Sent SIGTERM to {id}.");
+            Ok(0)
+        }
+        Cmd::Doctor {
+            escape,
+            backend,
+            network,
+            gui,
+            window,
+            app,
+            online,
+            env: env_mode,
+        } => {
+            if escape {
+                let display = if app {
+                    GuiMode::App
+                } else if window {
+                    GuiMode::Window
+                } else if gui {
+                    GuiMode::Headless
+                } else {
+                    GuiMode::Off
+                };
+                let failed = doctor::escape(
+                    &env,
+                    &doctor::EscapeOpts {
+                        backend,
+                        network,
+                        display,
+                        online,
+                        inherit: env_mode == "inherit",
+                    },
+                )?;
+                Ok(if failed == 0 { 0 } else { 1 })
+            } else {
+                Ok(if doctor::report(&env)? { 0 } else { 1 })
+            }
+        }
+        Cmd::Auth {
+            cmd: AuthCmd::Import { harness, auth },
+        } => {
+            let f = HarnessFactory::new(&env)?;
+            let Some(p) = f.profile(&harness) else {
+                bail!("unknown harness '{harness}'")
+            };
+            let done = state::auth_import(&env, p, &auth.parse()?)?;
+            if done.is_empty() {
+                println!("No credential files found for {harness}. Log in inside the sandbox instead: paddock {harness}");
+            }
+            for d in done {
+                println!("Imported {}", d.display());
+            }
+            Ok(0)
+        }
+        Cmd::Approve { path } => {
+            let project = build::resolve_project(path.as_deref())?;
+            let file = project.join(manifest::PROJECT_FILE);
+            let m = Manifest::read(&file)?;
+            println!("{}", serde_json::to_string_pretty(&m.widening())?);
+            manifest::approve(&env, &file, &m)?;
+            println!("Approved {}", file.display());
+            Ok(0)
+        }
+        Cmd::Init { path } => {
+            let project = build::resolve_project(path.as_deref())?;
+            let file = project.join(manifest::PROJECT_FILE);
+            if file.exists() {
+                bail!("{} already exists", file.display());
+            }
+            std::fs::write(&file, manifest::TEMPLATE)?;
+            println!("Wrote {}", file.display());
+            Ok(0)
+        }
+    }
+}
+
+#[derive(Parser)]
+#[command(name = "paddock")]
+struct RunArgsCli {
+    #[command(flatten)]
+    run: RunArgs,
+}
+
+fn approver_cmd(env: &HostEnv, cmd: ApproverCmd) -> Result<i32> {
+    use paddock::approver::{self as ap, HookConfig};
+    let target_user = |user: Option<String>| -> Result<String> {
+        let u = user
+            .or_else(|| std::env::var("SUDO_USER").ok())
+            .unwrap_or_else(|| env.user.clone());
+        if u.is_empty()
+            || !u
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c))
+        {
+            bail!("invalid user name");
+        }
+        Ok(u)
+    };
+    match cmd {
+        ApproverCmd::Show => {
+            let user = target_user(None)?;
+            let sys = ap::system_file(&user);
+            match ap::load_system(&user) {
+                Ok(Some(h)) => println!(
+                    "system: {} (trusted)\n  command: {}\n  capabilities: {}",
+                    sys.display(),
+                    h.command.join(" "),
+                    h.capabilities.join(", ")
+                ),
+                Ok(None) => println!("system: none ({})", sys.display()),
+                Err(e) => println!("system: {} is ignored: {e:#}", sys.display()),
+            }
+            match ap::load_signed(env)? {
+                Some(s) => println!(
+                    "password: {} (checked with the password when a sandbox starts)\n  command: {}\n  capabilities: {}",
+                    ap::user_file(env).display(),
+                    s.hook.command.join(" "),
+                    s.hook.capabilities.join(", ")
+                ),
+                None => println!("password: none"),
+            }
+            println!("The system file wins when both exist.");
+            Ok(0)
+        }
+        ApproverCmd::Enable {
+            capabilities,
+            timeout,
+            system,
+            user,
+            command,
+        } => {
+            let hook = HookConfig {
+                command,
+                capabilities,
+                timeout,
+            };
+            hook.validate()?;
+            if system {
+                if unsafe { libc::geteuid() } != 0 {
+                    bail!("--system writes a root-owned file: run it with sudo");
+                }
+                let user = target_user(user)?;
+                let f = ap::system_file(&user);
+                for d in [
+                    std::path::Path::new("/etc/paddock"),
+                    std::path::Path::new(ap::SYSTEM_DIR),
+                ] {
+                    std::fs::create_dir_all(d)?;
+                    std::fs::set_permissions(d, std::fs::Permissions::from_mode(0o755))?;
+                }
+                std::fs::write(&f, toml::to_string(&hook)?)?;
+                std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o644))?;
+                ap::root_owned_chain(&f)?;
+                println!(
+                    "Wrote {}. It applies to {user} from the next sandbox start.",
+                    f.display()
+                );
+            } else {
+                let p1 = rpassword::prompt_password(
+                    "New password for the agent approver (at least 8 characters): ",
+                )?;
+                if p1.chars().count() < 8 {
+                    bail!("the password needs at least 8 characters");
+                }
+                if rpassword::prompt_password("Again: ")? != p1 {
+                    bail!("the passwords differ");
+                }
+                let signed = ap::sign(&hook, &p1)?;
+                let f = ap::user_file(env);
+                std::fs::create_dir_all(f.parent().unwrap())?;
+                std::fs::write(&f, toml::to_string(&signed)?)?;
+                std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o600))?;
+                println!(
+                    "Wrote {}. paddock asks for this password when a sandbox starts.",
+                    f.display()
+                );
+            }
+            Ok(0)
+        }
+        ApproverCmd::Disable { system, user } => {
+            let f = if system {
+                ap::system_file(&target_user(user)?)
+            } else {
+                ap::user_file(env)
+            };
+            match std::fs::remove_file(&f) {
+                Ok(()) => println!("Removed {}", f.display()),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    println!("{} does not exist", f.display())
+                }
+                Err(e) if system => bail!("cannot remove {}: {e}; run it with sudo", f.display()),
+                Err(e) => return Err(e.into()),
+            }
+            Ok(0)
+        }
+        ApproverCmd::Test { capability } => {
+            let Some((hook, _)) = ap::resolve(env, true)? else {
+                bail!("no trusted approver is configured")
+            };
+            let p = paddock::broker::Pending {
+                id: "r-test".into(),
+                sandbox: "test".into(),
+                harness: "test".into(),
+                project: env.home.join("example-project"),
+                capability: capability.clone(),
+                summary: format!("sample {capability} request"),
+                detail: format!("A sample {capability} request from paddock approver test"),
+                reason: "testing the approver".into(),
+                created: paddock::state::now(),
+                expires: paddock::state::now() + 60,
+                session_allowed: true,
+            };
+            let (a, note) = ap::run_hook(&hook, &p);
+            match a {
+                Some(a) => println!("answer: {a:?}  note: {note}"),
+                None => println!("abstained or failed, so the user would decide: {note}"),
+            }
+            Ok(0)
+        }
+    }
+}
+
+fn app_cmd(env: &HostEnv, cmd: AppCmd) -> Result<i32> {
+    use paddock::app;
+    match cmd {
+        AppCmd::Run {
+            name,
+            roots,
+            gpu,
+            network,
+            env: env_mode,
+            auth,
+            backend,
+        } => {
+            let o = app::AppOptions {
+                name: name.clone(),
+                roots,
+                gpu,
+                network,
+                inherit_env: env_mode.as_deref().map(|e| e == "inherit"),
+                auth,
+                args: vec![],
+                backend,
+            };
+            match app::run(env, &o) {
+                Ok(code) => Ok(code),
+                Err(e) => {
+                    // A launcher entry has no terminal: show the error on the desktop too.
+                    if !std::io::IsTerminal::is_terminal(&std::io::stderr()) {
+                        if let Some(ns) = env.which("notify-send") {
+                            let _ = std::process::Command::new(ns)
+                                .args([
+                                    "--app-name=paddock",
+                                    &format!("paddock could not start {name}"),
+                                    &format!("{e:#}"),
+                                ])
+                                .status();
+                        }
+                    }
+                    Err(e)
+                }
+            }
+        }
+        AppCmd::Install {
+            name,
+            roots,
+            no_links,
+        } => {
+            app::app_profile(env, &name)?;
+            if !roots.is_empty() {
+                let rs = app::roots(env, &name, &roots)?;
+                state::set_app_roots(env, &name, &rs)?;
+                println!("Saved the workspace folders in [apps.{name}] of the user configuration.");
+            } else {
+                app::roots(env, &name, &[]).map_err(|_| {
+                    anyhow::anyhow!(
+                        "name the workspace folders: paddock app install {name} ~/src/project"
+                    )
+                })?;
+            }
+            let f = app::install(env, &name)?;
+            println!("Wrote {}. Start it from the app launcher.", f.display());
+            if !no_links {
+                for (scheme, old) in app::claim_links(env, &name)? {
+                    println!("{scheme}:// links now open in the {name} sandbox (before: {}). paddock app uninstall {name} gives them back.", if old.is_empty() { "no handler" } else { &old });
+                }
+            }
+            Ok(0)
+        }
+        AppCmd::Open { name, link } => app::open(env, &name, &link),
+        AppCmd::Uninstall { name } => {
+            for (scheme, old) in app::release_links(env, &name)? {
+                println!(
+                    "{scheme}:// links open with {} again",
+                    if old.is_empty() { "no handler" } else { &old }
+                );
+            }
+            let f = app::desktop_file(env, &name);
+            match std::fs::remove_file(&f) {
+                Ok(()) => println!("Removed {}", f.display()),
+                Err(_) => println!("{} does not exist", f.display()),
+            }
+            Ok(0)
+        }
+        AppCmd::List => {
+            let f = HarnessFactory::new(env)?;
+            for name in f.names() {
+                let Some(p) = f.profile(&name) else { continue };
+                if p.app.is_none() {
+                    continue;
+                }
+                let found = match p.app.as_ref().and_then(|a| a.flatpak.clone()) {
+                    Some(id) => format!("flatpak {id}"),
+                    None => f
+                        .create(&name)
+                        .map(|h| h.exe.display().to_string())
+                        .unwrap_or_else(|_| "not installed".into()),
+                };
+                let launcher = if app::desktop_file(env, &name).exists() {
+                    "launcher entry"
+                } else {
+                    "no launcher entry"
+                };
+                let roots = app::roots(env, &name, &[])
+                    .map(|r| {
+                        r.iter()
+                            .map(|x| x.display().to_string())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    })
+                    .unwrap_or_else(|_| "no folders".into());
+                println!(
+                    "{name:<16} {found}\n{:<16} {launcher}; folders: {roots}",
+                    ""
+                );
+            }
+            Ok(0)
+        }
+    }
+}
+
+/// Host windows that belong to app sandboxes: (sandbox id, app name, address).
+/// A window belongs to a sandbox when its process descends from the paddock
+/// process that runs the sandbox.
+fn app_windows(env: &HostEnv) -> Vec<(String, String, String)> {
+    let apps: Vec<Running> = Running::list(env)
+        .into_iter()
+        .filter(|r| r.gui == "app")
+        .collect();
+    if apps.is_empty() {
+        return vec![];
+    }
+    let Ok(out) = std::process::Command::new("hyprctl")
+        .args(["clients", "-j"])
+        .output()
+    else {
+        return vec![];
+    };
+    let clients: Vec<serde_json::Value> = serde_json::from_slice(&out.stdout).unwrap_or_default();
+    let mut found = Vec::new();
+    for c in &clients {
+        let (Some(pid), Some(address)) = (c["pid"].as_u64(), c["address"].as_str()) else {
+            continue;
+        };
+        let mut p = pid as u32;
+        'walk: for _ in 0..64 {
+            for r in &apps {
+                let host = if r.host_pid > 0 { r.host_pid } else { r.pid };
+                if p == host {
+                    found.push((r.id.clone(), r.harness.clone(), address.to_string()));
+                    break 'walk;
+                }
+            }
+            match state::parent_pid(p) {
+                Some(q) if q > 1 => p = q,
+                _ => break,
+            }
+        }
+    }
+    found
+}
+
+/// paddock's mark on a protected window: a sage border, set on that window
+/// only, at run time. Nothing in the Hyprland configuration changes, and the
+/// border goes away with the window.
+fn mark_window(address: &str) {
+    let lua = |prop: &str, value: &str| {
+        format!("hl.dsp.window.set_prop({{ window = \"address:{address}\", prop = \"{prop}\", value = \"{value}\" }})")
+    };
+    let run = |args: &[&str]| {
+        std::process::Command::new("hyprctl")
+            .args(args)
+            .output()
+            .map(|o| {
+                let t = String::from_utf8_lossy(&o.stdout).to_lowercase();
+                o.status.success() && !t.contains("error") && !t.contains("not found")
+            })
+            .unwrap_or(false)
+    };
+    let active = "rgb(9fb8a0) rgb(7fd29a) 45deg";
+    let inactive = "rgba(9fb8a088)";
+    let ok = run(&["dispatch", &lua("active_border_color", active)]);
+    if ok {
+        run(&["dispatch", &lua("inactive_border_color", inactive)]);
+    } else {
+        // Hyprland before the Lua configuration.
+        run(&[
+            "dispatch",
+            "setprop",
+            &format!("address:{address}"),
+            "activebordercolor",
+            active,
+        ]);
+        run(&[
+            "dispatch",
+            "setprop",
+            &format!("address:{address}"),
+            "inactivebordercolor",
+            inactive,
+        ]);
+    }
+}
+
+/// `paddock pick`: a project chooser for launcher entries, which start in a
+/// terminal without a project directory.
+fn pick(env: &HostEnv, harness: &str) -> Result<i32> {
+    use std::io::{BufRead, Write};
+    let f = HarnessFactory::new(env)?;
+    if f.profile(harness).is_none() {
+        bail!("unknown harness '{harness}'");
+    }
+    let mut recent = state::recent(env);
+    // Projects last used with this harness first, then the others.
+    recent.sort_by_key(|r| (r.harness != harness, std::cmp::Reverse(r.last)));
+    recent.truncate(9);
+    let home = env.home.display().to_string();
+    let short = |p: &std::path::Path| {
+        let s = p.display().to_string();
+        match s.strip_prefix(&home) {
+            Some(rest) => format!("~{rest}"),
+            None => s,
+        }
+    };
+    println!("Start {harness} in a paddock sandbox. Which project?\n");
+    for (i, r) in recent.iter().enumerate() {
+        let name = r
+            .project
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        println!(
+            "  {}  {:<20} {:<40} last: {}",
+            i + 1,
+            name,
+            short(&r.project),
+            r.harness
+        );
+    }
+    if recent.is_empty() {
+        println!("  No recent projects yet.");
+    }
+    let stdin = std::io::stdin();
+    let path = loop {
+        print!(
+            "\n{}Type a number or a path (q to quit): ",
+            if recent.is_empty() {
+                ""
+            } else {
+                "Enter for 1. "
+            }
+        );
+        std::io::stdout().flush().ok();
+        let mut line = String::new();
+        if stdin.lock().read_line(&mut line)? == 0 {
+            return Ok(0);
+        }
+        let line = line.trim();
+        if line == "q" {
+            return Ok(0);
+        }
+        if line.is_empty() && !recent.is_empty() {
+            break recent[0].project.clone();
+        }
+        if let Ok(n) = line.parse::<usize>() {
+            if (1..=recent.len()).contains(&n) {
+                break recent[n - 1].project.clone();
+            }
+            println!("There is no project {n}.");
+            continue;
+        }
+        let p = env.expand(line, &env.home);
+        if p.is_dir() {
+            break p;
+        }
+        println!("{} is not a folder.", p.display());
+    };
+    println!();
+    let me = std::env::current_exe()?;
+    let status = std::process::Command::new(me)
+        .arg(harness)
+        .arg(&path)
+        .status()?;
+    let code = status.code().unwrap_or(1);
+    if code != 0 {
+        // Launcher terminals close when the command ends: keep the error visible.
+        print!("\npaddock exited with {code}. Press Enter to close.");
+        std::io::stdout().flush().ok();
+        let mut s = String::new();
+        let _ = stdin.lock().read_line(&mut s);
+    }
+    Ok(code)
+}

@@ -1,0 +1,49 @@
+name = "claude"
+description = "Anthropic Claude Code"
+
+[locate]
+mise = "claude"
+commands = ["claude"]
+paths = ["~/.local/share/claude/local/claude", "~/.claude/local/claude"]
+
+[launch]
+# Logs in through a browser and a localhost callback.
+login_callback = true
+yolo_args = ["--dangerously-skip-permissions"]
+env = { DISABLE_AUTOUPDATER = "1" }
+
+[state]
+# Holds the account token and the MCP OAuth tokens (mcpOAuth).
+auth = [".claude/.credentials.json"]
+import_ro = [
+  ".claude/settings.json",
+  ".claude/CLAUDE.md",
+  ".claude/agents",
+  ".claude/commands",
+  ".claude/skills",
+  ".claude/output-styles",
+  ".agents/skills",
+]
+env_pass = ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL", "ANTHROPIC_MODEL", "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX"]
+
+# ~/.claude.json also holds the history of every project, so only these keys are copied.
+[[state.json_import]]
+file = ".claude.json"
+keys = [["mcpServers"], ["projects", "{project}", "mcpServers"], ["hasCompletedOnboarding"], ["lastOnboardingVersion"], ["theme"]]
+shared_keys = [["oauthAccount"], ["userID"]]
+
+[[mcp]]
+file = ".claude.json"
+path = ["mcpServers"]
+
+[[mcp]]
+file = ".claude.json"
+path = ["projects", "{project}", "mcpServers"]
+
+[[mcp]]
+file = ".mcp.json"
+in_project = true
+path = ["mcpServers"]
+
+[network]
+endpoints = ["api.anthropic.com", "claude.ai", "console.anthropic.com", "statsig.anthropic.com"]

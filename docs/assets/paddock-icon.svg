@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">
+  <!-- paddock: the same fence as the bar glyph (pointed pickets on two rails),
+       in sage on a dark tile. -->
+  <rect x="4" y="4" width="120" height="120" rx="28" fill="#0f1214"/>
+  <rect x="4.5" y="4.5" width="119" height="119" rx="27.5" fill="none" stroke="#2a3134"/>
+  <g fill="#7fa384">
+    <rect x="16" y="56" width="96" height="9" rx="2"/>
+    <rect x="16" y="80" width="96" height="9" rx="2"/>
+  </g>
+  <g fill="#9fb8a0">
+    <path d="M22 42 L29 33 L36 42 V98 H22 Z"/>
+    <path d="M44 42 L51 33 L58 42 V98 H44 Z"/>
+    <path d="M66 42 L73 33 L80 42 V98 H66 Z"/>
+    <path d="M88 42 L95 33 L102 42 V98 H88 Z"/>
+  </g>
+</svg>

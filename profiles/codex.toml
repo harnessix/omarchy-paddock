@@ -1,0 +1,41 @@
+name = "codex"
+description = "OpenAI Codex CLI"
+
+# Entries that come from documentation, not from a test. paddock doctor lists them.
+unverified = [
+  "state.auth .codex/.credentials.json: the file store for MCP OAuth tokens",
+]
+
+[locate]
+mise = "codex"
+commands = ["codex"]
+
+[launch]
+# Logs in through a browser and a localhost callback.
+login_callback = true
+# The help text says this flag is intended for externally sandboxed environments.
+yolo_args = ["--dangerously-bypass-approvals-and-sandbox"]
+
+[state]
+# MCP OAuth tokens are shared only when codex stores them in a file
+# (mcp_oauth_credentials_store = "file"). Tokens in the system keyring stay outside.
+auth = [".codex/auth.json", ".codex/.credentials.json"]
+import_ro = [".codex/AGENTS.md", ".codex/prompts", ".agents/skills"]
+# A writable copy: codex records project trust in config.toml. Edits made in
+# the sandbox are not copied back, and the host copy replaces them each start.
+seed = [".codex/config.toml"]
+env_pass = ["OPENAI_API_KEY", "OPENAI_BASE_URL", "CODEX_API_KEY"]
+
+# The project is already sandboxed: mark it trusted, so codex does not ask.
+[[state.toml_set]]
+file = ".codex/config.toml"
+path = ["projects", "{project}", "trust_level"]
+value = "trusted"
+
+[[mcp]]
+file = ".codex/config.toml"
+format = "toml"
+path = ["mcp_servers"]
+
+[network]
+endpoints = ["api.openai.com", "chatgpt.com", "auth.openai.com"]

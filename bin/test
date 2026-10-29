@@ -1,0 +1,41 @@
+#!/usr/bin/env bash
+# Run every automated check: unit and integration tests, the plugin manifest,
+# and the escape probe on each backend this host can run.
+set -euo pipefail
+root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$root"
+
+cargo fmt --check
+cargo clippy --all-targets -- -D warnings
+cargo test
+
+if command -v omarchy >/dev/null; then
+  omarchy plugin validate .
+fi
+
+bin=target/debug/paddock
+cargo build -q
+"$bin" doctor --escape --backend bwrap --network none
+"$bin" doctor --escape --backend bwrap --network none --env clean
+command -v pasta >/dev/null && "$bin" doctor --escape --backend bwrap --network egress --online
+command -v weston >/dev/null && "$bin" doctor --escape --backend bwrap --network none --gui
+if "$bin" doctor 2>/dev/null | grep "^  ok       docker$" >/dev/null; then
+  "$bin" doctor --escape --backend docker --network none
+  "$bin" doctor --escape --backend docker --network egress --online --gui
+  "$bin" doctor --escape --backend docker --network egress --app
+fi
+if "$bin" doctor 2>/dev/null | grep "^  ok       podman$" >/dev/null; then
+  "$bin" doctor --escape --backend podman --network none
+  "$bin" doctor --escape --backend podman --network egress --online --gui
+  "$bin" doctor --escape --backend podman --network egress --app
+fi
+if "$bin" doctor 2>/dev/null | grep "^  ok       srt$" >/dev/null; then
+  "$bin" doctor --escape --backend srt --network none
+  "$bin" doctor --escape --backend srt --network allowlist --online --gui
+  "$bin" doctor --escape --backend srt --network none --app
+fi
+# App mode needs a Wayland session with wp_security_context_v1.
+if [ -n "${WAYLAND_DISPLAY:-}" ] && command -v xdg-dbus-proxy >/dev/null; then
+  "$bin" doctor --escape --backend bwrap --network egress --app
+fi
+echo "All checks passed."

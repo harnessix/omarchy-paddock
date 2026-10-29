@@ -1,0 +1,26 @@
+name = "agy"
+description = "Google Antigravity CLI"
+
+# Entries that come from documentation, not from a test. paddock doctor lists them.
+unverified = [
+  "a full run inside paddock",
+  "state.seed: settings and the MCP tool cache",
+]
+
+[locate]
+mise = "agy"
+commands = ["agy", "antigravity"]
+
+[launch]
+# Logs in through a browser and a localhost callback.
+login_callback = true
+yolo_args = ["--dangerously-skip-permissions"]
+
+[state]
+auth = [".gemini/antigravity-cli/antigravity-oauth-token", ".gemini/antigravity-cli/mcp_oauth_tokens.json"]
+import_ro = [".gemini/settings.json", ".gemini/GEMINI.md", ".agents/skills"]
+seed = [".gemini/antigravity-cli/settings.json", ".gemini/antigravity-cli/mcp"]
+env_pass = ["GEMINI_API_KEY", "GOOGLE_API_KEY", "GOOGLE_CLOUD_PROJECT"]
+
+[network]
+endpoints = ["generativelanguage.googleapis.com", "oauth2.googleapis.com", "cloudcode-pa.googleapis.com"]

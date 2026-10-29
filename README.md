@@ -1,0 +1,361 @@
+# paddock
+
+<p align="center">
+  <img src="docs/assets/hero.png" alt="paddock: full auto-approval, nothing outside the fence" width="100%">
+</p>
+
+<p align="center">
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-192327" alt="License: MIT"></a>
+</p>
+
+paddock runs coding agents with full auto-approval inside a sandbox: terminal harnesses such as Claude Code, Codex, Antigravity, Gemini CLI, opencode and Copilot CLI, and desktop apps such as ChatGPT, Claude Desktop and VS Code. The sandbox contains only what the agent needs: the project, the harness, a private home directory, and package caches. Everything else on the host is absent from the file system. The agent cannot read it, so you do not need to approve each command.
+
+```sh
+cd ~/src/my-app
+paddock claude
+```
+
+> [!WARNING]
+> By default, the sandbox inherits your host environment variables, and the agent can read every token in them. paddock prints the names of the variables that look like secrets. High-privilege cloud credentials (AWS, Azure, Google Cloud, Vault, Terraform and others) are not passed unless you name them in `[env] pass`. To drop single variables, hide them. paddock saves the list in `~/.config/paddock/config.toml`.
+
+```sh
+paddock env hide GITHUB_TOKEN OPENAI_API_KEY
+paddock env unhide OPENAI_API_KEY
+paddock env show
+```
+
+To pass only an allowlist, run `paddock claude --env clean`, or set `[env] inherit = false`. To drop single variables, run `paddock env hide NAME`.
+
+## See it
+
+`paddock claude` opens Claude Code's own TUI, as you know it, with full auto-approval. Inside the paddock, the agent cannot see the SSH key on the machine, the `.env` in the project is empty for it, and it still runs commands and writes code without asking for approval.
+
+<p align="center">
+  <img src="docs/assets/demo.gif" alt="A terminal recording: paddock claude opens Claude Code's TUI with bypass permissions on; the agent runs a shell command and writes src/greet.rs without approval prompts, and reports that the SSH key does not exist and .env is empty; paddock explain then lists the mounts" width="100%">
+</p>
+
+## Why
+
+Harnesses tie two settings together in the wrong direction. Their built-in sandboxes restrict commands, so builds and tests fail for missing tools. Their auto-approval modes turn that sandbox off, so commands run on the host. The help text of Codex says that its bypass flag is "intended solely for running in environments that are externally sandboxed". paddock is that external sandbox.
+
+paddock moves the boundary from "which commands can run" to "which files exist". Inside the boundary, the agent has every tool and approves itself. The boundary is kernel namespaces, which the agent cannot negotiate with.
+
+## Install
+
+paddock is a Rust command and an Omarchy bar plugin in one repository. Clone the repository, and run the installer from its root. It installs the system packages, builds paddock, and runs `paddock doctor`.
+
+```sh
+git clone https://github.com/harnessix/omarchy-paddock
+cd omarchy-paddock
+bin/install
+```
+
+On Arch Linux, the installer installs a package with makepkg. It also knows apt and dnf, and then copies the binary to `~/.local/bin`; that path is best effort and is not tested on every release (see [Support scope](#support-scope)). Use `bin/install --minimal` to skip the desktop packages.
+
+| Package | Needed for |
+| :--- | :--- |
+| git | project and worktree detection (required) |
+| bubblewrap | the default backend (required) |
+| passt | outbound network on the bwrap backend (required) |
+| iproute2 | hiding host addresses on the bwrap backend (required) |
+| weston | displays for desktop projects, and `paddock-screenshot` |
+| xwayland | X11 apps on the private display |
+| dbus | a private session bus for desktop apps |
+| docker or podman | the container backend |
+| mise | per-project toolchains from `mise.toml` |
+| gnome-keyring | a private keyring in sandboxes of harnesses that need one, such as Copilot CLI |
+
+`paddock doctor` prints the same list with the state of each package and the install command for your distribution.
+
+To add the bar widget on Omarchy, point `omarchy plugin add` at this repository:
+
+```sh
+omarchy plugin add https://github.com/harnessix/omarchy-paddock --enable
+```
+
+The widget lists running sandboxes with their backend, network, display and login. Press Enter on a sandbox to go to the terminal that runs it (Hyprland). The row actions open the project folder, copy its path, show the display window of a sandbox in `window` mode, and stop the sandbox after a second press. The New button starts a sandbox in two steps: pick a recent project, then a harness that is installed on this machine, and paddock opens a terminal that runs it. The Checks button runs `paddock doctor`. Every action has a key, and the panel footer lists them.
+
+## Remove
+
+1. Remove the bar widget:
+
+   ```sh
+   omarchy plugin remove harnessix.paddock
+   ```
+
+2. Remove the command. If you installed the Arch package (`bin/install` does this on Arch Linux), run `sudo pacman -R omarchy-paddock`. Otherwise, delete `~/.local/bin/paddock`.
+
+3. Optional: delete the data that paddock keeps. These directories hold the sandbox homes, isolated logins, shared caches, worktrees and settings. Your own logins and files are not in them.
+
+   ```sh
+   rm -rf ~/.local/share/paddock ~/.cache/paddock ~/.local/state/paddock ~/.config/paddock
+   ```
+
+   If you set `XDG_DATA_HOME`, `XDG_CACHE_HOME`, `XDG_STATE_HOME` or `XDG_CONFIG_HOME`, the directories are under those paths instead.
+
+4. Optional: if you used the docker or podman backend, remove the images: `docker image rm $(docker image ls -q paddock-base)`.
+
+paddock does not change any file outside these directories, except the files that you name in `paddock env hide` (in `~/.config/paddock/config.toml`) and the git worktrees that `--worktree` creates. To remove a worktree, use the commands that paddock prints when the sandbox exits.
+
+## Use
+
+```sh
+paddock claude                 # Claude Code in the current project
+paddock codex ~/src/api        # Codex in another project
+paddock claude -- -p "fix the failing test"   # arguments after -- go to the harness
+paddock claude --worktree      # work on a new branch in a new worktree, review the diff at exit
+paddock shell claude           # a shell in the sandbox that claude gets
+paddock explain claude         # every mount, variable and rule, and why it is there
+paddock ps                     # running sandboxes
+paddock doctor                 # dependencies, backends, located harnesses
+paddock doctor --escape        # try to escape, and report each attempt
+paddock mcp claude             # MCP servers, and whether each runs in the sandbox
+paddock env show               # which host variables pass, by name
+```
+
+A sandbox uses your existing login of the harness. See [Logins and MCP](#logins-and-mcp) for a separate login.
+
+## What the sandbox contains
+
+| Inside the sandbox | Source on the host |
+| :--- | :--- |
+| The project (git root), read-write | the project directory |
+| `.git/hooks`, `.git/config`, read-only | the same files. Git runs them on the host. |
+| `$HOME`, read-write | a private directory per harness, login and project, under `$XDG_DATA_HOME/paddock/homes` |
+| Credential files of the harness | copied from your home directory, or from an isolated store |
+| Harness settings and skills, read-only | the files that the harness profile lists in `import_ro` |
+| The harness program, read-only | its install directory, found through PATH or mise |
+| Package caches (cargo, npm, uv, go, mise) | shared caches under `$XDG_CACHE_HOME/paddock/shared` |
+| `/usr`, `/etc`, read-only (bwrap backend) | the host system |
+
+The sandbox never contains your real home directory, `~/.ssh`, `~/.gnupg`, cloud credentials, browser profiles, the container runtime socket, or the session bus. Files with credential-shaped names in the project (`.env`, `*.pem`, `*.key`) are hidden. The policy engine refuses any configuration that breaks these rules, and names the line that asked for it.
+
+## Network
+
+| Mode | Behavior |
+| :--- | :--- |
+| `egress` (default) | Internet access that leaves the same way as host traffic. Host services are not reachable. |
+| `none` | No network. |
+| `host` | The host network namespace. Host-local services are reachable. Needs approval in `paddock.toml`. |
+
+Many users depend on a system proxy or a TUN device for a stable exit address, and an account can be flagged when that address changes. So paddock never gives a sandbox a bridged network.
+
+On the bwrap backend, `egress` uses pasta. pasta makes each outbound connection as an ordinary socket of a host process, so the connection follows the host routes, the TUN device, and the host DNS resolver. If the host sets `HTTPS_PROXY` or a similar variable, the sandbox gets the same value, and a proxy on the host loopback is the one loopback port that the sandbox can reach. paddock turns off the other port forwarding of pasta, and makes every address of the host unreachable inside the sandbox, so services on the host stay hidden.
+
+On the docker and podman backends, the container has no network interface. Its only way out is a Unix socket to a proxy in the paddock process on the host. That proxy connects like a host program, through the host proxy variables or directly. It refuses connections to the host itself. Programs that ignore `HTTPS_PROXY` get no network, so no traffic leaves by another path.
+
+`paddock doctor --escape --network egress --online` checks all of this: DNS and HTTPS work, and the host loopback, the other host addresses, and direct connections that bypass the proxy do not.
+
+## Logins and MCP
+
+By default, a sandbox uses your existing login (auth mode `shared`). paddock copies the credential files of the harness from your home directory into the sandbox at start. If the harness refreshes a token in the sandbox, paddock writes it back when the sandbox exits. If the file also changed on the host in the meantime, the host version stays, and paddock tells you.
+
+Some harnesses keep their login in the system keyring. Copilot CLI is one of them. Its sandbox gets a private keyring of its own (gnome-keyring, on a private session bus), encrypted with a password that paddock keeps on the host. The sandbox cannot reach your host keyring, and your host keyring does not see the sandbox's login. So you log in once inside the sandbox, and the login stays for later runs.
+
+For a separate account, use an isolated login. The sandbox then starts logged out, and you log in inside it. Each name is a separate store.
+
+```sh
+paddock claude --auth isolated          # one separate login
+paddock claude --auth isolated:work     # another one, named "work"
+paddock auth import claude --auth isolated:work   # start it from a copy of your login
+```
+
+MCP servers come from the same configuration as on the host, and MCP OAuth tokens come with the login. paddock mounts the runtime of each stdio server read-only when its command is in a tool install directory (system directories, mise, node_modules, uv, `~/.local/bin`). A server that needs other host files, or a server on a host loopback port, stays off until you allow it:
+
+```sh
+paddock mcp claude     # each server, and whether it runs in the sandbox
+```
+
+```toml
+# ~/.config/paddock/config.toml or the project paddock.toml
+[mcp]
+allow = ["my-server"]   # mount the host paths that this server needs, read-only
+
+[network]
+host_ports = [8765]     # a local MCP server on the host loopback
+```
+
+Some harnesses can keep MCP tokens in the system keyring instead of a file. The sandbox cannot reach the keyring. For Codex, set `mcp_oauth_credentials_store = "file"` to share the tokens.
+
+## Environment variables
+
+By default, the sandbox gets the host environment. The first time in a project, and each time the list changes, paddock prints how many variables it passed and the names of the ones that look like secrets. High-privilege cloud and infrastructure credentials are not passed either: AWS keys and session tokens, Azure client secrets, `GOOGLE_APPLICATION_CREDENTIALS`, Cloudflare, DigitalOcean and Hetzner tokens, `VAULT_TOKEN`, Terraform `TF_TOKEN_*`, and similar. They can create, delete or bill resources far beyond the project. The notice names the ones that it dropped, and `paddock env show` lists them. To pass one, name it in `[env] pass`. Variables that name a host socket or a control channel (`SSH_AUTH_SOCK`, `DBUS_SESSION_BUS_ADDRESS`, `HYPRLAND_INSTANCE_SIGNATURE`, `DOCKER_HOST`, terminal multiplexer sockets) are never passed, and the sandbox sets `HOME`, `PATH` and `TMPDIR` itself.
+
+To pass only an allowlist (terminal, locale, the variables of the harness profile, `[env] pass`, and the host proxy), use `--env clean`, or set this in `~/.config/paddock/config.toml`:
+
+```toml
+[env]
+inherit = false
+pass = ["MY_TOOL_TOKEN"]
+```
+
+## Desktop projects
+
+The sandbox has the libraries for desktop apps: the bwrap backend sees the host `/usr`, and the docker backend installs them in its image. Access to the display is the risk. A client of the host compositor can capture the screen and read the clipboard, and on wlroots compositors it can type into other windows. paddock has four display modes:
+
+| Mode | What the agent gets |
+| :--- | :--- |
+| `off` | No display. The default for projects that are not desktop projects. |
+| `headless` | A private compositor inside the sandbox, with Xwayland. The agent runs the app and inspects it with `paddock-screenshot`. Nothing on your desktop is reachable. paddock turns this mode on when it finds a desktop project (Tauri, Electron, GTK, Qt, egui, iced, Flutter and others). |
+| `window` | A nested compositor that runs on your desktop as one window. You watch the app, and the agent sees only that window. |
+| `host` | Your real compositor socket. Use it only when you must. Needs approval. |
+
+```sh
+paddock claude --gui window
+```
+
+Add `--gpu` to bind the GPU render nodes. Without it, apps render in software.
+
+## Host requests
+
+Sometimes the agent needs one thing from your computer: a screenshot of the real screen, one command on the host, or one file outside the project. paddock does not open the sandbox for that. The agent asks with `paddock-host`, you decide on the host, and paddock does the work on the host.
+
+| Capability | What the host does | Default |
+| :--- | :--- | :--- |
+| `screenshot` | Captures the screen, one output or the focused window | ask |
+| `exec` | Runs one command in the project folder, without a shell | ask, and never allow |
+| `fetch` | Copies one host file or folder into the project, at most 64 MiB | ask |
+| `clipboard-read`, `clipboard-write` | Reads or sets the host clipboard | ask |
+| `open-url` | Opens an http or https link in your browser, for example a harness login page | ask |
+| `notify` | Shows a desktop notification | allow |
+
+A request that asks waits for your answer for up to two minutes. You can answer in three places, and the first answer wins:
+
+- An approval card appears at the top of the screen as soon as a request arrives, without opening the panel. It shows the question, exactly what will run and in which folder, the reason that the agent gave, and the time left. Click No, Yes once or Yes for this session. The card never takes the keyboard when it appears, so typing in another window cannot answer it. To answer with the keyboard, bind a key to `omarchy-shell harnessix.paddock.approvals keys`: the card then starts on No.
+- The bar widget turns red and shows the number of waiting requests. The panel lists them and the most recent answers, including the ones that the agent approver gave.
+- Without the Omarchy plugin, a desktop notification offers the same three answers.
+- In a terminal, `paddock approvals` lists the requests, and `paddock approvals answer <id> once|session|deny` answers one.
+
+Some rules hold whatever your configuration says. `exec` is never allowed without asking, and "Allow for this session" covers only the identical command line. `fetch` refuses the protected paths (`~/.ssh`, `~/.gnupg`, cloud credentials and the others), even if you approve. Results that are files go to `.paddock/inbox/` in the project, which git ignores.
+
+Set the mode of each capability in `~/.config/paddock/config.toml`. A project `paddock.toml` cannot change these modes, because the agent can edit it.
+
+```toml
+[host]
+screenshot = "allow"   # deny | ask | allow
+clipboard-read = "deny"
+wait = 60              # seconds to wait for an answer
+```
+
+`paddock log` shows every request with its decision and result. To teach agents the client, run `paddock skill install`: it copies a short skill into the skill folders of your harnesses. Inside a sandbox, `paddock-host --help` is the full reference.
+
+You can let an agent on the host answer requests for you (`paddock approver`). paddock trusts that setting only from a root-owned file (`sudo paddock approver enable --system`) or from a file signed with a password that you type when a sandbox starts, so that a process on your computer cannot turn it on for itself. The agent approver can only answer the capabilities that you list, the rules above still hold, and if it does not answer clearly, the request comes to you.
+
+## App mode
+
+Desktop agent apps run in a sandbox too: ChatGPT with Codex, Claude Desktop, VS Code, and flatpak apps. They get the same file, git, secrets, environment and network rules as a terminal harness, and their windows are normal windows on your desktop.
+
+<p align="center">
+  <img src="docs/assets/app-demo.gif" alt="A recording: a host terminal shows an SSH key and a .env with a token, then runs paddock app run vscode; in VS Code's own terminal, the SSH key does not exist, .env is 0 bytes, and an edit to the project works" width="100%">
+</p>
+
+```sh
+paddock app list                          # the apps paddock knows, and their launcher entries
+paddock app run claude-desktop ~/src/api  # run an app with one or more workspace folders
+paddock app install chatgpt-desktop ~/src/web   # add a launcher entry that runs it in paddock
+paddock app uninstall chatgpt-desktop
+```
+
+The app sees only the folders that you give it, from the command line or from `[apps.NAME] roots` in `~/.config/paddock/config.toml`. Its windows connect to your compositor through a restricted socket: the app cannot capture the screen, read the clipboard in the background, type into other windows or list them. On the session bus it reaches only the desktop portals and notifications, not the keyring or the system services. Add `--gpu` for hardware rendering.
+
+A flatpak app becomes an app profile with `[app] flatpak = "ID"`. paddock drops every permission that the app asks for and adds back only the workspace folders, the portals and, with `--gpu`, the GPU. Many flatpak apps ask for your whole home directory and the host bus, so their own sandbox is not enough.
+
+Windows of app sandboxes get a sage green border, so you can tell a protected app at a glance. paddock sets the border on each window at run time (Hyprland), and your Hyprland configuration does not change. App sandboxes appear in the bar panel with the other sandboxes. Enter on one focuses its window.
+
+Known limits:
+
+- Desktop apps log in again inside the sandbox. They keep their login in the sandbox home, because your keyring is out of reach.
+- A new window that gets focus can read the clipboard once. This is how Wayland clipboards work, and Flatpak has the same gap.
+- Tray icons may not appear.
+- Apps cannot update themselves inside the sandbox. Update them on the host, with your package manager or the app's own installer outside paddock.
+- To add a folder, restart the app. A running sandbox cannot get new mounts.
+- Custom links (`claude://`, `codex://`, `vscode://`) reach the app in its sandbox after `paddock app install`, which makes paddock their handler. `paddock app uninstall` gives them back to the old handler. Logins that return to `http://127.0.0.1:PORT` reach the app only with `[apps.NAME] login_ports = true` in `~/.config/paddock/config.toml`. Then the ports the app listens on are open on 127.0.0.1 of your machine while it listens, for any local program.
+
+## Launchers
+
+`paddock launchers install` adds a launcher entry for every harness and app that paddock finds on this machine, with the paddock icon, in a "Paddock" folder:
+
+- In the Omarchy menu (Super+Space), a Paddock submenu. paddock writes it as a marked block in `~/.config/omarchy/extensions/omarchy-menu.jsonc` and leaves the rest of the file as it is.
+- In menus that follow the XDG menu standard (GNOME, KDE, Xfce), a Paddock folder.
+- In any app launcher, search for "paddock".
+
+A terminal harness entry opens a terminal with `paddock pick <harness>`: pick a recent project or type a path, and the harness starts there. An app entry runs `paddock app run`.
+
+Logins work from these entries too. When a harness opens its login page, the approval card asks "Open the login page of claude in your browser?" and shows the link. After you allow it, the page opens in your browser on the host, and paddock forwards the one localhost port that the login returns to, for ten minutes and only while the sandbox listens on it. Login callbacks are on by default for claude, codex, copilot, gemini, opencode and agy (`[launch] login_callback` in the profile). They work on the bwrap, docker and podman backends; on srt, paddock prints a warning instead.
+
+```sh
+paddock launchers list      # what install would create
+paddock launchers install
+paddock launchers remove    # removes everything that install wrote, and nothing else
+```
+
+## Project settings
+
+`paddock init` writes a commented `paddock.toml` into the project. The project directory is writable from inside the sandbox, so an agent can edit this file. Any setting that widens access (extra mounts, host network, host display, GPU, passed variables, setup commands, image changes) needs a one-time approval on the host. paddock asks on the terminal, or you run `paddock approve`.
+
+## Backends
+
+| Backend | Use it when |
+| :--- | :--- |
+| bwrap (default) | You want every host tool, and start in milliseconds. |
+| podman, docker | The project needs system packages that the host does not have. The base image follows the host distribution. |
+
+Prefer rootless podman over docker. paddock runs it with `--userns=keep-id`, so files in the project keep your user as owner. The default seccomp profile of podman allows nested user namespaces, a common start of kernel exploits, so paddock derives a profile that blocks only that.
+
+## Add a harness
+
+A harness is a TOML profile. Put a file in `$XDG_CONFIG_HOME/paddock/harness.d/`. A file with the name of a built-in profile replaces it. The built-in profiles are in [profiles/](profiles/).
+
+```toml
+name = "myagent"
+description = "My agent"
+
+[locate]
+commands = ["myagent"]
+
+[launch]
+yolo_args = ["--yes-to-everything"]
+
+[state]
+auth = [".myagent/token.json"]
+import_ro = [".myagent/config.toml"]
+env_pass = ["MYAGENT_API_KEY"]
+```
+
+Before each start, paddock makes sure that the help text of the harness still mentions every flag in `yolo_args`. If a flag is renamed, paddock stops with an error and does not start a harness that waits for approvals.
+
+## Limits
+
+The project directory is writable, and you use its files on the host later. Some host tools run project files without being asked: direnv runs `.envrc`, mise runs hooks in `mise.toml`, editors run tasks. paddock reports changes to these files when the sandbox exits. Review them before you use them on the host.
+
+The agent can read its own API token and the variables that it inherits. With network access, it can send them elsewhere. Use `--env clean` and an isolated login to limit what it holds.
+
+pasta hides the host addresses that exist when the sandbox starts. If the host gets a new address while a sandbox runs, for example from a VPN that starts later, services on it are reachable from that sandbox until the next start. paddock watches for new addresses, shows a warning in the bar panel, and prints it at exit.
+
+Shared package caches connect the sandboxes of different projects. Tools that mise installs are writable only in a short provision step before the harness starts, and read-only while it runs. The cargo, npm, uv and go caches stay writable, because builds write them. Those caches check the hashes of what they download.
+
+Some profile entries come from documentation, not from a test on a real install. `paddock doctor` lists them for each installed harness.
+
+On rootful docker, an escape from the container is an escape to root. Use the bwrap backend or rootless podman when you can.
+
+## Support scope
+
+paddock is built and tested on Omarchy: Arch Linux with Hyprland. That is the supported platform. Every release passes `bin/test` and `paddock doctor --escape` there.
+
+- Other distributions and compositors are maintained by the community. The bwrap backend, the network isolation and the terminal harnesses work wherever bubblewrap, passt and user namespaces work, but nobody tests each release on them. The apt and dnf paths in `bin/install` are best effort.
+- Window focus and the border on protected app windows need Hyprland. The bar widget and the approval card need Omarchy.
+- Pull requests for other platforms are welcome when they meet the bar in [CONTRIBUTING.md](CONTRIBUTING.md). Issues about platforms outside Omarchy can be closed without a fix.
+- Every issue needs the output of `paddock doctor`. The issue form asks for it.
+
+## Development
+
+```sh
+bin/test
+```
+
+To contribute, read [CONTRIBUTING.md](CONTRIBUTING.md). `bin/test` runs the unit tests, the integration tests, the plugin manifest check, and `paddock doctor --escape` on each backend that the host can run. One test makes sure that tracked files contain no facts about the development machine: the home directory, the user name, the host name, the git server, or the git email.
+
+
+## License
+
+MIT

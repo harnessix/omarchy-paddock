@@ -1,0 +1,76 @@
+name: Bug report
+description: Something in paddock does not work as documented.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        paddock supports Omarchy (Arch Linux with Hyprland). On other platforms, an issue can be closed without a fix; a pull request that meets CONTRIBUTING.md is welcome instead.
+
+        A report without the full output of `paddock doctor` is closed.
+  - type: textarea
+    id: doctor
+    attributes:
+      label: Output of `paddock doctor`
+      description: Run `paddock doctor` and paste all of its output. Remove nothing except what you consider private, and say what you removed.
+      render: text
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: paddock version
+      description: Output of `paddock --version`.
+      placeholder: paddock 0.1.0
+    validations:
+      required: true
+  - type: dropdown
+    id: platform
+    attributes:
+      label: Platform
+      options:
+        - Omarchy (Arch Linux with Hyprland)
+        - Arch Linux, other compositor
+        - Debian or Ubuntu
+        - Fedora
+        - Other
+    validations:
+      required: true
+  - type: input
+    id: compositor
+    attributes:
+      label: Compositor and version
+      placeholder: Hyprland 0.56.2
+    validations:
+      required: true
+  - type: input
+    id: what
+    attributes:
+      label: Harness or app, and backend
+      description: For example `paddock claude --backend bwrap`, or `paddock app run vscode`.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: The exact commands, starting from a new terminal.
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: result
+    attributes:
+      label: What happened, and what you expected
+      description: Include the full error message as text, not a screenshot.
+    validations:
+      required: true
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checks
+      options:
+        - label: I ran `paddock doctor --escape` and included its output above if a check failed.
+          required: true
+        - label: I searched the existing issues.
+          required: true

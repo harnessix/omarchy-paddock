@@ -1,0 +1,370 @@
+//! `paddock-host`: the client that runs inside a sandbox. It sends one
+//! request to the host broker and prints the result. The help text is the full
+//! reference, so an agent never needs to read this source to use it.
+
+use crate::broker::{Request, Response, Status, PROTOCOL, SOCKET_IN_SANDBOX};
+use std::collections::BTreeMap;
+use std::io::{BufRead, BufReader, Write};
+use std::os::unix::net::UnixStream;
+
+pub const EXIT_USAGE: i32 = 2;
+pub const EXIT_NO_HOST: i32 = 6;
+
+pub const HELP: &str = r#"paddock-host: ask the host to do something that the sandbox cannot do.
+
+You are inside a paddock sandbox. You see only the project, your own home
+directory and package caches. paddock-host sends one request to paddock on the
+host. Depending on the user's configuration, the host does it at once, asks the
+user first, or refuses. Nothing here opens the sandbox itself.
+
+USAGE
+  paddock-host capabilities [--json]
+  paddock-host screenshot [--target screen|window|output:NAME] [--out FILE] [--reason TEXT]
+  paddock-host exec [--timeout SECONDS] [--reason TEXT] -- COMMAND [ARG...]
+  paddock-host fetch HOST_PATH [--reason TEXT]
+  paddock-host clipboard get [--reason TEXT]
+  paddock-host clipboard set TEXT [--reason TEXT]
+  paddock-host open URL [--reason TEXT]
+  paddock-host notify TITLE [BODY]
+  paddock-host help [CAPABILITY]
+
+Common options
+  --reason TEXT   One sentence that tells the user why you ask. The user sees it
+                  next to the request. Requests with a clear reason get answered.
+  --json          Print the full response as one JSON object (all commands).
+
+FIRST STEP
+  Run `paddock-host capabilities --json` to see which capabilities exist and
+  whether each one is allowed, asks the user, or is denied. Do not send
+  requests for a capability whose mode is "deny": they fail at once.
+
+WAITING
+  A request in "ask" mode waits until the user answers on the host: in the
+  Omarchy bar panel, in a desktop notification, or with `paddock approvals`.
+  The wait is at most the time in "wait_seconds" (default 120). Do not run two
+  requests at the same time. Do not retry a denied request: ask the user in
+  the conversation instead.
+
+RESULTS
+  Files (screenshots, fetched files) are written to .paddock/inbox/ in the
+  project. That folder has its own .gitignore, so results are never committed.
+  The command prints the path of the file. exec prints the command's stdout to
+  stdout and its stderr to stderr, and exits with the command's exit code.
+
+EXIT CODES
+  0   done (for exec: the command's own exit code is returned instead)
+  2   wrong usage of paddock-host
+  3   the user denied the request
+  4   the capability is set to deny in the user's configuration
+  5   nobody answered in time
+  6   no host connection: not inside a paddock sandbox, or paddock is too old
+  7   the host tried and failed; the message says why
+  8   the host rejected the request as invalid, for example a protected path
+
+EXAMPLES
+  paddock-host screenshot --reason "check the layout of the settings window"
+  paddock-host screenshot --target window --out settings.png
+  paddock-host exec --reason "restart the dev database" -- systemctl --user restart postgres
+  paddock-host fetch /etc/hosts --reason "compare host name resolution"
+  paddock-host open https://example.com/docs
+  paddock-host notify "Build finished" "All 214 tests passed"
+"#;
+
+fn cap_help(cap: &str) -> Option<&'static str> {
+    Some(match cap {
+        "screenshot" => {
+            r#"paddock-host screenshot: capture the host screen into the project.
+
+  --target screen      every output (default)
+  --target output:NAME one output, for example output:eDP-1
+  --target window      the window that has focus on the host (Hyprland only)
+  --out FILE           file name in .paddock/inbox/ (default screenshot-TIME.png)
+
+Prints the path of the PNG file. Read it with your image tools.
+The sandbox's own display, if it has one, is captured with paddock-screenshot
+instead; that needs no approval."#
+        }
+        "exec" => {
+            r#"paddock-host exec: run one command on the host.
+
+  paddock-host exec [--timeout SECONDS] -- COMMAND [ARG...]
+
+The command runs in the project directory on the host, with the user's host
+environment, without a shell. To use shell syntax, run sh -c 'TEXT' as the
+command. The user sees the exact command line before it runs. "Allow for this
+session" covers only the identical command line. The configuration cannot set
+exec to allow: every new command line needs an answer.
+--timeout stops the command after SECONDS (default 120, at most 3600).
+stdout and stderr are returned (at most 1 MiB each), and paddock-host exits
+with the command's exit code."#
+        }
+        "fetch" => {
+            r#"paddock-host fetch: copy one host file or directory into the project.
+
+  paddock-host fetch HOST_PATH
+
+HOST_PATH must be absolute. The copy goes to .paddock/inbox/ and is a one-time
+snapshot. Symbolic links inside a directory are skipped. The limit is 64 MiB.
+Protected paths (~/.ssh, ~/.gnupg, cloud credentials, browser profiles and the
+other paths that paddock never mounts) are refused even if the user would
+allow them."#
+        }
+        "clipboard-read" | "clipboard" => {
+            r#"paddock-host clipboard: read or set the host clipboard.
+
+  paddock-host clipboard get       print the clipboard text
+  paddock-host clipboard set TEXT  replace the clipboard text
+
+The capabilities are named clipboard-read and clipboard-write."#
+        }
+        "open-url" | "open" => {
+            r#"paddock-host open URL: open an http or https URL in the host browser.
+
+The capability is named open-url. Other schemes are refused."#
+        }
+        "notify" => {
+            r#"paddock-host notify TITLE [BODY]: show a desktop notification on the host.
+
+Allowed by default. Use it to tell the user that long work is done."#
+        }
+        _ => return None,
+    })
+}
+
+/// Send one request to the broker.
+pub fn send(req: &Request) -> Result<Response, String> {
+    let path =
+        std::env::var("PADDOCK_HOST_SOCKET").unwrap_or_else(|_| SOCKET_IN_SANDBOX.to_string());
+    let mut s =
+        UnixStream::connect(&path).map_err(|e| format!("cannot reach the host at {path}: {e}"))?;
+    let line = serde_json::to_string(req).map_err(|e| e.to_string())?;
+    writeln!(s, "{line}").map_err(|e| e.to_string())?;
+    let mut reader = BufReader::new(s);
+    let mut out = String::new();
+    reader.read_line(&mut out).map_err(|e| e.to_string())?;
+    serde_json::from_str(out.trim()).map_err(|e| format!("bad response from the host: {e}"))
+}
+
+struct Parsed {
+    json: bool,
+    reason: String,
+    opts: BTreeMap<String, String>,
+    rest: Vec<String>,
+}
+
+fn parse(args: &[String], with_values: &[&str]) -> Result<Parsed, String> {
+    let mut p = Parsed {
+        json: false,
+        reason: String::new(),
+        opts: BTreeMap::new(),
+        rest: vec![],
+    };
+    let mut i = 0;
+    while i < args.len() {
+        let a = &args[i];
+        if a == "--" {
+            p.rest.extend(args[i + 1..].iter().cloned());
+            break;
+        } else if a == "--json" {
+            p.json = true;
+        } else if a == "--reason" {
+            p.reason = args.get(i + 1).ok_or("--reason needs a value")?.clone();
+            i += 1;
+        } else if let Some(name) = a.strip_prefix("--") {
+            if !with_values.contains(&name) {
+                return Err(format!("unknown option {a}"));
+            }
+            p.opts.insert(
+                name.to_string(),
+                args.get(i + 1).ok_or(format!("{a} needs a value"))?.clone(),
+            );
+            i += 1;
+        } else {
+            p.rest.push(a.clone());
+        }
+        i += 1;
+    }
+    Ok(p)
+}
+
+fn usage(msg: &str) -> i32 {
+    eprintln!("paddock-host: {msg}\nRun `paddock-host --help` for the full reference.");
+    EXIT_USAGE
+}
+
+/// The entry point. Returns the process exit code.
+pub fn main(args: &[String]) -> i32 {
+    let Some(cmd) = args.first().map(String::as_str) else {
+        print!("{HELP}");
+        return EXIT_USAGE;
+    };
+    let rest = &args[1..];
+    if matches!(cmd, "-h" | "--help" | "help") {
+        match rest.first() {
+            Some(c) => match cap_help(c) {
+                Some(t) => println!("{t}"),
+                None => return usage(&format!("no help for '{c}'")),
+            },
+            None => print!("{HELP}"),
+        }
+        return 0;
+    }
+    if rest.iter().any(|a| a == "-h" || a == "--help") {
+        println!("{}", cap_help(cmd).unwrap_or(HELP));
+        return 0;
+    }
+    let req = |cap: &str, reason: String, args: BTreeMap<String, serde_json::Value>| Request {
+        v: PROTOCOL,
+        cap: cap.to_string(),
+        args,
+        reason,
+    };
+    let built = (|| -> Result<(Request, bool), String> {
+        Ok(match cmd {
+            "capabilities" => {
+                let p = parse(rest, &[])?;
+                (req("capabilities", String::new(), BTreeMap::new()), p.json)
+            }
+            "screenshot" => {
+                let p = parse(rest, &["target", "out"])?;
+                let mut a = BTreeMap::new();
+                for k in ["target", "out"] {
+                    if let Some(v) = p.opts.get(k) {
+                        a.insert(k.to_string(), serde_json::json!(v));
+                    }
+                }
+                (req("screenshot", p.reason, a), p.json)
+            }
+            "exec" => {
+                let p = parse(rest, &["timeout"])?;
+                if p.rest.is_empty() {
+                    return Err("exec needs a command after --".into());
+                }
+                let mut a = BTreeMap::new();
+                a.insert("argv".to_string(), serde_json::json!(p.rest));
+                if let Some(t) = p.opts.get("timeout") {
+                    a.insert(
+                        "timeout".into(),
+                        serde_json::json!(t
+                            .parse::<u64>()
+                            .map_err(|_| "--timeout needs a number")?),
+                    );
+                }
+                (req("exec", p.reason, a), p.json)
+            }
+            "fetch" => {
+                let p = parse(rest, &[])?;
+                let [path] = p.rest.as_slice() else {
+                    return Err("fetch needs exactly one host path".into());
+                };
+                let mut a = BTreeMap::new();
+                a.insert("path".into(), serde_json::json!(path));
+                (req("fetch", p.reason, a), p.json)
+            }
+            "clipboard" => {
+                let p = parse(rest, &[])?;
+                match p.rest.as_slice() {
+                    [g] if g == "get" => (req("clipboard-read", p.reason, BTreeMap::new()), p.json),
+                    [s, text] if s == "set" => {
+                        let mut a = BTreeMap::new();
+                        a.insert("text".into(), serde_json::json!(text));
+                        (req("clipboard-write", p.reason, a), p.json)
+                    }
+                    _ => return Err("use: clipboard get | clipboard set TEXT".into()),
+                }
+            }
+            "open" => {
+                let p = parse(rest, &[])?;
+                let [url] = p.rest.as_slice() else {
+                    return Err("open needs one URL".into());
+                };
+                let mut a = BTreeMap::new();
+                a.insert("url".into(), serde_json::json!(url));
+                (req("open-url", p.reason, a), p.json)
+            }
+            "notify" => {
+                let p = parse(rest, &[])?;
+                let mut a = BTreeMap::new();
+                match p.rest.as_slice() {
+                    [t] => {
+                        a.insert("title".into(), serde_json::json!(t));
+                    }
+                    [t, b] => {
+                        a.insert("title".into(), serde_json::json!(t));
+                        a.insert("body".into(), serde_json::json!(b));
+                    }
+                    _ => return Err("notify needs a title and an optional body".into()),
+                }
+                (req("notify", p.reason, a), p.json)
+            }
+            other => return Err(format!("unknown command '{other}'")),
+        })
+    })();
+    let (request, json) = match built {
+        Ok(x) => x,
+        Err(e) => return usage(&e),
+    };
+    let resp = match send(&request) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("paddock-host: {e}\nThis command works only inside a paddock sandbox.");
+            return EXIT_NO_HOST;
+        }
+    };
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&resp).unwrap_or_default()
+        );
+    } else {
+        print_human(&request, &resp);
+    }
+    if resp.status == Status::Done && request.cap == "exec" {
+        return resp.result["exit_code"].as_i64().unwrap_or(0) as i32;
+    }
+    resp.status.exit_code()
+}
+
+fn print_human(req: &Request, resp: &Response) {
+    if resp.status != Status::Done {
+        let what = match resp.status {
+            Status::Denied => "denied by the user",
+            Status::Disabled => "disabled in the user's configuration",
+            Status::Timeout => "not answered in time",
+            Status::Failed => "failed on the host",
+            Status::Invalid => "rejected as invalid",
+            Status::Done => unreachable!(),
+        };
+        eprintln!("paddock-host: {} {what}: {}", req.cap, resp.message);
+        return;
+    }
+    let r = &resp.result;
+    match req.cap.as_str() {
+        "capabilities" => {
+            println!("wait for an answer: {} seconds", r["wait_seconds"]);
+            for c in r["capabilities"].as_array().into_iter().flatten() {
+                println!(
+                    "{:<16} {:<6}{} {}",
+                    c["name"].as_str().unwrap_or(""),
+                    c["mode"].as_str().unwrap_or(""),
+                    if c["session_granted"] == true {
+                        " (allowed this session)"
+                    } else {
+                        ""
+                    },
+                    c["description"].as_str().unwrap_or("")
+                );
+            }
+        }
+        "exec" => {
+            print!("{}", r["stdout"].as_str().unwrap_or(""));
+            eprint!("{}", r["stderr"].as_str().unwrap_or(""));
+        }
+        "clipboard-read" => print!("{}", r["text"].as_str().unwrap_or("")),
+        _ => {
+            if let Some(p) = r["path"].as_str() {
+                println!("{p}");
+            }
+        }
+    }
+}

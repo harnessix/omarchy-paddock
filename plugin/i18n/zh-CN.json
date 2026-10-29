@@ -1,0 +1,107 @@
+{
+  "bar.label": "Paddock",
+  "bar.running": {
+    "other": "%1 个沙箱运行中"
+  },
+  "panel.title": "Paddock",
+  "panel.running": {
+    "other": "%1 个沙箱运行中"
+  },
+  "state.loading": "正在读取沙箱状态…",
+  "state.idle": "没有运行中的沙箱",
+  "state.empty": "没有正在运行的沙箱。可以在这里新建，也可以在项目终端中运行 paddock <harness>。",
+  "state.missingShort": "命令未安装",
+  "state.missing": "找不到 paddock 命令。安装程序会安装它和所需的软件包。",
+  "state.install": "安装 paddock",
+  "state.errorShort": "无法读取状态",
+  "state.error": "无法读取 paddock ps 的输出。请同时更新插件和命令。",
+  "row.title": "%1 · %2",
+  "row.detail": "%1 · %2 · 显示 %3 · %4",
+  "row.auth": "登录 %1",
+  "time.minutes": {
+    "other": "%1 分钟"
+  },
+  "time.hours": {
+    "other": "%1 小时"
+  },
+  "action.folder": "打开项目目录",
+  "action.copy": "复制项目路径",
+  "action.display": "显示沙箱的显示窗口",
+  "action.stop": "停止这个沙箱",
+  "action.confirmStop": "再按一次以停止",
+  "msg.noTerminal": "没有找到这个沙箱的窗口。",
+  "msg.noDisplay": "没有找到显示窗口。",
+  "msg.copied": "已复制项目路径。",
+  "msg.confirmStop": "要停止 %2 中的 %1 吗？请在 4 秒内再按一次停止。",
+  "msg.stopped": "沙箱已停止。",
+  "msg.stopFailed": "沙箱没有停止，它可能已经结束。",
+  "new.button": "新建",
+  "new.back": "返回",
+  "new.stepProject": "新建沙箱 · 第 1/2 步",
+  "new.stepHarness": "新建沙箱 · 第 2/2 步",
+  "new.noRecent": "还没有最近的项目。用 paddock <harness> 在某个项目中启动过沙箱后，它会出现在这里。",
+  "new.lastUsed": "上次使用 %1",
+  "keys.list": "↵ 终端 · ←→ 操作 · Del 停止 · N 新建",
+  "keys.new": "↵ 选择 · Esc 返回",
+  "footer.checks": "自检",
+  "footer.checksTip": "在终端中运行 paddock doctor",
+  "terminal.pressEnter": "按回车关闭。",
+  "new.chooseProject": "选择项目",
+  "new.chooseHarness": "选择 harness",
+  "approve.header": {
+    "other": "%1 个请求等待你的批准"
+  },
+  "approve.meta": "%1 · %2 · %3",
+  "approve.detailLabel": "将在你的电脑上执行：",
+  "approve.reason": "agent 的说法：%1",
+  "time.secondsAgo": {
+    "other": "%1 秒前"
+  },
+  "time.left": {
+    "other": "剩余 %1 秒"
+  },
+  "approve.openCard": "请在屏幕顶部的卡片上答复。回车：在卡片上用键盘操作。",
+  "keys.toCard": "↵ 到卡片上答复 · Del 拒绝 · ↑↓ 移动",
+  "recent.header": "最近的宿主机请求",
+  "recent.byAgent": "agent 代批",
+  "popup.state.pending": "需要你的批准",
+  "popup.state.sending": "正在提交…",
+  "popup.state.allowed": "已允许",
+  "popup.state.denied": "已拒绝",
+  "popup.state.gone": "已不在等待",
+  "popup.position": "第 %1 / %2 个",
+  "popup.answer.deny": "否",
+  "popup.answer.once": "是，仅此一次",
+  "popup.answer.session": "是，本会话内",
+  "popup.keysHint": "点击答复",
+  "popup.ask.exec": "允许 %2 中的 %1 在你的电脑上运行这条命令吗？",
+  "popup.ask.screenshot": "允许 %2 中的 %1 截取你的屏幕吗？",
+  "popup.ask.fetch": "允许 %2 中的 %1 从你的电脑复制这些内容吗？",
+  "popup.ask.clipboard-read": "允许 %2 中的 %1 读取你的剪贴板吗？",
+  "popup.ask.clipboard-write": "允许 %2 中的 %1 设置你的剪贴板吗？",
+  "popup.ask.open-url": "允许 %2 中的 %1 打开这个链接吗？",
+  "popup.ask.notify": "允许 %2 中的 %1 显示一条通知吗？",
+  "popup.ask.other": "允许 %2 中的 %1 在你的电脑上执行这个操作吗？",
+  "approve.gone": "这个请求已不在等待：它已超时，或已在别处答复。",
+  "approve.denied": "已拒绝。",
+  "approve.allowed": "已允许。",
+  "popup.ask.login": "在浏览器中打开 %1 的登录页吗？（%2）",
+  "popup.state.login": "登录",
+  "recent.once": "已允许一次",
+  "recent.session": "本会话内允许",
+  "recent.byConfig": "按你的设置允许",
+  "recent.denied": "已拒绝",
+  "recent.timedOut": "已超时",
+  "recent.invalid": "已拒绝：无效请求",
+  "recent.blocked": "按你的设置拒绝",
+  "recent.other": "已结束",
+  "time.minutesAgo": {
+    "other": "%1 分钟前"
+  },
+  "time.hoursAgo": {
+    "other": "%1 小时前"
+  },
+  "time.daysAgo": {
+    "other": "%1 天前"
+  }
+}

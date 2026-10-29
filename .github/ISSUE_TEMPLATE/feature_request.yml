@@ -1,0 +1,29 @@
+name: Feature request
+description: Suggest a change to what paddock does.
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        paddock keeps its scope small on purpose: an agent gets full auto-approval and sees only what it needs. Requests that widen what a sandbox can reach need a clear reason and a design for the risk.
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: What you tried to do, and what stopped you.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Your proposal
+      description: What paddock would do, and what a sandbox could reach that it cannot reach now.
+    validations:
+      required: true
+  - type: textarea
+    id: doctor
+    attributes:
+      label: Output of `paddock doctor`
+      render: text
+    validations:
+      required: true

@@ -1,0 +1,117 @@
+{
+  "bar.label": "Paddock",
+  "bar.running": {
+    "one": "%1 sandbox running",
+    "other": "%1 sandboxes running"
+  },
+  "panel.title": "Paddock",
+  "panel.running": {
+    "one": "%1 sandbox running",
+    "other": "%1 sandboxes running"
+  },
+  "state.loading": "Checking sandboxes…",
+  "state.idle": "Nothing running",
+  "state.empty": "No sandbox is running. Start one here, or run paddock <harness> in a project terminal.",
+  "state.missingShort": "Command not installed",
+  "state.missing": "The paddock command was not found. The installer adds it and the packages it needs.",
+  "state.install": "Install paddock",
+  "state.errorShort": "Cannot read status",
+  "state.error": "paddock ps returned output that this panel cannot read. Update the plugin and the command together.",
+  "row.title": "%1 · %2",
+  "row.detail": "%1 · %2 · display %3 · %4",
+  "row.auth": "login %1",
+  "time.minutes": {
+    "one": "%1 min",
+    "other": "%1 min"
+  },
+  "time.hours": {
+    "one": "%1 h",
+    "other": "%1 h"
+  },
+  "action.folder": "Open the project folder",
+  "action.copy": "Copy the project path",
+  "action.display": "Show the sandbox display window",
+  "action.stop": "Stop this sandbox",
+  "action.confirmStop": "Press again to stop",
+  "msg.noTerminal": "No window was found for this sandbox.",
+  "msg.noDisplay": "The display window was not found.",
+  "msg.copied": "Project path copied.",
+  "msg.confirmStop": "Stop %1 in %2? Press stop again within 4 seconds.",
+  "msg.stopped": "Sandbox stopped.",
+  "msg.stopFailed": "The sandbox did not stop. It may have ended already.",
+  "new.button": "New",
+  "new.back": "Back",
+  "new.stepProject": "New sandbox · step 1 of 2",
+  "new.stepHarness": "New sandbox · step 2 of 2",
+  "new.noRecent": "No recent projects yet. Projects appear here after you start a sandbox in them with paddock <harness>.",
+  "new.lastUsed": "last used with %1",
+  "keys.list": "↵ terminal · ←→ actions · Del stop · N new",
+  "keys.new": "↵ choose · Esc back",
+  "footer.checks": "Checks",
+  "footer.checksTip": "Run paddock doctor in a terminal",
+  "terminal.pressEnter": "Press Enter to close.",
+  "new.chooseProject": "Choose a project",
+  "new.chooseHarness": "Choose a harness",
+  "approve.header": {
+    "one": "%1 request waiting for you",
+    "other": "%1 requests waiting for you"
+  },
+  "approve.meta": "%1 · %2 · %3",
+  "approve.detailLabel": "What will happen on your computer:",
+  "approve.reason": "The agent says: %1",
+  "time.secondsAgo": {
+    "one": "%1 s ago",
+    "other": "%1 s ago"
+  },
+  "time.left": {
+    "one": "%1 s left",
+    "other": "%1 s left"
+  },
+  "approve.openCard": "Answer on the card at the top of the screen. Enter: use the keyboard there.",
+  "keys.toCard": "↵ answer on the card · Del deny · ↑↓ move",
+  "recent.header": "Recent host requests",
+  "recent.byAgent": "by agent",
+  "popup.state.pending": "Approval needed",
+  "popup.state.sending": "Sending…",
+  "popup.state.allowed": "Allowed",
+  "popup.state.denied": "Denied",
+  "popup.state.gone": "No longer waiting",
+  "popup.position": "%1 of %2",
+  "popup.answer.deny": "No",
+  "popup.answer.once": "Yes, once",
+  "popup.answer.session": "Yes, for this session",
+  "popup.keysHint": "Click to answer",
+  "popup.ask.exec": "Allow %1 in %2 to run this command on your computer?",
+  "popup.ask.screenshot": "Allow %1 in %2 to take a screenshot of your screen?",
+  "popup.ask.fetch": "Allow %1 in %2 to copy this from your computer?",
+  "popup.ask.clipboard-read": "Allow %1 in %2 to read your clipboard?",
+  "popup.ask.clipboard-write": "Allow %1 in %2 to set your clipboard?",
+  "popup.ask.open-url": "Allow %1 in %2 to open this link?",
+  "popup.ask.notify": "Allow %1 in %2 to show a notification?",
+  "popup.ask.other": "Allow %1 in %2 to do this on your computer?",
+  "approve.gone": "This request is no longer waiting: it timed out or was answered elsewhere.",
+  "approve.denied": "Denied.",
+  "approve.allowed": "Allowed.",
+  "popup.ask.login": "Open the login page of %1 in your browser? (%2)",
+  "popup.state.login": "Login",
+  "recent.once": "allowed once",
+  "recent.session": "allowed for the session",
+  "recent.byConfig": "allowed by your settings",
+  "recent.denied": "denied",
+  "recent.timedOut": "timed out",
+  "recent.invalid": "refused: invalid",
+  "recent.blocked": "refused by your settings",
+  "recent.other": "finished",
+  "time.minutesAgo": {
+    "one": "%1 min ago",
+    "other": "%1 min ago"
+  },
+  "time.hoursAgo": {
+    "one": "%1 h ago",
+    "other": "%1 h ago"
+  },
+  "time.daysAgo": {
+    "one": "%1 day ago",
+    "other": "%1 days ago"
+  }
+}

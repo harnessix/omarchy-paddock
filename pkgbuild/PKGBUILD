@@ -1,0 +1,39 @@
+# Builds paddock from this source tree: run `makepkg -si` in this directory,
+# or `bin/install` from the repository root.
+pkgname=omarchy-paddock
+pkgver=0.1.0
+pkgrel=1
+pkgdesc='Run coding-agent harnesses with full auto-approval inside an isolated sandbox'
+conflicts=('paddock-git')
+arch=('x86_64' 'aarch64')
+license=('MIT')
+depends=('git' 'bubblewrap' 'passt' 'iproute2')
+optdepends=(
+  'weston: displays for desktop projects (headless and window modes) and paddock-screenshot'
+  'xorg-xwayland: X11 apps on the private display'
+  'dbus: a private session bus for desktop apps'
+  'docker: container backend'
+  'podman: rootless container backend'
+  'mise: per-project toolchains from mise.toml'
+  'gnome-keyring: a private keyring in sandboxes of harnesses that need one (copilot)'
+)
+makedepends=('cargo')
+source=()
+sha256sums=()
+
+build() {
+  cd "$startdir/.."
+  cargo build --release --locked
+}
+
+check() {
+  cd "$startdir/.."
+  cargo test --release --locked --lib
+}
+
+package() {
+  cd "$startdir/.."
+  install -Dm755 target/release/paddock "$pkgdir/usr/bin/paddock"
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+  install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
+}

@@ -1,0 +1,12 @@
+/target
+/build
+/pkgbuild/pkg
+/pkgbuild/src
+/pkgbuild/*.pkg.tar.*
+
+# Design and agent notes stay out of version control.
+/docs/DESIGN.md
+CLAUDE.md
+CLAUDE.local.md
+AGENTS.md
+.claude/

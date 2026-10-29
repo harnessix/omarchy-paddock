@@ -1,0 +1,15 @@
+name = "vscode"
+description = "Visual Studio Code"
+unverified = ["extensions that start host services"]
+
+[locate]
+commands = ["code"]
+
+[launch]
+args = ["--ozone-platform=wayland", "--no-sandbox", "--password-store=basic", "--wait"]
+
+[app]
+display_name = "Visual Studio Code"
+icon = "visual-studio-code"
+schemes = ["vscode"]
+open_roots = true
