@@ -959,10 +959,20 @@ fn real_main() -> Result<i32> {
             match cmd {
                 ShimsCmd::List => {
                     let on = shims::installed(&env);
+                    let active = shims::active(&env);
                     for (harness, cmd) in shims::detect(&env)? {
-                        println!("{cmd:<10} paddock run {harness}");
+                        let state = if on && active.contains(&cmd) {
+                            "on "
+                        } else {
+                            "off"
+                        };
+                        println!("{state}  {cmd:<10} paddock run {harness}");
                     }
-                    println!("\nShims are {}.", if on { "on" } else { "off" });
+                    if on {
+                        println!("\nShims are on. Run one command without the sandbox with PADDOCK_BYPASS=1. Turn them off with: paddock shims remove");
+                    } else {
+                        println!("\nShims are off. Turn them on with: paddock shims install");
+                    }
                 }
                 ShimsCmd::Install => {
                     let r = shims::install(&env)?;
