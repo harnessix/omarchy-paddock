@@ -266,6 +266,9 @@ impl Backend for Docker {
         if !child.wait()?.success() {
             bail!("image build failed");
         }
+        // Older paddock images that no container uses, and the rest of the
+        // automatic tier of `paddock gc`.
+        crate::storage::after_build(env, &tag);
         Ok(())
     }
 

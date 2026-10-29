@@ -1,6 +1,6 @@
 ---
 name: paddock
-description: Install, configure, troubleshoot or remove paddock on the host. paddock is a sandbox for coding agents (Claude Code, Codex, Copilot CLI, Gemini CLI, opencode) and desktop apps such as VS Code. Use it outside a sandbox, when the user asks for any of these tasks or asks to run an agent in a sandbox.
+description: Install, configure, troubleshoot, clean up or remove paddock on the host. paddock is a sandbox for coding agents (Claude Code, Codex, Copilot CLI, Gemini CLI, opencode) and desktop apps such as VS Code. Use it outside a sandbox, when the user asks for any of these tasks or asks to run an agent in a sandbox.
 ---
 
 # Setting up and using paddock on the host
@@ -94,6 +94,18 @@ After a configuration change, run `paddock explain <harness>` and make sure that
 
 An agent in a sandbox can ask the host for a screenshot, one command, one file, the clipboard, or a link in the browser. The user answers on the approval card, in the bar panel, or with `paddock approvals`. `paddock log` shows every request and its answer. Report pending requests to the user. Do not answer them.
 
+## Disk space
+
+You can run `paddock du` and a `paddock gc` dry run at any time. Neither command changes anything. Add `--json` for data. A `paddock gc` without `--yes` only prints a list, also with `--homes`, `--worktrees` or `--include-app-logins`.
+
+Ask the user before you run `paddock gc` with `--yes`. Show them the dry-run list first, and say which items they lose:
+
+- `--homes` deletes transcripts and settings of old projects.
+- `--include-app-logins` deletes the login of a desktop app. The user must log in again.
+- `--worktrees --force` deletes uncommitted changes in a worktree. Its branch and commits stay.
+
+Do not delete sandbox homes, images or worktrees with `rm`, `docker rmi` or `git worktree remove`. `paddock gc` checks that no sandbox runs in them.
+
 ## Remove
 
 ```sh
@@ -102,4 +114,4 @@ paddock launchers remove
 omarchy plugin remove harnessix.paddock
 ```
 
-Then delete `~/.local/bin/paddock`, or run `sudo pacman -R omarchy-paddock` if `bin/install` installed the Arch package. The data directories are `~/.local/share/paddock`, `~/.cache/paddock`, `~/.local/state/paddock` and `~/.config/paddock`. They hold sandbox homes and isolated logins, so ask the user before you delete them.
+Then delete `~/.local/bin/paddock`, or run `sudo pacman -R omarchy-paddock` if `bin/install` installed the Arch package. The data directories are `~/.local/share/paddock`, `~/.cache/paddock`, `~/.local/state/paddock` and `~/.config/paddock`. They hold sandbox homes and isolated logins, so ask the user before you delete them. To free space and keep paddock, use `paddock gc` instead.

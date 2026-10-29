@@ -116,7 +116,9 @@ Then ask your agent, for example: "Install paddock and make the sandbox the defa
 
 3. Remove the command. If you installed the Arch package (`bin/install` does this on Arch Linux), run `sudo pacman -R omarchy-paddock`. Otherwise, delete `~/.local/bin/paddock`.
 
-4. Optional: delete the data that paddock keeps. These directories hold the sandbox homes, isolated logins, shared caches, worktrees and settings. Your own logins and files are not in them.
+4. Optional: to free space and keep paddock, run `paddock gc` instead. See [Disk space](#disk-space).
+
+5. Optional: delete the data that paddock keeps. These directories hold the sandbox homes, isolated logins, shared caches, worktrees and settings. Your own logins and files are not in them.
 
    ```sh
    rm -rf ~/.local/share/paddock ~/.cache/paddock ~/.local/state/paddock ~/.config/paddock
@@ -124,7 +126,7 @@ Then ask your agent, for example: "Install paddock and make the sandbox the defa
 
    If you set `XDG_DATA_HOME`, `XDG_CACHE_HOME`, `XDG_STATE_HOME` or `XDG_CONFIG_HOME`, the directories are under those paths instead.
 
-5. Optional: if you used the docker or podman backend, remove the images: `docker image rm $(docker image ls -q paddock-base)`.
+6. Optional: if you used the docker or podman backend, remove the images: `docker image rm $(docker image ls -q paddock-base)`. Run the same command with `podman` for podman.
 
 paddock does not change any file outside these directories, except the files that you name in `paddock env hide` (in `~/.config/paddock/config.toml`), the git worktrees that `--worktree` creates, and the files that `paddock shims install` and `paddock launchers install` change. Step 2 undoes those two. To remove a worktree, use the commands that paddock prints when the sandbox exits.
 
@@ -203,6 +205,46 @@ ignore = ["*.desktop", "*.part", "*.tmp"]   # never listed
 ```
 
 By default, paddock ignores `*.desktop` launchers, because they can run commands when you open them, and partial or lock files.
+
+## Disk space
+
+Each harness gets its own home in each project, so the homes grow with the number of projects. The docker and podman backends also keep one image for each configuration.
+
+`paddock du` lists what paddock stores and how much space it uses:
+
+- Each sandbox home: harness, login, project, size, last use, and what you lose when you delete it.
+- The paddock images of docker and podman, and whether each is current or in use.
+- The worktrees that `--worktree` created, with their unmerged commits.
+- The session records of `paddock files`, and the keyring passwords of app homes.
+
+On btrfs, a size counts only the data that no other file shares. On other file systems, it counts the allocated blocks, as `du` does. The first line names the kind. `paddock du --json` prints the same data as JSON.
+
+`paddock gc` removes what is no longer needed. Without `--yes`, it removes nothing and prints the list.
+
+```sh
+paddock gc                                  # what --yes would remove
+paddock gc --yes                            # remove the automatic items
+paddock gc --homes --older-than 30          # also list homes unused for 30 days
+paddock gc --homes --yes                    # remove them
+```
+
+`--yes` alone removes these items:
+
+- Paddock images that are not current and that no container uses.
+- Keyring passwords whose home is gone.
+- Session records that ended more than 30 days ago.
+- Homes of harnesses whose profile no longer exists.
+- Old shared caches that paddock no longer uses, such as `~/.cache/paddock/shared/mise-installs`. paddock keeps them while a sandbox runs.
+
+paddock also does this after it builds a new image. To turn that off, set `PADDOCK_GC_AFTER_BUILD=0`.
+
+The other items need a flag that names them:
+
+- `--homes` adds homes whose project is gone, or that were not used for `--older-than` days (default 90). A home holds the transcripts and settings of a harness in one project. A terminal harness keeps its login in your home or in `~/.local/share/paddock/auth`, so the login stays.
+- A desktop app keeps its login in its home. If you delete the home, you must log in again. These homes also need `--include-app-logins`.
+- `--worktrees` adds paddock worktrees. A worktree with unmerged commits or uncommitted changes also needs `--force`. paddock then keeps its branch, so the commits stay in the repository.
+
+paddock never removes the home or worktree of a running sandbox. It deletes only inside its own directories. It never follows a symlink, so a link in a sandbox home cannot point it at your files. A sandbox can edit the `.paddock-origin` file in its home, which records the project. paddock uses that file only when it matches the folder name of the home, which contains a hash of the project path.
 
 ## Network
 
