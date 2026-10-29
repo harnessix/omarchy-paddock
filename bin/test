@@ -9,6 +9,8 @@ cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 cargo test
 
+.github/scripts/check-manifest.sh
+.github/scripts/leak-guard.sh
 if command -v omarchy >/dev/null; then
   omarchy plugin validate .
 fi
