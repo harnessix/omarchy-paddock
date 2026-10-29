@@ -29,7 +29,7 @@ if [ -n "$hits" ]; then
   echo "leak guard: blocked internal name found:"; echo "$hits"; status=1
 fi
 
-hits=$(git grep -nIE '/home/[A-Za-z0-9_.-]+' -- . ":!$self" | grep -vE '/home/demo([/"'"'"' ]|$)' || true)
+hits=$(git grep -noIE '/home/[A-Za-z0-9_.-]+' -- . ":!$self" | grep -vE ':/home/demo$' || true)
 if [ -n "$hits" ]; then
   echo "leak guard: private home path found (use /home/demo/):"; echo "$hits"; status=1
 fi
