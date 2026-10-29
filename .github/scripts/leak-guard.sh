@@ -39,7 +39,8 @@ if [ -n "${1:-}" ]; then
   for e in $emails; do
     case "$e" in
       *@users.noreply.github.com|noreply@github.com|noreply@anthropic.com) ;;
-      *) echo "leak guard: commit email is not a noreply address: $e"; status=1 ;;
+      # Only the masked address goes to the public log.
+      *) echo "leak guard: a commit email is not a noreply address: ${e:0:1}***@${e#*@}"; status=1 ;;
     esac
   done
 fi
