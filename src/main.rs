@@ -20,6 +20,13 @@ use std::path::PathBuf;
     after_help = "Examples:\n  paddock claude              start Claude Code in the current project\n  paddock codex ~/src/app     start Codex in another project\n  paddock explain claude      show every mount, variable and rule, and why\n  paddock doctor --escape     try to escape the sandbox and report the result"
 )]
 struct Cli {
+    /// Show more log output: -v info, -vv debug, -vvv trace. PADDOCK_LOG=debug
+    /// or PADDOCK_LOG=broker=debug sets levels too.
+    #[arg(short, long, global = true, action = clap::ArgAction::Count)]
+    verbose: u8,
+    /// Show only errors.
+    #[arg(short, long, global = true, action = clap::ArgAction::Count)]
+    quiet: u8,
     #[command(subcommand)]
     cmd: Cmd,
 }
@@ -111,6 +118,14 @@ enum Cmd {
         /// Also check that DNS and HTTPS work from inside.
         #[arg(long)]
         online: bool,
+        /// Print a diagnostic report for bug reports: version, doctor output
+        /// and recent paddock warnings from the journal. Names, paths,
+        /// variable values and tokens are removed.
+        #[arg(long, conflicts_with = "escape")]
+        report: bool,
+        /// With --report: write the report to this file instead of stdout.
+        #[arg(long, requires = "report")]
+        output: Option<PathBuf>,
     },
     /// Show or change which host environment variables a sandbox inherits.
     Env {
@@ -643,6 +658,7 @@ fn real_main() -> Result<i32> {
     // Exit quietly when stdout is closed, for example by `| head`.
     unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL) };
     let cli = Cli::parse();
+    paddock::logging::init(i32::from(cli.verbose) - i32::from(cli.quiet));
     if let Cmd::Inbound = &cli.cmd {
         paddock::app::inbound_serve()?;
         return Ok(0);
@@ -1136,7 +1152,23 @@ fn real_main() -> Result<i32> {
             app,
             online,
             env: env_mode,
+            report,
+            output,
         } => {
+            if report {
+                let text = paddock::report::build(&env);
+                match output {
+                    Some(f) => {
+                        std::fs::write(&f, &text)?;
+                        println!(
+                            "Wrote the report to {}. Check it before you share it.",
+                            f.display()
+                        );
+                    }
+                    None => print!("{text}"),
+                }
+                return Ok(0);
+            }
             if escape {
                 let display = if app {
                     GuiMode::App
@@ -1529,14 +1561,19 @@ fn mark_window(address: &str) {
     if ok {
         run(&["dispatch", &lua("inactive_border_color", inactive)]);
     } else {
-        // Hyprland before the Lua configuration.
-        run(&[
+        // Hyprland before the Lua configuration. Debug only: the plugin runs
+        // this every few seconds, so anything louder would fill the journal.
+        log::debug!("window {address}: Lua set_prop failed, using setprop");
+        let ok = run(&[
             "dispatch",
             "setprop",
             &format!("address:{address}"),
             "activebordercolor",
             active,
         ]);
+        if !ok {
+            log::debug!("window {address}: setprop failed too, no border");
+        }
         run(&[
             "dispatch",
             "setprop",

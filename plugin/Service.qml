@@ -38,6 +38,19 @@ Item {
   readonly property string findPaddock: "pd() { for p in \"$(command -v paddock)\" \"$HOME/.local/bin/paddock\" \"$HOME/.cargo/bin/paddock\"; do if [ -n \"$p\" ] && [ -x \"$p\" ]; then \"$p\" \"$@\"; return; fi; done; return 127; }"
   readonly property string launcher: findPaddock + "; pd \"$@\""
 
+  // Logging, as the Omarchy shell does it: silent normally, console.warn on
+  // a real fallback (once per message, the polls repeat every few seconds),
+  // and console.log only with PADDOCK_DEBUG=true in the shell's environment.
+  // Read the output with: journalctl -t omarchy-shell
+  readonly property bool debug: Quickshell.env("PADDOCK_DEBUG") === "true"
+  property string lastWarning: ""
+  function warnOnce(msg) {
+    if (msg === lastWarning) return
+    lastWarning = msg
+    console.warn("paddock: " + msg)
+  }
+  function debugLog(msg) { if (debug) console.log("paddock: " + msg) }
+
   function plain(val, maxLen) {
     var s = String(val === undefined || val === null ? "" : val)
     return s.length > maxLen ? s.slice(0, maxLen) : s
@@ -163,7 +176,7 @@ Item {
     id: listProc
     command: ["sh", "-c", root.launcher, "paddock", "approvals", "--json"]
     onExited: function(exitCode) {
-      if (exitCode !== 0) return
+      if (exitCode !== 0) { root.debugLog("approvals --json exited with " + exitCode); return }
       try {
         var p = JSON.parse(buffer)
         if (!p || p.api_version !== "paddock.approvals/v1" || !Array.isArray(p.pending)) return
@@ -192,7 +205,10 @@ Item {
         }
         root.requests = fresh
         if (fresh.length === 0) root.keyboardMode = false
-      } catch (e) {}
+        root.lastWarning = ""
+      } catch (e) {
+        root.warnOnce("cannot read paddock approvals --json, keeping the old list: " + e)
+      }
     }
   }
 

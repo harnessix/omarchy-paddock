@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Logging with levels. `-v` and `-q` change how much paddock prints, and `PADDOCK_LOG=debug` or `PADDOCK_LOG=broker=debug` sets the level for everything or for one part. The broker, the proxy, the login callback forwarder and the window border also write to the systemd journal: `journalctl -t paddock -p warning`.
+- `paddock doctor --report` prints a diagnostic report for bug reports, without user names, paths, variable values or tokens.
+- The bar plugin writes a warning to the shell log when it cannot read paddock's output. `PADDOCK_DEBUG=true` shows more.
 - `paddock shims install` makes the sandbox the default: typing `claude`, `codex` and the other harness commands in bash or zsh starts them in a sandbox. `paddock shims remove` undoes it, and nothing breaks if paddock is removed first.
 - A `paddock` agent skill for the host, next to `paddock-host`. Install both with `npx skills add harnessix/omarchy-paddock`.
 

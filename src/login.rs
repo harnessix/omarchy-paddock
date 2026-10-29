@@ -73,6 +73,10 @@ pub fn note_opened(raw: &str) {
     let until = Instant::now() + WINDOW;
     let mut m = ALLOWED.lock().unwrap();
     for p in callback_ports(raw) {
+        log::debug!(
+            "login callback port {p} open for {} seconds",
+            WINDOW.as_secs()
+        );
         m.insert(p, until);
     }
 }

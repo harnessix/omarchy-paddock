@@ -197,7 +197,7 @@ impl Manifest {
     fn merge(&mut self, o: Manifest) {
         // [host] and [apps] are trusted only from the user configuration.
         if o.host.is_some() || !o.apps.is_empty() {
-            eprintln!("paddock: warning: [host] and [apps] in a project paddock.toml are ignored");
+            log::warn!("[host] and [apps] in a project paddock.toml are ignored");
         }
         if o.default_harness.is_some() {
             self.default_harness = o.default_harness;

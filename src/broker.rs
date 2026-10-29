@@ -295,12 +295,17 @@ fn audit(env: &HostEnv, ctx: &Context, req: &Request, decision: &str, resp: &Res
     if let Some(d) = f.parent() {
         let _ = std::fs::create_dir_all(d);
     }
-    if let Ok(mut file) = std::fs::OpenOptions::new()
+    match std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(&f)
     {
-        let _ = writeln!(file, "{line}");
+        Ok(mut file) => {
+            if let Err(e) = writeln!(file, "{line}") {
+                log::warn!("cannot write the audit log {}: {e}", f.display());
+            }
+        }
+        Err(e) => log::warn!("cannot open the audit log {}: {e}", f.display()),
     }
 }
 
@@ -859,6 +864,7 @@ impl Broker {
         }
         if let Err(e) = validate(&self.env, req) {
             let r = Response::new(Status::Invalid, e.to_string());
+            log::info!("sandbox {}: invalid {} request: {e}", self.ctx.id, req.cap);
             audit(&self.env, &self.ctx, req, "invalid", &r);
             return r;
         }
@@ -929,6 +935,21 @@ impl Broker {
             },
         };
         audit(&self.env, &self.ctx, req, decision, &resp);
+        log::info!(
+            "sandbox {}: {} request {}: {:?}",
+            self.ctx.id,
+            req.cap,
+            decision,
+            resp.status
+        );
+        if matches!(resp.status, Status::Failed) {
+            log::warn!(
+                "sandbox {}: {} failed: {}",
+                self.ctx.id,
+                req.cap,
+                resp.message
+            );
+        }
         resp
     }
 
@@ -962,11 +983,14 @@ pub fn serve(socket: &Path, broker: Broker) -> Result<()> {
     let listener = UnixListener::bind(socket)
         .with_context(|| format!("cannot listen on {}", socket.display()))?;
     let broker = Arc::new(broker);
+    log::debug!("serving host requests for sandbox {}", broker.ctx.id);
     std::thread::spawn(move || {
         for conn in listener.incoming().flatten() {
             let b = broker.clone();
             std::thread::spawn(move || {
-                let _ = b.serve_conn(conn);
+                if let Err(e) = b.serve_conn(conn) {
+                    log::debug!("connection failed: {e:#}");
+                }
             });
         }
     });

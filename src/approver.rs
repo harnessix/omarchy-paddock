@@ -215,7 +215,7 @@ pub fn resolve(env: &HostEnv, interactive: bool) -> Result<Option<(HookConfig, S
     match load_system(&env.user) {
         Ok(Some(h)) => return Ok(Some((h, Source::System(system_file(&env.user))))),
         Ok(None) => {}
-        Err(e) => eprintln!("paddock: warning: {e:#}"),
+        Err(e) => log::warn!("{e:#}"),
     }
     let Some(signed) = load_signed(env)? else {
         return Ok(None);
