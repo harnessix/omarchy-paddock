@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "harnessix.paddock",
   "name": "Paddock",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "author": "harnessix",
   "license": "MIT",
   "description": "Runs coding agents and apps in paddock sandboxes: start, find and stop them, and answer their host requests.",
