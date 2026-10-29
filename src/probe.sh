@@ -145,6 +145,29 @@ else
   fail host-client-connects "paddock-host is not on PATH"
 fi
 
+# Push and pull requests: no credentials inside, and every push goes to the
+# host. doctor answers pushes to origin with "allow for this session" and
+# checks on the host what each push asked for.
+if [ -n "$PADDOCK_PROBE_PUSH" ]; then
+  helpers=$(git config --get-all credential.helper 2>/dev/null | grep -v '^$')
+  creds=""
+  for f in "$HOME/.git-credentials" "$HOME/.config/gh/hosts.yml" "$HOME/.config/git/credentials"; do [ -e "$f" ] && creds="$creds $f"; done
+  if [ -n "$helpers$creds$GH_TOKEN$GITHUB_TOKEN" ]; then fail no-git-credentials "found:${helpers:+ helper $helpers}$creds${GH_TOKEN:+ GH_TOKEN}${GITHUB_TOKEN:+ GITHUB_TOKEN}"; else ok no-git-credentials; fi
+  g() { git -C "$P" -c user.name=probe -c user.email=probe@localhost "$@"; }
+  g commit -q --allow-empty -m "paddock probe push" 2>/dev/null
+  if g push -q origin HEAD:refs/heads/paddock-probe >/dev/null 2>&1; then ok git-push-through-host; else fail git-push-through-host "git push origin failed"; fi
+  g commit -q --allow-empty -m "paddock probe push 2" 2>/dev/null
+  if g push -q origin HEAD:refs/heads/paddock-probe >/dev/null 2>&1; then ok git-push-session-grant; else fail git-push-session-grant "the second push failed"; fi
+  (cd "$P" && paddock-host git push -q --force origin HEAD~1:refs/heads/paddock-probe >/dev/null 2>&1)
+  (cd "$P" && paddock-host git push -q --force origin HEAD~2:refs/heads/paddock-probe >/dev/null 2>&1)
+  # .git/config is read-only here, so name the new remote another way.
+  url=$(g remote get-url origin)
+  (cd "$P" && GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=remote.sneaky.url GIT_CONFIG_VALUE_0="$url" paddock-host git push -q sneaky HEAD:refs/heads/sneaky >/dev/null 2>&1); rc=$?
+  if [ "$rc" = 3 ]; then ok git-push-denied-exit-code; else fail git-push-denied-exit-code "exit code $rc, expected 3"; fi
+  (cd "$P" && gh auth token >/dev/null 2>&1); rc=$?
+  if [ "$rc" = 8 ]; then ok forge-refuses-auth; else fail forge-refuses-auth "exit code $rc, expected 8"; fi
+fi
+
 # Positive checks: the sandbox must still be useful.
 if [ -n "$PADDOCK_PROBE_ONLINE" ] && [ -z "$PADDOCK_PROBE_RELAY" ] && [ "$PADDOCK_PROBE_BACKEND" != srt ]; then
   if getent hosts example.com >/dev/null 2>&1; then ok dns-works; else fail dns-works "cannot resolve example.com"; fi

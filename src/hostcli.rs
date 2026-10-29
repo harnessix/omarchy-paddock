@@ -7,6 +7,8 @@ use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 
+mod git;
+
 pub const EXIT_USAGE: i32 = 2;
 pub const EXIT_NO_HOST: i32 = 6;
 
@@ -26,6 +28,8 @@ USAGE
   paddock-host clipboard set TEXT [--reason TEXT]
   paddock-host open URL [--reason TEXT]
   paddock-host notify TITLE [BODY]
+  paddock-host git push [REMOTE] [REFSPEC...]   (plain `git push` works too)
+  paddock-host gh COMMAND [ARG...]              (plain `gh` works too)
   paddock-host help [CAPABILITY]
 
 Common options
@@ -51,8 +55,14 @@ RESULTS
   The command prints the path of the file. exec prints the command's stdout to
   stdout and its stderr to stderr, and exits with the command's exit code.
 
+PUSH AND PULL REQUESTS
+  The sandbox has no git credentials and no gh login, and it never gets them.
+  `git push` and `gh` still work: the host does the push or runs gh with the
+  user's own login, after the user approves. Run `paddock-host help git-push`
+  and `paddock-host help forge` for the rules.
+
 EXIT CODES
-  0   done (for exec: the command's own exit code is returned instead)
+  0   done (for exec and gh: the command's own exit code is returned instead)
   2   wrong usage of paddock-host
   3   the user denied the request
   4   the capability is set to deny in the user's configuration
@@ -68,6 +78,9 @@ EXAMPLES
   paddock-host fetch /etc/hosts --reason "compare host name resolution"
   paddock-host open https://example.com/docs
   paddock-host notify "Build finished" "All 214 tests passed"
+  git push -u origin fix-login
+  gh pr create --title "Fix the login timeout" --body "Closes #12"
+  gh pr checks --watch
 "#;
 
 fn cap_help(cap: &str) -> Option<&'static str> {
@@ -126,6 +139,56 @@ The capability is named open-url. Other schemes are refused."#
             r#"paddock-host notify TITLE [BODY]: show a desktop notification on the host.
 
 Allowed by default. Use it to tell the user that long work is done."#
+        }
+        "git-push" | "git" | "push" => {
+            r#"git push: the host pushes your commits with the user's credentials.
+
+  git push [REMOTE] [REFSPEC...]
+  paddock-host git push [REMOTE] [REFSPEC...]
+
+Use plain `git push`. The sandbox git configuration sends every push to an
+https, ssh or git@ URL, and to every remote of the project, to the host. The
+user sees the remote URL, each local and remote branch, the commits (at most
+20) and whether the push is a force push, then answers.
+
+  - Force pushes, deleting a branch and pushes to the default branch (main,
+    master or the remote HEAD) need an answer every time.
+  - "Allow for this session" covers only the same remote and branch.
+  - A remote that you add in the sandbox (git remote add) is marked as new
+    and needs an answer every time. A changed URL of an existing remote is
+    ignored: the host pushes to the URL that it had when the sandbox started.
+  - Hooks never run on the host. Run your checks before you push.
+  - --force-with-lease, --dry-run, --atomic and push options are not
+    supported. Use --force if you must, and expect a question.
+
+Set PADDOCK_PUSH_REASON to tell the user why you push. `paddock-host git
+push` exits with the codes below; plain `git push` exits with 1 when the
+host refuses."#
+        }
+        "forge" | "gh" => {
+            r#"gh: pull requests, issues and CI runs, run on the host.
+
+  gh COMMAND [ARG...]
+  paddock-host gh COMMAND [ARG...]
+
+Use plain `gh`. The host runs it with the user's login; the token never
+enters the sandbox. Only these commands exist:
+
+  read (no question):  pr view|list|checks|diff, issue view|list,
+                       run view|watch|list, repo view
+  write (asks first):  pr create, pr comment, issue comment
+
+  - The repository is always one of the project's remotes. --repo can choose
+    another remote's repository, but never an unrelated one.
+  - Commands that default to the current branch (pr view, pr checks, pr diff,
+    pr comment, and --head of pr create) get the sandbox's branch. Push the
+    branch first.
+  - --body-file is read in the sandbox and sent as --body. --web, --editor
+    and --template-file are refused.
+  - gh api, gh auth, gh secret and every other command are refused.
+
+Extra options: --paddock-reason TEXT, --paddock-timeout SECONDS (default 120,
+1800 for watch), --paddock-json. The exit code is gh's own."#
         }
         _ => return None,
     })
@@ -199,6 +262,13 @@ pub fn main(args: &[String]) -> i32 {
         return EXIT_USAGE;
     };
     let rest = &args[1..];
+    match cmd {
+        "git" => return git::git_main(rest),
+        "git-remote-helper" => return git::remote_helper(rest),
+        "gh" => return git::gh_main(rest),
+        "forge" if rest.first().is_some_and(|t| t == "gh") => return git::gh_main(&rest[1..]),
+        _ => {}
+    }
     if matches!(cmd, "-h" | "--help" | "help") {
         match rest.first() {
             Some(c) => match cap_help(c) {
@@ -356,7 +426,7 @@ fn print_human(req: &Request, resp: &Response) {
                 );
             }
         }
-        "exec" => {
+        "exec" | "forge" => {
             print!("{}", r["stdout"].as_str().unwrap_or(""));
             eprint!("{}", r["stderr"].as_str().unwrap_or(""));
         }

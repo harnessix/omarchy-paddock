@@ -134,7 +134,7 @@ pub fn run(
         None
     };
     backend.prepare(env, &built.spec, interactive)?;
-    start_broker(env, &mut built, interactive)?;
+    let repo = start_broker(env, &mut built, interactive)?;
     // Terminal harnesses that log in through a browser and a localhost callback.
     let _login = if built.profile.launch.login_callback && built.spec.gui.mode != GuiMode::App {
         crate::login::prepare(env, &mut built.spec, backend.name() == "srt")?
@@ -187,7 +187,7 @@ pub fn run(
         &spec.project,
     )?;
     let auth = AuthSync::copy_in(env, &built.profile, &built.auth, &spec.home_src)?;
-    state::write_gitconfig(env, &spec.home_src)?;
+    state::write_gitconfig(env, &spec.home_src, repo.as_ref())?;
     let watched = state::snapshot(&spec.watch);
 
     if !quiet {
@@ -395,7 +395,12 @@ pub fn select_backend(env: &HostEnv, built: &Built) -> Result<Box<dyn Backend>> 
 
 /// Start the host passthrough for this sandbox and give the sandbox the
 /// `paddock-host` command. See broker.rs.
-fn start_broker(env: &HostEnv, built: &mut Built, interactive: bool) -> Result<()> {
+/// Returns the repository snapshot that `git-push` and `forge` work from.
+fn start_broker(
+    env: &HostEnv,
+    built: &mut Built,
+    interactive: bool,
+) -> Result<Option<crate::broker::git::Repo>> {
     let run_dir = env.paddock_run().join(&built.spec.id);
     std::fs::create_dir_all(&run_dir)?;
     let sock = run_dir.join("host.sock");
@@ -423,10 +428,15 @@ fn start_broker(env: &HostEnv, built: &mut Built, interactive: bool) -> Result<(
             }
         },
     };
+    // Taken before the sandbox runs: only these remotes count as known.
+    // The sandbox sees .git/config read-only, but it can name other remotes
+    // with `git -c` or its own ~/.gitconfig.
+    let repo = crate::broker::git::Repo::snapshot(&built.spec.project);
     let ctx = crate::broker::Context {
         id: built.spec.id.clone(),
         harness: built.spec.harness.clone(),
         project: built.spec.project.clone(),
+        repo: repo.clone(),
     };
     crate::broker::serve(
         &sock,
@@ -446,5 +456,19 @@ fn start_broker(env: &HostEnv, built: &mut Built, interactive: bool) -> Result<(
     built
         .spec
         .add_tool("paddock-host", wrapper, "host passthrough client");
-    Ok(())
+    // Plain `git push` and `gh` reach the host too. The sandbox .gitconfig
+    // sends pushes to the paddock:: remote helper.
+    let helper = run_dir.join("git-remote-paddock");
+    gui::write_file(
+        &helper,
+        "#!/bin/sh\nexec paddock host git-remote-helper \"$@\"\n",
+        0o755,
+    )?;
+    built
+        .spec
+        .add_tool("git-remote-paddock", helper, "git push through the host");
+    let gh = run_dir.join("gh");
+    gui::write_file(&gh, "#!/bin/sh\nexec paddock host gh \"$@\"\n", 0o755)?;
+    built.spec.add_tool("gh", gh, "gh through the host");
+    Ok(repo)
 }

@@ -221,6 +221,15 @@ pub const CLOUD_SECRETS: &[&str] = &[
     "TFE_TOKEN",
     "HCP_CLIENT_SECRET",
     "PULUMI_ACCESS_TOKEN",
+    // Code forges. The host pushes and runs gh for the sandbox (git-push and
+    // forge in broker.rs), so the token never needs to enter it.
+    "GH_TOKEN",
+    "GITHUB_TOKEN",
+    "GH_ENTERPRISE_TOKEN",
+    "GITHUB_ENTERPRISE_TOKEN",
+    "GITLAB_TOKEN",
+    "GL_TOKEN",
+    "GITEA_TOKEN",
 ];
 
 pub fn is_cloud_secret(name: &str) -> bool {

@@ -291,6 +291,7 @@ pub fn escape(env: &HostEnv, o: &EscapeOpts) -> Result<usize> {
     let _ctl = std::os::unix::net::UnixListener::bind(&ctl)?;
     std::env::set_var("DOCTOR_PLAIN_CANARY", "1");
     std::env::set_var("AWS_SECRET_ACCESS_KEY", "paddock-doctor-canary");
+    std::env::set_var("GH_TOKEN", "paddock-doctor-canary");
     std::env::set_var("DOCTOR_CANARY_SOCKET", "/nonexistent");
     std::env::set_var("DOCTOR_CANARY_CTL", &ctl);
     let detected = HostEnv::detect()?;
@@ -302,8 +303,33 @@ pub fn escape(env: &HostEnv, o: &EscapeOpts) -> Result<usize> {
             .args(args)
             .status()
     };
-    if !git(&["init", "-q"])?.success() {
+    if !git(&["init", "-q", "-b", "main"])?.success() {
         bail!("git init failed");
+    }
+    // A local bare repository as `origin`, so the git-push checks need no
+    // network. The sandbox cannot see it; only the host push reaches it.
+    let remote = root.join("remote.git");
+    let ident = [
+        "-c",
+        "user.name=paddock",
+        "-c",
+        "user.email=doctor@localhost",
+    ];
+    let ready = Command::new("git")
+        .args(["init", "-q", "--bare"])
+        .arg(&remote)
+        .status()?
+        .success()
+        && git(&[
+            &ident[..],
+            &["commit", "-q", "--allow-empty", "-m", "start"],
+        ]
+        .concat())?
+        .success()
+        && git(&["remote", "add", "origin", &remote.display().to_string()])?.success()
+        && git(&["push", "-q", "origin", "main"])?.success();
+    if !ready {
+        bail!("cannot set up the git remote for the push checks");
     }
     std::fs::write(project.join(".env"), "TOKEN=paddock-secret-canary\n")?;
     std::fs::write(project.join("README"), "paddock doctor project\n")?;
@@ -433,8 +459,11 @@ pub fn escape(env: &HostEnv, o: &EscapeOpts) -> Result<usize> {
         if o.inherit { "inherit" } else { "clean" },
         "doctor",
     );
-    // Host passthrough requests from the probe are always denied.
-    built.approver = Some(std::sync::Arc::new(crate::broker::DenyAll));
+    built.spec.set_env("PADDOCK_PROBE_PUSH", "1", "doctor");
+    // Host passthrough requests from the probe are denied, except pushes to
+    // the known remote, which get "allow for this session".
+    let recorder = std::sync::Arc::new(Recorder::default());
+    built.approver = Some(recorder.clone());
     s_set_approvals(&mut built, env);
     let env2 = HostEnv::detect()?;
     // A file in the host /tmp: srt shares the host /tmp unless it is denied.
@@ -523,6 +552,16 @@ pub fn escape(env: &HostEnv, o: &EscapeOpts) -> Result<usize> {
             println!("  {line}");
         }
     }
+    for (name, problem) in push_checks(&recorder, &remote) {
+        seen += 1;
+        match problem {
+            None => println!("  ok {name}"),
+            Some(p) => {
+                failed += 1;
+                println!("  FAIL {name}: {p}");
+            }
+        }
+    }
     match &outside {
         Some(o) if o.exists() => {
             println!(
@@ -551,6 +590,91 @@ pub fn escape(env: &HostEnv, o: &EscapeOpts) -> Result<usize> {
         }
     );
     Ok(failed)
+}
+
+/// The escape test's approver: it records every request, answers pushes to
+/// the known remote with "allow for this session" and denies the rest.
+#[derive(Default)]
+struct Recorder {
+    seen: std::sync::Mutex<Vec<crate::broker::Pending>>,
+}
+
+impl crate::broker::Approver for Recorder {
+    fn ask(
+        &self,
+        _: &HostEnv,
+        p: &crate::broker::Pending,
+        _: std::time::Duration,
+    ) -> Option<crate::broker::Answer> {
+        self.seen.lock().unwrap().push(p.clone());
+        let known_push = p.capability == "git-push" && !p.summary.starts_with("NEW REMOTE");
+        Some(if known_push {
+            crate::broker::Answer::Session
+        } else {
+            crate::broker::Answer::Deny
+        })
+    }
+}
+
+/// Host-side checks of what the probe's pushes asked for.
+fn push_checks(r: &Recorder, remote: &std::path::Path) -> Vec<(&'static str, Option<String>)> {
+    let seen = r.seen.lock().unwrap();
+    let pushes: Vec<_> = seen.iter().filter(|p| p.capability == "git-push").collect();
+    let plain: Vec<_> = pushes
+        .iter()
+        .filter(|p| p.summary == "git push origin paddock-probe")
+        .collect();
+    let forced: Vec<_> = pushes
+        .iter()
+        .filter(|p| p.summary == "git push origin paddock-probe (force)")
+        .collect();
+    let new_remote: Vec<_> = pushes
+        .iter()
+        .filter(|p| p.summary.starts_with("NEW REMOTE: git push sneaky"))
+        .collect();
+    let on_remote = Command::new("git")
+        .arg("-C")
+        .arg(remote)
+        .args(["rev-parse", "--verify", "-q", "refs/heads/paddock-probe"])
+        .output()
+        .is_ok_and(|o| o.status.success());
+    let check = |ok: bool, why: String| (!ok).then_some(why);
+    vec![
+        (
+            "git-push-request",
+            check(
+                plain.len() == 1 && on_remote,
+                format!(
+                    "{} push requests for the probe branch (expected 1), branch on the remote: {on_remote}",
+                    plain.len()
+                ),
+            ),
+        ),
+        (
+            "git-push-card-lists-commits",
+            check(
+                plain.first().is_some_and(|p| p.detail.contains("paddock probe push")),
+                "the card does not list the pushed commit".into(),
+            ),
+        ),
+        (
+            "git-push-force-not-session-granted",
+            check(
+                forced.len() == 2 && forced.iter().all(|p| !p.session_allowed),
+                format!(
+                    "{} force push requests (expected 2, none with a session grant)",
+                    forced.len()
+                ),
+            ),
+        ),
+        (
+            "git-push-new-remote-flagged",
+            check(
+                new_remote.len() == 1 && !new_remote[0].session_allowed,
+                format!("{} flagged requests for the added remote (expected 1)", new_remote.len()),
+            ),
+        ),
+    ]
 }
 
 fn host_ipv4_addrs() -> Vec<String> {

@@ -31,6 +31,9 @@ const MAX_REQUEST: usize = 64 * 1024;
 const MAX_FETCH: u64 = 64 * 1024 * 1024;
 const MAX_OUTPUT: usize = 1024 * 1024;
 
+pub mod forge;
+pub mod git;
+
 /// The capabilities, in the order `paddock-host capabilities` lists them.
 pub const CAPABILITIES: &[(&str, &str)] = &[
     (
@@ -49,6 +52,14 @@ pub const CAPABILITIES: &[(&str, &str)] = &[
     ("clipboard-write", "set the host clipboard"),
     ("open-url", "open a URL in the host browser"),
     ("notify", "show a desktop notification on the host"),
+    (
+        "git-push",
+        "push commits to a remote of the project with the user's own credentials",
+    ),
+    (
+        "forge",
+        "run allowed gh commands (pull requests, issues, CI runs) on the project's repository",
+    ),
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -278,14 +289,21 @@ pub fn audit_file(env: &HostEnv) -> PathBuf {
     env.paddock_state().join("host-audit.jsonl")
 }
 
-fn audit(env: &HostEnv, ctx: &Context, req: &Request, decision: &str, resp: &Response) {
+fn audit(
+    env: &HostEnv,
+    ctx: &Context,
+    req: &Request,
+    detail: &str,
+    decision: &str,
+    resp: &Response,
+) {
     let line = serde_json::json!({
         "time": state::now(),
         "sandbox": ctx.id,
         "harness": ctx.harness,
         "project": ctx.project,
         "capability": req.cap,
-        "detail": describe(req, &ctx.project).1,
+        "detail": detail,
         "reason": req.reason,
         "decision": decision,
         "status": resp.status,
@@ -315,6 +333,8 @@ pub struct Context {
     pub id: String,
     pub harness: String,
     pub project: PathBuf,
+    /// The project repository as it was when the sandbox started.
+    pub repo: Option<git::Repo>,
 }
 
 /// The answer source. The real one waits for `paddock approvals answer` or a
@@ -508,6 +528,25 @@ pub fn describe(req: &Request, project: &Path) -> (String, String) {
             "show a notification".into(),
             arg_str(req, "title").unwrap_or("").to_string(),
         ),
+        "git-push" => (
+            format!("git push {}", arg_str(req, "remote").unwrap_or("")),
+            format!(
+                "git push {} {}",
+                arg_str(req, "remote").unwrap_or(""),
+                req.args
+                    .get("refs")
+                    .map(|r| r.to_string())
+                    .unwrap_or_default()
+            ),
+        ),
+        "forge" => {
+            let line = std::iter::once(arg_str(req, "tool").unwrap_or("gh").to_string())
+                .chain(argv(req))
+                .map(|a| shell_quote(&a))
+                .collect::<Vec<_>>()
+                .join(" ");
+            (line.chars().take(80).collect(), line)
+        }
         other => (other.to_string(), other.to_string()),
     }
 }
@@ -577,6 +616,23 @@ fn validate(env: &HostEnv, req: &Request) -> Result<()> {
             arg_str(req, "title").context("notify needs a title")?;
         }
         "clipboard-read" => {}
+        "git-push" => git::validate(&req.args)?,
+        "forge" => {
+            let t = arg_str(req, "tool").unwrap_or("gh");
+            if forge::tool(t).is_none() {
+                bail!(
+                    "forge supports {}",
+                    forge::TOOLS
+                        .iter()
+                        .map(|t| t.name)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+            }
+            if argv(req).is_empty() {
+                bail!("forge needs a command, for example pr view");
+            }
+        }
         other => bail!("unknown capability {other}"),
     }
     Ok(())
@@ -653,7 +709,12 @@ fn run_capture(cmd: &mut Command, timeout: Duration) -> Result<(i32, String, Str
 }
 
 /// Do the approved work on the host.
-fn perform(env: &HostEnv, ctx: &Context, req: &Request) -> Result<serde_json::Value> {
+fn perform(env: &HostEnv, ctx: &Context, req: &Request, work: &Work) -> Result<serde_json::Value> {
+    match work {
+        Work::Push(plan) => return git::push(plan),
+        Work::Forge(call) => return run_forge(env, ctx, req, call),
+        Work::Plain => {}
+    }
     match req.cap.as_str() {
         "screenshot" => {
             let grim = env
@@ -817,6 +878,131 @@ fn copy_tree(from: &Path, to: &Path) -> Result<()> {
     Ok(())
 }
 
+/// The work behind a request, worked out before the user is asked.
+enum Work {
+    Plain,
+    Push(git::PushPlan),
+    Forge(forge::Call),
+}
+
+/// What the user sees and what a session grant covers.
+struct Prepared {
+    summary: String,
+    detail: String,
+    /// "Allow for this session" stores these keys. A request is covered when
+    /// every key is granted.
+    keys: Vec<String>,
+    /// A session grant can cover this request.
+    session_allowed: bool,
+    /// Ask even when the configuration says allow.
+    always_ask: bool,
+    /// Allowed without asking unless the capability is denied (forge reads).
+    read_only: bool,
+    work: Work,
+}
+
+fn prepare(env: &HostEnv, ctx: &Context, req: &Request) -> Result<Prepared> {
+    match req.cap.as_str() {
+        "git-push" => {
+            let plan = git::plan(
+                ctx.repo.as_ref(),
+                &env.paddock_run().join(&ctx.id),
+                &req.args,
+            )?;
+            let session_allowed = plan.session_allowed();
+            Ok(Prepared {
+                summary: plan.summary(),
+                detail: plan.detail(),
+                keys: plan.grant_keys(),
+                session_allowed,
+                always_ask: !session_allowed,
+                read_only: false,
+                work: Work::Push(plan),
+            })
+        }
+        "forge" => {
+            let t =
+                forge::tool(arg_str(req, "tool").unwrap_or("gh")).context("unknown forge tool")?;
+            let remotes = ctx
+                .repo
+                .as_ref()
+                .map(|r| r.remotes.as_slice())
+                .unwrap_or_default();
+            let call = forge::check(t, &argv(req), arg_str(req, "branch"), remotes)?;
+            let line = std::iter::once(call.tool.to_string())
+                .chain(call.argv.iter().cloned())
+                .map(|a| shell_quote(&a))
+                .collect::<Vec<_>>()
+                .join(" ");
+            let write = call.access == forge::Access::Write;
+            Ok(Prepared {
+                summary: format!("{} {} on {}", call.tool, call.command, call.repo),
+                detail: format!(
+                    "{} on the host with your {} login:\n{line}",
+                    if write { "Change" } else { "Read" },
+                    call.tool
+                ),
+                keys: vec![call.grant_key()],
+                session_allowed: true,
+                always_ask: false,
+                read_only: !write,
+                work: Work::Forge(call),
+            })
+        }
+        _ => {
+            let (summary, detail) = describe(req, &ctx.project);
+            Ok(Prepared {
+                summary,
+                detail,
+                keys: vec![grant_key(req)],
+                session_allowed: true,
+                always_ask: false,
+                read_only: false,
+                work: Work::Plain,
+            })
+        }
+    }
+}
+
+/// Run a checked forge call in an empty folder: the tool must not read the
+/// project's `.git`, which the sandbox can write.
+fn run_forge(
+    env: &HostEnv,
+    ctx: &Context,
+    req: &Request,
+    call: &forge::Call,
+) -> Result<serde_json::Value> {
+    let exe = env
+        .which(call.tool)
+        .with_context(|| format!("{} is not installed on the host", call.tool))?;
+    let dir = env
+        .paddock_run()
+        .join(&ctx.id)
+        .join(format!("forge-{}", new_request_id()));
+    std::fs::create_dir_all(&dir)?;
+    let long = call.argv.iter().any(|a| a == "watch" || a == "--watch");
+    let timeout = req
+        .args
+        .get("timeout")
+        .and_then(|t| t.as_u64())
+        .unwrap_or(if long { 1800 } else { 120 })
+        .clamp(1, 3600);
+    let mut cmd = Command::new(exe);
+    cmd.args(&call.argv)
+        .current_dir(&dir)
+        .env("GH_PROMPT_DISABLED", "1")
+        .env("GH_NO_UPDATE_NOTIFIER", "1")
+        .env("GH_SPINNER_DISABLED", "1")
+        .env("NO_COLOR", "1")
+        .env_remove("GH_REPO")
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE");
+    let r = run_capture(&mut cmd, Duration::from_secs(timeout));
+    let _ = std::fs::remove_dir_all(&dir);
+    let (code, out, err) = r?;
+    Ok(serde_json::json!({ "exit_code": code, "stdout": out, "stderr": err }))
+}
+
 pub struct Broker {
     pub env: HostEnv,
     pub ctx: Context,
@@ -862,79 +1048,113 @@ impl Broker {
         if req.cap == "capabilities" {
             return Response::done(self.capabilities());
         }
-        if let Err(e) = validate(&self.env, req) {
-            let r = Response::new(Status::Invalid, e.to_string());
-            log::info!("sandbox {}: invalid {} request: {e}", self.ctx.id, req.cap);
-            audit(&self.env, &self.ctx, req, "invalid", &r);
-            return r;
-        }
-        let (decision, allowed) = match self.policy.mode(&req.cap) {
-            Mode::Deny => ("disabled", None),
-            Mode::Allow => ("allowed by configuration", Some(true)),
-            Mode::Ask => {
-                let key = grant_key(req);
-                if self.grants.lock().unwrap().contains(&key) {
-                    ("allowed for this session", Some(true))
-                } else {
-                    let (summary, detail) = describe(req, &self.ctx.project);
-                    let p = Pending {
-                        id: new_request_id(),
-                        sandbox: self.ctx.id.clone(),
-                        harness: self.ctx.harness.clone(),
-                        project: self.ctx.project.clone(),
-                        capability: req.cap.clone(),
-                        summary,
-                        detail,
-                        reason: req.reason.chars().take(500).collect(),
-                        created: state::now(),
-                        expires: state::now() + self.policy.wait,
-                        session_allowed: true,
-                    };
-                    match self.approver.ask_with_source(
-                        &self.env,
-                        &p,
-                        Duration::from_secs(self.policy.wait),
-                    ) {
-                        Some((Answer::Once, "agent")) => {
-                            ("allowed once by the agent approver", Some(true))
-                        }
-                        Some((Answer::Once, _)) => ("allowed once", Some(true)),
-                        Some((Answer::Session, who)) => {
-                            self.grants.lock().unwrap().push(key);
-                            if who == "agent" {
-                                ("allowed for this session by the agent approver", Some(true))
-                            } else {
-                                ("allowed for this session", Some(true))
-                            }
-                        }
-                        Some((Answer::Deny, "agent")) => {
-                            ("denied by the agent approver", Some(false))
-                        }
-                        Some((Answer::Deny, _)) => ("denied", Some(false)),
-                        None => ("timed out", None),
-                    }
-                }
-            }
+        let invalid = |e: anyhow::Error| {
+            let r = Response::new(Status::Invalid, format!("{e:#}"));
+            log::info!(
+                "sandbox {}: invalid {} request: {e:#}",
+                self.ctx.id,
+                req.cap
+            );
+            audit(
+                &self.env,
+                &self.ctx,
+                req,
+                &describe(req, &self.ctx.project).1,
+                "invalid",
+                &r,
+            );
+            r
         };
-        let resp = match (decision, allowed) {
-            ("disabled", _) => Response::new(
+        if let Err(e) = validate(&self.env, req) {
+            return invalid(e);
+        }
+        let mode = self.policy.mode(&req.cap);
+        if mode == Mode::Deny {
+            let r = Response::new(
                 Status::Disabled,
                 format!(
                     "{} is set to deny in [host] of the user configuration",
                     req.cap
                 ),
-            ),
+            );
+            audit(
+                &self.env,
+                &self.ctx,
+                req,
+                &describe(req, &self.ctx.project).1,
+                "disabled",
+                &r,
+            );
+            return r;
+        }
+        let prep = match prepare(&self.env, &self.ctx, req) {
+            Ok(p) => p,
+            Err(e) => return invalid(e),
+        };
+        let granted = || {
+            let g = self.grants.lock().unwrap();
+            prep.session_allowed && prep.keys.iter().all(|k| g.contains(k))
+        };
+        let (decision, allowed) = if mode == Mode::Allow && !prep.always_ask {
+            ("allowed by configuration", Some(true))
+        } else if prep.read_only {
+            ("allowed: read-only", Some(true))
+        } else if granted() {
+            ("allowed for this session", Some(true))
+        } else {
+            let p = Pending {
+                id: new_request_id(),
+                sandbox: self.ctx.id.clone(),
+                harness: self.ctx.harness.clone(),
+                project: self.ctx.project.clone(),
+                capability: req.cap.clone(),
+                summary: prep.summary.clone(),
+                detail: prep.detail.clone(),
+                reason: req.reason.chars().take(500).collect(),
+                created: state::now(),
+                expires: state::now() + self.policy.wait,
+                session_allowed: prep.session_allowed,
+            };
+            match self.approver.ask_with_source(
+                &self.env,
+                &p,
+                Duration::from_secs(self.policy.wait),
+            ) {
+                Some((Answer::Once, "agent")) => ("allowed once by the agent approver", Some(true)),
+                Some((Answer::Once, _)) => ("allowed once", Some(true)),
+                // A grant this request cannot have counts as once.
+                Some((Answer::Session, _)) if !prep.session_allowed => (
+                    "allowed once (no session grant for this request)",
+                    Some(true),
+                ),
+                Some((Answer::Session, who)) => {
+                    self.grants
+                        .lock()
+                        .unwrap()
+                        .extend(prep.keys.iter().cloned());
+                    if who == "agent" {
+                        ("allowed for this session by the agent approver", Some(true))
+                    } else {
+                        ("allowed for this session", Some(true))
+                    }
+                }
+                Some((Answer::Deny, "agent")) => ("denied by the agent approver", Some(false)),
+                Some((Answer::Deny, _)) => ("denied", Some(false)),
+                None => ("timed out", None),
+            }
+        };
+        let resp = match (decision, allowed) {
             ("timed out", _) => Response::new(
                 Status::Timeout,
                 format!("nobody answered within {} seconds", self.policy.wait),
             ),
             (_, Some(false)) => Response::new(Status::Denied, "the user denied the request"),
-            _ => match perform(&self.env, &self.ctx, req) {
+            _ => match perform(&self.env, &self.ctx, req, &prep.work) {
                 Ok(result) => Response::done(result),
                 Err(e) => Response::new(Status::Failed, format!("{e:#}")),
             },
         };
-        audit(&self.env, &self.ctx, req, decision, &resp);
+        audit(&self.env, &self.ctx, req, &prep.detail, decision, &resp);
         log::info!(
             "sandbox {}: {} request {}: {:?}",
             self.ctx.id,
