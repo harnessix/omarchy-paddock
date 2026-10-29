@@ -229,6 +229,20 @@ pub fn report(env: &HostEnv) -> Result<bool> {
     Ok(missing_required.is_empty())
 }
 
+/// The IPv4 default gateway, from /proc/net/route.
+fn default_gateway() -> Option<std::net::IpAddr> {
+    let text = std::fs::read_to_string("/proc/net/route").ok()?;
+    text.lines().skip(1).find_map(|l| {
+        let f: Vec<&str> = l.split_whitespace().collect();
+        if f.len() > 2 && f[1] == "00000000" {
+            let gw = u32::from_str_radix(f[2], 16).ok()?;
+            (gw != 0).then(|| std::net::IpAddr::from(gw.to_le_bytes()))
+        } else {
+            None
+        }
+    })
+}
+
 fn doctor_harness() -> Result<Harness> {
     let profile: Profile = toml::from_str("name = \"doctor\"\n")?;
     Ok(Harness {
@@ -352,6 +366,13 @@ pub fn escape(env: &HostEnv, o: &EscapeOpts) -> Result<usize> {
         "doctor",
     );
     s.set_env("PADDOCK_PROBE_DENIED", denied.join(":"), "doctor");
+    // The default gateway is on the LAN on most machines; with the LAN
+    // blocked, the sandbox must not reach it.
+    if !s.lan {
+        if let Some(gw) = default_gateway().filter(crate::proxy::is_lan) {
+            s.set_env("PADDOCK_PROBE_LAN", gw.to_string(), "doctor");
+        }
+    }
     s.set_env("PADDOCK_PROBE_OTHER", other.display().to_string(), "doctor");
     s.set_env(
         "PADDOCK_PROBE_HOSTFILE",

@@ -213,6 +213,8 @@ pub struct SandboxSpec {
     pub host_ports: Vec<(u16, String)>,
     /// Domains reachable in network mode `allowlist`.
     pub allow_domains: Vec<String>,
+    /// Private and link-local networks are reachable (network.lan).
+    pub lan: bool,
     /// A private keyring starts with the command (keyring.rs).
     pub keyring: bool,
     pub gui: Gui,
@@ -270,6 +272,7 @@ impl SandboxSpec {
             publish: Vec::new(),
             host_ports: Vec::new(),
             allow_domains: Vec::new(),
+            lan: false,
             keyring: false,
             gui: Gui::default(),
             setup: Vec::new(),

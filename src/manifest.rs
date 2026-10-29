@@ -115,6 +115,9 @@ pub struct NetworkCfg {
     /// Extra domains for network mode `allowlist`, besides the harness's own.
     #[serde(default)]
     pub allow: Vec<String>,
+    /// Let the sandbox reach private and link-local networks (the LAN).
+    /// Off by default: routers, NAS boxes and printers stay unreachable.
+    pub lan: Option<bool>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -219,6 +222,9 @@ impl Manifest {
         self.network.publish.extend(o.network.publish);
         self.network.host_ports.extend(o.network.host_ports);
         self.network.allow.extend(o.network.allow);
+        if o.network.lan.is_some() {
+            self.network.lan = o.network.lan;
+        }
         if o.auth.mode.is_some() {
             self.auth.mode = o.auth.mode;
         }
@@ -259,6 +265,7 @@ impl Manifest {
             "network.host": self.network.mode == Some(Network::Host),
             "network.publish": self.network.publish,
             "network.host_ports": self.network.host_ports,
+            "network.lan": self.network.lan == Some(true),
             "mcp.allow": self.mcp.allow,
             "auth.shared": self.auth.mode.as_deref() == Some("shared"),
             "env.inherit": self.env.inherit == Some(true),
@@ -277,6 +284,7 @@ impl Manifest {
             || self.network.mode == Some(Network::Host)
             || !self.network.publish.is_empty()
             || !self.network.host_ports.is_empty()
+            || self.network.lan == Some(true)
             || !self.mcp.allow.is_empty()
             || self.auth.mode.as_deref() == Some("shared")
             || self.env.inherit == Some(true)
@@ -368,6 +376,7 @@ pub const TEMPLATE: &str = r#"# paddock.toml: sandbox settings for this project.
 # mode = "egress"             # none | egress | allowlist | host
 # publish = [5173]            # ports reachable from the host
 # allow = ["crates.io"]       # extra domains for mode = "allowlist" (srt backend)
+# lan = true                # reach private networks: routers, NAS, other machines on the LAN
 # host_ports = [8765]         # host loopback ports reachable from the sandbox (local MCP servers)
 
 [auth]
