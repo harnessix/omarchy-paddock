@@ -30,6 +30,10 @@ paddock is a security tool. Some changes let a sandbox reach more of the host: a
 
 4. If you changed behavior that users see, update `README.md`. Write in plain English: short sentences, active voice.
 
+## Continuous integration
+
+GitHub Actions runs checks on every pull request and on each push to `main`. It runs `cargo fmt`, `cargo clippy` and the tests. It runs the escape probe on the bwrap backend without a display. It checks the plugin manifest. A leak guard fails the build if a file contains private notes, internal names, or home paths other than `/home/demo`, or if a commit email is not a noreply address. The scripts are in `.github/scripts/`. Every check must pass before review.
+
 ## The pull request
 
 Fill in every part of the pull request template:
