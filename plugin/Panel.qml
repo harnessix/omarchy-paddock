@@ -72,6 +72,9 @@ Panel {
   // $HOME is expanded by the shell at run time; no user path is stored here.
   readonly property string findPaddock: "pd() { for p in \"$(command -v paddock)\" \"$HOME/.local/bin/paddock\" \"$HOME/.cargo/bin/paddock\"; do if [ -n \"$p\" ] && [ -x \"$p\" ]; then \"$p\" \"$@\"; return; fi; done; return 127; }"
   readonly property string launcher: findPaddock + "; pd \"$@\""
+  // Starts an app sandbox without a terminal: the app has its own windows.
+  // Arguments: app name, project folder. paddock shows errors as a notification.
+  readonly property string appLauncher: "for p in \"$(command -v paddock)\" \"$HOME/.local/bin/paddock\" \"$HOME/.cargo/bin/paddock\"; do [ -n \"$p\" ] && [ -x \"$p\" ] && break; p=; done; [ -n \"$p\" ] || exit 127; if command -v uwsm-app >/dev/null 2>&1; then exec setsid uwsm-app -- \"$p\" app run \"$1\" \"$2\"; else exec setsid \"$p\" app run \"$1\" \"$2\"; fi"
 
   // Logging, as the Omarchy shell does it: silent normally, console.warn on
   // a real fallback (once per message, the polls repeat every few seconds),
@@ -139,7 +142,8 @@ Panel {
   }
 
   function rowCount() {
-    if (view === "project") return recentProjects.length
+    // The first row of the project step opens a folder dialog.
+    if (view === "project") return recentProjects.length + 1
     if (view === "harness") return installedHarnesses().length
     return approvals.length + sandboxes.length + artifacts.length
   }
@@ -325,6 +329,14 @@ Panel {
     root.confirmId = ""
     loadStartData()
   }
+  // Any folder, not only recent ones. The panel steps aside while the
+  // dialog is open and comes back at the harness step.
+  function pickFolder() {
+    if (folderProc.running) return
+    root.controller.hide()
+    folderProc.buffer = ""
+    folderProc.running = true
+  }
   function chooseProject(path) {
     root.chosenProject = path
     root.view = "harness"
@@ -335,6 +347,13 @@ Panel {
     for (var j = 0; j < list.length; j++) if (list[j].name === last) root.selectedIndex = j
   }
   function launch(harness) {
+    var entry = harnesses.filter(function(h) { return h.name === harness })[0]
+    if (entry && entry.app) {
+      // An app is not a terminal program: `paddock NAME` refuses it.
+      Quickshell.execDetached(["sh", "-c", root.appLauncher, "paddock-app", harness, root.chosenProject])
+      root.close()
+      return
+    }
     Quickshell.execDetached(["sh", "-c", root.terminal, "paddock-terminal", root.chosenProject, "paddock · " + harness + " · " + root.baseName(root.chosenProject), "sh", "-c", root.launcher, "paddock", harness])
     root.close()
   }
@@ -375,7 +394,8 @@ Panel {
   }
   function activate() {
     if (view === "project") {
-      if (recentProjects.length) chooseProject(recentProjects[selectedIndex].project)
+      if (selectedIndex === 0) pickFolder()
+      else chooseProject(recentProjects[selectedIndex - 1].project)
       return
     }
     if (view === "harness") {
@@ -411,6 +431,18 @@ Panel {
     property string buffer: ""
     stdout: SplitParser {
       onRead: function(line) { if (proc.buffer.length < 262144) proc.buffer += line }
+    }
+  }
+
+  JsonProc {
+    id: folderProc
+    command: ["sh", "-c", "command -v zenity >/dev/null 2>&1 || exit 127; exec zenity --file-selection --directory --title=\"$1\" --filename=\"$HOME/\"", "paddock-folder", strings.t("new.chooseFolderTitle")]
+    onExited: function(exitCode) {
+      var path = buffer.trim()
+      if (exitCode === 127) { root.controller.show(); root.say(strings.t("new.noZenity")); return }
+      if (exitCode !== 0 || path === "") { root.controller.show(); return }
+      root.chooseProject(path)
+      root.controller.show()
     }
   }
 
@@ -501,11 +533,15 @@ Panel {
     onExited: function(exitCode) {
       try {
         var p = JSON.parse(buffer)
-        var raw = p && p.api_version === "paddock.recent/v1" && Array.isArray(p.projects) ? p.projects.slice(0, 12) : []
+        var raw = p && p.api_version === "paddock.recent/v1" && Array.isArray(p.projects) ? p.projects : []
+        // Hidden folders (caches, scratch runs) stay out, as in the menu dialog.
+        raw = raw.filter(function(r) { return typeof r.project === "string" && r.project.indexOf("/.") < 0 }).slice(0, 8)
         root.recentProjects = raw.map(function(r) {
           return { project: root.plain(r.project, 512), name: root.plain(root.baseName(r.project), 48), harness: root.plain(r.harness, 24), last: Number(r.last || 0) }
         })
       } catch (e) { root.recentProjects = [] }
+      // Enter still starts the most recent project; the folder dialog is one row up.
+      if (root.view === "project" && root.selectedIndex === 0 && root.recentProjects.length) root.selectedIndex = 1
     }
   }
 
@@ -517,7 +553,7 @@ Panel {
         var p = JSON.parse(buffer)
         var raw = p && p.api_version === "paddock.list/v1" && Array.isArray(p.harnesses) ? p.harnesses.slice(0, 32) : []
         root.harnesses = raw.map(function(h) {
-          return { name: root.plain(h.name, 24), description: root.plain(h.description, 60), installed: h.installed === true }
+          return { name: root.plain(h.name, 24), description: root.plain(h.description, 60), installed: h.installed === true, app: h.app === true }
         })
       } catch (e) { root.harnesses = [] }
     }
@@ -944,12 +980,19 @@ Panel {
               color: root.dim
               text: strings.t("new.noRecent")
             }
+            ListRow {
+              rowIndex: 0
+              glyph: "󰉖"
+              title: strings.t("new.otherFolder")
+              caption: strings.t("new.otherFolderHint")
+              onActivated: root.pickFolder()
+            }
             Repeater {
               model: root.view === "project" ? root.recentProjects : []
               delegate: ListRow {
                 required property var modelData
                 required property int index
-                rowIndex: index
+                rowIndex: index + 1
                 glyph: "󰉋"
                 title: modelData.name
                 caption: root.shortPath(modelData.project)
@@ -970,7 +1013,7 @@ Panel {
                 required property var modelData
                 required property int index
                 rowIndex: index
-                glyph: "󰚩"
+                glyph: modelData.app ? "󰀻" : "󰚩"
                 title: modelData.name
                 caption: modelData.description
                 onActivated: root.launch(modelData.name)

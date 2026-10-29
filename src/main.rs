@@ -893,8 +893,9 @@ fn real_main() -> Result<i32> {
                 .into_iter()
                 .map(|name| {
                     let desc = f.profile(&name).map(|p| p.description.clone()).unwrap_or_default();
+                    let app = f.profile(&name).is_some_and(|p| p.app.is_some());
                     let exe = f.create(&name).ok().map(|h| h.exe.display().to_string());
-                    serde_json::json!({ "name": name, "description": desc, "installed": exe.is_some(), "exe": exe })
+                    serde_json::json!({ "name": name, "description": desc, "installed": exe.is_some(), "exe": exe, "app": app })
                 })
                 .collect();
             println!(

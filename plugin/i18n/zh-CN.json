@@ -39,7 +39,7 @@
   "new.back": "返回",
   "new.stepProject": "新建沙箱 · 第 1/2 步",
   "new.stepHarness": "新建沙箱 · 第 2/2 步",
-  "new.noRecent": "还没有最近的项目。用 paddock <harness> 在某个项目中启动过沙箱后，它会出现在这里。",
+  "new.noRecent": "还没有最近的项目。在上面选择一个文件夹，或在项目里用 paddock <harness> 启动沙箱。",
   "new.lastUsed": "上次使用 %1",
   "keys.list": "↵ 终端 · ←→ 操作 · Del 停止 · N 新建",
   "keys.new": "↵ 选择 · Esc 返回",
@@ -119,5 +119,9 @@
     "one": "%1 在项目外保存了 %2 个文件。打开 Paddock 面板即可恢复。",
     "other": "%1 在项目外保存了 %2 个文件。打开 Paddock 面板即可恢复。"
   },
-  "keys.files": "↵ 恢复 · → 打开目录"
+  "keys.files": "↵ 恢复 · → 打开目录",
+  "new.otherFolder": "选择其他文件夹…",
+  "new.otherFolderHint": "这台电脑上的任意项目文件夹",
+  "new.chooseFolderTitle": "为 paddock 选择项目文件夹",
+  "new.noZenity": "安装 zenity 后可以选择任意文件夹"
 }
