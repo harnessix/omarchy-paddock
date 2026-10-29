@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Security: host-side file operations in folders that a sandbox can write no longer follow symlinks. A sandbox was able to replace a file or folder in its home or in the project with a symlink, so that paddock on the host read or wrote somewhere else. The credential sync could copy a host file into the credential store, and the store could then bring it back into the sandbox. The `.gitconfig`, settings and seed copies, and the screenshot and fetch results in `.paddock/inbox`, could write outside the sandbox. Now paddock walks such paths one folder at a time without following symlinks, writes a new file and renames it into place, and never deletes an existing result. Thanks to the Omarchy plugin marketplace review for the report.
+
 ## 0.1.3
 
 This release fixes a security problem. Update from earlier versions: in 0.1.2 and before, a project's `mise.toml` was able to replace tools that sandboxes of other projects run. It also adds `paddock du` and `paddock gc`, and smaller docker and podman images.

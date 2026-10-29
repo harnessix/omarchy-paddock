@@ -418,3 +418,37 @@ fn forge_reads_skip_the_question_and_writes_ask() {
     let (_t, b, _, _) = setup_repo(None, p);
     assert_eq!(b.handle(&forge(&["pr", "list"])).status, Status::Disabled);
 }
+
+#[test]
+fn inbox_never_follows_a_planted_link() {
+    use std::os::unix::fs::symlink;
+    let t = tempfile::tempdir().unwrap();
+    let project = t.path().join("p");
+    let outside = t.path().join("outside");
+    std::fs::create_dir_all(&project).unwrap();
+    std::fs::create_dir_all(&outside).unwrap();
+    // `.paddock` as a link to a host folder.
+    symlink(&outside, project.join(".paddock")).unwrap();
+    assert!(inbox(&project).is_err());
+    assert!(std::fs::read_dir(&outside).unwrap().next().is_none());
+    // `inbox` as a link.
+    std::fs::remove_file(project.join(".paddock")).unwrap();
+    std::fs::create_dir_all(project.join(".paddock")).unwrap();
+    symlink(&outside, project.join(".paddock/inbox")).unwrap();
+    assert!(inbox(&project).is_err());
+    assert!(std::fs::read_dir(&outside).unwrap().next().is_none());
+    // A real inbox works, and existing names are never replaced.
+    std::fs::remove_file(project.join(".paddock/inbox")).unwrap();
+    let d = inbox(&project).unwrap();
+    std::fs::write(project.join(".paddock/inbox/shot.png"), "old").unwrap();
+    let (_, name) = d.new_file("shot.png", 0o644).unwrap();
+    assert_eq!(name, "shot-1.png");
+    assert_eq!(
+        std::fs::read_to_string(project.join(".paddock/inbox/shot.png")).unwrap(),
+        "old"
+    );
+    assert_eq!(
+        std::fs::read_to_string(project.join(".paddock/.gitignore")).unwrap(),
+        "*\n"
+    );
+}

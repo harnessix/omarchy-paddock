@@ -10,7 +10,7 @@ use crate::run;
 use crate::spec::{GuiMode, Network};
 use anyhow::{bail, Result};
 use std::net::TcpListener;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 pub const PROBE: &str = include_str!("probe.sh");
@@ -451,7 +451,11 @@ pub fn escape(env: &HostEnv, o: &EscapeOpts) -> Result<usize> {
         ..Default::default()
     };
     let mut built = build::build_with(env, &opts, doctor_harness()?)?;
-    std::fs::write(built.spec.home_src.join(".paddock-doctor-canary"), "x")?;
+    crate::safefs::Root::open(&built.spec.home_src)?.write(
+        Path::new(".paddock-doctor-canary"),
+        b"x",
+        0o600,
+    )?;
     // The private bus test leaves its keyring in the doctor's home, which the
     // other tests share. Remove it before and after.
     let keyrings = built.spec.home_src.join(".local/share/keyrings");
