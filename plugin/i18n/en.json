@@ -43,7 +43,7 @@
   "new.back": "Back",
   "new.stepProject": "New sandbox · step 1 of 2",
   "new.stepHarness": "New sandbox · step 2 of 2",
-  "new.noRecent": "No recent projects yet. Choose a folder below, or start a sandbox with paddock <harness> in a project.",
+  "new.noRecent": "No recent projects yet. Choose a folder above, or start a sandbox with paddock <harness> in a project.",
   "new.lastUsed": "last used with %1",
   "keys.list": "↵ terminal · ←→ actions · Del stop · N new",
   "keys.new": "↵ choose · Esc back",

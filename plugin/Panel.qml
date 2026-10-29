@@ -142,7 +142,7 @@ Panel {
   }
 
   function rowCount() {
-    // The last row of the project step opens a folder dialog.
+    // The first row of the project step opens a folder dialog.
     if (view === "project") return recentProjects.length + 1
     if (view === "harness") return installedHarnesses().length
     return approvals.length + sandboxes.length + artifacts.length
@@ -394,8 +394,8 @@ Panel {
   }
   function activate() {
     if (view === "project") {
-      if (selectedIndex < recentProjects.length) chooseProject(recentProjects[selectedIndex].project)
-      else pickFolder()
+      if (selectedIndex === 0) pickFolder()
+      else chooseProject(recentProjects[selectedIndex - 1].project)
       return
     }
     if (view === "harness") {
@@ -533,11 +533,15 @@ Panel {
     onExited: function(exitCode) {
       try {
         var p = JSON.parse(buffer)
-        var raw = p && p.api_version === "paddock.recent/v1" && Array.isArray(p.projects) ? p.projects.slice(0, 12) : []
+        var raw = p && p.api_version === "paddock.recent/v1" && Array.isArray(p.projects) ? p.projects : []
+        // Hidden folders (caches, scratch runs) stay out, as in the menu dialog.
+        raw = raw.filter(function(r) { return typeof r.project === "string" && r.project.indexOf("/.") < 0 }).slice(0, 8)
         root.recentProjects = raw.map(function(r) {
           return { project: root.plain(r.project, 512), name: root.plain(root.baseName(r.project), 48), harness: root.plain(r.harness, 24), last: Number(r.last || 0) }
         })
       } catch (e) { root.recentProjects = [] }
+      // Enter still starts the most recent project; the folder dialog is one row up.
+      if (root.view === "project" && root.selectedIndex === 0 && root.recentProjects.length) root.selectedIndex = 1
     }
   }
 
@@ -976,25 +980,25 @@ Panel {
               color: root.dim
               text: strings.t("new.noRecent")
             }
+            ListRow {
+              rowIndex: 0
+              glyph: "󰉖"
+              title: strings.t("new.otherFolder")
+              caption: strings.t("new.otherFolderHint")
+              onActivated: root.pickFolder()
+            }
             Repeater {
               model: root.view === "project" ? root.recentProjects : []
               delegate: ListRow {
                 required property var modelData
                 required property int index
-                rowIndex: index
+                rowIndex: index + 1
                 glyph: "󰉋"
                 title: modelData.name
                 caption: root.shortPath(modelData.project)
                 caption2: strings.t("new.lastUsed").arg(modelData.harness)
                 onActivated: root.chooseProject(modelData.project)
               }
-            }
-            ListRow {
-              rowIndex: root.recentProjects.length
-              glyph: "󰉖"
-              title: strings.t("new.otherFolder")
-              caption: strings.t("new.otherFolderHint")
-              onActivated: root.pickFolder()
             }
           }
 
