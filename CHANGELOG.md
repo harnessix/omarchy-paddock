@@ -1,7 +1,12 @@
 # Changelog
 
-## Unreleased
+## 0.1.1
 
+Highlights: push and open pull requests from a sandbox without credentials, an encrypted keyring for desktop apps, a worktree for each app, files saved outside the project that you can recover, and the LAN blocked by default.
+
+- A menu start of an app without saved workspace folders asks for one in a dialog: a recent project or any folder. Before, the start failed without a message.
+- `paddock doctor` lists the commands that shims take over, the rc file that loads them, the one-off bypass and how to turn them off. `paddock shims list` marks each command on or off.
+- Releases include a prebuilt `x86_64` Linux binary and its SHA-256 checksum.
 - App mode: each app gets a private session bus inside the sandbox, with a private keyring. Claude, ChatGPT and VS Code store their logins and secrets encrypted there, and Claude no longer warns that no system keyring is available. `paddock portal` on that bus sends the app's web links to the host browser after your approval, and its notifications to your desktop. The app gets no file chooser portal and cannot reach the host bus. `[apps.NAME] bus = "host-filtered"` keeps the filtered host bus. `paddock doctor --escape --app` checks the private bus, and `--bus host-filtered` checks the other one.
 - App mode: a login page that an app opens through paddock and that returns to a localhost port reaches the app without `login_ports`, the same way as for terminal harnesses.
 - Push and open pull requests from a sandbox without credentials in it. Plain `git push` goes to the new `git-push` host capability: the host pushes with your credentials after you see the remote, the branches, the commits and the force flag. Force pushes, pushes to the default branch and pushes to a remote that the sandbox names itself ask every time. Hooks never run on the host.
