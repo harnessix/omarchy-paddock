@@ -1,0 +1,51 @@
+name: Release
+
+# Builds the paddock binary for a version tag and attaches it to the GitHub
+# Release of that tag. The release notes come from the matching section of
+# CHANGELOG.md. Run it by hand to add binaries to an existing tag.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing tag to build, for example v0.1.0
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: build and publish
+    # An older Ubuntu links against an older glibc, so the binary also runs
+    # on distributions with a newer one.
+    runs-on: ubuntu-22.04
+    env:
+      TAG: ${{ github.event.inputs.tag || github.ref_name }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Check the version
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)
+          [ "v$version" = "$TAG" ] || { echo "::error::Cargo.toml has $version, the tag is $TAG"; exit 1; }
+      - run: cargo build --release --locked
+      - name: Package
+        run: |
+          name="paddock-${TAG#v}-x86_64-linux"
+          mkdir -p "dist/$name"
+          cp target/release/paddock README.md LICENSE CHANGELOG.md "dist/$name/"
+          tar -C dist -czf "dist/$name.tar.gz" "$name"
+          (cd dist && sha256sum "$name.tar.gz" > "$name.tar.gz.sha256")
+          awk -v v="## ${TAG#v}" '$0==v{f=1;next} /^## /{f=0} f' CHANGELOG.md > dist/notes.md
+          [ -s dist/notes.md ] || { echo "::error::CHANGELOG.md has no section ## ${TAG#v}"; exit 1; }
+      - name: Publish
+        run: |
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            gh release create "$TAG" --verify-tag --title "paddock ${TAG#v}" --notes-file dist/notes.md
+          fi
+          gh release upload "$TAG" dist/*.tar.gz dist/*.sha256 --clobber
