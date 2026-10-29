@@ -132,6 +132,11 @@ pub const HOST_ONLY_ENV: &[&str] = &[
     "PADDOCK_HARNESS",
     "CLAUDECODE",
     "CLAUDE_CODE_ENTRYPOINT",
+    // The Claude app's control channel to the sessions it started. A
+    // sandbox started from such a session must not talk to the host app.
+    "CLAUDE_CODE_MESSAGING_TOKEN",
+    "CLAUDE_CODE_MESSAGING_SOCKET",
+    "CLAUDE_CODE_SSE_PORT",
 ];
 
 /// Whether a host variable can be inherited. Besides the fixed list, any
@@ -412,6 +417,16 @@ mod tests {
         let mut s = spec(&env, &project);
         s.add_mount(Mount::same(&project, true, "test"));
         assert!(enforce(&env, &s).is_ok());
+    }
+
+    #[test]
+    fn claude_app_control_channel_stays_outside() {
+        assert!(!inheritable_var("CLAUDE_CODE_MESSAGING_TOKEN", "abc"));
+        assert!(!inheritable_var(
+            "CLAUDE_CODE_MESSAGING_SOCKET",
+            "/run/user/1000/cc-socks/1.sock"
+        ));
+        assert!(inheritable_var("EDITOR", "nvim"));
     }
 
     #[test]
