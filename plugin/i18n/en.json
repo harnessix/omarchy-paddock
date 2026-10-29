@@ -113,5 +113,21 @@
   "time.daysAgo": {
     "one": "%1 day ago",
     "other": "%1 days ago"
-  }
+  },
+  "files.header": {
+    "one": "%1 file saved outside the project",
+    "other": "%1 files saved outside the project"
+  },
+  "files.caption": "%1 · %2 · recover to %3",
+  "files.new": "new",
+  "action.recover": "Copy this file to the host",
+  "action.reveal": "Open its folder in the sandbox home",
+  "msg.recovered": "Recovered to %1",
+  "msg.recoverFailed": "Not recovered. Run paddock recover in a terminal to see why.",
+  "notice.title": "Paddock: new files in a sandbox",
+  "notice.body": {
+    "one": "%1 saved %2 file outside the project. Open the Paddock panel to recover it.",
+    "other": "%1 saved %2 files outside the project. Open the Paddock panel to recover them."
+  },
+  "keys.files": "↵ recover · → open folder"
 }

@@ -39,6 +39,12 @@ Panel {
   // The last answered requests, newest first, from `paddock log --json`.
   property var recent: []
   property var sandboxes: []
+  // Files that sandboxes saved outside the project, from `paddock files --json`.
+  // One entry per file; paths and names are untrusted text.
+  property var artifacts: []
+  // Keys of files already seen, so only new ones raise a notice.
+  property var seenArtifacts: ({})
+  property bool artifactsLoaded: false
   property var recentProjects: []
   property var harnesses: []
   // "ok", "missing" (paddock is not on PATH), or "error"
@@ -135,12 +141,54 @@ Panel {
   function rowCount() {
     if (view === "project") return recentProjects.length
     if (view === "harness") return installedHarnesses().length
-    return approvals.length + sandboxes.length
+    return approvals.length + sandboxes.length + artifacts.length
   }
 
   // In the list view, approvals come first, then sandboxes, in one cursor order.
   function isApprovalRow(i) { return view === "list" && i < approvals.length }
   function sandboxAt(i) { return sandboxes[i - approvals.length] }
+  // File rows follow the sandboxes.
+  function isArtifactRow(i) { return view === "list" && artifacts.length > 0 && i >= approvals.length + sandboxes.length }
+  function artifactAt(i) { return artifacts[i - approvals.length - sandboxes.length] }
+  function dirName(path) {
+    var p = String(path || "")
+    var k = p.lastIndexOf("/")
+    return k > 0 ? p.slice(0, k) : p
+  }
+  function recoverFile(f) {
+    runPaddock(["recover", f.id, "--", f.path], function(code) {
+      root.say(code === 0 ? strings.t("msg.recovered").arg(root.shortPath(f.target)) : strings.t("msg.recoverFailed"))
+      root.actionIndex = -1
+      root.refreshFiles()
+    })
+  }
+  function revealFile(f) {
+    Quickshell.execDetached(["xdg-open", root.dirName(f.home + "/" + f.path)])
+    root.close()
+  }
+  function refreshFiles() {
+    if (!filesProc.running) { filesProc.buffer = ""; filesProc.running = true }
+  }
+  // A desktop notification for files that appeared since the last check.
+  // It never takes the keyboard.
+  function noticeNew(list) {
+    var seen = Object.assign({}, root.seenArtifacts)
+    var fresh = {}
+    for (var i = 0; i < list.length; i++) {
+      var key = list[i].id + "\n" + list[i].path + "\n" + list[i].mtime
+      if (root.artifactsLoaded && !root.seenArtifacts[key] && list[i].isNew) {
+        var k = list[i].harness + " · " + list[i].projectName
+        fresh[k] = (fresh[k] || 0) + 1
+      }
+      seen[key] = true
+    }
+    root.seenArtifacts = seen
+    root.artifactsLoaded = true
+    for (var who in fresh) {
+      Quickshell.execDetached(["notify-send", "--app-name=Paddock", "--icon=folder-download", "--",
+        strings.t("notice.title"), strings.tn("notice.body", fresh[who]).arg(who).arg(Commons.I18n.formatNumber(fresh[who]))])
+    }
+  }
 
   // Answers for a request, safest first. Enter alone never answers.
   function answersFor(a) {
@@ -213,6 +261,7 @@ Panel {
 
   function refresh() {
     if (!psProc.running) { psProc.buffer = ""; psProc.running = true }
+    refreshFiles()
   }
 
   function loadStartData() {
@@ -321,7 +370,7 @@ Panel {
     if (view !== "list" || rowCount() === 0) return
     root.cursorActive = true
     if (isApprovalRow(selectedIndex)) return
-    var n = actionsFor(sandboxAt(selectedIndex)).length
+    var n = isArtifactRow(selectedIndex) ? 2 : actionsFor(sandboxAt(selectedIndex)).length
     root.actionIndex = Math.max(-1, Math.min(n - 1, root.actionIndex + dx))
   }
   function activate() {
@@ -335,6 +384,11 @@ Panel {
       return
     }
     if (isApprovalRow(selectedIndex)) { answerOnCard(); return }
+    if (isArtifactRow(selectedIndex)) {
+      var f = artifactAt(selectedIndex)
+      if (actionIndex === 1) revealFile(f); else recoverFile(f)
+      return
+    }
     if (sandboxes.length === 0) { startNew(); return }
     var s = sandboxAt(selectedIndex)
     if (actionIndex < 0) goToTerminal(s)
@@ -395,6 +449,48 @@ Panel {
       } catch (e) {
         root.warnOnce("cannot read paddock ps --json (exit " + exitCode + "), showing an error: " + e)
         root.pluginState = "error"
+      }
+    }
+  }
+
+  JsonProc {
+    id: filesProc
+    command: ["sh", "-c", root.launcher, "paddock", "files", "--json"]
+    onExited: function(exitCode) {
+      // An older paddock has no files command: show nothing.
+      if (exitCode !== 0) { root.artifacts = []; return }
+      try {
+        var p = JSON.parse(buffer)
+        var raw = p && p.api_version === "paddock.files/v1" && Array.isArray(p.sandboxes) ? p.sandboxes.slice(0, 32) : []
+        var clean = []
+        for (var i = 0; i < raw.length; i++) {
+          var s = raw[i] || {}
+          var id = String(s.id || "")
+          // ids are passed to a command; accept only the documented shape.
+          if (!/^[A-Za-z0-9_-]{1,96}$/.test(id)) continue
+          var files = Array.isArray(s.files) ? s.files : []
+          for (var j = 0; j < files.length && clean.length < 40; j++) {
+            var f = files[j] || {}
+            var path = root.plain(f.path, 1024)
+            if (path === "" || path.charAt(0) === "/" || path.split("/").indexOf("..") >= 0) continue
+            clean.push({
+              id: id,
+              harness: root.plain(s.harness, 24),
+              projectName: root.plain(root.baseName(s.project), 48),
+              home: root.plain(s.home, 1024),
+              path: path,
+              name: root.plain(root.baseName(path), 120),
+              target: root.plain(f.target, 1024),
+              mtime: Number(f.mtime || 0),
+              isNew: f["new"] === true
+            })
+          }
+        }
+        root.noticeNew(clean)
+        root.artifacts = clean
+        if (root.view === "list" && root.selectedIndex >= root.rowCount()) root.selectedIndex = Math.max(0, root.rowCount() - 1)
+      } catch (e) {
+        root.artifacts = []
       }
     }
   }
@@ -634,6 +730,7 @@ Panel {
       onDeleteRequested: {
         if (root.view !== "list" || root.rowCount() === 0) return
         if (root.isApprovalRow(root.selectedIndex)) root.answer(root.approvals[root.selectedIndex], "deny")
+        else if (root.isArtifactRow(root.selectedIndex)) return
         else root.stop(root.sandboxAt(root.selectedIndex))
       }
       onTextKey: function(text, modifiers) {
@@ -794,6 +891,47 @@ Panel {
             }
           }
 
+          // Files that sandboxes saved outside the project: in the sandbox
+          // home until recovered. Enter copies one to the host.
+          Column {
+            width: parent.width
+            spacing: Style.space(2)
+            visible: root.view === "list" && root.artifacts.length > 0
+
+            PanelSectionHeader {
+              width: parent.width
+              text: strings.tn("files.header", root.artifacts.length).arg(Commons.I18n.formatNumber(root.artifacts.length))
+              foreground: root.fg
+              fontFamily: root.fontFamily
+            }
+
+            Repeater {
+              model: root.view === "list" ? root.artifacts : []
+              delegate: ListRow {
+                required property var modelData
+                required property int index
+                readonly property int at: index + root.approvals.length + root.sandboxes.length
+                rowIndex: at
+                glyph: "󰈔"
+                title: modelData.name + (modelData.isNew ? "  · " + strings.t("files.new") : "")
+                caption: strings.t("files.caption").arg(modelData.harness).arg(modelData.projectName).arg(root.shortPath(root.dirName(modelData.target)))
+                showActions: true
+                onActivated: root.recoverFile(modelData)
+
+                ActionButton {
+                  sandboxIndex: at; position: 0
+                  iconText: "󰇚"; tooltipText: strings.t("action.recover")
+                  onClicked: root.recoverFile(modelData)
+                }
+                ActionButton {
+                  sandboxIndex: at; position: 1
+                  iconText: "󰉋"; tooltipText: strings.t("action.reveal")
+                  onClicked: root.revealFile(modelData)
+                }
+              }
+            }
+          }
+
           // New sandbox, step 1: a recent project.
           Column {
             width: parent.width
@@ -897,6 +1035,7 @@ Panel {
               wrapMode: Text.WordWrap
               text: root.view !== "list" ? strings.t("keys.new")
                 : root.isApprovalRow(root.selectedIndex) && root.approvals.length > 0 ? strings.t("keys.toCard")
+                : root.isArtifactRow(root.selectedIndex) && root.artifacts.length > 0 ? strings.t("keys.files")
                 : strings.t("keys.list")
             }
             Button {
