@@ -300,6 +300,10 @@ enum AppCmd {
         /// bwrap (default), docker, podman or srt. srt needs --network allowlist or none.
         #[arg(long, short)]
         backend: Option<String>,
+        /// Open the first workspace folder in a new git worktree on its own
+        /// branch. Default: [apps.NAME] worktree in the user configuration.
+        #[arg(long)]
+        worktree: bool,
     },
     /// Add a launcher entry (Super+Space) that starts the app in a sandbox.
     Install {
@@ -512,6 +516,7 @@ impl RunArgs {
             gpu: self.gpu,
             no_yolo: self.no_yolo,
             worktree: self.worktree,
+            worktree_app: None,
             allow_domains: self.allow.clone(),
             app_bus: None,
             inherit_env: self.env.as_deref().map(|e| e == "inherit"),
@@ -533,50 +538,9 @@ fn start(env: &HostEnv, a: &RunArgs, shell: bool) -> Result<i32> {
     let wt = built.worktree.clone();
     let code = run::run(env, built, backend.as_ref(), false, false)?.code;
     if let Some(w) = wt {
-        report_worktree(&w);
+        eprintln!("\n{}", build::worktree_report(&w));
     }
     Ok(code)
-}
-
-fn report_worktree(w: &build::Worktree) {
-    let git = |dir: &std::path::Path, args: &[&str]| {
-        std::process::Command::new("git")
-            .arg("-C")
-            .arg(dir)
-            .args(args)
-            .output()
-            .map(|o| String::from_utf8_lossy(&o.stdout).trim_end().to_string())
-            .unwrap_or_default()
-    };
-    let range = format!("{}..{}", w.base, w.branch);
-    let commits = git(&w.repo, &["log", "--oneline", &range]);
-    let stat = git(
-        &w.repo,
-        &["diff", "--stat", &format!("{}...{}", w.base, w.branch)],
-    );
-    let dirty = git(&w.path, &["status", "--short"]);
-    eprintln!(
-        "\npaddock: the agent worked in {} on branch {}.",
-        w.path.display(),
-        w.branch
-    );
-    if commits.is_empty() && dirty.is_empty() {
-        eprintln!("paddock: it made no changes. Remove the worktree:\n  git -C {} worktree remove {} && git -C {0} branch -D {}", w.repo.display(), w.path.display(), w.branch);
-        return;
-    }
-    if !commits.is_empty() {
-        eprintln!("commits:\n{commits}\n{stat}");
-    }
-    if !dirty.is_empty() {
-        eprintln!("uncommitted changes in the worktree:\n{dirty}");
-    }
-    eprintln!(
-        "review:  git -C {r} diff {b}...{br}\nmerge:   git -C {r} merge {br}\nremove:  git -C {r} worktree remove --force {p} && git -C {r} branch -D {br}",
-        r = w.repo.display(),
-        b = &w.base[..w.base.len().min(12)],
-        br = w.branch,
-        p = w.path.display()
-    );
 }
 
 fn explain(env: &HostEnv, a: &RunArgs, json: bool) -> Result<()> {
@@ -1606,8 +1570,39 @@ fn approver_cmd(env: &HostEnv, cmd: ApproverCmd) -> Result<i32> {
 }
 
 /// Ask for a workspace folder with a desktop dialog: the recent projects, or
-/// any folder. None when the user cancels or zenity is not installed.
-fn pick_folder_gui(env: &HostEnv, name: &str) -> Option<PathBuf> {
+/// any folder. For a git repository, also ask whether to open it in a new
+/// worktree; that is the default answer. None when the user cancels or
+/// zenity is not installed.
+fn pick_folder_gui(env: &HostEnv, name: &str) -> Option<(PathBuf, bool)> {
+    let dir = pick_dir_gui(env, name)?;
+    let is_repo = std::process::Command::new("git")
+        .arg("-C")
+        .arg(&dir)
+        .args(["rev-parse", "--verify", "-q", "HEAD"])
+        .output()
+        .is_ok_and(|o| o.status.success());
+    if !is_repo {
+        return Some((dir, false));
+    }
+    let zenity = env.which("zenity")?;
+    const THIS: &str = "Open this folder";
+    let out = std::process::Command::new(zenity)
+        .args(["--question", "--title", "Open in a new worktree?", "--width=480"])
+        .arg(format!(
+            "--text=Open {} in a new git worktree on its own branch?\n\nThe app then cannot switch branches or overwrite changes in your checkout. When it exits, paddock lists its commits and changes.",
+            dir.display()
+        ))
+        .args(["--ok-label=New worktree", "--cancel-label=Cancel"])
+        .arg(format!("--extra-button={THIS}"))
+        .output()
+        .ok()?;
+    if out.status.success() {
+        return Some((dir, true));
+    }
+    (String::from_utf8_lossy(&out.stdout).trim() == THIS).then_some((dir, false))
+}
+
+fn pick_dir_gui(env: &HostEnv, name: &str) -> Option<PathBuf> {
     let zenity = env.which("zenity")?;
     let label = paddock::app::app_profile(env, name)
         .ok()
@@ -1674,8 +1669,10 @@ fn app_cmd(env: &HostEnv, cmd: AppCmd) -> Result<i32> {
             env: env_mode,
             auth,
             backend,
+            worktree,
         } => {
             let mut roots = roots;
+            let mut worktree = worktree;
             // A launcher entry has no terminal to show "no workspace folders".
             // Ask for a folder on the desktop instead.
             if roots.is_empty()
@@ -1683,7 +1680,10 @@ fn app_cmd(env: &HostEnv, cmd: AppCmd) -> Result<i32> {
                 && !std::io::IsTerminal::is_terminal(&std::io::stderr())
             {
                 match pick_folder_gui(env, &name) {
-                    Some(dir) => roots.push(dir),
+                    Some((dir, new_worktree)) => {
+                        roots.push(dir);
+                        worktree |= new_worktree;
+                    }
                     None if env.which("zenity").is_some() => return Ok(0),
                     None => {}
                 }
@@ -1697,6 +1697,7 @@ fn app_cmd(env: &HostEnv, cmd: AppCmd) -> Result<i32> {
                 auth,
                 args: vec![],
                 backend,
+                worktree,
             };
             match app::run(env, &o) {
                 Ok(code) => Ok(code),

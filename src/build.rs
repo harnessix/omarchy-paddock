@@ -30,6 +30,8 @@ pub struct Options {
     pub args: Vec<String>,
     /// Work in a new git worktree on its own branch.
     pub worktree: bool,
+    /// Name the worktree branch after this app.
+    pub worktree_app: Option<String>,
     /// Extra domains for network mode `allowlist`.
     pub allow_domains: Vec<String>,
     /// App mode: the session bus, instead of `[apps.NAME] bus`.
@@ -54,7 +56,29 @@ fn git(dir: &Path, args: &[&str]) -> Result<String> {
     )
 }
 
-pub fn create_worktree(env: &HostEnv, repo: &Path) -> Result<Worktree> {
+/// Today's date in UTC as YYYYMMDD, for branch names.
+fn today() -> String {
+    ymd(state::now())
+}
+
+fn ymd(unix: u64) -> String {
+    let days = (unix / 86_400) as i64;
+    // Civil date from days since 1970-01-01 (Howard Hinnant's algorithm).
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + i64::from(m <= 2);
+    format!("{y:04}{m:02}{d:02}")
+}
+
+/// A worktree for one run. `app` names the branch after an app:
+/// `paddock/<app>-<date>-<id>`. Terminal runs get `paddock/<id>`.
+pub fn create_worktree(env: &HostEnv, repo: &Path, app: Option<&str>) -> Result<Worktree> {
     if git(repo, &["rev-parse", "--show-toplevel"])
         .map(PathBuf::from)
         .ok()
@@ -68,7 +92,14 @@ pub fn create_worktree(env: &HostEnv, repo: &Path) -> Result<Worktree> {
     }
     let base = git(repo, &["rev-parse", "HEAD"]).context("--worktree needs at least one commit")?;
     let id = state::new_id("wt", repo);
-    let branch = format!("paddock/{id}");
+    let branch = match app {
+        Some(a) => format!(
+            "paddock/{a}-{}-{}",
+            today(),
+            id.rsplit('-').next().unwrap_or("0")
+        ),
+        None => format!("paddock/{id}"),
+    };
     let path = env
         .paddock_data()
         .join("worktrees")
@@ -93,6 +124,72 @@ pub fn create_worktree(env: &HostEnv, repo: &Path) -> Result<Worktree> {
         branch,
         base,
     })
+}
+
+/// What the run left in its worktree: commits, uncommitted changes and the
+/// commands to review, merge or remove it. Empty lines are dropped.
+pub fn worktree_report(w: &Worktree) -> String {
+    let git = |dir: &Path, args: &[&str]| {
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim_end().to_string())
+            .unwrap_or_default()
+    };
+    let range = format!("{}..{}", w.base, w.branch);
+    let commits = git(&w.repo, &["log", "--oneline", &range]);
+    let stat = git(
+        &w.repo,
+        &["diff", "--stat", &format!("{}...{}", w.base, w.branch)],
+    );
+    let dirty = git(&w.path, &["status", "--short"]);
+    let mut t = format!(
+        "paddock: the sandbox worked in {} on branch {}.\n",
+        w.path.display(),
+        w.branch
+    );
+    if commits.is_empty() && dirty.is_empty() {
+        t.push_str(&format!(
+            "paddock: it made no changes. Remove the worktree:\n  git -C {} worktree remove {} && git -C {0} branch -D {}",
+            w.repo.display(),
+            w.path.display(),
+            w.branch
+        ));
+        return t;
+    }
+    if !commits.is_empty() {
+        t.push_str(&format!("commits:\n{commits}\n{stat}\n"));
+    }
+    if !dirty.is_empty() {
+        t.push_str(&format!("uncommitted changes in the worktree:\n{dirty}\n"));
+    }
+    t.push_str(&format!(
+        "review:  git -C {r} diff {b}...{br}\nmerge:   git -C {r} merge {br}\nremove:  git -C {r} worktree remove --force {p} && git -C {r} branch -D {br}",
+        r = w.repo.display(),
+        b = &w.base[..w.base.len().min(12)],
+        br = w.branch,
+        p = w.path.display()
+    ));
+    t
+}
+
+/// One line for a notification: how many commits and changed files.
+pub fn worktree_counts(w: &Worktree) -> (usize, usize) {
+    let count = |dir: &Path, args: &[&str]| {
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).lines().count())
+            .unwrap_or(0)
+    };
+    (
+        count(&w.repo, &["rev-list", &format!("{}..{}", w.base, w.branch)]),
+        count(&w.path, &["status", "--short"]),
+    )
 }
 
 pub struct Built {
@@ -144,7 +241,11 @@ pub fn build_with(env: &HostEnv, opts: &Options, harness: Harness) -> Result<Bui
     // works in the worktree.
     let home_key = project.clone();
     let worktree = if opts.worktree {
-        Some(create_worktree(env, &project)?)
+        Some(create_worktree(
+            env,
+            &project,
+            opts.worktree_app.as_deref(),
+        )?)
     } else {
         None
     };
@@ -338,7 +439,12 @@ pub fn build_with(env: &HostEnv, opts: &Options, harness: Harness) -> Result<Bui
             c.extend(profile.launch.yolo_args.iter().cloned());
         }
         c.extend(profile.launch.args.iter().cloned());
-        c.extend(opts.args.iter().cloned());
+        // An editor that opens the repository opens the worktree instead.
+        let repo_arg = home_key.display().to_string();
+        c.extend(opts.args.iter().map(|a| match &worktree {
+            Some(w) if *a == repo_arg => w.path.display().to_string(),
+            _ => a.clone(),
+        }));
         c
     };
 
@@ -418,4 +524,70 @@ pub fn build_with(env: &HostEnv, opts: &Options, harness: Harness) -> Result<Bui
         manifest: m,
         backend,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dates_for_branch_names() {
+        assert_eq!(ymd(0), "19700101");
+        assert_eq!(ymd(951_782_400), "20000229");
+        assert_eq!(ymd(4_102_444_799), "20991231");
+    }
+
+    #[test]
+    fn an_app_worktree_has_its_own_branch_and_report() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("app");
+        std::fs::create_dir_all(&repo).unwrap();
+        let g = |dir: &Path, args: &[&str]| {
+            let ok = std::process::Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(["-c", "user.name=t", "-c", "user.email=t@localhost"])
+                .args(args)
+                .status()
+                .unwrap()
+                .success();
+            assert!(ok, "git {args:?}");
+        };
+        g(&repo, &["init", "-q", "-b", "main"]);
+        g(&repo, &["commit", "-q", "--allow-empty", "-m", "one"]);
+        let repo = std::fs::canonicalize(&repo).unwrap();
+        let mut vars = std::collections::BTreeMap::new();
+        vars.insert(
+            "XDG_DATA_HOME".to_string(),
+            tmp.path().join("data").display().to_string(),
+        );
+        let env = HostEnv::from_parts(tmp.path().join("home"), "t".into(), 1000, 1000, vars);
+        let w = create_worktree(&env, &repo, Some("vscode")).unwrap();
+        assert!(w
+            .branch
+            .starts_with(&format!("paddock/vscode-{}-", today())));
+        assert!(w
+            .path
+            .starts_with(tmp.path().join("data/paddock/worktrees")));
+        assert!(worktree_report(&w).contains("made no changes"));
+        g(
+            &w.path,
+            &["commit", "-q", "--allow-empty", "-m", "work in the app"],
+        );
+        std::fs::write(w.path.join("new.txt"), "x").unwrap();
+        let r = worktree_report(&w);
+        assert!(
+            r.contains("work in the app") && r.contains("?? new.txt"),
+            "{r}"
+        );
+        assert_eq!(worktree_counts(&w), (1, 1));
+        // The checkout itself stays on its branch.
+        let head = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["branch", "--show-current"])
+            .output()
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&head.stdout).trim(), "main");
+    }
 }

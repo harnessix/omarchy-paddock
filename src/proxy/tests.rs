@@ -31,7 +31,9 @@ fn start(cfg: HostProxy) -> (tempfile::TempDir, std::path::PathBuf) {
 fn request(sock: &Path, text: &str) -> (u16, UnixStream) {
     let mut s = UnixStream::connect(sock).unwrap();
     s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
-    s.write_all(text.as_bytes()).unwrap();
+    // A proxy at its connection limit answers 503 and closes without reading,
+    // so the write can fail. The answer is still there to read.
+    let _ = s.write_all(text.as_bytes());
     let (head, _) = read_head(&mut s).unwrap();
     let mut h = [httparse::EMPTY_HEADER; 16];
     let mut r = httparse::Response::new(&mut h);

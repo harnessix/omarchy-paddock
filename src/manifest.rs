@@ -65,6 +65,8 @@ pub struct AppCfg {
     /// local process can connect to them meanwhile. Off by default.
     #[serde(default)]
     pub login_ports: bool,
+    /// Open the first workspace folder in a new git worktree on each start.
+    pub worktree: Option<bool>,
     /// The app's session bus. `private` (default): a bus inside the sandbox
     /// with a private keyring and paddock's link and notification services.
     /// `host-filtered`: the host bus through a filter that passes only the
