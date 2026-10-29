@@ -103,5 +103,21 @@
   },
   "time.daysAgo": {
     "other": "%1 天前"
-  }
+  },
+  "files.header": {
+    "one": "项目外保存了 %1 个文件",
+    "other": "项目外保存了 %1 个文件"
+  },
+  "files.caption": "%1 · %2 · 恢复到 %3",
+  "files.new": "新",
+  "action.recover": "把这个文件复制到主机",
+  "action.reveal": "在沙箱主目录中打开所在目录",
+  "msg.recovered": "已恢复到 %1",
+  "msg.recoverFailed": "没有恢复。请在终端运行 paddock recover 查看原因。",
+  "notice.title": "Paddock：沙箱中有新文件",
+  "notice.body": {
+    "one": "%1 在项目外保存了 %2 个文件。打开 Paddock 面板即可恢复。",
+    "other": "%1 在项目外保存了 %2 个文件。打开 Paddock 面板即可恢复。"
+  },
+  "keys.files": "↵ 恢复 · → 打开目录"
 }

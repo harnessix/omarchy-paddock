@@ -129,6 +129,7 @@ paddock claude --worktree      # work on a new branch in a new worktree, review 
 paddock shell claude           # a shell in the sandbox that claude gets
 paddock explain claude         # every mount, variable and rule, and why it is there
 paddock ps                     # running sandboxes
+paddock files                  # files a sandbox saved outside the project
 paddock doctor                 # dependencies, backends, located harnesses
 paddock doctor --escape        # try to escape, and report each attempt
 paddock mcp claude             # MCP servers, and whether each runs in the sandbox
@@ -151,6 +152,38 @@ A sandbox uses your existing login of the harness. See [Logins and MCP](#logins-
 | `/usr`, `/etc`, read-only (bwrap backend) | the host system |
 
 The sandbox never contains your real home directory, `~/.ssh`, `~/.gnupg`, cloud credentials, browser profiles, the container runtime socket, or the session bus. Files with credential-shaped names in the project (`.env`, `*.pem`, `*.key`) are hidden. The policy engine refuses any configuration that breaks these rules, and names the line that asked for it.
+
+## Files outside the project
+
+The project is shared with the host, so the agent's changes there are already yours. A file that the agent saves anywhere else, for example to `~/Desktop` or `~/Downloads`, stays in the private sandbox home. You do not see it until you recover it.
+
+`paddock files` lists these files for each sandbox, also after the sandbox exits. It also shows the commits and the changed paths in the project since the sandbox started.
+
+```sh
+paddock files                                 # every sandbox that has files
+paddock files claude-app-1a2b3c               # one sandbox
+paddock recover claude-app-1a2b3c Desktop/report.pdf          # to ~/Desktop/report.pdf
+paddock recover claude-app-1a2b3c --all --to ~/Inbox
+paddock discard claude-app-1a2b3c Downloads/setup.zip
+```
+
+`paddock recover` copies the file to the host, then deletes the sandbox copy. Add `--keep` to keep it. The rules:
+
+- A recovered file never replaces a file. If the name is taken, the file gets a new name, such as `report (1).pdf`.
+- paddock never writes into a hidden path of your home, such as `~/.ssh` or `~/.config`, into its own directories, or into system directories. It refuses, even when you ask for it.
+- paddock copies regular files only. It skips symlinks, devices and pipes, and it never follows a symlink in the sandbox home.
+
+The Omarchy panel lists the same files. Press Enter on a file to recover it. When a sandbox saves a new file, a desktop notification tells you. The notification does not take the keyboard.
+
+paddock looks in the recovery folders only. The defaults are `Desktop`, `Documents`, `Downloads`, `Pictures`, `Videos` and `Music`, with all their subfolders. A folder of your host that has another name, set in `~/.config/user-dirs.dirs`, is the target. Change the folders in `~/.config/paddock/config.toml`. A project `paddock.toml` cannot change them, because the agent can edit it.
+
+```toml
+[recovery]
+folders = ["Desktop", "Downloads", "out"]
+ignore = ["*.desktop", "*.part", "*.tmp"]   # never listed
+```
+
+By default, paddock ignores `*.desktop` launchers, because they can run commands when you open them, and partial or lock files.
 
 ## Network
 

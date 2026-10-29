@@ -234,6 +234,14 @@ pub fn run(
         host_pid: std::process::id(),
     };
     running.register(env)?;
+    // Kept after exit, so `paddock files` can list what the sandbox left.
+    if let Err(e) =
+        crate::recover::Session::begin(env, &spec.id, &spec.harness, &spec.project, &spec.home_src)
+    {
+        if !quiet {
+            log::warn!("cannot record the session for `paddock files`: {e:#}");
+        }
+    }
     if !quiet {
         let home_key = built
             .worktree
@@ -330,11 +338,47 @@ pub fn run(
         }
     }
     let _ = std::fs::remove_dir_all(env.paddock_run().join(&spec.id));
+    crate::recover::Session::end(env, &spec.id);
+    if !quiet {
+        recovery_notice(env, &spec.id, &spec.home_src, running.started);
+    }
     use std::os::unix::process::ExitStatusExt;
     let code = status
         .code()
         .unwrap_or_else(|| 128 + status.signal().unwrap_or(0));
     Ok(Outcome { code, stdout: out })
+}
+
+/// Quick Recovery at exit: name the files that the sandbox left in its
+/// recovery folders, and the command that brings them to the host.
+fn recovery_notice(env: &HostEnv, id: &str, home: &Path, started: u64) {
+    let cfg = match crate::recover::RecoveryCfg::load(env) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("paddock: warning: {e:#}");
+            return;
+        }
+    };
+    let items: Vec<_> = crate::recover::scan(env, &cfg, home, started)
+        .into_iter()
+        .filter(|i| i.new)
+        .collect();
+    if items.is_empty() {
+        return;
+    }
+    eprintln!(
+        "paddock: the sandbox saved {} file(s) outside the project. They stay in the sandbox until you recover them:",
+        items.len()
+    );
+    for i in items.iter().take(10) {
+        eprintln!("  {}", i.path);
+    }
+    if items.len() > 10 {
+        eprintln!("  ... and {} more", items.len() - 10);
+    }
+    eprintln!(
+        "paddock: list them with `paddock files {id}`, copy them with `paddock recover {id} PATH`"
+    );
 }
 
 pub fn select_backend(env: &HostEnv, built: &Built) -> Result<Box<dyn Backend>> {

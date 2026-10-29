@@ -95,6 +95,38 @@ enum Cmd {
     },
     /// Stop a running sandbox.
     Stop { id: String },
+    /// List the files a sandbox saved outside the project, and its project changes.
+    #[command(after_help = FILES_HELP)]
+    Files {
+        /// A sandbox id from `paddock ps` or an earlier run. Without it, every sandbox home with files.
+        id: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Copy files from a sandbox home to the host, then remove the sandbox copy.
+    Recover {
+        id: String,
+        /// Paths as `paddock files` shows them, such as Desktop/report.pdf.
+        #[arg(required_unless_present = "all")]
+        paths: Vec<String>,
+        /// Recover every listed file.
+        #[arg(long, conflicts_with = "paths")]
+        all: bool,
+        /// Put the files in this directory instead of the same path under your home.
+        #[arg(long)]
+        to: Option<PathBuf>,
+        /// Leave the sandbox copy in place.
+        #[arg(long)]
+        keep: bool,
+    },
+    /// Delete files from the recovery folders of a sandbox home.
+    Discard {
+        id: String,
+        #[arg(required_unless_present = "all")]
+        paths: Vec<String>,
+        #[arg(long, conflicts_with = "paths")]
+        all: bool,
+    },
     /// Check dependencies, or try to escape the sandbox with --escape.
     Doctor {
         #[arg(long)]
@@ -1135,6 +1167,15 @@ fn real_main() -> Result<i32> {
             }
             Ok(0)
         }
+        Cmd::Files { id, json } => files_cmd(&env, id.as_deref(), json),
+        Cmd::Recover {
+            id,
+            paths,
+            all,
+            to,
+            keep,
+        } => recover_cmd(&env, &id, paths, all, to.as_deref(), keep),
+        Cmd::Discard { id, paths, all } => discard_cmd(&env, &id, paths, all),
         Cmd::Stop { id } => {
             let Some(r) = Running::list(&env).into_iter().find(|r| r.id == id) else {
                 bail!("no running sandbox with id {id}")
@@ -1237,6 +1278,161 @@ fn real_main() -> Result<i32> {
 struct RunArgsCli {
     #[command(flatten)]
     run: RunArgs,
+}
+
+const FILES_HELP: &str = "The project is shared with the host, so its changes are already yours. \
+Files that a sandbox saves elsewhere, for example to ~/Desktop or ~/Downloads, stay in its private home. \
+Recovery folders and ignore rules are set in [recovery] of ~/.config/paddock/config.toml:
+
+  [recovery]
+  folders = [\"Desktop\", \"Documents\", \"Downloads\", \"Pictures\", \"Videos\", \"Music\"]
+  ignore = [\"*.desktop\", \"*.part\"]";
+
+fn session_for(env: &HostEnv, id: &str) -> Result<paddock::recover::Session> {
+    paddock::recover::Session::load(env, id)
+        .ok_or_else(|| anyhow::anyhow!("no sandbox with id {id}; `paddock files` lists them"))
+}
+
+fn files_cmd(env: &HostEnv, id: Option<&str>, json: bool) -> Result<i32> {
+    use paddock::recover::{self, RecoveryCfg, Session};
+    let cfg = RecoveryCfg::load(env)?;
+    let sessions = match id {
+        Some(id) => vec![session_for(env, id)?],
+        None => Session::latest_per_home(env),
+    };
+    let mut out = Vec::new();
+    for s in sessions.into_iter().take(32) {
+        let items = recover::scan(env, &cfg, &s.home, s.started);
+        let running = s.running(env);
+        if id.is_none() && items.is_empty() && !running {
+            continue;
+        }
+        let changes = recover::project_changes(&s);
+        out.push((s, running, items, changes));
+    }
+    if json {
+        let list: Vec<_> = out
+            .iter()
+            .map(|(s, running, items, changes)| {
+                serde_json::json!({
+                    "id": s.id, "harness": s.harness, "project": s.project, "home": s.home,
+                    "started": s.started, "ended": s.ended, "running": running,
+                    "files": items, "project_changes": changes,
+                })
+            })
+            .collect();
+        println!(
+            "{}",
+            serde_json::json!({ "api_version": "paddock.files/v1", "sandboxes": list })
+        );
+        return Ok(0);
+    }
+    if out.is_empty() {
+        println!("No sandbox has files outside its project.");
+        return Ok(0);
+    }
+    for (s, running, items, changes) in &out {
+        println!(
+            "{}  {} in {}{}",
+            s.id,
+            s.harness,
+            s.project.display(),
+            if *running { "  (running)" } else { "" }
+        );
+        if items.is_empty() {
+            println!("  no files in the recovery folders");
+        }
+        for i in items {
+            println!(
+                "  {} {:<48} {:>9}  -> {}",
+                if i.new { "new" } else { "   " },
+                i.path,
+                i.size,
+                i.target.display()
+            );
+        }
+        if changes.git {
+            println!(
+                "  project: {} new commit(s), {} changed path(s) since start",
+                changes.commits.len(),
+                changes.changed.len()
+            );
+            for c in changes.commits.iter().take(10) {
+                println!("    commit {c}");
+            }
+            for c in changes.changed.iter().take(20) {
+                println!("    {c}");
+            }
+        }
+        println!();
+    }
+    println!("Copy a file to the host with `paddock recover ID PATH`, or delete it with `paddock discard ID PATH`.");
+    Ok(0)
+}
+
+fn pick_paths(
+    env: &HostEnv,
+    cfg: &paddock::recover::RecoveryCfg,
+    s: &paddock::recover::Session,
+    paths: Vec<String>,
+    all: bool,
+) -> Vec<String> {
+    if all {
+        paddock::recover::scan(env, cfg, &s.home, s.started)
+            .into_iter()
+            .map(|i| i.path)
+            .collect()
+    } else {
+        paths
+    }
+}
+
+fn recover_cmd(
+    env: &HostEnv,
+    id: &str,
+    paths: Vec<String>,
+    all: bool,
+    to: Option<&std::path::Path>,
+    keep: bool,
+) -> Result<i32> {
+    let cfg = paddock::recover::RecoveryCfg::load(env)?;
+    let s = session_for(env, id)?;
+    let mut failed = 0;
+    for p in pick_paths(env, &cfg, &s, paths, all) {
+        match paddock::recover::recover(env, &cfg, &s.home, &p, to, keep) {
+            Ok(r) => println!(
+                "Recovered {} -> {}{}",
+                r.from,
+                r.to.display(),
+                if r.renamed {
+                    " (renamed: a file with that name exists)"
+                } else {
+                    ""
+                }
+            ),
+            Err(e) => {
+                failed += 1;
+                eprintln!("paddock: cannot recover {p}: {e:#}");
+            }
+        }
+    }
+    Ok(if failed > 0 { 1 } else { 0 })
+}
+
+fn discard_cmd(env: &HostEnv, id: &str, paths: Vec<String>, all: bool) -> Result<i32> {
+    let cfg = paddock::recover::RecoveryCfg::load(env)?;
+    let s = session_for(env, id)?;
+    let mut failed = 0;
+    for p in pick_paths(env, &cfg, &s, paths, all) {
+        match paddock::recover::discard(&cfg, &s.home, &p) {
+            Ok(r) => println!("Deleted {r} from the sandbox"),
+            Err(e) => {
+                failed += 1;
+                eprintln!("paddock: cannot delete {p}: {e:#}");
+            }
+        }
+    }
+    Ok(if failed > 0 { 1 } else { 0 })
 }
 
 fn approver_cmd(env: &HostEnv, cmd: ApproverCmd) -> Result<i32> {
