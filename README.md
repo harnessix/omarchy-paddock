@@ -50,6 +50,15 @@ cd omarchy-paddock
 bin/install
 ```
 
+Without a Rust toolchain, use the prebuilt binary from the [latest release](https://github.com/harnessix/omarchy-paddock/releases/latest). It is one file. Check its checksum, copy it to `~/.local/bin`, and run `paddock doctor`, which prints the command that installs the system packages below:
+
+```sh
+sha256sum -c paddock-*-x86_64-linux.tar.gz.sha256
+tar -xzf paddock-*-x86_64-linux.tar.gz
+install -m 755 paddock-*-x86_64-linux/paddock ~/.local/bin/paddock
+paddock doctor
+```
+
 On Arch Linux, the installer installs a package with makepkg. It also knows apt and dnf, and then copies the binary to `~/.local/bin`; that path is best effort and is not tested on every release (see [Support scope](#support-scope)). Use `bin/install --minimal` to skip the desktop packages.
 
 | Package | Needed for |
