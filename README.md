@@ -63,7 +63,7 @@ On Arch Linux, the installer installs a package with makepkg. It also knows apt 
 | dbus | a private session bus for desktop apps |
 | docker or podman | the container backend |
 | mise | per-project toolchains from `mise.toml` |
-| gnome-keyring | a private keyring in sandboxes of harnesses that need one, such as Copilot CLI |
+| gnome-keyring | a private keyring for app sandboxes and for harnesses that need one, such as Copilot CLI |
 
 `paddock doctor` prints the same list with the state of each package and the install command for your distribution.
 
@@ -318,7 +318,22 @@ paddock app install chatgpt-desktop ~/src/web   # add a launcher entry that runs
 paddock app uninstall chatgpt-desktop
 ```
 
-The app sees only the folders that you give it, from the command line or from `[apps.NAME] roots` in `~/.config/paddock/config.toml`. Its windows connect to your compositor through a restricted socket: the app cannot capture the screen, read the clipboard in the background, type into other windows or list them. On the session bus it reaches only the desktop portals and notifications, not the keyring or the system services. Add `--gpu` for hardware rendering.
+The app sees only the folders that you give it, from the command line or from `[apps.NAME] roots` in `~/.config/paddock/config.toml`. Its windows connect to your compositor through a restricted socket: the app cannot capture the screen, read the clipboard in the background, type into other windows or list them. Add `--gpu` for hardware rendering.
+
+The app gets a session bus of its own, inside the sandbox. It cannot reach your session bus, your keyring or the system services. Three services run on its bus:
+
+- A private keyring (gnome-keyring). The app stores its login and other secrets there, encrypted with a password that paddock keeps on the host. Claude, ChatGPT and VS Code use it. You log in once inside the sandbox, and the login stays for later runs.
+- Links. When the app opens a web link, paddock asks you, the same way as for `paddock-host open`, and then opens the link in your browser. The app's request for a link through the desktop portal works the same way.
+- Notifications. They appear on your desktop, with the app's name.
+
+The app gets no file chooser portal. It uses its own file dialog, which shows only the files in the sandbox. If an app needs the real desktop portals, give it the filtered host bus in `~/.config/paddock/config.toml`:
+
+```toml
+[apps.NAME]
+bus = "host-filtered"
+```
+
+On that bus the app reaches only the desktop portals, notifications and the tray. It gets no keyring, so it keeps its login in a plain file in the sandbox home. Flatpak apps always use flatpak's own filtered host bus.
 
 A flatpak app becomes an app profile with `[app] flatpak = "ID"`. paddock drops every permission that the app asks for and adds back only the workspace folders, the portals and, with `--gpu`, the GPU. Many flatpak apps ask for your whole home directory and the host bus, so their own sandbox is not enough.
 
@@ -326,12 +341,13 @@ Windows of app sandboxes get a sage green border, so you can tell a protected ap
 
 Known limits:
 
-- Desktop apps log in again inside the sandbox. They keep their login in the sandbox home, because your keyring is out of reach. Some apps say so: Claude, for example, warns that no system keyring is available and that it stores secrets without encryption. The secrets stay in the sandbox home, which only your user can read.
+- Desktop apps log in again inside the sandbox, because your keyring is out of reach. The login then stays in the private keyring of the sandbox. An app with `bus = "host-filtered"` has no keyring. Claude, for example, then warns that no system keyring is available and stores its secrets without encryption, in the sandbox home, which only your user can read.
+- The app cannot open files with your desktop apps or pick files outside the sandbox. Its file dialog shows only the sandbox.
 - A new window that gets focus can read the clipboard once. This is how Wayland clipboards work, and Flatpak has the same gap.
 - Tray icons may not appear.
 - Apps cannot update themselves inside the sandbox. Update them on the host, with your package manager or the app's own installer outside paddock.
 - To add a folder, restart the app. A running sandbox cannot get new mounts.
-- Custom links (`claude://`, `codex://`, `vscode://`) reach the app in its sandbox after `paddock app install`, which makes paddock their handler. `paddock app uninstall` gives them back to the old handler. Logins that return to `http://127.0.0.1:PORT` reach the app only with `[apps.NAME] login_ports = true` in `~/.config/paddock/config.toml`. Then the ports the app listens on are open on 127.0.0.1 of your machine while it listens, for any local program.
+- Custom links (`claude://`, `codex://`, `vscode://`) reach the app in its sandbox after `paddock app install`, which makes paddock their handler. `paddock app uninstall` gives them back to the old handler. A login page that the app opens through paddock and that returns to `http://127.0.0.1:PORT` reaches the app: paddock opens that one port on 127.0.0.1 of your machine for ten minutes, while the app listens on it. If an app opens its login page in another way, set `[apps.NAME] login_ports = true` in `~/.config/paddock/config.toml`. Then all the ports the app listens on are open on 127.0.0.1 of your machine while it listens, for any local program.
 
 ## Sandbox by default
 

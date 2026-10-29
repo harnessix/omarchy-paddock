@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- App mode: each app gets a private session bus inside the sandbox, with a private keyring. Claude, ChatGPT and VS Code store their logins and secrets encrypted there, and Claude no longer warns that no system keyring is available. `paddock portal` on that bus sends the app's web links to the host browser after your approval, and its notifications to your desktop. The app gets no file chooser portal and cannot reach the host bus. `[apps.NAME] bus = "host-filtered"` keeps the filtered host bus. `paddock doctor --escape --app` checks the private bus, and `--bus host-filtered` checks the other one.
+- App mode: a login page that an app opens through paddock and that returns to a localhost port reaches the app without `login_ports`, the same way as for terminal harnesses.
 - A sandbox started from a Claude app session no longer inherits the app's control channel (`CLAUDE_CODE_MESSAGING_TOKEN` and `CLAUDE_CODE_MESSAGING_SOCKET`).
 - Network mode `egress` blocks the LAN by default: private, link-local and CGNAT ranges, on every backend. `[network] lan = true` allows it again. `paddock doctor --escape` checks it.
 - Logging with levels. `-v` and `-q` change how much paddock prints, and `PADDOCK_LOG=debug` or `PADDOCK_LOG=broker=debug` sets the level for everything or for one part. The broker, the proxy, the login callback forwarder and the window border also write to the systemd journal: `journalctl -t paddock -p warning`.

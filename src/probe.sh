@@ -179,7 +179,48 @@ if [ -n "$PADDOCK_PROBE_APP" ]; then
     if wtype -P Shift_L -p Shift_L 2>/dev/null; then fail app-no-virtual-keyboard "wtype sent input"; else ok app-no-virtual-keyboard; fi
   fi
   if gdbus call --session -d org.freedesktop.portal.Desktop -o /org/freedesktop/portal/desktop -m org.freedesktop.DBus.Properties.Get org.freedesktop.portal.OpenURI version >/dev/null 2>&1; then ok app-portal-reachable; else fail app-portal-reachable "the OpenURI portal is not reachable"; fi
-  if gdbus call --session -d org.freedesktop.secrets -o /org/freedesktop/secrets -m org.freedesktop.DBus.Peer.Ping >/dev/null 2>&1; then fail app-keyring-hidden "the host keyring answered"; else ok app-keyring-hidden; fi
+  if [ "$PADDOCK_PROBE_APP_BUS" = private ]; then
+    # The bus is a dbus-daemon in this sandbox, not the host bus.
+    bus_id=$(gdbus call --session -d org.freedesktop.DBus -o /org/freedesktop/DBus -m org.freedesktop.DBus.GetId 2>/dev/null | tr -d "(',)")
+    bus_pid=$(gdbus call --session -d org.freedesktop.DBus -o /org/freedesktop/DBus -m org.freedesktop.DBus.GetConnectionUnixProcessID org.freedesktop.DBus 2>/dev/null | grep -oE "[0-9]+" | tail -n 1)
+    if [ -z "$bus_id" ]; then
+      fail app-bus-private "no session bus"
+    elif [ "$bus_id" = "$PADDOCK_PROBE_HOST_BUS_ID" ]; then
+      fail app-bus-private "the session bus is the host bus"
+    elif [ -n "$bus_pid" ] && [ "$(cat /proc/$bus_pid/comm 2>/dev/null)" = dbus-daemon ]; then
+      ok app-bus-private
+    else
+      fail app-bus-private "the bus daemon is not a process of this sandbox"
+    fi
+    # The keyring on the bus is the sandbox's own gnome-keyring.
+    k_pid=$(gdbus call --session -d org.freedesktop.DBus -o /org/freedesktop/DBus -m org.freedesktop.DBus.GetConnectionUnixProcessID org.freedesktop.secrets 2>/dev/null | grep -oE "[0-9]+" | tail -n 1)
+    case "$(cat /proc/${k_pid:-0}/comm 2>/dev/null)" in
+      gnome-keyring*) ok app-keyring-private ;;
+      *) fail app-keyring-private "no keyring of this sandbox on the bus" ;;
+    esac
+    if gdbus call --session -d org.freedesktop.Notifications -o /org/freedesktop/Notifications -m org.freedesktop.Notifications.GetServerInformation 2>/dev/null | grep -q "'paddock'"; then ok app-notifications-relayed; else fail app-notifications-relayed "the notification service is not paddock portal"; fi
+    # A link goes to the host broker, which the doctor answers with deny:
+    # the portal reports that as code 1.
+    if has dbus-monitor; then
+      dbus-monitor --session "type='signal',interface='org.freedesktop.portal.Request',member='Response'" >/tmp/probe-monitor 2>&1 &
+      mon=$!
+      sleep 0.3
+      gdbus call --session -d org.freedesktop.portal.Desktop -o /org/freedesktop/portal/desktop -m org.freedesktop.portal.OpenURI.OpenURI "" "https://example.com/paddock-probe" "{'handle_token': <'probe'>}" >/dev/null 2>&1
+      i=0; while ! grep -q "uint32" /tmp/probe-monitor && [ $i -lt 60 ]; do sleep 0.05; i=$((i+1)); done
+      kill $mon 2>/dev/null
+      if grep -A1 "path=/org/freedesktop/portal/desktop/request/.*/probe" /tmp/probe-monitor | grep -q "uint32 1"; then ok app-open-url-asks-host; else fail app-open-url-asks-host "OpenURI did not reach the host broker: $(tr '\n' ' ' </tmp/probe-monitor | cut -c1-200)"; fi
+    else
+      skip app-open-url-asks-host "dbus-monitor is not installed"
+    fi
+    if gdbus call --session -d org.freedesktop.portal.Desktop -o /org/freedesktop/portal/desktop -m org.freedesktop.DBus.Properties.Get org.freedesktop.portal.FileChooser version >/dev/null 2>&1 \
+      || gdbus call --session -d org.freedesktop.portal.Documents -o /org/freedesktop/portal/documents -m org.freedesktop.DBus.Peer.Ping >/dev/null 2>&1; then
+      fail app-no-file-portal "a file portal answered"
+    else
+      ok app-no-file-portal
+    fi
+  else
+    if gdbus call --session -d org.freedesktop.secrets -o /org/freedesktop/secrets -m org.freedesktop.DBus.Peer.Ping >/dev/null 2>&1; then fail app-keyring-hidden "the host keyring answered"; else ok app-keyring-hidden; fi
+  fi
   if gdbus call --session -d org.freedesktop.systemd1 -o /org/freedesktop/systemd1 -m org.freedesktop.DBus.Peer.Ping >/dev/null 2>&1; then fail app-systemd-hidden "the systemd user manager answered"; else ok app-systemd-hidden; fi
   if gdbus call --session -d org.freedesktop.Flatpak -o /org/freedesktop/Flatpak/Development -m org.freedesktop.DBus.Peer.Ping >/dev/null 2>&1; then fail app-flatpak-spawn-hidden "the flatpak host command service answered"; else ok app-flatpak-spawn-hidden; fi
 fi

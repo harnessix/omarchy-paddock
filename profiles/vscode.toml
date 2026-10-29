@@ -6,7 +6,7 @@ unverified = ["extensions that start host services"]
 commands = ["code"]
 
 [launch]
-args = ["--ozone-platform=wayland", "--no-sandbox", "--password-store=basic", "--wait"]
+args = ["--ozone-platform=wayland", "--no-sandbox", "--password-store=gnome-libsecret", "--wait"]
 
 [app]
 display_name = "Visual Studio Code"

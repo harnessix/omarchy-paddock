@@ -18,6 +18,7 @@ pub mod login;
 pub mod manifest;
 pub mod mcp;
 pub mod policy;
+pub mod portal;
 pub mod profile;
 pub mod proxy;
 pub mod recover;

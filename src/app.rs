@@ -2,10 +2,13 @@
 //! and flatpak apps) in a sandbox.
 //!
 //! The app's windows are normal windows on the host desktop, through a
-//! restricted Wayland socket (wlsec.rs). Its session bus is a filtered proxy
+//! restricted Wayland socket (wlsec.rs). Its session bus is a private
+//! `dbus-daemon` inside the sandbox, with a private keyring and paddock's
+//! link and notification services (keyring.rs, portal.rs). With
+//! `[apps.NAME] bus = "host-filtered"` it is the host bus through a filter
 //! that passes only the desktop portals (open a URL, choose a file), the
-//! notification service and the tray. The host keyring, the systemd user
-//! manager and every other service stay out of reach.
+//! notification service and the tray. Either way, the host keyring, the
+//! systemd user manager and every other host service stay out of reach.
 
 use crate::env::HostEnv;
 use crate::spec::{sandbox_runtime_dir, SandboxSpec};
@@ -31,15 +34,24 @@ pub const BUS_OWN: &[&str] = &[];
 /// restricted Wayland socket.
 pub struct AppSession {
     _wayland: crate::wlsec::RestrictedSocket,
-    proxy: Child,
+    proxy: Option<Child>,
     _forwarder: Option<ports::Forwarder>,
 }
 
 impl Drop for AppSession {
     fn drop(&mut self) {
-        let _ = self.proxy.kill();
-        let _ = self.proxy.wait();
+        if let Some(p) = &mut self.proxy {
+            let _ = p.kill();
+            let _ = p.wait();
+        }
     }
+}
+
+/// The session bus of an app, from the user configuration only: a project
+/// file cannot give an app the host bus.
+pub fn bus_mode(env: &HostEnv, name: &str) -> Result<AppBus> {
+    let user = Manifest::load(env, &env.home.join(".paddock-no-project"))?.merged;
+    Ok(user.apps.get(name).and_then(|a| a.bus).unwrap_or_default())
 }
 
 /// Where links for the app arrive inside the sandbox.
@@ -64,8 +76,12 @@ pub fn start_session(
         .unwrap_or_default();
     let user = Manifest::load(env, &env.home.join(".paddock-no-project"))?.merged;
     let login_ports = user.apps.get(&profile.name).is_some_and(|a| a.login_ports);
+    // On the private bus, links go through the host passthrough channel, so
+    // paddock knows the login callback port of each login page it opens,
+    // the same way as for terminal harnesses (login.rs).
+    let callbacks = spec.private_bus && !login_ports;
     let inbound = run.join("inbound");
-    if !schemes.is_empty() || login_ports {
+    if !schemes.is_empty() || login_ports || callbacks {
         std::fs::create_dir_all(&inbound)?;
         spec.add_mount(Mount::bind(
             &inbound,
@@ -73,9 +89,14 @@ pub fn start_session(
             true,
             "app mode: link handoff",
         ));
+        // Links start the app itself, on the bus that already runs.
+        let app_cmd = match spec.command.split_first() {
+            Some((w, rest)) if spec.private_bus && w == crate::keyring::TOOL => rest,
+            _ => &spec.command[..],
+        };
         spec.set_env(
             "PADDOCK_INBOUND_CMD",
-            serde_json::to_string(&spec.command)?,
+            serde_json::to_string(app_cmd)?,
             "app mode: link handoff",
         );
         spec.set_env(
@@ -83,6 +104,9 @@ pub fn start_session(
             schemes.join(","),
             "app mode: link handoff",
         );
+        if callbacks {
+            spec.set_env("PADDOCK_INBOUND_PORTS", "1", "app mode: login callbacks");
+        }
         if login_ports {
             spec.set_env("PADDOCK_INBOUND_PORTS", "1", "app mode: login_ports");
             spec.warnings.push(format!(
@@ -92,12 +116,40 @@ pub fn start_session(
         }
         spec.setup.push("paddock inbound >/dev/null 2>&1 &".into());
     }
-    let forwarder = login_ports.then(|| ports::Forwarder::start(inbound.clone()));
+    let forwarder = if login_ports {
+        Some(ports::Forwarder::start(inbound.clone()))
+    } else if callbacks {
+        Some(ports::Forwarder::start_filtered(
+            inbound.clone(),
+            crate::login::allowed,
+        ))
+    } else {
+        None
+    };
 
     let wl_path = run.join("wayland");
     let wayland = crate::wlsec::create(&wl_path, &format!("paddock.{}", spec.harness), &spec.id)?;
     spec.gui.host_socket = Some(wl_path);
 
+    if spec.private_bus {
+        // The bus itself starts inside the sandbox (keyring.rs). Apps that
+        // open links with xdg-open instead of the portal reach the host the
+        // same way.
+        crate::login::open_shim(env, spec, "app mode: links to the host browser")?;
+        spec.set_env(
+            "DBUS_SESSION_BUS_ADDRESS",
+            format!(
+                "unix:path={}",
+                sandbox_runtime_dir(spec.uid).join("bus").display()
+            ),
+            "app mode: private session bus",
+        );
+        return Ok(AppSession {
+            _wayland: wayland,
+            proxy: None,
+            _forwarder: forwarder,
+        });
+    }
     let bus_addr = env
         .var("DBUS_SESSION_BUS_ADDRESS")
         .context("app mode needs the host session bus (DBUS_SESSION_BUS_ADDRESS is not set)")?
@@ -136,18 +188,18 @@ pub fn start_session(
     spec.set_env(
         "DBUS_SESSION_BUS_ADDRESS",
         format!("unix:path={}", rt.join("bus").display()),
-        "app mode: portal-only bus",
+        "app mode: filtered host bus",
     );
     Ok(AppSession {
         _wayland: wayland,
-        proxy,
+        proxy: Some(proxy),
         _forwarder: forwarder,
     })
 }
 
 use crate::build::{self, Options};
 use crate::detect::{self, Detector};
-use crate::manifest::Manifest;
+use crate::manifest::{AppBus, Manifest};
 use crate::profile::{HarnessFactory, Profile};
 use crate::spec::{GuiMode, Mount, Network};
 
