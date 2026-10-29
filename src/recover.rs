@@ -480,8 +480,54 @@ pub fn default_target(env: &HostEnv, cfg: &RecoveryCfg, rel: &str) -> Option<Pat
     Some(base.join(rest))
 }
 
+/// A sandbox file, held open through its parent directory. Every directory
+/// on the way is opened with O_NOFOLLOW, so a sandbox that swaps a folder for
+/// a symlink while paddock works cannot point it at a host file.
+struct Source {
+    dir: std::os::fd::OwnedFd,
+    name: std::ffi::CString,
+    file: std::fs::File,
+    rel: String,
+}
+
+impl Source {
+    /// Remove the file through the directory that was opened, not by path.
+    fn unlink(&self) -> std::io::Result<()> {
+        use std::os::fd::AsRawFd;
+        // SAFETY: a valid directory fd and a NUL-terminated name.
+        if unsafe { libc::unlinkat(self.dir.as_raw_fd(), self.name.as_ptr(), 0) } == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
+    }
+}
+
+fn open_at(
+    dir: libc::c_int,
+    name: &std::ffi::CStr,
+    flags: libc::c_int,
+) -> std::io::Result<std::os::fd::OwnedFd> {
+    use std::os::fd::FromRawFd;
+    // SAFETY: openat with a NUL-terminated name; the fd is owned on success.
+    let fd = unsafe {
+        libc::openat(
+            dir,
+            name.as_ptr(),
+            flags | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) })
+    }
+}
+
 /// Check a relative path from the user and open the sandbox file it names.
-fn open_source(cfg: &RecoveryCfg, home: &Path, rel: &str) -> Result<(std::fs::File, String)> {
+fn open_source(cfg: &RecoveryCfg, home: &Path, rel: &str) -> Result<Source> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::ffi::OsStrExt;
     let rel = rel.trim_start_matches("./").to_string();
     let p = Path::new(&rel);
     if p.is_absolute() || !p.components().all(|c| matches!(c, Component::Normal(_))) {
@@ -493,18 +539,52 @@ fn open_source(cfg: &RecoveryCfg, home: &Path, rel: &str) -> Result<(std::fs::Fi
             cfg.folders.join(", ")
         );
     }
-    if !no_symlinks(home, p) {
-        bail!("'{rel}' goes through a symlink; only regular files are recovered");
+    let cstr = |s: &std::ffi::OsStr| std::ffi::CString::new(s.as_bytes()).context("bad file name");
+    let symlink =
+        || anyhow::anyhow!("'{rel}' goes through a symlink; only regular files are recovered");
+    let mut dir = open_at(
+        libc::AT_FDCWD,
+        &cstr(home.as_os_str())?,
+        libc::O_DIRECTORY | libc::O_RDONLY,
+    )
+    .with_context(|| format!("cannot open the sandbox home {}", home.display()))?;
+    let parts: Vec<_> = p
+        .components()
+        .map(|c| c.as_os_str().to_os_string())
+        .collect();
+    let (last, dirs) = parts.split_last().context("empty path")?;
+    for d in dirs {
+        dir = open_at(
+            dir.as_raw_fd(),
+            &cstr(d)?,
+            libc::O_DIRECTORY | libc::O_RDONLY,
+        )
+        .map_err(|e| {
+            if e.raw_os_error() == Some(libc::ELOOP) || e.raw_os_error() == Some(libc::ENOTDIR) {
+                symlink()
+            } else {
+                anyhow::Error::from(e).context(format!("cannot open {rel} in the sandbox"))
+            }
+        })?;
     }
-    let f = std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-        .open(home.join(p))
-        .with_context(|| format!("cannot open {rel} in the sandbox"))?;
-    if !f.metadata()?.is_file() {
+    let name = cstr(last)?;
+    let fd = open_at(dir.as_raw_fd(), &name, libc::O_RDONLY | libc::O_NONBLOCK).map_err(|e| {
+        if e.raw_os_error() == Some(libc::ELOOP) {
+            symlink()
+        } else {
+            anyhow::Error::from(e).context(format!("cannot open {rel} in the sandbox"))
+        }
+    })?;
+    let file = std::fs::File::from(fd);
+    if !file.metadata()?.is_file() {
         bail!("'{rel}' is not a regular file");
     }
-    Ok((f, rel))
+    Ok(Source {
+        dir,
+        name,
+        file,
+        rel,
+    })
 }
 
 /// The reason a destination is refused, or None.
@@ -627,7 +707,8 @@ pub fn recover(
     to: Option<&Path>,
     keep: bool,
 ) -> Result<Recovered> {
-    let (mut src, rel) = open_source(cfg, home, rel)?;
+    let src = open_source(cfg, home, rel)?;
+    let rel = src.rel.clone();
     let name = Path::new(&rel).file_name().context("no file name")?;
     let wanted = match to {
         Some(d) => d.join(name),
@@ -648,7 +729,9 @@ pub fn recover(
         );
     }
     let wanted = real_dir.join(wanted.file_name().context("no file name")?);
-    let mode = src.metadata()?.permissions().mode() & 0o777;
+    // Never recover execute or special bits: a file from the sandbox must not
+    // become a program that one click on the host runs.
+    let mode = src.file.metadata()?.permissions().mode() & 0o666;
     let mut n = 0;
     let (mut out, dest) = loop {
         let c = candidate(&wanted, n);
@@ -664,7 +747,7 @@ pub fn recover(
             Err(e) => return Err(e).with_context(|| format!("cannot create {}", c.display())),
         }
     };
-    let copied = std::io::copy(&mut src, &mut out)
+    let copied = std::io::copy(&mut &src.file, &mut out)
         .and_then(|_| out.flush())
         .and_then(|_| out.sync_all());
     if let Err(e) = copied {
@@ -672,7 +755,7 @@ pub fn recover(
         return Err(e).with_context(|| format!("cannot copy {rel} to {}", dest.display()));
     }
     if !keep {
-        std::fs::remove_file(home.join(&rel)).with_context(|| {
+        src.unlink().with_context(|| {
             format!(
                 "copied to {}, but cannot remove the sandbox copy",
                 dest.display()
@@ -688,9 +771,10 @@ pub fn recover(
 
 /// Delete one file from a recovery folder of the sandbox home.
 pub fn discard(cfg: &RecoveryCfg, home: &Path, rel: &str) -> Result<String> {
-    let (_f, rel) = open_source(cfg, home, rel)?;
-    std::fs::remove_file(home.join(&rel)).with_context(|| format!("cannot delete {rel}"))?;
-    Ok(rel)
+    let src = open_source(cfg, home, rel)?;
+    src.unlink()
+        .with_context(|| format!("cannot delete {}", src.rel))?;
+    Ok(src.rel)
 }
 
 #[cfg(test)]
