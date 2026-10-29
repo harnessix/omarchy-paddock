@@ -1574,6 +1574,64 @@ fn approver_cmd(env: &HostEnv, cmd: ApproverCmd) -> Result<i32> {
     }
 }
 
+/// Ask for a workspace folder with a desktop dialog: the recent projects, or
+/// any folder. None when the user cancels or zenity is not installed.
+fn pick_folder_gui(env: &HostEnv, name: &str) -> Option<PathBuf> {
+    let zenity = env.which("zenity")?;
+    let label = paddock::app::app_profile(env, name)
+        .ok()
+        .and_then(|p| p.app.map(|a| a.display_name))
+        .unwrap_or_else(|| name.to_string());
+    let title = format!("Open {label} in paddock");
+    const OTHER: &str = "Choose another folder…";
+    // Recent projects, shown with ~. Hidden folders (caches, test runs) stay out.
+    let mut projects: Vec<String> = Vec::new();
+    for r in state::recent(env) {
+        let Ok(rel) = r.project.strip_prefix(&env.home) else {
+            continue;
+        };
+        if rel
+            .components()
+            .any(|c| c.as_os_str().to_string_lossy().starts_with('.'))
+        {
+            continue;
+        }
+        let p = format!("~/{}", rel.display());
+        if !projects.contains(&p) {
+            projects.push(p);
+        }
+    }
+    let chosen = if projects.is_empty() {
+        OTHER.to_string()
+    } else {
+        let out = std::process::Command::new(&zenity)
+            .args(["--list", "--title", &title, "--width=640", "--height=420"])
+            .args(["--text", "The app sees only this folder."])
+            .args(["--column", "Project folder"])
+            .args(&projects)
+            .arg(OTHER)
+            .output()
+            .ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+    if chosen.is_empty() {
+        return None;
+    }
+    if chosen != OTHER {
+        return Some(env.expand(&chosen, &env.home));
+    }
+    let out = std::process::Command::new(&zenity)
+        .args(["--file-selection", "--directory", "--title", &title])
+        .arg(format!("--filename={}/", env.home.display()))
+        .output()
+        .ok()?;
+    let dir = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (out.status.success() && !dir.is_empty()).then(|| PathBuf::from(dir))
+}
+
 fn app_cmd(env: &HostEnv, cmd: AppCmd) -> Result<i32> {
     use paddock::app;
     match cmd {
@@ -1586,6 +1644,19 @@ fn app_cmd(env: &HostEnv, cmd: AppCmd) -> Result<i32> {
             auth,
             backend,
         } => {
+            let mut roots = roots;
+            // A launcher entry has no terminal to show "no workspace folders".
+            // Ask for a folder on the desktop instead.
+            if roots.is_empty()
+                && app::roots(env, &name, &[]).is_err()
+                && !std::io::IsTerminal::is_terminal(&std::io::stderr())
+            {
+                match pick_folder_gui(env, &name) {
+                    Some(dir) => roots.push(dir),
+                    None if env.which("zenity").is_some() => return Ok(0),
+                    None => {}
+                }
+            }
             let o = app::AppOptions {
                 name: name.clone(),
                 roots,
