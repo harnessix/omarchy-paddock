@@ -21,7 +21,7 @@ body:
     attributes:
       label: paddock version
       description: Output of `paddock --version`.
-      placeholder: paddock 0.1.2
+      placeholder: paddock 0.1.3
     validations:
       required: true
   - type: dropdown
