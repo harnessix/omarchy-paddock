@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Security: `toml_set` (for example Codex's project trust in `~/.codex/config.toml`) reads and writes the sandbox home through the no-follow file layer too. A symlink left in the home by an earlier run made paddock on the host create or change a file outside the home. Reported in the Omarchy plugin marketplace review.
+
 ## 0.1.4
 
 A security release. Update from every earlier version: a sandbox was able to make paddock on the host read or write files outside the sandbox through symlinks.
