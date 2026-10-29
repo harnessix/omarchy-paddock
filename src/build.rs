@@ -61,7 +61,7 @@ fn today() -> String {
     ymd(state::now())
 }
 
-fn ymd(unix: u64) -> String {
+pub(crate) fn ymd(unix: u64) -> String {
     let days = (unix / 86_400) as i64;
     // Civil date from days since 1970-01-01 (Howard Hinnant's algorithm).
     let z = days + 719_468;
@@ -259,6 +259,12 @@ pub fn build_with(env: &HostEnv, opts: &Options, harness: Harness) -> Result<Bui
         .parse()?;
     let id = state::new_id(&profile.name, &project);
     let home_src = state::sandbox_home(env, &profile.name, &auth, &home_key)?;
+    // For `paddock du` and `paddock gc`. The sandbox can rewrite it, so they
+    // read it as a hint only.
+    crate::storage::write_origin(
+        &home_src,
+        &crate::storage::Origin::new(&home_key, &profile.name, &auth, profile.app.is_some()),
+    )?;
     let mut spec = SandboxSpec::new(
         id,
         &profile.name,

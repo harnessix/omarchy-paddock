@@ -95,6 +95,36 @@ enum Cmd {
     },
     /// Stop a running sandbox.
     Stop { id: String },
+    /// Show the disk space of sandbox homes, images, worktrees and records.
+    #[command(after_help = DU_HELP)]
+    Du {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Remove paddock data that is no longer needed. A dry run unless --yes.
+    #[command(after_help = GC_HELP)]
+    Gc {
+        /// Remove the listed items. Without it, paddock only prints them.
+        #[arg(long, short = 'y')]
+        yes: bool,
+        /// Also homes whose project is gone or that were not used for --older-than days.
+        #[arg(long)]
+        homes: bool,
+        /// With --homes: the age in days of an unused home.
+        #[arg(long, value_name = "DAYS", default_value_t = paddock::storage::DEFAULT_OLDER_THAN)]
+        older_than: u64,
+        /// With --homes: also desktop app homes. Their login is lost.
+        #[arg(long)]
+        include_app_logins: bool,
+        /// Also paddock worktrees.
+        #[arg(long)]
+        worktrees: bool,
+        /// With --worktrees: also worktrees with unmerged commits or uncommitted changes.
+        #[arg(long)]
+        force: bool,
+        #[arg(long)]
+        json: bool,
+    },
     /// List the files a sandbox saved outside the project, and its project changes.
     #[command(after_help = FILES_HELP)]
     Files {
@@ -1170,6 +1200,27 @@ fn real_main() -> Result<i32> {
             Ok(0)
         }
         Cmd::Files { id, json } => files_cmd(&env, id.as_deref(), json),
+        Cmd::Du { json } => du_cmd(&env, json),
+        Cmd::Gc {
+            yes,
+            homes,
+            older_than,
+            include_app_logins,
+            worktrees,
+            force,
+            json,
+        } => gc_cmd(
+            &env,
+            &paddock::storage::GcOptions {
+                yes,
+                homes,
+                older_than_days: older_than,
+                include_app_logins,
+                worktrees,
+                force,
+            },
+            json,
+        ),
         Cmd::Recover {
             id,
             paths,
@@ -1299,6 +1350,109 @@ Recovery folders and ignore rules are set in [recovery] of ~/.config/paddock/con
 fn session_for(env: &HostEnv, id: &str) -> Result<paddock::recover::Session> {
     paddock::recover::Session::load(env, id)
         .ok_or_else(|| anyhow::anyhow!("no sandbox with id {id}; `paddock files` lists them"))
+}
+
+const DU_HELP: &str = "On btrfs, sizes are exclusive bytes from `btrfs filesystem du`: data that \
+another file shares (reflinks, snapshots) does not count. On other file systems, sizes are \
+allocated bytes, as `du` counts them. The header names the kind.";
+
+const GC_HELP: &str = "Without --yes, paddock gc only prints what it would remove.
+
+--yes alone removes: paddock images that are not current and that no container uses, keyring
+passwords whose home is gone, session records that ended more than 30 days ago, homes of
+harnesses whose profile no longer exists, and old shared caches (mise-installs). paddock also does this after it builds a new image
+(PADDOCK_GC_AFTER_BUILD=0 turns that off).
+
+--homes adds homes whose project is gone or that were not used for --older-than days (90).
+A desktop app keeps its login in its home: those homes also need --include-app-logins.
+--worktrees adds paddock worktrees. A worktree with unmerged commits or uncommitted changes
+also needs --force, and paddock keeps its branch.
+
+paddock never removes the home or worktree of a running sandbox, and never deletes outside
+its own directories or through a symlink.
+
+Examples:
+  paddock gc                      what --yes would remove
+  paddock gc --homes --older-than 30
+  paddock gc --yes";
+
+fn du_cmd(env: &HostEnv, json: bool) -> Result<i32> {
+    use paddock::storage;
+    let containers = storage::RealContainers(env);
+    let host = storage::Host::real(env, &containers);
+    let inv = storage::scan(env, &host, true);
+    if json {
+        let mut v = serde_json::to_value(&inv)?;
+        v["api_version"] = "paddock.du/v1".into();
+        println!("{}", serde_json::to_string_pretty(&v)?);
+    } else {
+        print!("{}", storage::render_du(env, &inv, state::now()));
+    }
+    Ok(0)
+}
+
+fn gc_cmd(env: &HostEnv, o: &paddock::storage::GcOptions, json: bool) -> Result<i32> {
+    use paddock::storage;
+    let containers = storage::RealContainers(env);
+    let host = storage::Host::real(env, &containers);
+    let mut inv = storage::scan(env, &host, false);
+    let mut items = storage::plan(&inv, o, state::now());
+    storage::measure_plan(&mut inv, &mut items);
+    let removed = if o.yes {
+        storage::apply(env, &containers, &items)
+    } else {
+        vec![]
+    };
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "api_version": "paddock.gc/v1",
+                "dry_run": !o.yes,
+                "items": items,
+                "removed": removed,
+                "notes": inv.notes,
+            }))?
+        );
+        return Ok(i32::from(removed.iter().any(|r| r.error.is_some())));
+    }
+    for n in &inv.notes {
+        eprintln!("paddock: {n}");
+    }
+    if !o.yes {
+        print!("{}", storage::render_plan(&items, false));
+        return Ok(0);
+    }
+    let mut freed = 0;
+    let mut failed = false;
+    for r in &removed {
+        match &r.error {
+            None => {
+                freed += r.bytes;
+                let note = r
+                    .note
+                    .as_ref()
+                    .map(|n| format!(", {n}"))
+                    .unwrap_or_default();
+                println!("removed {} ({}{note})", r.what, storage::human(r.bytes));
+            }
+            Some(e) => {
+                failed = true;
+                eprintln!("paddock: cannot remove {}: {e}", r.what);
+            }
+        }
+    }
+    let left: Vec<_> = items.iter().filter(|i| !i.selected()).collect();
+    for i in &left {
+        println!(
+            "kept {} ({}): needs {}",
+            i.what,
+            storage::human(i.bytes),
+            i.needs.join(" ")
+        );
+    }
+    println!("paddock gc: freed {}.", storage::human(freed));
+    Ok(i32::from(failed))
 }
 
 fn files_cmd(env: &HostEnv, id: Option<&str>, json: bool) -> Result<i32> {
