@@ -137,18 +137,43 @@ fn copy_private(from: &Path, to: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Write bytes to a host path that only the host can write, atomically.
+fn write_private(bytes: &[u8], to: &Path) -> Result<()> {
+    if let Some(dir) = to.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let tmp = to.with_extension("paddock-tmp");
+    std::fs::write(&tmp, bytes).with_context(|| format!("write {}", tmp.display()))?;
+    std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
+    std::fs::rename(&tmp, to)?;
+    Ok(())
+}
+
 struct AuthItem {
     stored: PathBuf,
-    inside: PathBuf,
+    /// Relative to the sandbox home, which the sandbox can write.
+    rel: PathBuf,
     inside_at_start: Option<String>,
     stored_at_start: Option<String>,
 }
 
 /// Credentials are copied, not bind-mounted: harnesses replace token files
 /// with a rename, which a single-file bind mount does not survive.
+///
+/// The sandbox home is sandbox-controlled: every access to it goes through
+/// `safefs`, so a symlink planted there is never followed by the host.
 pub struct AuthSync {
     pub mode: AuthMode,
+    home: PathBuf,
     items: Vec<AuthItem>,
+}
+
+/// The hash of a credential file inside the sandbox home. A symlink or a
+/// special file in its place is an error, never followed.
+fn inside_hash(root: &crate::safefs::Root, rel: &Path) -> Result<Option<String>> {
+    Ok(root
+        .read(rel, crate::safefs::MAX_READ)?
+        .map(|b| hex(&Sha256::digest(&b))))
 }
 
 pub struct SyncResult {
@@ -165,25 +190,30 @@ impl AuthSync {
         home_src: &Path,
     ) -> Result<Self> {
         let root = auth_root(env, &profile.name, mode);
+        let home = crate::safefs::Root::open(home_src)?;
         let mut items = Vec::new();
         for rel in &profile.state.auth {
             let stored = root.join(rel);
-            let inside = home_src.join(rel);
+            let rel = PathBuf::from(rel);
             if stored.is_file() {
-                copy_private(&stored, &inside)?;
-            } else if inside.is_file() && *mode == AuthMode::Shared {
+                let bytes = std::fs::read(&stored)
+                    .with_context(|| format!("cannot read {}", stored.display()))?;
+                home.write(&rel, &bytes, 0o600)
+                    .with_context(|| format!("credential {}", rel.display()))?;
+            } else if *mode == AuthMode::Shared {
                 // The host is logged out: do not keep an older login inside.
-                std::fs::remove_file(&inside)?;
+                home.remove(&rel)?;
             }
             items.push(AuthItem {
-                inside_at_start: file_hash(&inside),
+                inside_at_start: inside_hash(&home, &rel)?,
                 stored_at_start: file_hash(&stored),
                 stored,
-                inside,
+                rel,
             });
         }
         Ok(Self {
             mode: mode.clone(),
+            home: home_src.to_path_buf(),
             items,
         })
     }
@@ -196,19 +226,27 @@ impl AuthSync {
             saved: vec![],
             conflicts: vec![],
         };
+        let home = crate::safefs::Root::open(&self.home)?;
         for it in &self.items {
-            let now = file_hash(&it.inside);
-            if now.is_none() || now == it.inside_at_start {
+            // A symlink or special file in place of a credential is refused:
+            // reading through it would copy a host file into the store.
+            let bytes = match home.read(&it.rel, crate::safefs::MAX_READ) {
+                Ok(Some(b)) => b,
+                Ok(None) => continue,
+                Err(e) => {
+                    log::warn!("not saving the credential {}: {e:#}", it.rel.display());
+                    continue;
+                }
+            };
+            let now = Some(hex(&Sha256::digest(&bytes)));
+            if now == it.inside_at_start {
                 continue;
             }
             if file_hash(&it.stored) != it.stored_at_start {
                 r.conflicts.push(it.stored.clone());
                 continue;
             }
-            if let Some(dir) = it.stored.parent() {
-                std::fs::create_dir_all(dir)?;
-            }
-            copy_private(&it.inside, &it.stored)?;
+            write_private(&bytes, &it.stored)?;
             r.saved.push(it.stored.clone());
         }
         Ok(r)
@@ -235,32 +273,14 @@ pub fn auth_import(env: &HostEnv, profile: &Profile, mode: &AuthMode) -> Result<
     Ok(done)
 }
 
-pub fn copy_tree(from: &Path, to: &Path) -> Result<()> {
-    let meta = std::fs::symlink_metadata(from)?;
-    if meta.is_dir() {
-        std::fs::create_dir_all(to)?;
-        for e in std::fs::read_dir(from)? {
-            let e = e?;
-            copy_tree(&e.path(), &to.join(e.file_name()))?;
-        }
-    } else if meta.is_file() {
-        if let Some(d) = to.parent() {
-            std::fs::create_dir_all(d)?;
-        }
-        // A read-only leftover, such as an old bind-mount point, cannot be
-        // overwritten in place.
-        let _ = std::fs::remove_file(to);
-        std::fs::copy(from, to)?;
-    }
-    Ok(())
-}
-
 /// Copy `seed` paths from the host home into the sandbox home.
 pub fn seed(env: &HostEnv, profile: &Profile, home_src: &Path) -> Result<()> {
+    let home = crate::safefs::Root::open(home_src)?;
     for rel in &profile.state.seed {
         let host = env.home.join(rel);
         if host.exists() {
-            copy_tree(&host, &home_src.join(rel)).with_context(|| format!("seed {rel}"))?;
+            home.copy_in(&host, Path::new(rel))
+                .with_context(|| format!("seed {rel}"))?;
         }
     }
     Ok(())
@@ -310,10 +330,13 @@ pub fn json_import(
         else {
             continue;
         };
-        let inside_file = home_src.join(&ji.file);
-        let mut inside: serde_json::Value = std::fs::read_to_string(&inside_file)
+        let home = crate::safefs::Root::open(home_src)?;
+        let rel = Path::new(&ji.file);
+        let mut inside: serde_json::Value = home
+            .read(rel, crate::safefs::MAX_READ)
             .ok()
-            .and_then(|t| serde_json::from_str(&t).ok())
+            .flatten()
+            .and_then(|b| serde_json::from_slice(&b).ok())
             .unwrap_or_else(|| serde_json::json!({}));
         let mut keys: Vec<&Vec<String>> = ji.keys.iter().collect();
         if *mode == AuthMode::Shared {
@@ -325,11 +348,11 @@ pub fn json_import(
                 json_set(&mut inside, &k, v.clone());
             }
         }
-        if let Some(d) = inside_file.parent() {
-            std::fs::create_dir_all(d)?;
-        }
-        std::fs::write(&inside_file, serde_json::to_string_pretty(&inside)?)?;
-        std::fs::set_permissions(&inside_file, std::fs::Permissions::from_mode(0o600))?;
+        home.write(
+            rel,
+            serde_json::to_string_pretty(&inside)?.as_bytes(),
+            0o600,
+        )?;
     }
     Ok(())
 }
@@ -352,7 +375,7 @@ pub fn write_gitconfig(
     }
     text.push_str("[init]\n\tdefaultBranch = main\n");
     text.push_str(&crate::broker::git::sandbox_gitconfig(repo));
-    std::fs::write(home_src.join(".gitconfig"), text)?;
+    crate::safefs::Root::open(home_src)?.write(Path::new(".gitconfig"), text.as_bytes(), 0o644)?;
     Ok(())
 }
 
@@ -622,5 +645,78 @@ mod toml_set_tests {
         );
         assert_eq!(v["mcp_servers"]["a"]["command"].as_str(), Some("a"));
         assert!(text.starts_with("# mine"));
+    }
+}
+
+#[cfg(test)]
+mod auth_sync_tests {
+    use super::*;
+    use std::collections::BTreeMap;
+    use std::os::unix::fs::symlink;
+
+    fn setup() -> (tempfile::TempDir, HostEnv, Profile, PathBuf, PathBuf) {
+        let t = tempfile::tempdir().unwrap();
+        let host_home = t.path().join("host");
+        let sandbox_home = t.path().join("sandbox");
+        std::fs::create_dir_all(host_home.join(".tool")).unwrap();
+        std::fs::create_dir_all(&sandbox_home).unwrap();
+        let env = HostEnv::from_parts(host_home.clone(), "demo".into(), 1, 1, BTreeMap::new());
+        let p: Profile =
+            toml::from_str("name = \"t\"\n[state]\nauth = [\".tool/token\"]\n").unwrap();
+        (t, env, p, host_home, sandbox_home)
+    }
+
+    #[test]
+    fn copy_out_refuses_a_symlinked_credential() {
+        let (t, env, p, host_home, sb) = setup();
+        std::fs::write(host_home.join(".tool/token"), "old").unwrap();
+        let secret = t.path().join("id_key");
+        std::fs::write(&secret, "PRIVATE KEY").unwrap();
+        let sync = AuthSync::copy_in(&env, &p, &AuthMode::Shared, &sb).unwrap();
+        // The sandbox swaps its token for a link to a host file.
+        std::fs::remove_file(sb.join(".tool/token")).unwrap();
+        symlink(&secret, sb.join(".tool/token")).unwrap();
+        let r = sync.copy_out().unwrap();
+        assert!(r.saved.is_empty());
+        assert_eq!(
+            std::fs::read_to_string(host_home.join(".tool/token")).unwrap(),
+            "old"
+        );
+    }
+
+    #[test]
+    fn copy_in_never_writes_through_a_planted_link() {
+        let (t, env, p, host_home, sb) = setup();
+        std::fs::write(host_home.join(".tool/token"), "tok").unwrap();
+        let victim = t.path().join("victim");
+        std::fs::create_dir_all(&victim).unwrap();
+        // A previous run left `.tool` as a link to a host folder.
+        symlink(&victim, sb.join(".tool")).unwrap();
+        assert!(AuthSync::copy_in(&env, &p, &AuthMode::Shared, &sb).is_err());
+        assert!(!victim.join("token").exists());
+        // A file link is replaced, not written through.
+        std::fs::remove_file(sb.join(".tool")).unwrap();
+        std::fs::create_dir_all(sb.join(".tool")).unwrap();
+        std::fs::write(victim.join("f"), "keep").unwrap();
+        symlink(victim.join("f"), sb.join(".tool/token")).unwrap();
+        AuthSync::copy_in(&env, &p, &AuthMode::Shared, &sb).unwrap();
+        assert_eq!(std::fs::read_to_string(victim.join("f")).unwrap(), "keep");
+        assert_eq!(
+            std::fs::read_to_string(sb.join(".tool/token")).unwrap(),
+            "tok"
+        );
+    }
+
+    #[test]
+    fn gitconfig_replaces_a_link() {
+        let (t, env, _p, _h, sb) = setup();
+        let victim = t.path().join("bashrc");
+        std::fs::write(&victim, "keep").unwrap();
+        symlink(&victim, sb.join(".gitconfig")).unwrap();
+        write_gitconfig(&env, &sb, None).unwrap();
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "keep");
+        assert!(std::fs::read_to_string(sb.join(".gitconfig"))
+            .unwrap()
+            .contains("[init]"));
     }
 }

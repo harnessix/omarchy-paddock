@@ -25,6 +25,7 @@ pub mod proxy;
 pub mod recover;
 pub mod report;
 pub mod run;
+pub mod safefs;
 pub mod shims;
 pub mod spec;
 pub mod state;

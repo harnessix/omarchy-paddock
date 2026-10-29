@@ -660,15 +660,17 @@ fn safe_name(raw: &str, fallback: &str) -> String {
     }
 }
 
-fn inbox(project: &Path) -> Result<PathBuf> {
-    let dir = project.join(INBOX);
-    std::fs::create_dir_all(&dir)?;
-    // Keep results out of commits.
-    let ignore = project.join(".paddock/.gitignore");
-    if !ignore.exists() {
-        std::fs::write(ignore, "*\n")?;
+/// The inbox in the project. The project is sandbox-writable, so the folder
+/// is opened one step at a time without following symlinks, and every result
+/// is written through it (see safefs).
+fn inbox(project: &Path) -> Result<crate::safefs::Dir> {
+    let root = crate::safefs::Root::open(project)?;
+    let dot = root.dir(Path::new(".paddock"), true)?;
+    // Keep results out of commits. An existing entry, whatever it is, stays.
+    if let Ok(mut f) = dot.create_new(std::ffi::OsStr::new(".gitignore"), 0o644) {
+        f.write_all(b"*\n")?;
     }
-    Ok(dir)
+    dot.subdir(std::ffi::OsStr::new("inbox"), true)
 }
 
 fn run_capture(cmd: &mut Command, timeout: Duration) -> Result<(i32, String, String)> {
@@ -725,7 +727,6 @@ fn perform(env: &HostEnv, ctx: &Context, req: &Request, work: &Work) -> Result<s
                 arg_str(req, "out").unwrap_or(""),
                 &format!("screenshot-{}.png", state::now()),
             );
-            let out = dir.join(&name);
             let mut cmd = Command::new(grim);
             match arg_str(req, "target").unwrap_or("screen") {
                 "screen" => {}
@@ -737,12 +738,19 @@ fn perform(env: &HostEnv, ctx: &Context, req: &Request, work: &Work) -> Result<s
                     cmd.args(["-o", t.trim_start_matches("output:")]);
                 }
             }
-            cmd.arg(&out);
-            let (code, _, err) = run_capture(&mut cmd, Duration::from_secs(20))?;
-            if code != 0 {
-                bail!("grim failed: {}", err.trim());
+            // grim writes the PNG to stdout; paddock writes the file through
+            // the inbox folder it opened, so grim never resolves a project path.
+            cmd.arg("-");
+            let out = cmd.stdin(Stdio::null()).stderr(Stdio::piped()).output()?;
+            if !out.status.success() {
+                bail!(
+                    "grim failed: {}",
+                    String::from_utf8_lossy(&out.stderr).trim()
+                );
             }
-            Ok(serde_json::json!({ "path": out }))
+            let (mut f, name) = dir.new_file(&name, 0o644)?;
+            f.write_all(&out.stdout)?;
+            Ok(serde_json::json!({ "path": dir.path().join(name) }))
         }
         "exec" => {
             let a = argv(req);
@@ -769,11 +777,19 @@ fn perform(env: &HostEnv, ctx: &Context, req: &Request, work: &Work) -> Result<s
                 );
             }
             let dir = inbox(&ctx.project)?;
-            let dst = dir.join(safe_name(&src.to_string_lossy(), "fetched"));
-            let _ = std::fs::remove_dir_all(&dst);
-            let _ = std::fs::remove_file(&dst);
-            copy_tree(&src, &dst)?;
-            Ok(serde_json::json!({ "path": dst, "bytes": size }))
+            let want = safe_name(&src.to_string_lossy(), "fetched");
+            // Never remove what is there: a free name instead.
+            let name = if std::fs::symlink_metadata(&src)?.is_dir() {
+                let (d, name) = dir.new_subdir(&want)?;
+                d.copy_tree_in(&src)?;
+                name
+            } else {
+                let (mut f, name) = dir.new_file(&want, 0o644)?;
+                let mut s = std::fs::File::open(&src)?;
+                std::io::copy(&mut s, &mut f)?;
+                name
+            };
+            Ok(serde_json::json!({ "path": dir.path().join(name), "bytes": size }))
         }
         "clipboard-read" => {
             let wp = env
@@ -861,21 +877,6 @@ fn tree_size(p: &Path) -> Result<u64> {
     } else {
         Ok(m.len())
     }
-}
-
-fn copy_tree(from: &Path, to: &Path) -> Result<()> {
-    let m = std::fs::symlink_metadata(from)?;
-    if m.is_dir() {
-        std::fs::create_dir_all(to)?;
-        for e in std::fs::read_dir(from)? {
-            let e = e?;
-            copy_tree(&e.path(), &to.join(e.file_name()))?;
-        }
-    } else if m.is_file() {
-        std::fs::copy(from, to)?;
-    }
-    // Symlinks are skipped: a link could point anywhere on the host.
-    Ok(())
 }
 
 /// The work behind a request, worked out before the user is asked.

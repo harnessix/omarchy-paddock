@@ -263,9 +263,11 @@ impl Backend for Srt {
                 continue;
             }
             let rel = m.dst.strip_prefix(&env.home)?;
-            let _ = crate::state::copy_tree(src, &spec.home_src.join(rel));
+            // The sandbox home is sandbox-controlled: copy without following
+            // anything that a sandbox planted there.
+            let _ = crate::safefs::Root::open(&spec.home_src)?.copy_in(src, rel);
         }
-        std::fs::create_dir_all(spec.home_src.join(".paddock-run"))?;
+        crate::safefs::Root::open(&spec.home_src)?.dir(Path::new(".paddock-run"), true)?;
         Ok(())
     }
 
