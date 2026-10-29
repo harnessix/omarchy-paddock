@@ -223,7 +223,21 @@ pub fn report(env: &HostEnv) -> Result<bool> {
 
     println!("\nShell commands:");
     if crate::shims::installed(env) {
-        println!("  on       typing a harness command starts it in a sandbox (paddock shims remove turns this off)");
+        let cmds = crate::shims::active(env);
+        let home = env.home.display().to_string();
+        let rcs: Vec<String> = crate::shims::loaded_from(env)
+            .iter()
+            .map(|p| p.display().to_string().replacen(&home, "~", 1))
+            .collect();
+        println!(
+            "  on       these commands start in a sandbox: {}",
+            cmds.join(", ")
+        );
+        println!("           loaded by one line in {}", rcs.join(" and "));
+        if let Some(c) = cmds.iter().find(|c| *c == "claude").or(cmds.first()) {
+            println!("           run one without the sandbox: PADDOCK_BYPASS=1 {c}");
+        }
+        println!("           turn all of them off: paddock shims remove");
     } else {
         println!("  off      harness commands run without a sandbox; paddock shims install makes the sandbox the default");
     }

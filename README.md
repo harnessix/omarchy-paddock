@@ -372,7 +372,7 @@ An agent reads files with the same commands that you use. One wrong `grep -r` or
 
 ```sh
 paddock shims install    # claude, codex, copilot and the others now start in a sandbox
-paddock shims list       # the commands it covers, and whether they are on
+paddock shims list       # each command, and whether it is on
 paddock shims remove     # takes everything away again
 ```
 
@@ -382,6 +382,7 @@ After `install`, typing `claude` in a new shell runs `paddock run claude` in the
 - In your home directory, the command stops with an error, because paddock does not use the home directory as a project. Go to a project first.
 - Shell functions win over PATH, so version managers such as mise do not bypass them. Scripts and programs that start `claude` themselves are not covered: only interactive bash and zsh shells.
 - If paddock or the script is gone, each function runs the real program, and the line in the rc file does nothing.
+- `paddock doctor` lists the commands that start in a sandbox, the rc file that loads them, and how to turn them off. Each run also prints a `paddock:` line with the sandbox it started, so you always see when a shim takes over.
 
 ## Launchers
 

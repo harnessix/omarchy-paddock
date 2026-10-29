@@ -151,6 +151,28 @@ pub fn remove(env: &HostEnv) -> Result<Vec<PathBuf>> {
     Ok(removed)
 }
 
+/// The commands that the installed script takes over, in its order.
+pub fn active(env: &HostEnv) -> Vec<String> {
+    std::fs::read_to_string(script_file(env))
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|l| l.strip_suffix("() {"))
+        .map(str::to_string)
+        .collect()
+}
+
+/// The rc files that load the script.
+pub fn loaded_from(env: &HostEnv) -> Vec<PathBuf> {
+    rc_files(env)
+        .into_iter()
+        .filter(|rc| {
+            std::fs::read_to_string(rc)
+                .map(|t| t.contains(MARK))
+                .unwrap_or(false)
+        })
+        .collect()
+}
+
 /// Whether the shims are on: the script exists and an rc file sources it.
 pub fn installed(env: &HostEnv) -> bool {
     script_file(env).is_file()
