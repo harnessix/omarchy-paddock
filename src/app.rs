@@ -214,6 +214,9 @@ pub struct AppOptions {
     pub args: Vec<String>,
     /// bwrap (default), docker, podman or srt. Flatpak apps need bwrap.
     pub backend: Option<String>,
+    /// Open the first workspace folder in a new git worktree. `[apps.NAME]
+    /// worktree` turns it on too.
+    pub worktree: bool,
 }
 
 pub fn app_profile(env: &HostEnv, name: &str) -> Result<Profile> {
@@ -294,7 +297,19 @@ pub fn run(env: &HostEnv, o: &AppOptions) -> Result<i32> {
     let roots = roots(env, &o.name, &o.roots)?;
     let user = Manifest::load(env, &env.home.join(".paddock-no-project"))?.merged;
     let gpu = o.gpu || user.apps.get(&o.name).and_then(|a| a.gpu).unwrap_or(false);
+    let worktree = o.worktree
+        || user
+            .apps
+            .get(&o.name)
+            .and_then(|a| a.worktree)
+            .unwrap_or(false);
     if let Some(id) = profile.app.as_ref().and_then(|a| a.flatpak.clone()) {
+        if worktree {
+            bail!(
+                "{} is a flatpak app: worktrees work only for apps that paddock sandboxes itself",
+                o.name
+            );
+        }
         if o.backend.as_deref().is_some_and(|b| b != "bwrap") {
             bail!("{} is a flatpak app: flatpak runs its own bubblewrap sandbox, so it needs the bwrap backend", o.name);
         }
@@ -311,13 +326,45 @@ pub fn run(env: &HostEnv, o: &AppOptions) -> Result<i32> {
         inherit_env: o.inherit_env,
         auth: o.auth.clone(),
         args: app_args(&profile, &roots, &o.args),
+        worktree,
+        worktree_app: Some(o.name.clone()),
         ..Default::default()
     };
     let mut built = build::build(env, &opts)?;
     add_roots(env, &mut built.spec, &built.manifest, &roots[1..])?;
     crate::policy::enforce(env, &built.spec)?;
     let backend = crate::run::select_backend(env, &built)?;
-    Ok(crate::run::run(env, built, backend.as_ref(), false, false)?.code)
+    let wt = built.worktree.clone();
+    let code = crate::run::run(env, built, backend.as_ref(), false, false)?.code;
+    if let Some(w) = wt {
+        report_worktree(env, &o.name, &w);
+    }
+    Ok(code)
+}
+
+/// After the app exits: print what it left in its worktree, and send a
+/// notification when no terminal shows the text (a launcher start).
+fn report_worktree(env: &HostEnv, name: &str, w: &build::Worktree) {
+    eprintln!("\n{}", build::worktree_report(w));
+    if std::io::IsTerminal::is_terminal(&std::io::stderr()) {
+        return;
+    }
+    let Some(ns) = env.which("notify-send") else {
+        return;
+    };
+    let (commits, changed) = build::worktree_counts(w);
+    let _ = std::process::Command::new(ns)
+        .args([
+            "--app-name=paddock",
+            &format!("{name} worked on branch {}", w.branch),
+            &format!(
+                "{commits} commits and {changed} uncommitted changes in {}. Review: git -C {} log {}",
+                w.path.display(),
+                w.repo.display(),
+                w.branch
+            ),
+        ])
+        .status();
 }
 
 /// Flatpak apps run in flatpak's own sandbox, with every permission the app
@@ -547,6 +594,7 @@ pub fn open(env: &HostEnv, name: &str, link: &str) -> Result<i32> {
             auth: None,
             args: vec![link.to_string()],
             backend: None,
+            worktree: false,
         },
     )
 }
