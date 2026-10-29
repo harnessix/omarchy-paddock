@@ -227,7 +227,13 @@ pub fn run(
         auth: built.auth.to_string(),
         window_pid: _compositor.as_ref().map(|c| c.pid()),
         // Short lines for the bar panel, which shows the first one.
-        warnings: if spec.env.contains_key("PADDOCK_INBOUND_PORTS") {
+        // Only `login_ports = true` opens every port. The filtered login
+        // callback (one approved port, ten minutes) is not worth a warning.
+        warnings: if spec
+            .warnings
+            .iter()
+            .any(|w| w.starts_with("login_ports is on"))
+        {
             vec!["login ports open on 127.0.0.1".to_string()]
         } else {
             Vec::new()
