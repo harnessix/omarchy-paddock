@@ -297,10 +297,10 @@ mod tests {
 
     fn r() -> Redactor {
         let vars = BTreeMap::from([
-            ("HOME".to_string(), "/home/alice".to_string()),
+            ("HOME".to_string(), "/home/demo".to_string()),
             (
                 "PATH".to_string(),
-                "/usr/bin:/home/alice/.local/bin".to_string(),
+                "/usr/bin:/home/demo/.local/bin".to_string(),
             ),
             (
                 "ANTHROPIC_API_KEY".to_string(),
@@ -310,13 +310,13 @@ mod tests {
             ("EGL_PLATFORM".to_string(), "wayland".to_string()),
             ("SHORT".to_string(), "ab".to_string()),
         ]);
-        Redactor::new("/home/alice", "alice", "alicebox", &vars)
+        Redactor::new("/home/demo", "alice", "alicebox", &vars)
     }
 
     #[test]
     fn removes_home_user_host_env_values_and_tokens() {
         let text = "\
-project /home/alice/src/app on alicebox for alice
+project /home/demo/src/app on alicebox for alice
 key abc123-secret-value and a-long-plain-value, Xwayland
 token ghp_0123456789abcdefghijABCDEF here
 OPENAI_API_KEY=sk-live-anything
@@ -327,7 +327,7 @@ alicealice stays, PATH /usr/bin:~/.local/bin
 ";
         let out = r().redact(text);
         for leak in [
-            "/home/alice",
+            "/home/demo",
             "alicebox",
             " alice\n",
             "abc123-secret-value",
