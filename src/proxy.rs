@@ -543,9 +543,14 @@ pub fn serve(socket: &Path, cfg: HostProxy) -> Result<()> {
     let listener = UnixListener::bind(socket)
         .with_context(|| format!("cannot listen on {}", socket.display()))?;
     let active = Arc::new(AtomicUsize::new(0));
+    log::debug!("proxy listening on {}", socket.display());
     std::thread::spawn(move || {
         for mut conn in listener.incoming().flatten() {
             if active.load(Ordering::SeqCst) >= cfg.max_conns {
+                log::warn!(
+                    "proxy: {} connections are open, refusing a new one",
+                    cfg.max_conns
+                );
                 respond(&mut conn, 503, "Service Unavailable");
                 continue;
             }
@@ -553,7 +558,9 @@ pub fn serve(socket: &Path, cfg: HostProxy) -> Result<()> {
             let cfg = cfg.clone();
             let active = active.clone();
             std::thread::spawn(move || {
-                let _ = handle(&cfg, conn);
+                if let Err(e) = handle(&cfg, conn) {
+                    log::debug!("proxy request failed: {e:#}");
+                }
                 active.fetch_sub(1, Ordering::SeqCst);
             });
         }

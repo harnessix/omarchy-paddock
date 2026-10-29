@@ -377,6 +377,17 @@ Some profile entries come from documentation, not from a test on a real install.
 
 On rootful docker, an escape from the container is an escape to root. Use the bwrap backend or rootless podman when you can.
 
+## Logs and bug reports
+
+paddock prints warnings and errors to the terminal. Other messages stay hidden.
+
+- `-v` shows more: `-v` adds info, `-vv` debug, `-vvv` trace. `-q` shows errors only.
+- `PADDOCK_LOG` sets the level too. `PADDOCK_LOG=debug` applies to everything. `PADDOCK_LOG=broker=debug,proxy=trace` applies to single parts.
+- The parts that run for the whole session also write to the systemd journal, under the name `paddock`. These are the host request broker, the proxy, the login callback forwarder and the window border. Read the warnings with `journalctl -t paddock -p warning`. Without systemd, paddock skips the journal.
+- The bar plugin is silent. It writes a warning to the shell log when it cannot read paddock's output. To see more, start the shell with `PADDOCK_DEBUG=true`. Read the shell log with `journalctl -t omarchy-shell`.
+
+To report a bug, run `paddock doctor --report`. It prints the version, the `paddock doctor` output, the running sandboxes and recent paddock warnings from the journal. `--output FILE` writes it to a file. The report replaces your user name, host name, home path, variable values and tokens with placeholders. Read it before you share it.
+
 ## Support scope
 
 paddock is built and tested on Omarchy: Arch Linux with Hyprland. That is the supported platform. Every release passes `bin/test` and `paddock doctor --escape` there.
@@ -384,7 +395,7 @@ paddock is built and tested on Omarchy: Arch Linux with Hyprland. That is the su
 - Other distributions and compositors are maintained by the community. The bwrap backend, the network isolation and the terminal harnesses work wherever bubblewrap, passt and user namespaces work, but nobody tests each release on them. The apt and dnf paths in `bin/install` are best effort.
 - Window focus and the border on protected app windows need Hyprland. The bar widget and the approval card need Omarchy.
 - Pull requests for other platforms are welcome when they meet the bar in [CONTRIBUTING.md](CONTRIBUTING.md). Issues about platforms outside Omarchy can be closed without a fix.
-- Every issue needs the output of `paddock doctor`. The issue form asks for it.
+- Every issue needs the output of `paddock doctor --report`. The issue form asks for it.
 
 ## Development
 

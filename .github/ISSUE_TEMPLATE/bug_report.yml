@@ -7,12 +7,12 @@ body:
       value: |
         paddock supports Omarchy (Arch Linux with Hyprland). On other platforms, an issue can be closed without a fix; a pull request that meets CONTRIBUTING.md is welcome instead.
 
-        A report without the full output of `paddock doctor` is closed.
+        A report without the full output of `paddock doctor --report` is closed.
   - type: textarea
     id: doctor
     attributes:
-      label: Output of `paddock doctor`
-      description: Run `paddock doctor` and paste all of its output. Remove nothing except what you consider private, and say what you removed.
+      label: Output of `paddock doctor --report`
+      description: Run `paddock doctor --report` and paste all of its output. It replaces your user name, host name, paths, variable values and tokens. Read it, remove anything else you consider private, and say what you removed. If your paddock has no `--report`, paste the output of `paddock doctor`.
       render: text
     validations:
       required: true

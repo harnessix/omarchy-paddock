@@ -202,7 +202,7 @@ pub fn run(
             eprintln!("paddock: {n}");
         }
         for w in &spec.warnings {
-            eprintln!("paddock: warning: {w}");
+            log::warn!("{w}");
         }
     }
 
