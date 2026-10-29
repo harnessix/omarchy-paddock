@@ -57,7 +57,8 @@ fn forbidden() -> Vec<(String, String)> {
     }
     if let Ok(o) = Command::new("git").args(["config", "user.email"]).output() {
         let email = String::from_utf8_lossy(&o.stdout).trim().to_string();
-        if email.contains('@') {
+        // A noreply address is public by design, and the leak guard names some.
+        if email.contains('@') && !email.contains("noreply") {
             v.push(("git email".into(), email));
         }
     }
