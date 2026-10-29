@@ -229,3 +229,41 @@ fn sessions_persist_and_report_project_changes() {
     assert!(Session::load(&env, "../x").is_none());
     assert_eq!(Session::latest_per_home(&env).len(), 1);
 }
+
+#[test]
+fn symlinked_folders_never_reach_host_files() {
+    let (tmp, env, sb) = setup();
+    let cfg = RecoveryCfg::default();
+    // The sandbox turns a recovery folder into a link to a host folder.
+    let secret = tmp.path().join("host-ssh");
+    write(&secret.join("id_key"), "secret");
+    symlink(&secret, sb.join("Downloads")).unwrap();
+    assert!(discard(&cfg, &sb, "Downloads/id_key").is_err());
+    assert!(recover(&env, &cfg, &sb, "Downloads/id_key", None, false).is_err());
+    assert_eq!(
+        std::fs::read_to_string(secret.join("id_key")).unwrap(),
+        "secret"
+    );
+    // The same one level deeper.
+    std::fs::create_dir_all(sb.join("Documents")).unwrap();
+    symlink(&secret, sb.join("Documents/sub")).unwrap();
+    assert!(discard(&cfg, &sb, "Documents/sub/id_key").is_err());
+    assert!(secret.join("id_key").exists());
+}
+
+#[test]
+fn recovered_files_are_not_executable() {
+    let (_tmp, env, sb) = setup();
+    let cfg = RecoveryCfg::default();
+    write(&sb.join("Desktop/run.sh"), "#!/bin/sh\n");
+    std::fs::set_permissions(
+        sb.join("Desktop/run.sh"),
+        std::fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+    let r = recover(&env, &cfg, &sb, "Desktop/run.sh", None, false).unwrap();
+    assert_eq!(
+        std::fs::metadata(&r.to).unwrap().permissions().mode() & 0o777,
+        0o644
+    );
+}

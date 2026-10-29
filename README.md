@@ -171,7 +171,7 @@ paddock discard claude-app-1a2b3c Downloads/setup.zip
 
 - A recovered file never replaces a file. If the name is taken, the file gets a new name, such as `report (1).pdf`.
 - paddock never writes into a hidden path of your home, such as `~/.ssh` or `~/.config`, into its own directories, or into system directories. It refuses, even when you ask for it.
-- paddock copies regular files only. It skips symlinks, devices and pipes, and it never follows a symlink in the sandbox home.
+- paddock copies regular files only. It skips symlinks, devices and pipes, and it never follows a symlink in the sandbox home. A recovered file is never executable: paddock drops the execute bits, so one click on the host cannot run it.
 
 The Omarchy panel lists the same files. Press Enter on a file to recover it. When a sandbox saves a new file, a desktop notification tells you. The notification does not take the keyboard.
 
