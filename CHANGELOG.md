@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.1.2
 
 - The bar panel starts apps again. Its New flow ran every entry in a terminal as `paddock NAME`, which refuses apps, so the terminal closed at once. Apps now start with `paddock app run` and no terminal, and the list marks them with the app icon. `paddock list --json` has an `app` field.
 - The New flow of the bar panel can start in any folder: its first row, "Choose another folder…", opens a folder dialog. The recent list leaves out hidden folders. Before, only projects that had run in paddock could be chosen.
