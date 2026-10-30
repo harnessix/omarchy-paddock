@@ -619,7 +619,13 @@ fn podman_seccomp(env: &HostEnv, podman: &Path) -> Result<std::path::PathBuf> {
 /// root, on the host side of the home bind. A root-owned `~/.config` then
 /// stops apps from creating their settings there: Electron apps lose their
 /// crash-report folder and abort at start.
+///
+/// The sandbox can write its home, so every step goes through safefs: a
+/// symlink planted there is an error and is never followed, and a file is
+/// only ever created new, never truncated.
 pub fn precreate_mount_points(spec: &SandboxSpec) -> Result<()> {
+    use crate::safefs::{Kind, Root};
+    let root = Root::open(&spec.home_src)?;
     for m in &spec.mounts {
         let Ok(rel) = m.dst.strip_prefix(&spec.home) else {
             continue;
@@ -627,7 +633,6 @@ pub fn precreate_mount_points(spec: &SandboxSpec) -> Result<()> {
         if rel.as_os_str().is_empty() {
             continue;
         }
-        let target = spec.home_src.join(rel);
         let is_dir = match (&m.src, m.kind) {
             (_, MountKind::Tmpfs | MountKind::MaskDir) => true,
             (_, MountKind::MaskFile) => false,
@@ -635,13 +640,23 @@ pub fn precreate_mount_points(spec: &SandboxSpec) -> Result<()> {
             (None, _) => true,
         };
         if is_dir {
-            std::fs::create_dir_all(&target)?;
-        } else {
-            if let Some(d) = target.parent() {
-                std::fs::create_dir_all(d)?;
-            }
-            if !target.exists() {
-                std::fs::File::create(&target)?;
+            root.dir(rel, true)?;
+            continue;
+        }
+        let (Some(name), parent) = (rel.file_name(), rel.parent().unwrap_or(Path::new(""))) else {
+            continue;
+        };
+        let d = root.dir(parent, true)?;
+        // Concurrent starts of the same project share the home: a file that
+        // appeared meanwhile is fine, a symlink is not.
+        if let Err(e) = d.create_new(name, 0o600) {
+            match d.kind(name)? {
+                Some(Kind::Symlink) => bail!(
+                    "{} is a symlink; paddock does not follow it. Remove it and start again",
+                    d.path().join(name).display()
+                ),
+                Some(_) => {}
+                None => return Err(e),
             }
         }
     }
@@ -651,6 +666,61 @@ pub fn precreate_mount_points(spec: &SandboxSpec) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mount_points_never_follow_links_planted_in_the_home() {
+        use crate::spec::Mount;
+        use std::os::unix::fs::symlink;
+        let t = tempfile::tempdir().unwrap();
+        let (home_src, outside) = (t.path().join("hs"), t.path().join("outside"));
+        std::fs::create_dir_all(&home_src).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("keep"), "host").unwrap();
+        let home = Path::new("/home/demo");
+        let spec = |mounts: Vec<Mount>| {
+            let mut s = SandboxSpec::new(
+                "t".into(),
+                "claude",
+                Path::new("/w"),
+                home_src.clone(),
+                home,
+                1000,
+                1000,
+                "demo",
+            );
+            s.mounts = mounts;
+            s
+        };
+        // Plain mount points are made as folders and new files.
+        let ok = spec(vec![
+            Mount::tmpfs(home.join(".cache/x"), "t"),
+            Mount::mask(home.join(".config/a/token"), false, "t"),
+        ]);
+        precreate_mount_points(&ok).unwrap();
+        precreate_mount_points(&ok).unwrap();
+        assert!(home_src.join(".cache/x").is_dir());
+        assert!(home_src.join(".config/a/token").is_file());
+
+        // A planted folder link creates nothing outside.
+        symlink(&outside, home_src.join(".cargo")).unwrap();
+        let s = spec(vec![Mount::tmpfs(home.join(".cargo/registry"), "t")]);
+        assert!(precreate_mount_points(&s).is_err());
+        assert!(!outside.join("registry").exists());
+
+        // A dangling file link creates no file anywhere; a link to a host
+        // file does not truncate it.
+        symlink(outside.join("new"), home_src.join("dangling")).unwrap();
+        symlink(outside.join("keep"), home_src.join("keep")).unwrap();
+        for n in ["dangling", "keep"] {
+            let s = spec(vec![Mount::mask(home.join(n), false, "t")]);
+            assert!(precreate_mount_points(&s).is_err(), "{n}");
+        }
+        assert!(!outside.join("new").exists());
+        assert_eq!(
+            std::fs::read_to_string(outside.join("keep")).unwrap(),
+            "host"
+        );
+    }
 
     #[test]
     fn image_variants_share_layers() {

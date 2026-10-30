@@ -234,7 +234,11 @@ pub fn desktop_marker(project: &Path) -> Option<String> {
         }
     }
     let contains = |file: &str, words: &[&str]| -> Option<String> {
-        let text = std::fs::read_to_string(project.join(file)).ok()?;
+        // The project is sandbox-writable: no symlink, FIFO or huge file.
+        let bytes = crate::safefs::Root::open(project)
+            .and_then(|r| r.read(Path::new(file), crate::safefs::MAX_READ))
+            .ok()??;
+        let text = String::from_utf8_lossy(&bytes);
         words
             .iter()
             .find(|w| text.contains(*w))

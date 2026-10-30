@@ -3,6 +3,7 @@
 ## Unreleased
 
 - Security: `toml_set` (for example Codex's project trust in `~/.codex/config.toml`) reads and writes the sandbox home through the no-follow file layer too. A symlink left in the home by an earlier run made paddock on the host create or change a file outside the home. Reported in the Omarchy plugin marketplace review.
+- Security: more host steps no longer follow what a sandbox leaves in folders it can write. `fetch` opens the path before it asks, shows where it leads, checks it again after your answer, and copies what it opened, so a swap during the wait cannot copy a login into the sandbox. It refuses pipes, devices and folders that hold a protected path, and it also protects harness logins. A docker or podman start makes mount points in the sandbox home without following a symlink there. `mounts.rw`, `mounts.ro`, `secrets.hide` and app workspace folders refuse a path that goes through a symlink in a sandbox-writable folder. The host `mise which` runs in `/` and loads no project config. The login port forwarder and `paddock app open` refuse a symlinked socket. Reads of project files after exit, MCP and mise config, `paddock.toml` and `ports.json` never open a pipe or a device and have a size limit. `paddock init`, the srt temporary folder, the doctor keyring cleanup and `paddock gc` never write or delete through a symlink. `paddock doctor --escape` plants a pipe, a `/dev/zero` link and home links, and checks that the host does not follow them.
 
 ## 0.1.4
 

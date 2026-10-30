@@ -71,6 +71,14 @@ fi
 # Try to write next to HOME. doctor checks on the host that nothing arrived.
 (echo probe > "$HOME/../paddock-escape-probe") 2>/dev/null
 
+# Leave traps for the host, as an agent could between runs. doctor checks on
+# the host that it neither follows nor opens them (names as in doctor.rs).
+rm -f "$P/.envrc" "$P/.vscode/tasks.json"
+mkfifo "$P/.envrc" 2>/dev/null
+mkdir -p "$P/.vscode" && ln -s /dev/zero "$P/.vscode/tasks.json" 2>/dev/null
+ln -s ../paddock-escape-link-dir "$HOME/.paddock-probe-dir-link" 2>/dev/null
+ln -s ../paddock-escape-link-file "$HOME/.paddock-probe-file-link" 2>/dev/null
+
 if [ "$PADDOCK_PROBE_NETWORK" != host ]; then
   if has bash; then
     if timeout 3 bash -c "exec 3<>/dev/tcp/127.0.0.1/$PADDOCK_PROBE_PORT" 2>/dev/null; then

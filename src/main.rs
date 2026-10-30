@@ -1322,10 +1322,13 @@ fn real_main() -> Result<i32> {
         Cmd::Init { path } => {
             let project = build::resolve_project(path.as_deref())?;
             let file = project.join(manifest::PROJECT_FILE);
-            if file.exists() {
-                bail!("{} already exists", file.display());
-            }
-            std::fs::write(&file, manifest::TEMPLATE)?;
+            // A new file only: a dangling symlink there is not followed.
+            let dir =
+                paddock::safefs::Root::open(&project)?.dir(std::path::Path::new(""), false)?;
+            let mut f = dir
+                .create_new(std::ffi::OsStr::new(manifest::PROJECT_FILE), 0o644)
+                .map_err(|e| anyhow::anyhow!("{} already exists: {e:#}", file.display()))?;
+            std::io::Write::write_all(&mut f, manifest::TEMPLATE.as_bytes())?;
             println!("Wrote {}", file.display());
             Ok(0)
         }

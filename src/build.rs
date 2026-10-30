@@ -205,6 +205,27 @@ pub struct Built {
     pub backend: String,
 }
 
+/// The host folders that a sandbox can write, as real paths: the project,
+/// every read-write mount so far, and all sandbox homes and worktrees (a
+/// sandbox of another project can write those).
+pub fn sandbox_writable(env: &HostEnv, spec: &SandboxSpec) -> Vec<PathBuf> {
+    let mut v = vec![
+        spec.project.clone(),
+        spec.home_src.clone(),
+        env.paddock_data().join("homes"),
+        env.paddock_data().join("worktrees"),
+    ];
+    v.extend(
+        spec.mounts
+            .iter()
+            .filter(|m| m.kind == crate::spec::MountKind::Rw)
+            .filter_map(|m| m.src.clone()),
+    );
+    v.into_iter()
+        .map(|p| std::fs::canonicalize(&p).unwrap_or(p))
+        .collect()
+}
+
 pub fn resolve_project(path: Option<&Path>) -> Result<PathBuf> {
     let raw = match path {
         Some(p) => p.to_path_buf(),
@@ -373,27 +394,22 @@ pub fn build_with(env: &HostEnv, opts: &Options, harness: Harness) -> Result<Bui
     }
 
     // The manifest.
-    for raw in &m.mounts.rw {
-        let p = env.expand(raw, &project);
-        if !p.exists() {
-            bail!("manifest mounts.rw: {} does not exist", p.display());
+    // An approved entry is resolved again at each start. A symlink on its
+    // way inside a folder the sandbox can write could point it anywhere, so
+    // such a symlink is refused (see safefs::resolve_approved).
+    for (list, rw, origin) in [
+        (&m.mounts.rw, true, "manifest mounts.rw"),
+        (&m.mounts.ro, false, "manifest mounts.ro"),
+    ] {
+        for raw in list {
+            let p = env.expand(raw, &project);
+            if !p.exists() {
+                bail!("{origin}: {} does not exist", p.display());
+            }
+            let real = crate::safefs::resolve_approved(&p, &sandbox_writable(env, &spec))
+                .with_context(|| origin.to_string())?;
+            spec.add_mount(Mount::same(real, rw, origin));
         }
-        spec.add_mount(Mount::same(
-            std::fs::canonicalize(&p)?,
-            true,
-            "manifest mounts.rw",
-        ));
-    }
-    for raw in &m.mounts.ro {
-        let p = env.expand(raw, &project);
-        if !p.exists() {
-            bail!("manifest mounts.ro: {} does not exist", p.display());
-        }
-        spec.add_mount(Mount::same(
-            std::fs::canonicalize(&p)?,
-            false,
-            "manifest mounts.ro",
-        ));
     }
     for k in &m.env.pass {
         if let Some(v) = env.var(k) {

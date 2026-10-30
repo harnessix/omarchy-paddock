@@ -1,6 +1,6 @@
 use super::*;
 use std::cell::RefCell;
-use std::os::unix::fs::symlink;
+use std::os::unix::fs::{symlink, PermissionsExt};
 
 fn setup() -> (tempfile::TempDir, HostEnv) {
     let tmp = tempfile::tempdir().unwrap();

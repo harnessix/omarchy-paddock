@@ -47,15 +47,29 @@ fn to_json(v: toml::Value) -> serde_json::Value {
     serde_json::to_value(v).unwrap_or(serde_json::Value::Null)
 }
 
+/// Harness configuration files can hold long histories (`~/.claude.json`).
+const MAX_CONFIG: u64 = 64 << 20;
+
 pub fn servers(env: &HostEnv, profile: &Profile, project: &Path) -> Vec<Server> {
     let mut out: Vec<Server> = Vec::new();
     for src in &profile.mcp {
+        // A project file is sandbox-writable: no symlink is followed. Neither
+        // read opens a FIFO or takes a huge file.
         let file = if src.in_project {
             project.join(&src.file)
         } else {
             env.home.join(&src.file)
         };
-        let Ok(text) = std::fs::read_to_string(&file) else {
+        let bytes = if src.in_project {
+            crate::safefs::Root::open(project)
+                .and_then(|r| r.read(Path::new(&src.file), MAX_CONFIG))
+        } else {
+            crate::safefs::read_path(&file, true, MAX_CONFIG)
+        };
+        let Ok(Some(bytes)) = bytes else {
+            continue;
+        };
+        let Ok(text) = String::from_utf8(bytes) else {
             continue;
         };
         let doc: serde_json::Value = if src.format == "toml" {

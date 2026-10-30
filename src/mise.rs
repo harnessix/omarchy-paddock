@@ -28,6 +28,22 @@ pub const DISABLED_BACKENDS: &[&str] = &[
 /// (rust uses rustup in the home), so a shared install does not work.
 const PRIVATE_CORE: &[&str] = &["rust"];
 
+/// A command for the host mise that loads no project configuration. mise
+/// reads `mise.toml` files from its working directory and the folders above
+/// it, and a trusted one can run commands (`exec()` in templates, `[env]`).
+/// So it runs in `/`, its search stops there, and the extra trusted paths
+/// of the caller do not apply.
+pub fn host_command(mise: &Path) -> std::process::Command {
+    let mut c = std::process::Command::new(mise);
+    c.current_dir("/")
+        .env("PWD", "/")
+        .env("MISE_CEILING_PATHS", "/")
+        .env_remove("MISE_TRUSTED_CONFIG_PATHS")
+        .env_remove("MISE_ENV")
+        .env_remove("MISE_ENV_FILE");
+    c
+}
+
 /// mise's registry: short name to backends, in the order mise prefers them.
 #[derive(Debug, Default)]
 pub struct Registry(BTreeMap<String, Vec<String>>);
@@ -46,14 +62,9 @@ impl Registry {
         Self(map)
     }
 
-    /// Read the registry of the host mise. It runs in `/`, so no project
-    /// config loads.
+    /// Read the registry of the host mise. See `host_command`.
     pub fn load(mise: &Path) -> Self {
-        let out = crate::env::capture(
-            std::process::Command::new(mise)
-                .arg("registry")
-                .current_dir("/"),
-        );
+        let out = crate::env::capture(host_command(mise).arg("registry"));
         out.map(|t| Self::parse(&t)).unwrap_or_default()
     }
 
@@ -179,10 +190,15 @@ pub fn shared_tool<'a>(tool: &'a str, registry: &Registry) -> Option<&'a str> {
 pub fn shared_installs(project: &Path, registry: &Registry) -> Vec<String> {
     let mut entries = Vec::new();
     let mut aliases = BTreeSet::new();
+    // The project is sandbox-writable: no symlinks, FIFOs or huge files.
+    let Ok(root) = crate::safefs::Root::open(project) else {
+        return Vec::new();
+    };
     for f in crate::detect::MISE_FILES {
-        let Ok(text) = std::fs::read_to_string(project.join(f)) else {
+        let Ok(Some(bytes)) = root.read(Path::new(f), crate::safefs::MAX_READ) else {
             continue;
         };
+        let text = String::from_utf8_lossy(&bytes);
         if f.ends_with(".tool-versions") {
             entries.extend(parse_tool_versions(&text));
         } else {
@@ -229,6 +245,33 @@ pub fn all_installed(installs: &Path, specs: &[String]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn host_mise_runs_outside_the_project() {
+        let t = tempfile::tempdir().unwrap();
+        let fake = t.path().join("mise");
+        std::fs::write(
+            &fake,
+            "#!/bin/sh\necho \"$(pwd) $MISE_CEILING_PATHS ${MISE_TRUSTED_CONFIG_PATHS-none}\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
+        let out = crate::env::capture(&mut host_command(&fake)).unwrap();
+        assert_eq!(out, "/ / none");
+    }
+
+    #[test]
+    fn shared_installs_skip_planted_links_and_fifos() {
+        let t = tempfile::tempdir().unwrap();
+        let p = t.path().join("p");
+        std::fs::create_dir_all(&p).unwrap();
+        std::fs::write(t.path().join("real.toml"), "[tools]\nnode = \"22\"\n").unwrap();
+        std::os::unix::fs::symlink(t.path().join("real.toml"), p.join("mise.toml")).unwrap();
+        let c = std::ffi::CString::new(p.join(".tool-versions").to_str().unwrap()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        assert!(shared_installs(&p, &registry()).is_empty());
+    }
 
     fn registry() -> Registry {
         Registry::parse(
