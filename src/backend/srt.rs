@@ -30,7 +30,8 @@ pub const MIN_VERSION: (u32, u32, u32) = (0, 0, 81);
 /// for harnesses: a shim depends on the manager's configuration at run time.
 pub fn srt_exe(env: &HostEnv) -> Option<PathBuf> {
     if let Some(mise) = env.which("mise") {
-        if let Ok(p) = crate::env::capture(Command::new(mise).args(["which", "srt"])) {
+        if let Ok(p) = crate::env::capture(crate::mise::host_command(&mise).args(["which", "srt"]))
+        {
             let p = PathBuf::from(p.lines().last().unwrap_or_default());
             if crate::env::is_executable(&p) {
                 return Some(p);
@@ -51,7 +52,9 @@ pub fn package_root(env: &HostEnv) -> Option<PathBuf> {
         && !real.to_string_lossy().contains("node_modules")
     {
         if let Some(mise) = env.which("mise") {
-            if let Ok(p) = crate::env::capture(Command::new(mise).args(["which", "srt"])) {
+            if let Ok(p) =
+                crate::env::capture(crate::mise::host_command(&mise).args(["which", "srt"]))
+            {
                 real = std::fs::canonicalize(p.lines().last().unwrap_or_default()).ok()?;
             }
         }
@@ -304,7 +307,10 @@ impl Backend for Srt {
         let bridge = bridge_dir(env, spec);
         std::fs::create_dir_all(&bridge)?;
         let tmp = private_tmp(env, spec);
-        std::fs::create_dir_all(&tmp)?;
+        // In the sandbox home: a planted .paddock-tmp link must not make
+        // paddock create a folder elsewhere and allow writes to it.
+        crate::safefs::Root::open(&spec.home_src)?
+            .dir(Path::new(".paddock-tmp").join(&spec.id).as_path(), true)?;
         vars.insert("TMPDIR".into(), s(&bridge));
         // srt cannot bind-mount: the socket stays at its host path, in the run
         // folder, which allowRead already covers.

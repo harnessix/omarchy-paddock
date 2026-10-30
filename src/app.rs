@@ -248,10 +248,36 @@ pub fn roots(env: &HostEnv, name: &str, cli: &[PathBuf]) -> Result<Vec<PathBuf>>
              or save them: paddock app install {name} ~/src/project"
         );
     }
+    // The roots are resolved again at each start. A symlink on the way inside
+    // a folder a sandbox can write (another root, a sandbox home) is refused:
+    // a sandbox could have planted it to point the root somewhere else.
+    let data = [
+        env.paddock_data().join("homes"),
+        env.paddock_data().join("worktrees"),
+    ];
+    let base: Vec<PathBuf> = data
+        .iter()
+        .map(|p| std::fs::canonicalize(p).unwrap_or_else(|_| p.clone()))
+        .collect();
+    let raw: Vec<PathBuf> = raw
+        .into_iter()
+        .map(|r| std::path::absolute(&r).unwrap_or(r))
+        .collect();
+    let first: Vec<PathBuf> = raw
+        .iter()
+        .map(|r| crate::safefs::resolve_approved(r, &base))
+        .collect::<Result<_>>()?;
     let mut out = Vec::new();
-    for r in raw {
-        let c =
-            std::fs::canonicalize(&r).with_context(|| format!("{} does not exist", r.display()))?;
+    for (i, r) in raw.iter().enumerate() {
+        let mut writable = base.clone();
+        writable.extend(
+            first
+                .iter()
+                .enumerate()
+                .filter(|(j, _)| *j != i)
+                .map(|(_, p)| p.clone()),
+        );
+        let c = crate::safefs::resolve_approved(r, &writable)?;
         if c == env.home || env.home.starts_with(&c) {
             bail!(
                 "{} is the home directory or contains it; name project folders instead",
@@ -567,12 +593,8 @@ pub fn open(env: &HostEnv, name: &str, link: &str) -> Result<i32> {
         .into_iter()
         .find(|r| r.harness == name && r.gui == "app");
     if let Some(r) = running {
-        let sock = env
-            .paddock_run()
-            .join(&r.id)
-            .join("inbound")
-            .join("open.sock");
-        let mut s = std::os::unix::net::UnixStream::connect(&sock)
+        let inbound = env.paddock_run().join(&r.id).join("inbound");
+        let mut s = ports::connect_inside(&inbound, "open.sock")
             .with_context(|| format!("the {name} sandbox is not ready for links yet"))?;
         writeln!(s, "{link}")?;
         let mut reply = String::new();
@@ -830,13 +852,29 @@ pub mod ports {
         }
     }
 
+    /// The sandbox writes this folder, so the ports file is read without
+    /// following a symlink, never from a FIFO, and only while it is small.
+    fn read_ports(dir: &Path) -> BTreeSet<u16> {
+        crate::safefs::Root::open(dir)
+            .and_then(|r| r.read(Path::new(PORTS_FILE), 64 * 1024))
+            .ok()
+            .flatten()
+            .and_then(|t| serde_json::from_slice(&t).ok())
+            .unwrap_or_default()
+    }
+
+    /// Connect to a socket that the sandbox made in `dir`. A symlink there
+    /// is refused, so the sandbox cannot point paddock at a host socket.
+    pub fn connect_inside(dir: &Path, name: &str) -> Result<UnixStream> {
+        let root = crate::safefs::Root::open(dir)?;
+        root.dir(Path::new(""), false)?
+            .connect(std::ffi::OsStr::new(name))
+    }
+
     fn manage(dir: &Path, stop: &Arc<AtomicBool>, filter: fn(u16) -> bool) {
         let mut open: BTreeMap<u16, Arc<AtomicBool>> = BTreeMap::new();
         while !stop.load(Ordering::SeqCst) {
-            let mut wanted: BTreeSet<u16> = std::fs::read_to_string(dir.join(PORTS_FILE))
-                .ok()
-                .and_then(|t| serde_json::from_str(&t).ok())
-                .unwrap_or_default();
+            let mut wanted = read_ports(dir);
             wanted.retain(|p| filter(*p));
             open.retain(|p, flag| {
                 let keep = wanted.contains(p);
@@ -861,7 +899,7 @@ pub mod ports {
                 let _ = l.set_nonblocking(true);
                 let flag = Arc::new(AtomicBool::new(false));
                 open.insert(p, flag.clone());
-                let (sock, stop) = (dir.join(FWD_SOCK), stop.clone());
+                let (sock, stop) = (dir.to_path_buf(), stop.clone());
                 std::thread::spawn(move || {
                     while !flag.load(Ordering::SeqCst) && !stop.load(Ordering::SeqCst) {
                         match l.accept() {
@@ -869,7 +907,7 @@ pub mod ports {
                                 let _ = tcp.set_nonblocking(false);
                                 let sock = sock.clone();
                                 std::thread::spawn(move || {
-                                    let mut u = match UnixStream::connect(&sock) {
+                                    let mut u = match connect_inside(&sock, FWD_SOCK) {
                                         Ok(u) => u,
                                         Err(e) => {
                                             log::warn!("port {p}: cannot reach the sandbox: {e}");
@@ -902,6 +940,33 @@ pub mod ports {
         fn reads_listening_ports_from_proc() {
             let tcp = "  sl  local_address rem_address   st\n   0: 0100007F:B8AC 00000000:0000 0A x\n   1: 0100007F:B8AD 0100007F:1F90 01 x\n   2: 00000000:0016 00000000:0000 0A x\n";
             assert_eq!(listening(tcp), BTreeSet::from([0xB8AC]));
+        }
+
+        #[test]
+        fn never_follows_links_or_fifos_the_sandbox_plants() {
+            let t = tempfile::tempdir().unwrap();
+            let (inbound, host) = (t.path().join("inbound"), t.path().join("host"));
+            std::fs::create_dir_all(&inbound).unwrap();
+            std::fs::create_dir_all(&host).unwrap();
+            // A host socket the sandbox must not reach.
+            let _l = UnixListener::bind(host.join("bus")).unwrap();
+            std::os::unix::fs::symlink(host.join("bus"), inbound.join(FWD_SOCK)).unwrap();
+            assert!(connect_inside(&inbound, FWD_SOCK).is_err());
+            std::fs::remove_file(inbound.join(FWD_SOCK)).unwrap();
+            let _own = UnixListener::bind(inbound.join(FWD_SOCK)).unwrap();
+            assert!(connect_inside(&inbound, FWD_SOCK).is_ok());
+
+            // A FIFO as the ports file reads as no ports and does not hang.
+            let c = std::ffi::CString::new(inbound.join(PORTS_FILE).to_str().unwrap()).unwrap();
+            assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+            assert!(read_ports(&inbound).is_empty());
+            std::fs::remove_file(inbound.join(PORTS_FILE)).unwrap();
+            std::fs::write(host.join("p.json"), "[8080]").unwrap();
+            std::os::unix::fs::symlink(host.join("p.json"), inbound.join(PORTS_FILE)).unwrap();
+            assert!(read_ports(&inbound).is_empty());
+            std::fs::remove_file(inbound.join(PORTS_FILE)).unwrap();
+            std::fs::write(inbound.join(PORTS_FILE), "[8080]").unwrap();
+            assert_eq!(read_ports(&inbound), BTreeSet::from([8080]));
         }
     }
 }

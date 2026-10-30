@@ -119,8 +119,34 @@ pub fn auth_root(env: &HostEnv, harness: &str, mode: &AuthMode) -> PathBuf {
     }
 }
 
+/// The hash of a regular file, streamed, of at most 1 GiB. A FIFO or a device
+/// is never opened, so this cannot hang the cleanup after a run.
 fn file_hash(p: &Path) -> Option<String> {
-    std::fs::read(p).ok().map(|b| hex(&Sha256::digest(&b)))
+    hash_open(p, true)
+}
+
+fn hash_open(p: &Path, follow: bool) -> Option<String> {
+    let f = crate::safefs::open_file(p, follow).ok()??;
+    let mut h = Sha256::new();
+    let mut r = std::io::Read::take(f, 1 << 30);
+    std::io::copy(&mut r, &mut h).ok()?;
+    Some(hex(&h.finalize()))
+}
+
+/// The state of a watched file in the sandbox-writable project. A symlink is
+/// not followed: its target text is the state, so a planted link shows as a
+/// change. A FIFO or a device shows as a change too and is never opened.
+fn watch_hash(p: &Path) -> Option<String> {
+    let m = std::fs::symlink_metadata(p).ok()?;
+    if m.file_type().is_symlink() {
+        let t = std::fs::read_link(p).ok()?;
+        return Some(format!("link:{}", t.display()));
+    }
+    if !m.is_file() {
+        use std::os::unix::fs::MetadataExt;
+        return Some(format!("special:{:o}", m.mode() & 0o170000));
+    }
+    hash_open(p, false).or_else(|| Some("unreadable".into()))
 }
 
 fn copy_private(from: &Path, to: &Path) -> Result<()> {
@@ -380,13 +406,13 @@ pub fn write_gitconfig(
 }
 
 pub fn snapshot(paths: &[PathBuf]) -> BTreeMap<PathBuf, Option<String>> {
-    paths.iter().map(|p| (p.clone(), file_hash(p))).collect()
+    paths.iter().map(|p| (p.clone(), watch_hash(p))).collect()
 }
 
 pub fn changed(before: &BTreeMap<PathBuf, Option<String>>) -> Vec<PathBuf> {
     before
         .iter()
-        .filter(|(p, h)| file_hash(p) != **h)
+        .filter(|(p, h)| watch_hash(p) != **h)
         .map(|(p, _)| p.clone())
         .collect()
 }
@@ -689,6 +715,31 @@ mod auth_sync_tests {
             std::fs::read_to_string(host_home.join(".tool/token")).unwrap(),
             "old"
         );
+    }
+
+    #[test]
+    fn watched_files_report_planted_links_and_fifos_without_hanging() {
+        let t = tempfile::tempdir().unwrap();
+        let (a, b, c) = (
+            t.path().join(".envrc"),
+            t.path().join("hook"),
+            t.path().join("x"),
+        );
+        std::fs::write(&a, "echo hi").unwrap();
+        std::fs::write(t.path().join("same"), "echo hi").unwrap();
+        let before = snapshot(&[a.clone(), b.clone(), c.clone()]);
+        // A link to a file with the same content, a FIFO, and /dev/zero.
+        std::fs::remove_file(&a).unwrap();
+        std::os::unix::fs::symlink(t.path().join("same"), &a).unwrap();
+        let cs = std::ffi::CString::new(b.to_str().unwrap()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(cs.as_ptr(), 0o600) }, 0);
+        std::os::unix::fs::symlink("/dev/zero", &c).unwrap();
+        let mut got = changed(&before);
+        got.sort();
+        let mut want = vec![a, b, c];
+        want.sort();
+        assert_eq!(got, want);
+        assert!(file_hash(Path::new("/dev/zero")).is_none());
     }
 
     #[test]

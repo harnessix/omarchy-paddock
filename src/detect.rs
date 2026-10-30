@@ -5,7 +5,7 @@
 use crate::env::{capture, HostEnv};
 use crate::manifest::Manifest;
 use crate::spec::{Mount, SandboxSpec};
-use anyhow::Result;
+use anyhow::{Context as _, Result};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -367,9 +367,15 @@ impl Detector for Secrets {
         }
         for h in &cx.manifest.secrets.hide {
             let p = cx.env.expand(h, cx.project);
-            if p.exists() {
-                spec.add_mount(Mount::mask(&p, p.is_dir(), "manifest secrets.hide"));
+            if std::fs::symlink_metadata(&p).is_err() {
+                continue;
             }
+            // A symlink in a sandbox-writable folder could move the mask
+            // away from the secret, so it is refused.
+            let writable = crate::build::sandbox_writable(cx.env, spec);
+            let real =
+                crate::safefs::resolve_approved(&p, &writable).context("manifest secrets.hide")?;
+            spec.add_mount(Mount::mask(&real, real.is_dir(), "manifest secrets.hide"));
         }
         Ok(())
     }

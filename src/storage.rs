@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Write};
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -619,12 +619,19 @@ fn worktree_gitdir(repo: &Path, wt: &Path) -> Option<PathBuf> {
         &["rev-parse", "--path-format=absolute", "--git-common-dir"],
     )?;
     let want = wt.join(".git");
+    // The git directory is sandbox-writable: no symlink, FIFO or huge file.
+    let root = crate::safefs::Root::open(Path::new(common.trim())).ok()?;
     subdirs(&Path::new(common.trim()).join("worktrees"))
         .into_iter()
         .find(|d| {
-            std::fs::read_to_string(d.join("gitdir"))
-                .map(|t| Path::new(t.trim()) == want)
-                .unwrap_or(false)
+            let Some(n) = d.file_name() else {
+                return false;
+            };
+            let rel = Path::new("worktrees").join(n).join("gitdir");
+            root.read(&rel, 64 * 1024)
+                .ok()
+                .flatten()
+                .is_some_and(|t| Path::new(String::from_utf8_lossy(&t).trim()) == want)
         })
 }
 
@@ -1416,7 +1423,8 @@ pub fn measure_plan(inv: &mut Inventory, items: &mut [Item]) {
 
 /// Refuse a path that is not strictly inside one of paddock's own
 /// directories, that is a symlink, or whose parents lead out through a symlink.
-pub fn check_removable(env: &HostEnv, path: &Path) -> Result<()> {
+/// Returns that directory, as a real path, and the path below it.
+pub fn check_removable(env: &HostEnv, path: &Path) -> Result<(PathBuf, PathBuf)> {
     if !path.is_absolute()
         || path
             .components()
@@ -1439,54 +1447,31 @@ pub fn check_removable(env: &HostEnv, path: &Path) -> Result<()> {
     // An old shared cache: only the exact folders that paddock replaced.
     if let Ok(shared) = std::fs::canonicalize(shared_cache(env)) {
         if parent == shared && OLD_CACHES.iter().any(|(old, _)| file == *old) {
-            return Ok(());
+            return Ok((shared, PathBuf::from(file)));
         }
     }
     for root in removable_roots(env) {
         let Ok(root) = std::fs::canonicalize(&root) else {
             continue;
         };
-        if parent.starts_with(&root) && parent.join(file).starts_with(&root) {
-            return Ok(());
+        if let Ok(rel) = parent.join(file).strip_prefix(&root) {
+            if !rel.as_os_str().is_empty() {
+                return Ok((root.clone(), rel.to_path_buf()));
+            }
         }
     }
     bail!("{} is outside paddock's own directories", path.display())
 }
 
-/// Delete a file or a tree after `check_removable`. Never follows a symlink.
+/// Delete a file or a tree after `check_removable`. Never follows a symlink:
+/// the walk starts at paddock's own folder and opens one step at a time, and
+/// read-only folders (a Go module cache) get write permission through the
+/// open folder, not by path (see safefs).
 pub fn remove_path(env: &HostEnv, path: &Path) -> Result<()> {
-    check_removable(env, path)?;
-    let meta = std::fs::symlink_metadata(path)?;
-    if !meta.is_dir() {
-        return Ok(std::fs::remove_file(path)?);
-    }
-    // remove_dir_all does not follow symlinks. Read-only folders, such as a
-    // Go module cache, need write permission first.
-    if std::fs::remove_dir_all(path).is_ok() {
-        return Ok(());
-    }
-    make_writable(path);
-    std::fs::remove_dir_all(path).with_context(|| format!("remove {}", path.display()))
-}
-
-fn make_writable(dir: &Path) {
-    let Ok(m) = std::fs::symlink_metadata(dir) else {
-        return;
-    };
-    if !m.is_dir() {
-        return;
-    }
-    if m.permissions().mode() & 0o700 != 0o700 {
-        let _ = std::fs::set_permissions(
-            dir,
-            std::fs::Permissions::from_mode(m.permissions().mode() | 0o700),
-        );
-    }
-    for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
-        if e.file_type().is_ok_and(|t| t.is_dir()) {
-            make_writable(&e.path());
-        }
-    }
+    let (root, rel) = check_removable(env, path)?;
+    crate::safefs::Root::open(&root)?
+        .remove_tree(&rel)
+        .with_context(|| format!("remove {}", path.display()))
 }
 
 fn git_status(repo: &Path, args: &[&str]) -> Result<()> {

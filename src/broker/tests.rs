@@ -149,6 +149,83 @@ fn fetch_copies_into_the_inbox_and_refuses_protected_paths() {
     assert!(r.message.contains("protected"));
 }
 
+/// Swaps the fetch source for a link to a credential file while the user
+/// decides, as a sandbox could.
+struct Swapper {
+    from: PathBuf,
+    to: PathBuf,
+    seen: Mutex<Option<String>>,
+}
+
+impl Approver for Swapper {
+    fn ask(&self, _: &HostEnv, p: &Pending, _: Duration) -> Option<Answer> {
+        *self.seen.lock().unwrap() = Some(p.detail.clone());
+        std::fs::remove_file(&self.from).unwrap();
+        std::os::unix::fs::symlink(&self.to, &self.from).unwrap();
+        Some(Answer::Once)
+    }
+}
+
+#[test]
+fn fetch_copies_what_the_user_saw_even_if_the_path_changes_while_waiting() {
+    let (t, b, _) = setup(None, HostPolicy::default());
+    let creds = b.env.home.join(".claude/.credentials.json");
+    std::fs::create_dir_all(creds.parent().unwrap()).unwrap();
+    std::fs::write(&creds, "token").unwrap();
+    let notes = b.ctx.project.join("notes");
+    std::fs::write(&notes, "harmless").unwrap();
+    // The project path is a link at first: the card shows where it leads.
+    let link = t.path().join("link-to-notes");
+    std::os::unix::fs::symlink(&notes, &link).unwrap();
+    let swap = Arc::new(Swapper {
+        from: notes.clone(),
+        to: creds.clone(),
+        seen: Mutex::new(None),
+    });
+    let b = Broker::new(
+        b.env.clone(),
+        b.ctx.clone(),
+        HostPolicy::default(),
+        swap.clone(),
+    );
+    let r = b.handle(&req("fetch", serde_json::json!({ "path": link })));
+    assert_eq!(r.status, Status::Done, "{}", r.message);
+    let dst = PathBuf::from(r.result["path"].as_str().unwrap());
+    assert_eq!(std::fs::read_to_string(dst).unwrap(), "harmless");
+    let seen = swap.seen.lock().unwrap().clone().unwrap();
+    assert!(seen.contains(&notes.display().to_string()), "{seen}");
+    // A second request now resolves to the credential file and is refused.
+    let r = b.handle(&req("fetch", serde_json::json!({ "path": notes })));
+    assert_eq!(r.status, Status::Invalid, "{}", r.message);
+}
+
+#[test]
+fn fetch_refuses_fifos_and_folders_that_hold_protected_paths() {
+    let (t, b, fixed) = setup(Some(Answer::Once), HostPolicy::default());
+    let fifo = t.path().join("pipe");
+    let c = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+    let r = b.handle(&req("fetch", serde_json::json!({ "path": fifo })));
+    assert_eq!(r.status, Status::Invalid, "{}", r.message);
+    std::fs::create_dir_all(b.env.home.join(".ssh")).unwrap();
+    let r = b.handle(&req("fetch", serde_json::json!({ "path": b.env.home })));
+    assert_eq!(r.status, Status::Invalid, "{}", r.message);
+    assert_eq!(fixed.asked.load(Ordering::SeqCst), 0);
+
+    // In a folder, FIFOs and links are skipped and nothing blocks.
+    let d = t.path().join("tree");
+    std::fs::create_dir_all(d.join("sub")).unwrap();
+    std::fs::write(d.join("sub/a"), "a").unwrap();
+    let c = std::ffi::CString::new(d.join("fifo").to_str().unwrap()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+    std::os::unix::fs::symlink(b.env.home.join(".ssh"), d.join("ssh")).unwrap();
+    let r = b.handle(&req("fetch", serde_json::json!({ "path": d })));
+    assert_eq!(r.status, Status::Done, "{}", r.message);
+    let dst = PathBuf::from(r.result["path"].as_str().unwrap());
+    assert_eq!(std::fs::read_to_string(dst.join("sub/a")).unwrap(), "a");
+    assert!(!dst.join("fifo").exists() && !dst.join("ssh").exists());
+}
+
 #[test]
 fn invalid_requests_are_rejected_before_asking() {
     let (_t, b, fixed) = setup(Some(Answer::Once), HostPolicy::default());

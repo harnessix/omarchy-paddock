@@ -75,6 +75,8 @@ pub fn probe_flags(env: &HostEnv, built: &Built) -> Result<()> {
 fn help_text(exe: &Path, args: &[String]) -> Result<String> {
     let mut child = Command::new(exe)
         .args(args)
+        // Not the project: a harness may read settings from its working folder.
+        .current_dir("/")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

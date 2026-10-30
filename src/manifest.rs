@@ -187,8 +187,17 @@ pub struct Loaded {
 }
 
 impl Manifest {
+    /// Read a project file. The sandbox can write the project, so a symlink
+    /// at the file is refused, and a FIFO or a huge file never hangs paddock.
     pub fn read(path: &Path) -> Result<Self> {
-        let text = std::fs::read_to_string(path)?;
+        Self::read_with(path, false)
+    }
+
+    fn read_with(path: &Path, follow: bool) -> Result<Self> {
+        let bytes = crate::safefs::read_path(path, follow, crate::safefs::MAX_READ)?
+            .with_context(|| format!("{} does not exist", path.display()))?;
+        let text = String::from_utf8(bytes)
+            .with_context(|| format!("{} is not UTF-8 text", path.display()))?;
         toml::from_str(&text).with_context(|| format!("{} is invalid", path.display()))
     }
 
@@ -196,7 +205,8 @@ impl Manifest {
     pub fn load(env: &HostEnv, project: &Path) -> Result<Loaded> {
         let user_file = env.paddock_config().join("config.toml");
         let user = if user_file.is_file() {
-            Self::read(&user_file)?
+            // The user configuration belongs to the host; it may be a link.
+            Self::read_with(&user_file, true)?
         } else {
             Self::default()
         };
@@ -422,3 +432,22 @@ pub const TEMPLATE: &str = r#"# paddock.toml: sandbox settings for this project.
 # image = "debian:stable"
 # packages = ["libssl-dev"]
 "#;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_planted_project_file_is_never_followed_or_opened() {
+        let t = tempfile::tempdir().unwrap();
+        let p = t.path().join("p");
+        std::fs::create_dir_all(&p).unwrap();
+        std::fs::write(t.path().join("other.toml"), "[mounts]\nrw = [\"/\"]\n").unwrap();
+        std::os::unix::fs::symlink(t.path().join("other.toml"), p.join(PROJECT_FILE)).unwrap();
+        assert!(Manifest::read(&p.join(PROJECT_FILE)).is_err());
+        std::fs::remove_file(p.join(PROJECT_FILE)).unwrap();
+        let c = std::ffi::CString::new(p.join(PROJECT_FILE).to_str().unwrap()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        assert!(Manifest::read(&p.join(PROJECT_FILE)).is_err());
+    }
+}

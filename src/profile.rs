@@ -8,7 +8,6 @@ use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
-use std::process::Command;
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -283,7 +282,7 @@ impl<'a> HarnessFactory<'a> {
         let mut tried = Vec::new();
         if let (Some(tool), Some(mise)) = (&p.locate.mise, self.env.which("mise")) {
             tried.push(format!("mise which {tool}"));
-            if let Ok(out) = capture(Command::new(mise).args(["which", tool])) {
+            if let Ok(out) = capture(crate::mise::host_command(&mise).args(["which", tool])) {
                 let path = PathBuf::from(out.lines().last().unwrap_or_default());
                 if is_executable(&path) {
                     return canonical(&path);

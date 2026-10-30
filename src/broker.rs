@@ -556,13 +556,12 @@ pub fn describe(req: &Request, project: &Path) -> (String, String) {
 fn grant_key(req: &Request) -> String {
     match req.cap.as_str() {
         "exec" => format!("exec\0{}", argv(req).join("\0")),
-        "fetch" => format!("fetch\0{}", arg_str(req, "path").unwrap_or("")),
         "open-url" => "open-url".into(),
         other => other.to_string(),
     }
 }
 
-fn validate(env: &HostEnv, req: &Request) -> Result<()> {
+fn validate(req: &Request) -> Result<()> {
     if req.v != PROTOCOL {
         bail!(
             "protocol version {} is not supported; this paddock speaks {PROTOCOL}",
@@ -590,17 +589,7 @@ fn validate(env: &HostEnv, req: &Request) -> Result<()> {
             if !p.is_absolute() {
                 bail!("fetch needs an absolute host path");
             }
-            let real = std::fs::canonicalize(&p)
-                .with_context(|| format!("{} does not exist on the host", p.display()))?;
-            // Protected paths stay protected even if the user would click allow.
-            for d in policy::denied_paths(env) {
-                if real.starts_with(&d) || p.starts_with(&d) {
-                    bail!(
-                        "{} is a protected path; paddock never copies it into a sandbox",
-                        p.display()
-                    );
-                }
-            }
+            // `prepare` opens the path and checks where it really leads.
         }
         "clipboard-write" => {
             arg_str(req, "text").context("clipboard-write needs text")?;
@@ -715,6 +704,7 @@ fn perform(env: &HostEnv, ctx: &Context, req: &Request, work: &Work) -> Result<s
     match work {
         Work::Push(plan) => return git::push(plan),
         Work::Forge(call) => return run_forge(env, ctx, req, call),
+        Work::Fetch(f) => return fetch(env, ctx, req, f),
         Work::Plain => {}
     }
     match req.cap.as_str() {
@@ -765,32 +755,7 @@ fn perform(env: &HostEnv, ctx: &Context, req: &Request, work: &Work) -> Result<s
             let (code, out, err) = run_capture(&mut cmd, Duration::from_secs(timeout))?;
             Ok(serde_json::json!({ "exit_code": code, "stdout": out, "stderr": err }))
         }
-        "fetch" => {
-            let src = std::fs::canonicalize(arg_str(req, "path").unwrap_or(""))?;
-            let size = tree_size(&src)?;
-            if size > MAX_FETCH {
-                bail!(
-                    "{} is {} MiB; the limit is {} MiB",
-                    src.display(),
-                    size >> 20,
-                    MAX_FETCH >> 20
-                );
-            }
-            let dir = inbox(&ctx.project)?;
-            let want = safe_name(&src.to_string_lossy(), "fetched");
-            // Never remove what is there: a free name instead.
-            let name = if std::fs::symlink_metadata(&src)?.is_dir() {
-                let (d, name) = dir.new_subdir(&want)?;
-                d.copy_tree_in(&src)?;
-                name
-            } else {
-                let (mut f, name) = dir.new_file(&want, 0o644)?;
-                let mut s = std::fs::File::open(&src)?;
-                std::io::copy(&mut s, &mut f)?;
-                name
-            };
-            Ok(serde_json::json!({ "path": dir.path().join(name), "bytes": size }))
-        }
+        "fetch" => bail!("fetch was not prepared"),
         "clipboard-read" => {
             let wp = env
                 .which("wl-paste")
@@ -863,20 +828,70 @@ fn active_window_geometry(env: &HostEnv) -> Result<String> {
     ))
 }
 
-fn tree_size(p: &Path) -> Result<u64> {
-    let m = std::fs::symlink_metadata(p)?;
-    if m.is_dir() {
-        let mut total = 0;
-        for e in std::fs::read_dir(p)? {
-            total += tree_size(&e?.path())?;
-            if total > MAX_FETCH {
-                break;
+/// A fetch source, opened before the user is asked. The copy reads from the
+/// open fd, so changing the path during the wait changes nothing.
+struct FetchPlan {
+    src: crate::safefs::Source,
+    /// Where the path led when it was opened; the prompt shows this.
+    real: PathBuf,
+    size: u64,
+}
+
+/// Refuse a fetch of a protected path: the path asked for, where it really
+/// leads, or a folder that holds a protected path.
+fn check_fetch(env: &HostEnv, asked: &Path, real: &Path, dir: bool) -> Result<()> {
+    let mut denied = policy::denied_paths(env);
+    // Harness logins too: paddock copies them in itself, never by request.
+    if let Ok(f) = crate::profile::HarnessFactory::new(env) {
+        for n in f.names() {
+            if let Some(p) = f.profile(&n) {
+                denied.extend(p.state.auth.iter().map(|a| env.home.join(a)));
             }
         }
-        Ok(total)
-    } else {
-        Ok(m.len())
     }
+    denied.push(env.paddock_data().join("auth"));
+    for d in denied {
+        let canon = std::fs::canonicalize(&d).ok();
+        let hit =
+            |d: &Path| real.starts_with(d) || asked.starts_with(d) || (dir && d.starts_with(real));
+        if hit(&d) || canon.as_deref().is_some_and(hit) {
+            bail!(
+                "{} is or holds a protected path; paddock never copies it into a sandbox",
+                asked.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+fn plan_fetch(env: &HostEnv, req: &Request) -> Result<FetchPlan> {
+    let asked = PathBuf::from(arg_str(req, "path").context("fetch needs a path")?);
+    let src = crate::safefs::Source::open(&asked)?;
+    let real = src.real_path()?;
+    check_fetch(env, &asked, &real, src.is_dir())?;
+    let size = src.size(MAX_FETCH)?;
+    if size > MAX_FETCH {
+        bail!(
+            "{} is {} MiB; the limit is {} MiB",
+            real.display(),
+            size >> 20,
+            MAX_FETCH >> 20
+        );
+    }
+    Ok(FetchPlan { src, real, size })
+}
+
+fn fetch(env: &HostEnv, ctx: &Context, req: &Request, f: &FetchPlan) -> Result<serde_json::Value> {
+    // Check again after the wait: the open file or folder may have moved
+    // into a protected place. A replaced path does not matter: the copy
+    // reads what was opened, which is what the user saw.
+    let asked = PathBuf::from(arg_str(req, "path").unwrap_or(""));
+    check_fetch(env, &asked, &f.src.real_path()?, f.src.is_dir())?;
+    let dir = inbox(&ctx.project)?;
+    let want = safe_name(&f.real.to_string_lossy(), "fetched");
+    // Never remove what is there: a free name instead.
+    let name = dir.copy_source(&f.src, &want, MAX_FETCH)?;
+    Ok(serde_json::json!({ "path": dir.path().join(name), "bytes": f.size }))
 }
 
 /// The work behind a request, worked out before the user is asked.
@@ -884,6 +899,7 @@ enum Work {
     Plain,
     Push(git::PushPlan),
     Forge(forge::Call),
+    Fetch(FetchPlan),
 }
 
 /// What the user sees and what a session grant covers.
@@ -948,6 +964,27 @@ fn prepare(env: &HostEnv, ctx: &Context, req: &Request) -> Result<Prepared> {
                 always_ask: false,
                 read_only: !write,
                 work: Work::Forge(call),
+            })
+        }
+        "fetch" => {
+            let plan = plan_fetch(env, req)?;
+            let (real, asked) = (plan.real.display(), arg_str(req, "path").unwrap_or(""));
+            let mut detail = format!(
+                "Copy the host path {real} into {}/{INBOX}",
+                ctx.project.display()
+            );
+            if Path::new(asked) != plan.real {
+                detail.push_str(&format!(" (asked for as {asked})"));
+            }
+            Ok(Prepared {
+                summary: format!("copy {real} into the sandbox"),
+                detail,
+                // A grant covers the real path the user saw.
+                keys: vec![format!("fetch\0{real}")],
+                session_allowed: true,
+                always_ask: false,
+                read_only: false,
+                work: Work::Fetch(plan),
             })
         }
         _ => {
@@ -1066,7 +1103,7 @@ impl Broker {
             );
             r
         };
-        if let Err(e) = validate(&self.env, req) {
+        if let Err(e) = validate(req) {
             return invalid(e);
         }
         let mode = self.policy.mode(&req.cap);
