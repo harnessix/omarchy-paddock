@@ -654,3 +654,16 @@ fn warns_about_cleartext_credentials_to_remote_proxies() {
     assert!(warn("ALL_PROXY", "socks5://u:p@127.0.0.1:1080").is_empty());
     assert!(!warn("HTTPS_PROXY", "http://u:p@proxy.example:3128")[0].contains("u:p"));
 }
+
+#[test]
+fn unknown_proxy_scheme_never_goes_direct() {
+    let cfg = HostProxy::from_vars(|k| {
+        (k == "HTTPS_PROXY").then(|| "socks4://10.9.9.9:1080".to_string())
+    });
+    assert!(matches!(cfg.https, Some(Upstream::Unsupported { .. })));
+    let e = open_tunnel(&cfg, "93.184.215.14", 443)
+        .err()
+        .unwrap()
+        .to_string();
+    assert!(e.starts_with("refused") && e.contains("socks4"), "{e}");
+}
