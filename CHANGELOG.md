@@ -4,6 +4,7 @@
 
 - Security: `paddock recover --to` walks to the target folder one folder at a time without following symlinks, checks where the opened folder really is, and creates the file in it. Before, it checked the path and then opened it again, so a sandbox that can write a folder on that path could swap it for a symlink in between and make paddock create a new file in a protected place such as `~/.ssh`.
 - Security: a flatpak app start asks for approval of a project `paddock.toml` that widens access, the same as every other sandbox. Before, a project `[secrets] reveal` applied without approval and exposed a `.env` to a flatpak app.
+- Security: the docker and podman egress proxy talks TLS to an `https://` host proxy. Before, it dropped the `https` scheme and sent the CONNECT request with the `Proxy-Authorization` header in plain TCP, so the proxy user name and password crossed the network in cleartext, even when the proxy then refused the request. Now the request and the credentials go only inside TLS, the proxy certificate must pass a check against the system trust store, and any TLS error fails the request instead of falling back to plain TCP. A remote `http://` or `socks5://` proxy with a user name in its URL still gets it in cleartext, as those protocols do, and paddock logs a warning. Reported in the Omarchy plugin marketplace review.
 
 ## 0.1.6
 

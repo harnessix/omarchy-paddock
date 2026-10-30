@@ -146,6 +146,9 @@ pub fn run(
         let mut cfg = crate::proxy::HostProxy::from_vars(|k| env.var(k).map(str::to_string));
         cfg.allow_loopback = built.spec.host_ports.iter().map(|(p, _)| *p).collect();
         cfg.allow_lan = built.spec.lan;
+        for w in cfg.cleartext_warnings() {
+            log::warn!("{w}");
+        }
         crate::proxy::serve(&sock, cfg)?;
     }
     // The shared install step: a clean sandbox without the project installs
