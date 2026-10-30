@@ -76,7 +76,33 @@ pub fn parse_url(raw: &str) -> Option<(String, String, u16)> {
 
 pub fn is_loopback(host: &str) -> bool {
     host.eq_ignore_ascii_case("localhost")
-        || host.parse::<IpAddr>().is_ok_and(|ip| ip.is_loopback())
+        || host
+            .parse::<IpAddr>()
+            .is_ok_and(|ip| canonical(ip).is_loopback())
+}
+
+/// The IPv4 address behind an IPv6 form that reaches it: IPv4-mapped
+/// (`::ffff:a.b.c.d`), IPv4-compatible (`::a.b.c.d`) and the NAT64
+/// well-known prefix (`64:ff9b::a.b.c.d`). Checks must see the IPv4 address,
+/// or `::ffff:127.0.0.1` passes as "not loopback".
+pub fn canonical(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V6(v6) => {
+            let s = v6.segments();
+            let o = v6.octets();
+            let v4 = std::net::Ipv4Addr::new(o[12], o[13], o[14], o[15]);
+            if let Some(m) = v6.to_ipv4_mapped() {
+                IpAddr::V4(m)
+            } else if (s[..6] == [0, 0, 0, 0, 0, 0] && !v6.is_loopback() && !v6.is_unspecified())
+                || s[..6] == [0x64, 0xff9b, 0, 0, 0, 0]
+            {
+                IpAddr::V4(v4)
+            } else {
+                ip
+            }
+        }
+        v4 => v4,
+    }
 }
 
 /// The proxy that the host uses.
@@ -186,7 +212,7 @@ pub const LAN_V4: &[&str] = &[
 pub const LAN_V6: &[&str] = &["fc00::/7", "fe80::/10"];
 
 pub fn is_lan(ip: &IpAddr) -> bool {
-    match ip {
+    match &canonical(*ip) {
         IpAddr::V4(v4) => {
             let o = v4.octets();
             v4.is_private() || v4.is_link_local() || (o[0] == 100 && (o[1] & 0xc0) == 64)
@@ -256,15 +282,18 @@ pub fn local_addrs() -> Vec<IpAddr> {
     out
 }
 
-/// Refuse targets on this host, except allowed loopback ports.
-fn check_target(cfg: &HostProxy, host: &str, port: u16) -> Result<()> {
-    let addrs: Vec<IpAddr> = match (host, port).to_socket_addrs() {
-        Ok(it) => it.map(|a| a.ip()).collect(),
+/// Refuse targets on this host, except allowed loopback ports. Returns the
+/// addresses that passed, so a direct connection uses exactly these and a
+/// second lookup (DNS rebinding) cannot change the target.
+fn check_target(cfg: &HostProxy, host: &str, port: u16) -> Result<Vec<std::net::SocketAddr>> {
+    let resolved: Vec<std::net::SocketAddr> = match (host, port).to_socket_addrs() {
+        Ok(it) => it.collect(),
         // Names that only the upstream proxy can resolve are not local.
-        Err(_) => return Ok(()),
+        Err(_) => return Ok(vec![]),
     };
-    let local = local_addrs();
-    for ip in addrs {
+    let local: Vec<IpAddr> = local_addrs().into_iter().map(canonical).collect();
+    for a in &resolved {
+        let ip = canonical(a.ip());
         if ip.is_loopback() {
             if !cfg.allow_loopback.contains(&port) {
                 bail!("refused: {host}:{port} is a host loopback port that is not allowed");
@@ -275,7 +304,21 @@ fn check_target(cfg: &HostProxy, host: &str, port: u16) -> Result<()> {
             bail!("refused: {host}:{port} is on a private network; set [network] lan = true to allow it");
         }
     }
-    Ok(())
+    Ok(resolved)
+}
+
+/// Connect to addresses that `check_target` already vetted.
+fn connect_addrs(host: &str, addrs: &[std::net::SocketAddr]) -> Result<TcpStream> {
+    let mut last = None;
+    for addr in addrs {
+        match TcpStream::connect_timeout(addr, CONNECT_TIMEOUT) {
+            Ok(s) => return Ok(s),
+            Err(e) => last = Some(e),
+        }
+    }
+    Err(last
+        .map(Into::into)
+        .unwrap_or_else(|| anyhow!("no address for {host}")))
 }
 
 fn connect_tcp(host: &str, port: u16) -> Result<TcpStream> {
@@ -325,14 +368,15 @@ fn authority(host: &str, port: u16) -> String {
 
 /// Open a tunnel to host:port the way a host program would.
 fn open_tunnel(cfg: &HostProxy, host: &str, port: u16) -> Result<TcpStream> {
-    check_target(cfg, host, port)?;
+    let vetted = check_target(cfg, host, port)?;
     let up = if cfg.bypass(host) || is_loopback(host) {
         None
     } else {
         cfg.https.as_ref()
     };
     match up {
-        None => connect_tcp(host, port),
+        // Direct: only the addresses that passed the check.
+        None => connect_addrs(host, &vetted),
         Some(Upstream::Http {
             host: ph,
             port: pp,

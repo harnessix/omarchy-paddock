@@ -311,3 +311,33 @@ fn lan_ranges() {
         assert!(!is_lan(&a.parse().unwrap()), "{a}");
     }
 }
+
+#[test]
+fn mapped_ipv6_forms_count_as_their_ipv4_address() {
+    for a in ["::ffff:127.0.0.1", "::127.0.0.1", "64:ff9b::7f00:1"] {
+        assert!(canonical(a.parse().unwrap()).is_loopback(), "{a}");
+    }
+    for a in [
+        "::ffff:192.168.5.1",
+        "::ffff:10.0.0.1",
+        "64:ff9b::a9fe:a9fe",
+    ] {
+        assert!(is_lan(&a.parse().unwrap()), "{a}");
+    }
+    assert!(is_loopback("::ffff:127.0.0.1"));
+    assert!(!is_lan(&"::ffff:8.8.8.8".parse().unwrap()));
+    // Real IPv6 loopback and unspecified stay what they are.
+    assert!(canonical("::1".parse().unwrap()).is_loopback());
+    assert!(canonical("::".parse().unwrap()).is_unspecified());
+}
+
+#[test]
+fn proxy_refuses_mapped_loopback_and_lan() {
+    let cfg = HostProxy::default();
+    for host in ["::ffff:127.0.0.1", "::ffff:192.168.1.1", "64:ff9b::7f00:1"] {
+        let e = check_target(&cfg, host, 8080).unwrap_err().to_string();
+        assert!(e.starts_with("refused"), "{host}: {e}");
+    }
+    let ok = check_target(&cfg, "::ffff:8.8.8.8", 443).unwrap();
+    assert_eq!(ok.len(), 1);
+}
