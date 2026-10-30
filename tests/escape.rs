@@ -35,4 +35,12 @@ fn bwrap_offline_escape_probe_passes() {
         String::from_utf8_lossy(&out.stderr)
     );
     assert!(text.contains("ok git-hooks-read-only"));
+    for check in [
+        "ok git-dir-cannot-be-renamed",
+        "ok git-commondir-read-only",
+        "ok git-planted-config-never-runs",
+        "ok git-layout-still-trusted",
+    ] {
+        assert!(text.contains(check), "missing {check}:\n{text}");
+    }
 }

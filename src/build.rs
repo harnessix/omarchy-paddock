@@ -47,13 +47,10 @@ pub struct Worktree {
     pub base: String,
 }
 
+/// A git call on a repository that a sandbox can write. It never runs what
+/// the repository's own configuration names (see hostgit.rs).
 fn git(dir: &Path, args: &[&str]) -> Result<String> {
-    crate::env::capture(
-        std::process::Command::new("git")
-            .arg("-C")
-            .arg(dir)
-            .args(args),
-    )
+    crate::hostgit::Checkout::open(dir)?.run(args)
 }
 
 /// Today's date in UTC as YYYYMMDD, for branch names.
@@ -79,18 +76,19 @@ pub(crate) fn ymd(unix: u64) -> String {
 /// A worktree for one run. `app` names the branch after an app:
 /// `paddock/<app>-<date>-<id>`. Terminal runs get `paddock/<id>`.
 pub fn create_worktree(env: &HostEnv, repo: &Path, app: Option<&str>) -> Result<Worktree> {
-    if git(repo, &["rev-parse", "--show-toplevel"])
-        .map(PathBuf::from)
-        .ok()
-        .as_deref()
-        != Some(repo)
-    {
+    let layout = crate::hostgit::Layout::discover(repo)?;
+    if layout.as_ref().map(|l| l.work_tree.as_path()) != Some(repo) {
         bail!(
             "--worktree needs a git repository: {} is not one",
             repo.display()
         );
     }
-    let base = git(repo, &["rev-parse", "HEAD"]).context("--worktree needs at least one commit")?;
+    let base = layout
+        .as_ref()
+        .unwrap()
+        .query(&["rev-parse", "HEAD"])
+        .map(|s| s.trim().to_string())
+        .context("--worktree needs at least one commit")?;
     let id = state::new_id("wt", repo);
     let branch = match app {
         Some(a) => format!(
@@ -128,23 +126,32 @@ pub fn create_worktree(env: &HostEnv, repo: &Path, app: Option<&str>) -> Result<
 
 /// What the run left in its worktree: commits, uncommitted changes and the
 /// commands to review, merge or remove it. Empty lines are dropped.
-pub fn worktree_report(w: &Worktree) -> String {
-    let git = |dir: &Path, args: &[&str]| {
-        std::process::Command::new("git")
-            .arg("-C")
-            .arg(dir)
-            .args(args)
-            .output()
-            .map(|o| String::from_utf8_lossy(&o.stdout).trim_end().to_string())
+pub fn worktree_report(env: &HostEnv, w: &Worktree) -> String {
+    let repo = crate::hostgit::Layout::discover(&w.repo).ok().flatten();
+    let query = |args: &[&str]| {
+        repo.as_ref()
+            .and_then(|l| l.try_query(args))
+            .map(|s| s.trim_end().to_string())
             .unwrap_or_default()
     };
     let range = format!("{}..{}", w.base, w.branch);
-    let commits = git(&w.repo, &["log", "--oneline", &range]);
-    let stat = git(
-        &w.repo,
-        &["diff", "--stat", &format!("{}...{}", w.base, w.branch)],
-    );
-    let dirty = git(&w.path, &["status", "--short"]);
+    let commits = query(&["log", "--oneline", &range]);
+    // `--no-textconv` keeps a textconv program in the repository
+    // configuration from running on the host.
+    let stat = query(&[
+        "diff",
+        "--stat",
+        "--no-textconv",
+        "--no-ext-diff",
+        &format!("{}...{}", w.base, w.branch),
+    ]);
+    // The work tree is read in a sandbox: `git status` runs clean filters,
+    // which no `-c` flag can turn off.
+    let dirty = match worktree_status(env, &w.path) {
+        Ok(Some(lines)) => lines.join("\n"),
+        Ok(None) => String::new(),
+        Err(e) => format!("paddock cannot read the worktree state: {e:#}"),
+    };
     let mut t = format!(
         "paddock: the sandbox worked in {} on branch {}.\n",
         w.path.display(),
@@ -175,21 +182,29 @@ pub fn worktree_report(w: &Worktree) -> String {
     t
 }
 
-/// One line for a notification: how many commits and changed files.
-pub fn worktree_counts(w: &Worktree) -> (usize, usize) {
-    let count = |dir: &Path, args: &[&str]| {
-        std::process::Command::new("git")
-            .arg("-C")
-            .arg(dir)
-            .args(args)
-            .output()
-            .map(|o| String::from_utf8_lossy(&o.stdout).lines().count())
-            .unwrap_or(0)
+/// The state of a worktree that a sandbox wrote. `Ok(None)` means this host
+/// cannot run the check in a sandbox, so the state stays unknown.
+pub fn worktree_status(env: &HostEnv, path: &Path) -> Result<Option<Vec<String>>> {
+    let Some(layout) = crate::hostgit::Layout::discover(path)? else {
+        return Ok(Some(vec![]));
     };
-    (
-        count(&w.repo, &["rev-list", &format!("{}..{}", w.base, w.branch)]),
-        count(&w.path, &["status", "--short"]),
-    )
+    layout.status(env, "normal")
+}
+
+/// One line for a notification: how many commits and changed files. The
+/// change count is None when the worktree state could not be read.
+pub fn worktree_counts(env: &HostEnv, w: &Worktree) -> (usize, Option<usize>) {
+    let commits = crate::hostgit::Layout::discover(&w.repo)
+        .ok()
+        .flatten()
+        .and_then(|l| l.try_query(&["rev-list", &format!("{}..{}", w.base, w.branch)]))
+        .map(|s| s.lines().count())
+        .unwrap_or(0);
+    let changed = worktree_status(env, &w.path)
+        .ok()
+        .flatten()
+        .map(|lines| lines.iter().filter(|l| !l.trim().is_empty()).count());
+    (commits, changed)
 }
 
 pub struct Built {
@@ -583,6 +598,10 @@ mod tests {
             "XDG_DATA_HOME".to_string(),
             tmp.path().join("data").display().to_string(),
         );
+        // PATH so that the sandboxed work-tree check can find bwrap and git.
+        if let Ok(p) = std::env::var("PATH") {
+            vars.insert("PATH".to_string(), p);
+        }
         let env = HostEnv::from_parts(tmp.path().join("home"), "t".into(), 1000, 1000, vars);
         let w = create_worktree(&env, &repo, Some("vscode")).unwrap();
         assert!(w
@@ -591,18 +610,21 @@ mod tests {
         assert!(w
             .path
             .starts_with(tmp.path().join("data/paddock/worktrees")));
-        assert!(worktree_report(&w).contains("made no changes"));
+        assert!(worktree_report(&env, &w).contains("made no changes"));
         g(
             &w.path,
             &["commit", "-q", "--allow-empty", "-m", "work in the app"],
         );
         std::fs::write(w.path.join("new.txt"), "x").unwrap();
-        let r = worktree_report(&w);
-        assert!(
-            r.contains("work in the app") && r.contains("?? new.txt"),
-            "{r}"
-        );
-        assert_eq!(worktree_counts(&w), (1, 1));
+        let r = worktree_report(&env, &w);
+        assert!(r.contains("work in the app"), "{r}");
+        if env.which("bwrap").is_some() {
+            // The worktree state comes from a sandboxed `git status`.
+            assert!(r.contains("?? new.txt"), "{r}");
+            assert_eq!(worktree_counts(&env, &w), (1, Some(1)));
+        } else {
+            assert_eq!(worktree_counts(&env, &w), (1, None));
+        }
         // The checkout itself stays on its branch.
         let head = std::process::Command::new("git")
             .arg("-C")

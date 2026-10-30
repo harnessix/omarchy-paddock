@@ -6,7 +6,12 @@ fn setup() -> (tempfile::TempDir, HostEnv, PathBuf) {
     let tmp = tempfile::tempdir().unwrap();
     let real = tmp.path().join("home");
     std::fs::create_dir_all(&real).unwrap();
-    let env = HostEnv::from_parts(real, "tester".into(), 1000, 1000, BTreeMap::new());
+    // PATH so that the work-tree checks can find bwrap and git.
+    let mut vars = BTreeMap::new();
+    if let Ok(p) = std::env::var("PATH") {
+        vars.insert("PATH".to_string(), p);
+    }
+    let env = HostEnv::from_parts(real, "tester".into(), 1000, 1000, vars);
     let sandbox = env.paddock_data().join("homes/claude/shared/p-1");
     std::fs::create_dir_all(&sandbox).unwrap();
     (tmp, env, sandbox)
@@ -197,7 +202,7 @@ fn sessions_persist_and_report_project_changes() {
     let proj = tmp.path().join("proj");
     std::fs::create_dir_all(&proj).unwrap();
     let g = |args: &[&str]| {
-        assert!(Command::new("git")
+        assert!(std::process::Command::new("git")
             .arg("-C")
             .arg(&proj)
             .args(["-c", "user.name=t", "-c", "user.email=t@example.invalid"])
@@ -221,11 +226,17 @@ fn sessions_persist_and_report_project_changes() {
     let s = Session::load(&env, "claude-p-abc123").unwrap();
     assert!(s.ended.is_some());
     assert!(!s.running(&env));
-    let c = project_changes(&s);
+    let c = project_changes(&env, &s);
     assert!(c.git);
     assert_eq!(c.commits.len(), 1);
     assert!(c.commits[0].ends_with("agent work"));
-    assert_eq!(c.changed, vec!["?? later.txt".to_string()]);
+    // The work-tree state comes from a sandboxed git run. A host without
+    // bubblewrap reports it as unknown instead of guessing.
+    if c.changed_unknown {
+        assert!(env.which("bwrap").is_none());
+    } else {
+        assert_eq!(c.changed, vec!["?? later.txt".to_string()]);
+    }
     assert!(Session::load(&env, "../x").is_none());
     assert_eq!(Session::latest_per_home(&env).len(), 1);
 }

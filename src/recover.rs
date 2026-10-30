@@ -23,7 +23,6 @@ use serde::{Deserialize, Serialize};
 use std::io::Write;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
-use std::process::Command;
 
 /// The XDG user directories, the defaults for recovery folders.
 pub const DEFAULT_FOLDERS: &[&str] = &[
@@ -190,6 +189,10 @@ pub struct Session {
     /// `git status --porcelain` lines of the project at start.
     #[serde(default)]
     pub git_status: Vec<String>,
+    /// True when the state at start could not be read, so a comparison with
+    /// it would be wrong.
+    #[serde(default)]
+    pub git_status_unknown: bool,
 }
 
 fn sessions_dir(env: &HostEnv) -> PathBuf {
@@ -212,6 +215,7 @@ impl Session {
         project: &Path,
         home: &Path,
     ) -> Result<()> {
+        let status = git_status(env, project);
         let s = Session {
             id: id.to_string(),
             harness: harness.to_string(),
@@ -220,7 +224,8 @@ impl Session {
             started: crate::state::now(),
             ended: None,
             git_head: git(project, &["rev-parse", "HEAD"]).map(|s| s.trim().to_string()),
-            git_status: git_status(project),
+            git_status_unknown: status.is_none(),
+            git_status: status.unwrap_or_default(),
         };
         s.save(env)?;
         prune(env);
@@ -289,32 +294,24 @@ fn prune(env: &HostEnv) {
     }
 }
 
+/// A query about refs and objects of a project that a sandbox can write. It
+/// never runs what the project's own configuration names (see hostgit.rs).
 fn git(dir: &Path, args: &[&str]) -> Option<String> {
-    // fsmonitor and other config could run commands; turn them off.
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(dir)
-        .args([
-            "-c",
-            "core.fsmonitor=false",
-            "-c",
-            "core.untrackedCache=false",
-        ])
-        .args(args)
-        .env("GIT_OPTIONAL_LOCKS", "0")
-        .stdin(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .output()
-        .ok()?;
-    out.status
-        .success()
-        .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+    crate::hostgit::Layout::discover(dir)
+        .ok()
+        .flatten()?
+        .try_query(args)
 }
 
-fn git_status(dir: &Path) -> Vec<String> {
-    git(dir, &["status", "--porcelain=v1", "--untracked-files=all"])
-        .map(|s| s.lines().map(str::to_string).collect())
-        .unwrap_or_default()
+/// The project's work-tree state, read in a sandbox: `git status` runs clean
+/// filters, which no `-c` flag turns off. None means it is unknown here.
+fn git_status(env: &HostEnv, dir: &Path) -> Option<Vec<String>> {
+    crate::hostgit::Layout::discover(dir)
+        .ok()
+        .flatten()?
+        .status(env, "all")
+        .ok()
+        .flatten()
 }
 
 /// What the agent changed in the project during a session.
@@ -325,9 +322,12 @@ pub struct ProjectChanges {
     pub commits: Vec<String>,
     /// `git status` lines that were not there at start.
     pub changed: Vec<String>,
+    /// True when the work-tree state could not be read, so `changed` is
+    /// empty for want of an answer, not because nothing changed.
+    pub changed_unknown: bool,
 }
 
-pub fn project_changes(s: &Session) -> ProjectChanges {
+pub fn project_changes(env: &HostEnv, s: &Session) -> ProjectChanges {
     let Some(head) = git(&s.project, &["rev-parse", "HEAD"]).map(|h| h.trim().to_string()) else {
         return ProjectChanges::default();
     };
@@ -347,14 +347,20 @@ pub fn project_changes(s: &Session) -> ProjectChanges {
         .unwrap_or_default(),
         _ => vec![],
     };
-    let changed = git_status(&s.project)
-        .into_iter()
-        .filter(|l| !s.git_status.contains(l))
-        .collect();
+    let now = git_status(env, &s.project);
+    let changed = match (&now, s.git_status_unknown) {
+        (Some(lines), false) => lines
+            .iter()
+            .filter(|l| !s.git_status.contains(l))
+            .cloned()
+            .collect(),
+        _ => vec![],
+    };
     ProjectChanges {
         git: true,
         commits,
         changed,
+        changed_unknown: now.is_none() || s.git_status_unknown,
     }
 }
 

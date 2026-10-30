@@ -552,30 +552,14 @@ fn loses(app: bool, harness: &str, auth: &str) -> String {
     format!("transcripts, history and settings of this project; {login}")
 }
 
+/// A query about refs and objects. The repositories and worktrees here are
+/// writable by sandboxes, so the call never reads their configuration and
+/// never touches a work tree (see hostgit.rs).
 fn git(dir: &Path, args: &[&str]) -> Option<String> {
-    // The worktrees are writable by sandboxes: keep git from running
-    // anything that their files could name.
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(dir)
-        .args([
-            "-c",
-            "core.fsmonitor=false",
-            "-c",
-            "core.untrackedCache=false",
-            "-c",
-            "core.hooksPath=/dev/null",
-        ])
-        .args(args)
-        .env("GIT_OPTIONAL_LOCKS", "0")
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .stdin(Stdio::null())
-        .stderr(Stdio::null())
-        .output()
-        .ok()?;
-    out.status
-        .success()
-        .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+    crate::hostgit::Layout::discover(dir)
+        .ok()
+        .flatten()?
+        .try_query(args)
 }
 
 struct ListedWorktree {
@@ -611,31 +595,15 @@ fn list_worktrees(repo: &Path) -> Vec<ListedWorktree> {
     v
 }
 
-/// The repository-side git directory of a linked worktree, found from the
-/// repository, not from the `.git` file in the worktree that a sandbox can edit.
-fn worktree_gitdir(repo: &Path, wt: &Path) -> Option<PathBuf> {
-    let common = git(
-        repo,
-        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
-    )?;
-    let want = wt.join(".git");
-    // The git directory is sandbox-writable: no symlink, FIFO or huge file.
-    let root = crate::safefs::Root::open(Path::new(common.trim())).ok()?;
-    subdirs(&Path::new(common.trim()).join("worktrees"))
-        .into_iter()
-        .find(|d| {
-            let Some(n) = d.file_name() else {
-                return false;
-            };
-            let rel = Path::new("worktrees").join(n).join("gitdir");
-            root.read(&rel, 64 * 1024)
-                .ok()
-                .flatten()
-                .is_some_and(|t| Path::new(String::from_utf8_lossy(&t).trim()) == want)
-        })
-}
-
-fn worktree_facts(repo: &Path, listed: &ListedWorktree) -> (Option<usize>, Option<bool>) {
+/// Facts about one worktree. The git directory of a linked worktree is not
+/// taken from its `.git` file: `Layout::discover` checks that the repository
+/// registered this worktree (see hostgit.rs), so there is nothing to look up
+/// by hand here.
+fn worktree_facts(
+    env: &HostEnv,
+    repo: &Path,
+    listed: &ListedWorktree,
+) -> (Option<usize>, Option<bool>) {
     let unmerged = listed.head.as_ref().and_then(|head| {
         let ex = listed.branch.as_ref().map(|b| format!("--exclude={b}"));
         let mut args = vec!["rev-list", "--count", head.as_str(), "--not"];
@@ -645,21 +613,19 @@ fn worktree_facts(repo: &Path, listed: &ListedWorktree) -> (Option<usize>, Optio
         args.extend(["--branches", "--remotes"]);
         git(repo, &args).and_then(|s| s.trim().parse().ok())
     });
-    let dirty = worktree_gitdir(repo, &listed.path).and_then(|gd| {
-        let gd = format!("--git-dir={}", gd.display());
-        let wt = format!("--work-tree={}", listed.path.display());
-        git(
-            repo,
-            &[
-                &gd,
-                &wt,
-                "status",
-                "--porcelain",
-                "--untracked-files=normal",
-            ],
-        )
-        .map(|s| !s.trim().is_empty())
-    });
+    // The work tree holds what a sandbox wrote, so `git status` runs in a
+    // sandbox of its own. The layout check also confirms that this worktree
+    // is one the repository registered. None means "not known".
+    let common = crate::hostgit::Layout::discover(repo)
+        .ok()
+        .flatten()
+        .map(|l| l.common_dir);
+    let dirty = crate::hostgit::Layout::discover(&listed.path)
+        .ok()
+        .flatten()
+        .filter(|l| Some(&l.common_dir) == common.as_ref())
+        .and_then(|l| l.status(env, "normal").ok().flatten())
+        .map(|lines| lines.iter().any(|l| !l.trim().is_empty()));
     (unmerged, dirty)
 }
 
@@ -984,7 +950,7 @@ pub fn scan(env: &HostEnv, host: &Host, with_sizes: bool) -> Inventory {
                     .entry(repo.clone())
                     .or_insert_with(|| list_worktrees(repo));
                 if let Some(l) = list.iter().find(|l| l.path == path) {
-                    let (unmerged, dirty) = worktree_facts(repo, l);
+                    let (unmerged, dirty) = worktree_facts(env, repo, l);
                     w.repo = Some(repo.clone());
                     w.branch = l.branch.clone();
                     w.unmerged = unmerged;
@@ -1474,28 +1440,11 @@ pub fn remove_path(env: &HostEnv, path: &Path) -> Result<()> {
         .with_context(|| format!("remove {}", path.display()))
 }
 
-fn git_status(repo: &Path, args: &[&str]) -> Result<()> {
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args([
-            "-c",
-            "core.hooksPath=/dev/null",
-            "-c",
-            "core.fsmonitor=false",
-        ])
-        .args(args)
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .stdin(Stdio::null())
-        .output()?;
-    if !out.status.success() {
-        bail!(
-            "git {}: {}",
-            args.join(" "),
-            String::from_utf8_lossy(&out.stderr).trim()
-        );
-    }
-    Ok(())
+/// A git command on the repository that may write or read its work tree, for
+/// example `worktree remove`, which runs a status internally. It is refused
+/// when the repository configuration can start a program (see hostgit.rs).
+fn git_write(repo: &Path, args: &[&str]) -> Result<()> {
+    crate::hostgit::Checkout::open(repo)?.run(args).map(|_| ())
 }
 
 /// The result of one removal.
@@ -1567,9 +1516,15 @@ pub fn apply(env: &HostEnv, containers: &dyn Containers, items: &[Item]) -> Vec<
                             a.push("--force");
                         }
                         a.push(&p);
-                        git_status(repo, &a)?;
+                        // The worktree itself is sandbox-written: its own
+                        // configuration must be harmless too, because the
+                        // removal reads that work tree.
+                        if let Ok(Some(l)) = crate::hostgit::Layout::discover(path) {
+                            l.guard()?;
+                        }
+                        git_write(repo, &a)?;
                         match branch {
-                            Some(b) if *delete_branch => git_status(repo, &["branch", "-D", b])?,
+                            Some(b) if *delete_branch => git_write(repo, &["branch", "-D", b])?,
                             Some(b) => note = Some(format!("kept the branch {b}")),
                             None => {}
                         }

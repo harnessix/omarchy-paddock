@@ -6,7 +6,12 @@ fn setup() -> (tempfile::TempDir, HostEnv) {
     let tmp = tempfile::tempdir().unwrap();
     let home = tmp.path().join("home");
     std::fs::create_dir_all(&home).unwrap();
-    let env = HostEnv::from_parts(home, "tester".into(), 1000, 1000, BTreeMap::new());
+    // PATH so that work-tree checks can find bwrap and git.
+    let mut vars = BTreeMap::new();
+    if let Ok(p) = std::env::var("PATH") {
+        vars.insert("PATH".to_string(), p);
+    }
+    let env = HostEnv::from_parts(home, "tester".into(), 1000, 1000, vars);
     (tmp, env)
 }
 
