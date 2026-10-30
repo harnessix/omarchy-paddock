@@ -4,6 +4,8 @@
 //! child. A parent hands tasks to two children through the tree scope of
 //! paddock kv. Skipped where the host cannot run bubblewrap.
 
+mod common;
+
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -45,8 +47,8 @@ fn toml_str(s: &str) -> String {
 }
 
 fn world(parent_script: &str) -> World {
-    let base = std::env::var("HOME").map(PathBuf::from).unwrap();
-    let tmp = tempfile::tempdir_in(base).unwrap();
+    // Not in /tmp: the sandbox has its own /tmp.
+    let tmp = common::tempdir();
     let root = tmp.path().to_path_buf();
     let cfg = root.join("cfg/paddock");
     std::fs::create_dir_all(cfg.join("harness.d")).unwrap();

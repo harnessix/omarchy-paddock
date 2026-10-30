@@ -10,6 +10,8 @@
 //! - A held Codex login is not checked: the record keeps its numbers, marked
 //!   as paused.
 
+mod common;
+
 use paddock::env::HostEnv;
 use paddock::state::{HeldLogin, Running};
 use std::collections::BTreeMap;
@@ -61,9 +63,8 @@ struct World {
 }
 
 fn world() -> World {
-    // In the home, as the other end-to-end tests: the sandbox has its own /tmp.
-    let base = std::env::var("HOME").map(PathBuf::from).unwrap();
-    let tmp = tempfile::tempdir_in(base).unwrap();
+    // Not in /tmp: the sandbox has its own /tmp.
+    let tmp = common::tempdir();
     let home = tmp.path().join("home");
     let omarchy = home.join("omarchy");
     write_exec(&omarchy.join("bin/omarchy-agent-usage-update"), FAKE_UPDATE);
@@ -242,7 +243,7 @@ fn omarchy_s_collector_runs_in_the_sandbox_without_network() {
         eprintln!("skipped: no Omarchy collector or Claude Code login file here");
         return;
     }
-    let t = tempfile::tempdir_in(&env.home).unwrap();
+    let t = common::tempdir();
     let sb = t.path().join("sb");
     std::fs::create_dir_all(sb.join(".claude")).unwrap();
     std::fs::write(
