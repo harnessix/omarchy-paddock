@@ -1172,11 +1172,13 @@ fn real_main() -> Result<i32> {
                 r.config.display()
             );
             println!("Wrote the shim folder {}.", r.shims.display());
-            let usage = paddock::omarchy_usage::install(&env)?;
-            println!(
-                "Wrote {}: the agents panel checks the limits of a login that a sandbox holds from paddock's side. It takes effect at your next login.",
-                usage[0].display()
-            );
+            match paddock::omarchy_usage::install(&env) {
+                Ok(_) => println!(
+                    "Added one marked block to {}: the agents panel checks the limits of a login that a sandbox holds from paddock's side. It takes effect at your next login.",
+                    paddock::omarchy_usage::hypr_config(&env).display()
+                ),
+                Err(e) => println!("The agents panel keeps checking limits on the host: {e:#}"),
+            }
             if let Err(e) = &r.reshim {
                 println!("mise reshim did not run: {e}. Run it yourself, or the key keeps starting agents without a sandbox.");
             }
