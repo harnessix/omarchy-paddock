@@ -375,26 +375,52 @@ fn report_worktree(env: &HostEnv, name: &str, w: &build::Worktree) {
     if std::io::IsTerminal::is_terminal(&std::io::stderr()) {
         return;
     }
-    let Some(ns) = env.which("notify-send") else {
-        return;
-    };
     let (commits, changed) = build::worktree_counts(env, w);
+    desktop_notice(env, &worktree_note(name, w, commits, changed));
+}
+
+/// The notification after an app worked in a worktree. The branch name and
+/// the paths come from a repository that the sandbox wrote, so they go only
+/// into the D-Bus message, never into the arguments of a host process.
+pub fn worktree_note(
+    name: &str,
+    w: &build::Worktree,
+    commits: usize,
+    changed: Option<usize>,
+) -> crate::broker::notify::Note {
     let changed = match changed {
         Some(n) => format!("{n}"),
         None => "an unknown number of".to_string(),
     };
-    let _ = std::process::Command::new(ns)
-        .args([
-            "--app-name=paddock",
-            &format!("{name} worked on branch {}", w.branch),
-            &format!(
-                "{commits} commits and {changed} uncommitted changes in {}. Review: git -C {} log {}",
-                w.path.display(),
-                w.repo.display(),
-                w.branch
-            ),
-        ])
-        .status();
+    crate::broker::notify::Note {
+        summary: format!("{name} worked on branch {}", w.branch),
+        body: format!(
+            "{commits} commits and {changed} uncommitted changes in {}. Review: git -C {} log {}",
+            w.path.display(),
+            w.repo.display(),
+            w.branch
+        ),
+        ..Default::default()
+    }
+}
+
+/// The notification when an app from a launcher entry cannot start.
+pub fn start_error_note(name: &str, e: &anyhow::Error) -> crate::broker::notify::Note {
+    crate::broker::notify::Note {
+        summary: format!("paddock could not start {name}"),
+        body: format!("{e:#}"),
+        ..Default::default()
+    }
+}
+
+/// Show a notification on the desktop through the session bus. The text can
+/// come from a sandbox: no process gets it as arguments, where a leading "-"
+/// would read as an option and every local user could read it in /proc.
+/// Without a session bus, the terminal text is all there is.
+pub fn desktop_notice(env: &HostEnv, n: &crate::broker::notify::Note) {
+    if let Err(e) = crate::broker::notify::show(env, n) {
+        log::debug!("no desktop notification: {e:#}");
+    }
 }
 
 /// Flatpak apps run in flatpak's own sandbox, with every permission the app
@@ -1168,6 +1194,50 @@ pub mod ports {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn notification_text_that_starts_with_a_dash_is_never_an_argument() {
+        use std::os::unix::fs::PermissionsExt;
+        let t = tempfile::tempdir().unwrap();
+        // A fake notify-send that records any arguments it gets.
+        let bin = t.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let record = t.path().join("argv.txt");
+        let script = bin.join("notify-send");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" >> '{}'\n",
+                record.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut vars = std::collections::BTreeMap::new();
+        vars.insert("PATH".to_string(), bin.display().to_string());
+        let env = HostEnv::from_parts(t.path().join("home"), "demo".into(), 1000, 1000, vars);
+
+        // A branch and a worktree path that a sandbox chose, and error text.
+        let w = build::Worktree {
+            repo: PathBuf::from("/home/demo/src/app"),
+            path: PathBuf::from("/home/demo/.local/share/paddock/worktrees/--help"),
+            branch: "--version".into(),
+            base: "main".into(),
+        };
+        let n = worktree_note("-x", &w, 2, Some(1));
+        assert_eq!(n.summary, "-x worked on branch --version");
+        assert!(n.body.contains("worktrees/--help"), "{}", n.body);
+        assert!(n.body.ends_with("log --version"), "{}", n.body);
+        let e = start_error_note("app", &anyhow::anyhow!("--icon=/home/demo/x"));
+        assert_eq!(e.body, "--icon=/home/demo/x");
+
+        // The text goes to the session bus as D-Bus strings, which are never
+        // parsed as options. Without a bus there is no notification, and no
+        // fallback to a process.
+        desktop_notice(&env, &n);
+        desktop_notice(&env, &e);
+        assert!(!record.exists(), "notify-send ran");
+    }
 
     #[test]
     fn editors_get_their_folders_and_chat_apps_do_not() {

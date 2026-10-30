@@ -503,6 +503,49 @@ pub fn removable_roots(env: &HostEnv) -> Vec<PathBuf> {
     ]
 }
 
+/// The harness name of the homes that `paddock doctor --escape` makes.
+pub const DOCTOR_HARNESS: &str = "doctor";
+
+/// Remove the homes of `paddock doctor --escape` runs that are over: the
+/// verified origin names a project that is gone, and no sandbox runs in the
+/// home. Each run has its own scratch project, so each run has its own home.
+/// A home without a verified origin stays for `paddock gc`. Returns the
+/// removed homes.
+pub fn remove_doctor_homes(env: &HostEnv) -> Vec<PathBuf> {
+    let running: BTreeSet<PathBuf> = Running::list(env)
+        .into_iter()
+        .filter(|r| r.harness == DOCTOR_HARNESS)
+        .filter_map(|r| {
+            let auth = r.auth.parse::<AuthMode>().ok()?;
+            Some(
+                homes_root(env)
+                    .join(DOCTOR_HARNESS)
+                    .join(login_dir(&auth))
+                    .join(state::slug(&r.project)),
+            )
+        })
+        .collect();
+    let mut removed = Vec::new();
+    for ldir in subdirs(&homes_root(env).join(DOCTOR_HARNESS)) {
+        let Some(auth) = auth_from_dir(&name(&ldir)) else {
+            continue;
+        };
+        let auth = auth.to_string();
+        for path in subdirs(&ldir) {
+            if running.contains(&path) {
+                continue;
+            }
+            let over = read_origin(&path).is_some_and(|o| {
+                origin_matches(&o, DOCTOR_HARNESS, &auth, &name(&path)) && !o.project.exists()
+            });
+            if over && crate::safefs::remove_tree_path(&path).is_ok() {
+                removed.push(path);
+            }
+        }
+    }
+    removed
+}
+
 /// Subdirectories, without symlinks.
 fn subdirs(dir: &Path) -> Vec<PathBuf> {
     let mut v: Vec<PathBuf> = std::fs::read_dir(dir)
@@ -889,7 +932,7 @@ pub fn scan(env: &HostEnv, host: &Host, with_sizes: bool) -> Inventory {
                 .max();
                 let (profile, app) = match &host.profiles {
                     // The escape probe's own harness has no profile file.
-                    _ if harness == "doctor" => (true, false),
+                    _ if harness == DOCTOR_HARNESS => (true, false),
                     Some(p) => match p.get(&harness) {
                         Some(app) => (true, *app),
                         None => (false, origin.as_ref().is_some_and(|o| o.app)),
@@ -1242,7 +1285,21 @@ pub fn plan(inv: &Inventory, o: &GcOptions, now: u64) -> Vec<Item> {
             .app
             .then(|| "the app's login in this home will be lost".to_string());
         let mut needs = Vec::new();
-        let (tier, reason) = if !h.profile {
+        let (tier, reason) = if h.harness == DOCTOR_HARNESS {
+            // Each escape run has its own scratch project and home. A home
+            // whose project is gone is a leftover; one without a verified
+            // origin is one when it is a day old. A run that is still
+            // setting up has its project and is not touched.
+            let left = h.project_exists == Some(false)
+                || (h.project.is_none() && h.last_active() < now.saturating_sub(DAY));
+            if !left {
+                continue;
+            }
+            (
+                Tier::Auto,
+                "a leftover of an escape test (paddock doctor --escape)".to_string(),
+            )
+        } else if !h.profile {
             if h.app {
                 need(&mut needs, o.homes, "--homes");
                 need(&mut needs, o.include_app_logins, "--include-app-logins");

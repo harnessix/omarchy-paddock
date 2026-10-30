@@ -116,8 +116,8 @@
   "msg.recoverFailed": "没有恢复。请在终端运行 paddock recover 查看原因。",
   "notice.title": "Paddock：沙箱中有新文件",
   "notice.body": {
-    "one": "%1 在项目外保存了 %2 个文件。打开 Paddock 面板即可恢复。",
-    "other": "%1 在项目外保存了 %2 个文件。打开 Paddock 面板即可恢复。"
+    "one": "沙箱在项目外保存了 %1 个文件。打开 Paddock 面板即可恢复。",
+    "other": "沙箱在项目外保存了 %1 个文件。打开 Paddock 面板即可恢复。"
   },
   "keys.files": "↵ 恢复 · → 打开目录",
   "new.otherFolder": "选择其他文件夹…",
