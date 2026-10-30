@@ -36,6 +36,12 @@ env_pass = ["XAI_API_KEY", "GROK_API_KEY"]
 env = "GROK_HOME"
 dir = ".grok"
 
+# Grok keeps one folder per session in ~/.grok/sessions. New sessions are
+# copied back at exit, so the Omarchy agents panel counts them.
+[state.history]
+copy_back = [".grok/sessions"]
+files = ["*.json", "*.jsonl"]
+
 [[mcp]]
 file = ".grok/config.toml"
 format = "toml"
