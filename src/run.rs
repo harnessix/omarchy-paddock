@@ -476,6 +476,11 @@ fn start_broker(
     // A child never gets a mode that its parent did not have.
     if let Some(c) = &built.spawn {
         policy.modes = crate::spawn::child_modes(&policy.modes, &c.modes);
+        if c.role == crate::spawn::Role::Reviewer {
+            policy
+                .modes
+                .insert("git-push".into(), crate::broker::Mode::Deny);
+        }
     }
     let human: std::sync::Arc<dyn crate::broker::Approver> =
         std::sync::Arc::new(crate::broker::HostApprover);
@@ -515,6 +520,7 @@ fn start_broker(
             .map(|c| c.chain.clone())
             .unwrap_or_default(),
         depth: built.spawn.as_ref().map_or(0, |c| c.depth),
+        role: built.spawn.as_ref().map(|c| c.role),
     };
     // Children of this sandbox (`paddock-host spawn`). A bad [spawn] table
     // turns spawn off for this run; the rest of the broker still works.

@@ -574,6 +574,21 @@ impl Checkout {
         cmd.current_dir(&self.layout.work_tree);
         run(cmd.args(args))
     }
+
+    /// The same, with a private index file instead of the repository's
+    /// own, and paddock as the author of a commit. `index` must be in a
+    /// folder that only the host can write.
+    pub fn run_with_index(&self, index: &Path, args: &[&str]) -> Result<String> {
+        self.layout.guard()?;
+        let mut cmd = hardened(&self.layout.git_dir, Some(&self.layout.work_tree));
+        cmd.current_dir(&self.layout.work_tree)
+            .env("GIT_INDEX_FILE", index)
+            .env("GIT_AUTHOR_NAME", "paddock")
+            .env("GIT_AUTHOR_EMAIL", "paddock@localhost")
+            .env("GIT_COMMITTER_NAME", "paddock")
+            .env("GIT_COMMITTER_EMAIL", "paddock@localhost");
+        run(cmd.args(args))
+    }
 }
 
 #[cfg(test)]

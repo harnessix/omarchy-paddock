@@ -434,6 +434,9 @@ pub struct Context {
     pub chain: Vec<String>,
     /// 0 when the user started the sandbox, 1 for its child, and so on.
     pub depth: u32,
+    /// The role of a child. A reviewer cannot push or change anything on
+    /// the forge. None when the user started the sandbox.
+    pub role: Option<crate::spawn::Role>,
 }
 
 /// The answer source. The real one waits for `paddock approvals answer` or a
@@ -1060,6 +1063,7 @@ enum Work {
     Spawn {
         harness: String,
         prompt: Vec<u8>,
+        opts: crate::spawn::StartOpts,
     },
     /// status, wait, kill or list of this sandbox's own children.
     SpawnControl,
@@ -1336,6 +1340,32 @@ impl Broker {
                 ),
             ));
         }
+        // A role is a fixed set of limits; the agent only names it.
+        let role: crate::spawn::Role = arg_str(req, "role")
+            .unwrap_or("implementer")
+            .parse()
+            .map_err(|e: anyhow::Error| invalid(format!("{e:#}")))?;
+        let num = |k: &str| req.args.get(k).and_then(|v| v.as_u64());
+        let limits = sp
+            .cfg
+            .limits(
+                num("timeout"),
+                num("mem"),
+                num("cpu_percent").map(|c| c.min(u32::MAX as u64) as u32),
+            )
+            .map_err(|e| invalid(format!("{e:#}")))?;
+        let scope = sp.scope_tool();
+        if scope.is_none() && (limits.mem.is_some() || limits.cpu_percent.is_some()) {
+            return Err(Response::new(
+                Status::Failed,
+                "paddock needs `systemd-run --user` to limit memory and CPUs, and it does not work on this host",
+            ));
+        }
+        let from_head = req
+            .args
+            .get("from_head")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
         let prompt = read_prompt(&self.ctx.project, arg_str(req, "prompt_file").unwrap_or(""))
             .map_err(|e| invalid(format!("{e:#}")))?;
         let text = String::from_utf8_lossy(&prompt);
@@ -1344,16 +1374,28 @@ impl Broker {
         let c = &sp.ceiling;
         let detail = format!(
             "Start {harness} in a new sandbox with this task. It runs once and stops.\n\
+             Role: {}\n\
              Login: {} (the {harness} login of this computer; this sandbox never sees it)\n\
-             Branch: a new worktree of {} from the current commit of this sandbox\n\
-             Limits: network {}, backend {}, no display, at most {} seconds, at most {} at a time\n\
+             Branch: a new worktree of {} from {}\n\
+             Limits: network {}, backend {}, no display, {} (enforced by {}), at most {} at a time\n\
              Results go to {}/{INBOX}.\n\n\
              Task ({chars} characters{}):\n{shown}",
+            role.describe(),
             c.auth,
             c.repo.display(),
+            if from_head {
+                "the files of this sandbox as they are now, uncommitted changes included"
+            } else {
+                "the current commit of this sandbox"
+            },
             format!("{:?}", c.network).to_lowercase(),
             c.backend,
-            sp.cfg.timeout,
+            limits.describe(),
+            if scope.is_some() {
+                "systemd-run"
+            } else {
+                "paddock"
+            },
             sp.cfg.max_running,
             self.ctx.project.display(),
             if chars > crate::spawn::PROMPT_SHOWN {
@@ -1363,19 +1405,53 @@ impl Broker {
             },
         );
         Ok(Prepared {
-            summary: format!("start {harness} with a task"),
+            summary: format!("start {harness} as {} with a task", role.name()),
             detail,
-            // A session grant covers this harness only.
-            keys: vec![format!("spawn\0{harness}")],
+            // A session grant covers this harness in this role only.
+            keys: vec![format!("spawn\0{harness}\0{}", role.name())],
             session_allowed: true,
             always_ask: false,
             read_only: false,
             audit: Some(format!(
-                "start {harness} in a new sandbox (login {}; task {chars} characters, not logged)",
-                c.auth
+                "start {harness} as {} in a new sandbox (login {}; {}; task {chars} characters, not logged)",
+                role.name(),
+                c.auth,
+                limits.describe()
             )),
-            work: Work::Spawn { harness, prompt },
+            work: Work::Spawn {
+                harness,
+                prompt,
+                opts: crate::spawn::StartOpts {
+                    role,
+                    limits,
+                    from_head,
+                },
+            },
         })
+    }
+
+    fn refuse_reviewer(&self, req: &Request) -> Response {
+        let r = Response::new(
+            Status::Disabled,
+            format!(
+                "this sandbox runs as a reviewer, which cannot use {}",
+                if req.cap == "git-push" {
+                    "git push"
+                } else {
+                    "forge commands that change something"
+                }
+            ),
+        );
+        audit(
+            &self.env,
+            &self.ctx,
+            req,
+            &audit_detail(req, &self.ctx.project, None),
+            None,
+            "refused: reviewer",
+            &r,
+        );
+        r
     }
 
     fn perform_spawn(&self, req: &Request, work: &Work) -> Response {
@@ -1386,7 +1462,14 @@ impl Broker {
         let id = arg_str(req, "id").unwrap_or("");
         let missing = || Response::new(Status::Invalid, format!("no child {id} of this sandbox"));
         match (work, arg_str(req, "action").unwrap_or("start")) {
-            (Work::Spawn { harness, prompt }, _) => match sp.start(harness, prompt) {
+            (
+                Work::Spawn {
+                    harness,
+                    prompt,
+                    opts,
+                },
+                _,
+            ) => match sp.start(harness, prompt, *opts) {
                 Ok(s) => Response::done(to_json(&s)),
                 Err(e) => Response::new(Status::Failed, format!("{e:#}")),
             },
@@ -1451,6 +1534,9 @@ impl Broker {
                 "max_depth": s.cfg.max_depth,
                 "depth": self.ctx.depth,
                 "timeout_seconds": s.cfg.timeout,
+                "max_mem": s.cfg.max_mem.map(crate::spawn::format_bytes),
+                "max_cpus": s.cfg.max_cpu_percent.map(crate::spawn::format_cpus),
+                "roles": ["implementer", "reviewer"],
             });
         }
         if let Some(p) = self.ctx.chain.last() {
@@ -1483,6 +1569,12 @@ impl Broker {
         };
         if let Err(e) = validate(req) {
             return invalid(e);
+        }
+        // A reviewer reads and reports. It never pushes and never changes
+        // anything on the forge, whatever the configuration allows.
+        let reviewer = self.ctx.role == Some(crate::spawn::Role::Reviewer);
+        if reviewer && req.cap == "git-push" {
+            return self.refuse_reviewer(req);
         }
         let mode = self.mode(&req.cap);
         if mode == Mode::Deny {
@@ -1530,6 +1622,9 @@ impl Broker {
                 Err(e) => return invalid(e),
             }
         };
+        if reviewer && req.cap == "forge" && !prep.read_only {
+            return self.refuse_reviewer(req);
+        }
         let granted = || {
             let g = self.grants.lock().unwrap();
             prep.session_allowed && prep.keys.iter().all(|k| g.contains(k))

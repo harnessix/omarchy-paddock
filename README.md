@@ -488,12 +488,27 @@ An agent in a sandbox can start an agent of another harness. For example, Claude
 
 ```sh
 paddock-host spawn codex --worktree --prompt-file task.md   # prints an id
+paddock-host spawn gemini --role reviewer --from-head --prompt-file review.md
+paddock-host spawn codex --prompt-file task.md --timeout 30m --mem 4G --cpus 2
 paddock-host status <id>
 paddock-host wait <id> --timeout 600
 paddock-host kill <id>
 ```
 
-The child runs the harness once, without a terminal (`claude -p`, `codex exec`, `opencode run`, `copilot -p`, `agy --print` or `grok --prompt-file`), and stops when the task is done. It works in a new worktree on the branch `paddock/spawn-<harness>-<id>`, from the commit that the parent has checked out. When it ends, paddock writes the results to `.paddock/inbox/spawn-<id>/` in the parent's project: `result.json` with the state, the exit code, the branch, the commit count and a diff summary, and `output.txt` with the end of the child's final output. The parent reads the branch with git and merges what it wants.
+The child runs the harness once, without a terminal (`claude -p`, `codex exec`, `opencode run`, `copilot -p`, `agy --print` or `grok --prompt-file`), and stops when the task is done. It works in a new worktree on the branch `paddock/spawn-<harness>-<id>`, from the commit that the parent has checked out. The worktree uses the same repository, so the child's commits are in the parent's repository at once. `wait` and `status` give the branch name and the exit status. The parent reads the branch with git, for example `git diff main...paddock/spawn-codex-<id>`, and merges what it wants. paddock also writes a short summary to `.paddock/inbox/spawn-<id>/`: `result.json` with the state, the exit code, the branch, the commit count and a diff summary, and `output.txt` with the end of the child's final output.
+
+With `--from-head`, the child starts from the parent's files as they are now. paddock first makes a commit of them, with uncommitted and new files but without ignored ones. It uses a private index file, so the parent's files, index and branches do not change. The host git call is the hardened one that paddock uses for worktrees: it refuses a repository configuration that can start a program.
+
+A role is a fixed set of limits. The agent names a role. It cannot combine its own limits.
+
+| Role | Files | Environment | Push and `gh` writes |
+| :--- | :--- | :--- | :--- |
+| `implementer` (the default) | its own writable worktree | clean | as the parent allows |
+| `reviewer` | read-only | clean | refused |
+
+"Clean" means that only the allowlist and the harness's own variables (for example `OPENAI_API_KEY` for codex) pass. A reviewer keeps the network mode of the parent for now.
+
+`--timeout`, `--mem` and `--cpus` can only lower the limits in your configuration. If the host has `systemd-run --user`, paddock starts the child's host process in a systemd scope with `MemoryMax`, `CPUQuota` and `RuntimeMaxSec`, so the limits cover the child sandbox and everything in it. paddock itself stops the child at the timeout, so the child can still save its login. The scope's runtime limit is a backstop one minute later. Without `systemd-run`, paddock enforces the timeout and refuses `--mem` and `--cpus`. The audit log says why a child stopped.
 
 Spawn is off until you turn it on. Only `~/.config/paddock/config.toml` can turn it on. A project `paddock.toml` cannot.
 
@@ -506,18 +521,20 @@ harnesses = ["codex"]    # the harnesses that a sandbox may start; empty by defa
 max_running = 2          # children of one sandbox that run at the same time
 max_depth = 1            # 1: a child cannot start children of its own
 timeout = 1800           # seconds that one child may run in total
+# max_mem = "4G"         # the most memory of one child; no limit by default
+# max_cpus = 2           # the most CPUs of one child; no limit by default
 ```
 
 These rules always hold:
 
-- A child never gets more than its parent. It gets the same backend, network mode, LAN setting, environment mode and approved mounts, and the same project. It gets no display. Its host capability modes are at most those of the parent. paddock uses the settings that the parent had when it started, so a change to `paddock.toml` during the run does not reach the child.
+- A child never gets more than its parent. It gets the same backend, network mode, LAN setting and approved mounts, and the same project. Its environment is clean. It gets no display. Its host capability modes are at most those of the parent. paddock uses the settings that the parent had when it started, so a change to `paddock.toml` during the run does not reach the child.
 - No credentials move between sandboxes. The child uses its own login of its harness, in its own sandbox home. The parent never sees it. The parent gets only the results.
-- The first spawn of each harness in a session asks you. The card shows the harness, the login it uses and the task. "Allow for this session" covers only that harness.
+- The first spawn of each harness in a session asks you. The card shows the harness, the role, the login it uses, the limits and the task. "Allow for this session" covers only that harness in that role.
 - Requests from a child, for example `git-push` or `exec`, show "Started by sandbox X" on the card. An "Allow for this session" answer for the parent does not apply to the child, and an answer for the child does not apply to the parent. Otherwise a sandbox could avoid a question by giving the work to a child.
-- paddock counts the running children and the depth on the host. A child stops when its parent ends, when you run `paddock stop` on the parent, after `timeout` seconds, or with `paddock-host kill`. No child keeps using your quota after the parent is gone.
+- paddock counts the running children and the depth on the host. A child stops when its parent ends, when you run `paddock stop` on the parent, at its time limit, or with `paddock-host kill`. No child keeps using your quota after the parent is gone.
 - The task never goes into the arguments of a process, which other users can see. The harness reads it on its standard input or from a private file. paddock reads the prompt file from the project without following symlinks, refuses pipes and devices, and allows at most 256 KiB.
 
-`paddock ps` and the bar panel show children under their parent, and the approval card names the sandbox that started a child. `paddock log` records the parent, the child, the harness, the branch, the exit status and the durations. It never records the task or the output. Gemini CLI has no one-shot entry yet, because paddock did not check its flags on a real install.
+`paddock ps` and the bar panel show children under their parent, and the approval card names the sandbox that started a child. `paddock log` records the parent, the child, the harness, the role, the branch, the limits, the exit status, the reason for the end and the durations. It never records the task or the output. Gemini CLI has no one-shot entry yet, because paddock did not check its flags on a real install.
 
 You can let an agent on the host answer requests for you (`paddock approver`). paddock trusts that setting only from a root-owned file (`sudo paddock approver enable --system`) or from a file signed with a password that you type when a sandbox starts, so that a process on your computer cannot turn it on for itself. The agent approver can only answer the capabilities that you list, the rules above still hold, and if it does not answer clearly, the request comes to you.
 
