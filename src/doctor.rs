@@ -252,6 +252,11 @@ pub fn report(env: &HostEnv) -> Result<bool> {
     } else {
         println!("  off      harness commands run without a sandbox; paddock shims install makes the sandbox the default");
     }
+
+    println!("\nUpdates:");
+    for l in crate::update::doctor_lines(env) {
+        println!("{l}");
+    }
     Ok(missing_required.is_empty())
 }
 

@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+- `paddock setup`: a first-run wizard. It shows the missing system packages with the install command for the distribution, and offers the shell commands, the launchers, the Omarchy bar widget, the default backend and app workspace folders. Each step says what it changes and how to undo it. A second run shows the state and changes nothing unless you ask. `--yes` with `--shims`/`--no-shims`, `--launchers`/`--no-launchers`, `--plugin`/`--no-plugin`, `--backend NAME` and `--app NAME=DIR` runs it without questions, for scripts and agents. The wizard runs `sudo` only after a yes on a terminal; with `--yes` it prints the command.
+- `paddock update`: updates paddock to the latest GitHub release. It downloads the tarball and its `.sha256` into a private folder, checks the checksum and the version that the new binary prints, then replaces the binary atomically, and runs `omarchy plugin update harnessix.paddock` when the bar widget is installed. HTTPS goes only to GitHub hosts, through the host proxy settings, and no redirect to another host is followed. A binary that a pacman package owns is not overwritten; paddock prints what to run instead. `--check` only reports. The command refuses to run inside a sandbox.
+- `paddock doctor` says when a newer release exists (checked at most once a day, at most two seconds of waiting, off with `PADDOCK_NO_UPDATE_CHECK=1`), and when a desktop app was updated on the host after its sandbox started.
+- README: a quick start at the top of Install. The bar widget from the Omarchy plugin marketplace does not install the `paddock` command.
+
 ## 0.1.7
 
 A security release. Update from every earlier version. The docker and podman relay sent the user name and password of an `https://` host proxy in cleartext, and connected directly when it could not use the proxy URL. `recover --to` could be redirected into a protected folder, and a project file could reveal secrets to a flatpak app without approval.

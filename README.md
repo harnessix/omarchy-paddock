@@ -42,6 +42,26 @@ paddock moves the boundary from "which commands can run" to "which files exist".
 
 ## Install
 
+### Quick start
+
+1. On Omarchy, add the bar widget. It installs only the widget, not the `paddock` command:
+
+   ```sh
+   omarchy plugin add https://github.com/harnessix/omarchy-paddock --enable
+   ```
+
+2. Install the `paddock` command: the prebuilt binary from the [latest release](https://github.com/harnessix/omarchy-paddock/releases/latest), or `bin/install` from a clone. Both are described below.
+
+3. Run the setup. It checks the system packages, and offers the shell commands, the launchers, the bar widget and the default backend, one step at a time. Each step says what it changes and how to undo it. A second run shows the state and changes nothing unless you ask.
+
+   ```sh
+   paddock setup
+   ```
+
+   Without questions, for scripts and agents, name each step: `paddock setup --yes --shims --launchers --no-plugin --backend bwrap`. `--app vscode=~/src/api` saves a workspace folder for an app. With `--yes`, the setup only prints the command that installs missing packages and never runs `sudo`.
+
+### From a clone or a release
+
 paddock is a Rust command and an Omarchy bar plugin in one repository. Clone the repository, and run the installer from its root. It installs the system packages, builds paddock, and runs `paddock doctor`.
 
 ```sh
@@ -84,6 +104,19 @@ omarchy plugin add https://github.com/harnessix/omarchy-paddock --enable
 
 The widget lists running sandboxes with their backend, network, display and login. Press Enter on a sandbox to go to the terminal that runs it (Hyprland). The row actions open the project folder, copy its path, show the display window of a sandbox in `window` mode, and stop the sandbox after a second press. The New button starts a sandbox in two steps: pick a recent project, then a harness that is installed on this machine, and paddock opens a terminal that runs it. The Checks button runs `paddock doctor`. Every action has a key, and the panel footer lists them.
 
+### Update
+
+```sh
+paddock update --check    # is there a newer release, and what an update would do
+paddock update            # asks first; --yes updates without asking
+```
+
+`paddock update` asks the GitHub API for the latest release. It downloads the tarball and its `.sha256` into a private folder, checks the checksum, and checks that the new binary prints the expected version. Then it writes the new binary next to the old one and renames it into place, so a cut download never leaves half a binary. It talks only to `api.github.com`, `github.com` and GitHub's download hosts over HTTPS, follows no redirect to another host, and uses your `HTTPS_PROXY`. If the bar widget is installed, it also runs `omarchy plugin update harnessix.paddock --yes`.
+
+If a package owns the binary (the Arch package that `bin/install` builds), `paddock update` does not overwrite it. Run `git pull` and `bin/install` in your clone instead. `paddock update` runs only on the host, never in a sandbox.
+
+`paddock doctor` says when a newer release exists. It checks at most once a day and waits at most two seconds; `PADDOCK_NO_UPDATE_CHECK=1` turns the check off. It also says when a desktop app was updated on the host while its sandbox runs, so that you restart it.
+
 ### Let your agent set it up
 
 paddock ships two agent skills. Install them with the [skills](https://github.com/vercel-labs/skills) command, which supports Claude Code, Codex, Copilot, Gemini CLI, opencode and other agents:
@@ -112,6 +145,8 @@ Then ask your agent, for example: "Install paddock and make the sandbox the defa
    paddock launchers remove
    ```
 
+   `paddock setup --yes --no-shims --no-launchers --no-plugin` does steps 1 and 2 in one command.
+
    If you forget this step, nothing breaks. The line in `~/.bashrc` runs only when its script exists, and each command falls back to the real program when paddock is gone. The launcher entries stay in the menu until you delete them.
 
 3. Remove the command. If you installed the Arch package (`bin/install` does this on Arch Linux), run `sudo pacman -R omarchy-paddock`. Otherwise, delete `~/.local/bin/paddock`.
@@ -128,7 +163,7 @@ Then ask your agent, for example: "Install paddock and make the sandbox the defa
 
 6. Optional: if you used the docker or podman backend, run `paddock gc --yes` before you remove the command. It removes the old paddock images and paddock's build cache. To remove the current images too, run `docker image rm $(docker image ls -q paddock-base)`, and the same command with `podman`.
 
-paddock does not change any file outside these directories, except the files that you name in `paddock env hide` (in `~/.config/paddock/config.toml`), the git worktrees that `--worktree` creates, and the files that `paddock shims install` and `paddock launchers install` change. Step 2 undoes those two. To remove a worktree, use the commands that paddock prints when the sandbox exits.
+paddock does not change any file outside these directories, except the files that you name in `paddock env hide` (in `~/.config/paddock/config.toml`), the git worktrees that `--worktree` creates, the files that `paddock shims install` and `paddock launchers install` change (also through `paddock setup`), and the paddock binary that `paddock update` replaces. Step 2 undoes the shell commands and launchers. To remove a worktree, use the commands that paddock prints when the sandbox exits.
 
 ## Use
 
@@ -143,6 +178,8 @@ paddock ps                     # running sandboxes
 paddock files                  # files a sandbox saved outside the project
 paddock doctor                 # dependencies, backends, located harnesses
 paddock doctor --escape        # try to escape, and report each attempt
+paddock setup                  # first-run steps; a second run changes nothing
+paddock update --check         # is there a newer release
 paddock mcp claude             # MCP servers, and whether each runs in the sandbox
 paddock env show               # which host variables pass, by name
 ```
