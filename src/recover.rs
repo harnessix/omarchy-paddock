@@ -21,7 +21,7 @@ use crate::env::HostEnv;
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::io::Write;
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 
 /// The XDG user directories, the defaults for recovery folders.
@@ -676,24 +676,6 @@ pub fn candidate(path: &Path, n: u32) -> PathBuf {
     path.with_file_name(name)
 }
 
-/// Create the missing directories of `dir` one by one, refusing symlinks.
-fn make_dirs(dir: &Path) -> Result<()> {
-    let mut p = PathBuf::new();
-    for c in dir.components() {
-        p.push(c);
-        match std::fs::create_dir(&p) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
-            Err(e) => return Err(e).with_context(|| format!("cannot create {}", p.display())),
-        }
-        let m = std::fs::symlink_metadata(&p)?;
-        if !m.is_dir() {
-            bail!("{} is not a directory", p.display());
-        }
-    }
-    Ok(())
-}
-
 pub struct Recovered {
     pub from: String,
     pub to: PathBuf,
@@ -723,40 +705,53 @@ pub fn recover(
     if let Some(why) = protected(env, &wanted) {
         bail!("refusing to write {}: it is in {why}", wanted.display());
     }
-    let dir = wanted.parent().context("no target directory")?;
-    make_dirs(dir)?;
-    // The directory may be a symlink target now; check the real location again.
-    let real_dir = std::fs::canonicalize(dir)?;
+    let parent = wanted.parent().context("no target directory")?;
+    let fname = wanted.file_name().context("no file name")?;
+    // A sandbox can write folders on the way (for example a project folder
+    // given with --to) and swap one for a symlink after the check. So walk
+    // from / one folder at a time without following symlinks, create what is
+    // missing, check where the opened folder really is, and create the file
+    // in that open folder. `resolve_dest` already resolved the user's own
+    // symlinks, so a symlink found now was planted after the check.
+    let root = crate::safefs::Root::open(Path::new("/"))?;
+    let dir = root
+        .dir(
+            parent.strip_prefix("/").context("target is not absolute")?,
+            true,
+        )
+        .with_context(|| format!("cannot open {}", parent.display()))?;
+    let real_dir = dir.real_path()?;
     if let Some(why) = protected(env, &real_dir) {
         bail!(
             "refusing to write into {}: it is in {why}",
             real_dir.display()
         );
     }
-    let wanted = real_dir.join(wanted.file_name().context("no file name")?);
     // Never recover execute or special bits: a file from the sandbox must not
     // become a program that one click on the host runs.
     let mode = src.file.metadata()?.permissions().mode() & 0o666;
     let mut n = 0;
-    let (mut out, dest) = loop {
-        let c = candidate(&wanted, n);
-        match std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .custom_flags(libc::O_NOFOLLOW)
-            .mode(mode)
-            .open(&c)
-        {
-            Ok(f) => break (f, c),
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && n < 999 => n += 1,
-            Err(e) => return Err(e).with_context(|| format!("cannot create {}", c.display())),
+    let (mut out, name) = loop {
+        let c = candidate(Path::new(fname), n);
+        let cname = c.file_name().context("no file name")?.to_os_string();
+        match dir.create_new(&cname, mode) {
+            Ok(f) => break (f, cname),
+            Err(e)
+                if n < 999
+                    && e.downcast_ref::<std::io::Error>()
+                        .is_some_and(|io| io.kind() == std::io::ErrorKind::AlreadyExists) =>
+            {
+                n += 1
+            }
+            Err(e) => return Err(e),
         }
     };
+    let dest = real_dir.join(&name);
     let copied = std::io::copy(&mut &src.file, &mut out)
         .and_then(|_| out.flush())
         .and_then(|_| out.sync_all());
     if let Err(e) = copied {
-        let _ = std::fs::remove_file(&dest);
+        let _ = dir.remove(&name);
         return Err(e).with_context(|| format!("cannot copy {rel} to {}", dest.display()));
     }
     if !keep {

@@ -569,6 +569,16 @@ pub fn flatpak_env(
     out
 }
 
+/// The merged configuration for an app's first folder. The same rule as
+/// every other sandbox: a project file that widens access (for example
+/// `[secrets] reveal`) needs the user's approval first. The app can edit that
+/// file, so it is never trusted on its own.
+fn approved_manifest(env: &HostEnv, root: &std::path::Path) -> Result<Manifest> {
+    let loaded = Manifest::load(env, root)?;
+    crate::manifest::require_approval(env, &loaded, false)?;
+    Ok(loaded.merged)
+}
+
 fn run_flatpak(
     env: &HostEnv,
     profile: &Profile,
@@ -592,7 +602,7 @@ fn run_flatpak(
         env.gid,
         &env.user,
     );
-    let m = Manifest::load(env, &roots[0])?.merged;
+    let m = approved_manifest(env, &roots[0])?;
     let ws = flatpak_workspace(env, &mut spec, &m, roots)?;
     let warning = check_exposed(
         &profile.name,
@@ -1314,6 +1324,34 @@ mod tests {
         let w = check_exposed("f", &ws.exposed, true).unwrap().unwrap();
         assert!(w.contains("deploy/.env"), "{w}");
         assert_eq!(check_exposed("f", &[], false).unwrap(), None);
+    }
+
+    #[test]
+    fn flatpak_needs_approval_for_a_project_reveal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let env = HostEnv::from_parts(
+            tmp.path().join("home"),
+            "demo".into(),
+            1,
+            1,
+            Default::default(),
+        );
+        let ws = tmp.path().join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::write(ws.join(".env"), "TOKEN=x").unwrap();
+        std::fs::write(ws.join("paddock.toml"), "[secrets]\nreveal = [\".env\"]\n").unwrap();
+        // Tests have no terminal: an unapproved widening is refused.
+        let e = approved_manifest(&env, &ws).unwrap_err().to_string();
+        assert!(e.contains("not approved"), "{e}");
+        // After approval it loads, with the reveal.
+        let loaded = Manifest::load(&env, &ws).unwrap();
+        let (file, m) = loaded.project.clone().unwrap();
+        crate::manifest::approve(&env, &file, &m).unwrap();
+        assert!(!approved_manifest(&env, &ws)
+            .unwrap()
+            .secrets
+            .reveal
+            .is_empty());
     }
 
     #[test]

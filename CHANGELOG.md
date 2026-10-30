@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- Security: `paddock recover --to` walks to the target folder one folder at a time without following symlinks, checks where the opened folder really is, and creates the file in it. Before, it checked the path and then opened it again, so a sandbox that can write a folder on that path could swap it for a symlink in between and make paddock create a new file in a protected place such as `~/.ssh`.
+- Security: a flatpak app start asks for approval of a project `paddock.toml` that widens access, the same as every other sandbox. Before, a project `[secrets] reveal` applied without approval and exposed a `.env` to a flatpak app.
+
 ## 0.1.6
 
 A security release. Update from every earlier version. It fixes four issues: the docker and podman proxy let IPv4-mapped addresses reach loopback and the LAN, a project's MCP config could mount other host folders, private request text was readable by other local users, and flatpak apps did not get the workspace protections. If you used `clipboard-write` with an older paddock, delete `~/.local/state/paddock/host-audit.jsonl`: older lines can hold clipboard text.
