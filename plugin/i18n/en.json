@@ -20,6 +20,8 @@
   "row.title": "%1 · %2",
   "row.detail": "%1 · %2 · display %3 · %4",
   "row.auth": "login %1",
+  "row.childTitle": "↳ %1 · started by %2",
+  "row.startedBy": "started by sandbox %1",
   "time.minutes": {
     "one": "%1 min",
     "other": "%1 min"
@@ -37,6 +39,10 @@
   "msg.noDisplay": "The display window was not found.",
   "msg.copied": "Project path copied.",
   "msg.confirmStop": "Stop %1 in %2? Press stop again within 4 seconds.",
+  "msg.confirmStopChildren": {
+    "one": "Stop %1 in %2 and the %3 sandbox that it started? Press stop again within 4 seconds.",
+    "other": "Stop %1 in %2 and the %3 sandboxes that it started? Press stop again within 4 seconds."
+  },
   "msg.stopped": "Sandbox stopped.",
   "msg.stopFailed": "The sandbox did not stop. It may have ended already.",
   "new.button": "New",
@@ -59,6 +65,7 @@
   "approve.meta": "%1 · %2 · %3",
   "approve.detailLabel": "What will happen on your computer:",
   "approve.reason": "The agent says: %1",
+  "approve.startedBy": "Started by sandbox %1. Your answers for that sandbox do not apply here.",
   "time.secondsAgo": {
     "one": "%1 s ago",
     "other": "%1 s ago"
@@ -88,6 +95,7 @@
   "popup.ask.clipboard-write": "Allow %1 in %2 to set your clipboard?",
   "popup.ask.open-url": "Allow %1 in %2 to open this link?",
   "popup.ask.notify": "Allow %1 in %2 to show a notification?",
+  "popup.ask.spawn": "Allow %1 in %2 to start another agent with this task?",
   "popup.ask.other": "Allow %1 in %2 to do this on your computer?",
   "approve.gone": "This request is no longer waiting: it timed out or was answered elsewhere.",
   "approve.denied": "Denied.",

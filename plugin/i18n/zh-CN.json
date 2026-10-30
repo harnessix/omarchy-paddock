@@ -18,6 +18,8 @@
   "row.title": "%1 · %2",
   "row.detail": "%1 · %2 · 显示 %3 · %4",
   "row.auth": "登录 %1",
+  "row.childTitle": "↳ %1 · 由 %2 启动",
+  "row.startedBy": "由沙箱 %1 启动",
   "time.minutes": {
     "other": "%1 分钟"
   },
@@ -33,6 +35,9 @@
   "msg.noDisplay": "没有找到显示窗口。",
   "msg.copied": "已复制项目路径。",
   "msg.confirmStop": "要停止 %2 中的 %1 吗？请在 4 秒内再按一次停止。",
+  "msg.confirmStopChildren": {
+    "other": "要停止 %2 中的 %1 以及它启动的 %3 个沙箱吗？请在 4 秒内再按一次停止。"
+  },
   "msg.stopped": "沙箱已停止。",
   "msg.stopFailed": "沙箱没有停止，它可能已经结束。",
   "new.button": "新建",
@@ -54,6 +59,7 @@
   "approve.meta": "%1 · %2 · %3",
   "approve.detailLabel": "将在你的电脑上执行：",
   "approve.reason": "agent 的说法：%1",
+  "approve.startedBy": "由沙箱 %1 启动。你对那个沙箱的回答不适用于这里。",
   "time.secondsAgo": {
     "other": "%1 秒前"
   },
@@ -81,6 +87,7 @@
   "popup.ask.clipboard-write": "允许 %2 中的 %1 设置你的剪贴板吗？",
   "popup.ask.open-url": "允许 %2 中的 %1 打开这个链接吗？",
   "popup.ask.notify": "允许 %2 中的 %1 显示一条通知吗？",
+  "popup.ask.spawn": "允许 %2 中的 %1 用这个任务启动另一个 agent 吗？",
   "popup.ask.other": "允许 %2 中的 %1 在你的电脑上执行这个操作吗？",
   "approve.gone": "这个请求已不在等待：它已超时，或已在别处答复。",
   "approve.denied": "已拒绝。",
