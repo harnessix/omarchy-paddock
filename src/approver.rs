@@ -346,19 +346,14 @@ impl Approver for Chain {
 }
 
 fn record(env: &HostEnv, p: &Pending, a: &str, note: &str) {
+    // The request detail can hold clipboard text or command arguments, so it
+    // stays out. The request id matches the line in the host audit log.
     let f = env.paddock_state().join("approver-decisions.jsonl");
-    if let Some(d) = f.parent() {
-        let _ = std::fs::create_dir_all(d);
-    }
-    if let Ok(mut file) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&f)
-    {
+    if let Ok(mut file) = crate::privfs::append(&f) {
         let _ = writeln!(
             file,
             "{}",
-            serde_json::json!({ "time": crate::state::now(), "request": p.id, "capability": p.capability, "detail": p.detail, "answer": a, "note": note })
+            serde_json::json!({ "time": crate::state::now(), "request": p.id, "capability": p.capability, "answer": a, "note": note })
         );
     }
 }

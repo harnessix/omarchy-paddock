@@ -144,7 +144,7 @@ impl WindowCompositor {
         let name = format!("paddock-{}", spec.id);
         let socket = rt.join(&name);
         let log = run_dir(env, spec).join("weston.log");
-        std::fs::create_dir_all(log.parent().unwrap())?;
+        crate::privfs::dir(log.parent().unwrap())?;
         let child = Command::new(weston)
             .arg("--backend=wayland")
             .arg(format!("--socket={name}"))

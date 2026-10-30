@@ -608,8 +608,7 @@ fn podman_seccomp(env: &HostEnv, podman: &Path) -> Result<std::path::PathBuf> {
         &hex(&Sha256::digest(body.as_bytes()))[..12]
     ));
     if !path.is_file() {
-        std::fs::create_dir_all(path.parent().unwrap())?;
-        std::fs::write(&path, body)?;
+        crate::privfs::write(&path, body)?;
     }
     Ok(path)
 }

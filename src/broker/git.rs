@@ -498,7 +498,7 @@ pub fn plan(
         );
     }
 
-    std::fs::create_dir_all(run_dir)?;
+    crate::privfs::dir(run_dir)?;
     let scratch = Scratch(run_dir.join(format!("push-{}", super::new_request_id())));
     let out = git_env(&mut Command::new("git"))
         .args(["init", "-q", "--bare"])

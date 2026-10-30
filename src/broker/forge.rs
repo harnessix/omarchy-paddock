@@ -217,6 +217,43 @@ pub struct Call {
     pub access: Access,
     pub repo: RepoId,
     pub command: String,
+    /// Body text for `--body-file -`. It goes on stdin, not in the arguments:
+    /// every local user can read the arguments of a host process.
+    pub stdin: Option<String>,
+}
+
+/// Split body text out of arguments: (the arguments without it, the body).
+/// Handles `--body X`, `-b X`, `--body=X`, `-bX` and `-b=X`; the last body
+/// wins, as in `gh`. Values of other flags and anything after `--` stay.
+pub fn split_body(t: &Tool, argv: &[String]) -> (Vec<String>, Option<String>) {
+    let mut out = Vec::new();
+    let mut body = None;
+    let mut i = 0;
+    while i < argv.len() {
+        let a = &argv[i];
+        i += 1;
+        if a == "--" {
+            out.extend(argv[i - 1..].iter().cloned());
+            break;
+        }
+        if a == "--body" || a == "-b" {
+            body = Some(argv.get(i).cloned().unwrap_or_default());
+            i += 1;
+        } else if let Some(v) = a.strip_prefix("--body=") {
+            body = Some(v.to_string());
+        } else if let Some(v) = a.strip_prefix("-b").filter(|_| !a.starts_with("--")) {
+            body = Some(v.strip_prefix('=').unwrap_or(v).to_string());
+        } else {
+            out.push(a.clone());
+            if t.value_flags.contains(&a.as_str()) {
+                if let Some(v) = argv.get(i) {
+                    out.push(v.clone());
+                    i += 1;
+                }
+            }
+        }
+    }
+    (out, body)
 }
 
 impl Call {
@@ -371,6 +408,10 @@ pub fn check(
         }
         out.extend([long.to_string(), repo.to_string()]);
     }
+    let (mut out, stdin) = split_body(t, &out);
+    if stdin.is_some() {
+        out.extend(["--body-file".to_string(), "-".to_string()]);
+    }
     out.append(&mut tail);
     argv_final.extend(out);
     Ok(Call {
@@ -379,6 +420,7 @@ pub fn check(
         access,
         repo,
         command: format!("{group} {sub}"),
+        stdin,
     })
 }
 
@@ -507,14 +549,15 @@ mod tests {
                 "create",
                 "--title",
                 "Fix",
-                "--body",
-                "Text",
                 "--head",
                 "fix-login",
                 "--repo",
-                "github.com/acme/app"
+                "github.com/acme/app",
+                "--body-file",
+                "-"
             ]
         );
+        assert_eq!(c.stdin.as_deref(), Some("Text"));
         let c = run(&["pr", "checks", "--watch"]).unwrap();
         assert_eq!(c.argv[..4], ["pr", "checks", "fix-login", "--watch"]);
         let c = run(&["pr", "view", "12", "--json", "title"]).unwrap();
@@ -542,6 +585,53 @@ mod tests {
         }
         // A value that looks like a flag stays a value.
         assert!(run(&["pr", "create", "--title", "--web is fixed"]).is_ok());
+    }
+
+    #[test]
+    fn body_text_never_stays_in_the_arguments() {
+        // Short flags with an attached value must not hold w, e, F or T,
+        // which the denied-flag check reads as a group of short flags.
+        for (args, body) in [
+            (
+                &["pr", "comment", "1", "--body", "private text"][..],
+                "private text",
+            ),
+            (
+                &["pr", "comment", "1", "-b", "private text"][..],
+                "private text",
+            ),
+            (
+                &["pr", "comment", "1", "--body=private text"][..],
+                "private text",
+            ),
+            (&["pr", "comment", "1", "-bsignal"][..], "signal"),
+            (&["issue", "comment", "2", "-b=signal"][..], "signal"),
+            (
+                &[
+                    "pr",
+                    "comment",
+                    "1",
+                    "--body",
+                    "old",
+                    "--body",
+                    "private text",
+                ][..],
+                "private text",
+            ),
+        ] {
+            let c = run(args).unwrap();
+            assert!(
+                !c.argv.iter().any(|a| a.contains(body) || a.contains("old")),
+                "{:?}",
+                c.argv
+            );
+            assert_eq!(c.argv[c.argv.len() - 2..], ["--body-file", "-"]);
+            assert_eq!(c.stdin.as_deref(), Some(body), "{args:?}");
+        }
+        // The value of another flag that looks like --body stays a value.
+        let c = run(&["pr", "create", "--title", "--body", "--head", "x"]).unwrap();
+        assert_eq!(c.argv[2..4], ["--title", "--body"]);
+        assert!(c.stdin.is_none());
     }
 
     #[test]

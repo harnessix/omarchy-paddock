@@ -96,7 +96,7 @@ pub fn create(path: &Path, app_id: &str, instance_id: &str) -> Result<Restricted
     };
     let _ = std::fs::remove_file(path);
     if let Some(d) = path.parent() {
-        std::fs::create_dir_all(d)?;
+        crate::privfs::dir(d)?;
     }
     let listener =
         UnixListener::bind(path).with_context(|| format!("cannot listen on {}", path.display()))?;

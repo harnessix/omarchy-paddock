@@ -259,11 +259,197 @@ fn every_request_is_audited() {
         .collect();
     assert_eq!(lines.len(), 2);
     assert_eq!(lines[0]["decision"], "denied");
-    assert_eq!(
-        lines[0]["detail"].as_str().unwrap().lines().last().unwrap(),
-        "true"
-    );
+    assert!(lines[0]["request"].as_str().unwrap().starts_with("r-"));
+    assert!(lines[0]["detail"]
+        .as_str()
+        .unwrap()
+        .starts_with("run on the host: true with 0 arguments"));
     assert_eq!(lines[1]["status"], "invalid");
+    assert!(lines[1]["request"].is_null());
+}
+
+fn audit_lines(b: &Broker) -> Vec<serde_json::Value> {
+    std::fs::read_to_string(audit_file(&b.env))
+        .unwrap()
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect()
+}
+
+const SECRET: &str = "hunter2-correct-horse-battery";
+
+#[test]
+fn the_audit_log_never_holds_request_payloads() {
+    // Denied and timed-out requests keep no text either. (Allowed ones would
+    // touch the real desktop of the test machine.)
+    for answer in [Some(Answer::Deny), None] {
+        let (_t, b, _) = setup(answer, HostPolicy::default());
+        b.handle(&req(
+            "clipboard-write",
+            serde_json::json!({ "text": format!("my password is {SECRET}") }),
+        ));
+        b.handle(&exec(&["curl", "-H", &format!("Authorization: {SECRET}")]));
+        b.handle(&req(
+            "notify",
+            serde_json::json!({ "title": SECRET, "body": SECRET }),
+        ));
+        b.handle(&req(
+            "open-url",
+            serde_json::json!({ "url": format!("https://example.org/login?code={SECRET}") }),
+        ));
+        b.handle(&req(
+            "forge",
+            serde_json::json!({ "argv": ["pr", "comment", "1", "--body", SECRET] }),
+        ));
+        let text = std::fs::read_to_string(audit_file(&b.env)).unwrap();
+        assert!(!text.contains(SECRET), "{answer:?}: {text}");
+        let lines = audit_lines(&b);
+        assert_eq!(lines.len(), 5);
+        assert_eq!(lines[0]["capability"], "clipboard-write");
+        // "my password is " is 15 characters.
+        assert_eq!(
+            lines[0]["detail"],
+            format!("set the host clipboard: {} characters", 15 + SECRET.len())
+        );
+        assert_eq!(
+            lines[1]["detail"].as_str().unwrap().split(" with ").next(),
+            Some("run on the host: curl")
+        );
+        assert!(lines[3]["detail"]
+            .as_str()
+            .unwrap()
+            .starts_with("open https://example.org ("));
+        assert!(lines[4]["detail"]
+            .as_str()
+            .unwrap()
+            .ends_with(&format!("(body: {} characters)", SECRET.len())));
+    }
+}
+
+#[test]
+fn the_audit_log_is_private_under_umask_022() {
+    use crate::privfs::tests::{mode, with_umask_022};
+    use std::os::unix::fs::PermissionsExt;
+    let (_t, b, _) = setup(Some(Answer::Deny), HostPolicy::default());
+    with_umask_022(|| {
+        b.handle(&exec(&["true"]));
+        let f = audit_file(&b.env);
+        assert_eq!(mode(&f), 0o600);
+        assert_eq!(mode(f.parent().unwrap()), 0o700);
+        // A log from an older paddock, readable by everyone, is tightened.
+        std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o644)).unwrap();
+        std::fs::set_permissions(f.parent().unwrap(), std::fs::Permissions::from_mode(0o755))
+            .unwrap();
+        b.handle(&exec(&["true"]));
+        assert_eq!(mode(&f), 0o600);
+        assert_eq!(mode(f.parent().unwrap()), 0o700);
+        assert_eq!(audit_lines(&b).len(), 2);
+    });
+}
+
+fn pending_for(b: &Broker, detail: &str) -> Pending {
+    Pending {
+        id: "r-1-abcdef12".into(),
+        sandbox: b.ctx.id.clone(),
+        harness: "claude".into(),
+        project: b.ctx.project.clone(),
+        capability: "clipboard-write".into(),
+        summary: "set the host clipboard".into(),
+        detail: detail.into(),
+        reason: String::new(),
+        created: state::now(),
+        expires: state::now() + 1,
+        session_allowed: true,
+    }
+}
+
+#[test]
+fn pending_and_answer_files_are_private_under_umask_022() {
+    use crate::privfs::tests::{mode, with_umask_022};
+    let (_t, b, _) = setup(None, HostPolicy::default());
+    with_umask_022(|| {
+        let p = pending_for(&b, "x");
+        let f = write_pending(&b.env, &p).unwrap();
+        assert_eq!(mode(&f), 0o600);
+        assert_eq!(mode(&approvals_dir(&b.env)), 0o700);
+        answer(&b.env, &p.id, Answer::Deny).unwrap();
+        assert_eq!(
+            mode(&approvals_dir(&b.env).join(format!("{}.answer", p.id))),
+            0o600
+        );
+    });
+}
+
+/// A fake `notify-send` that records its arguments. paddock must not run
+/// it: arguments of a host process are visible to every local user.
+fn fake_notify_send(b: &mut Broker, dir: &Path) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let bin = dir.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let record = dir.join("argv.txt");
+    let script = bin.join("notify-send");
+    std::fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" >> '{}'\n",
+            record.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let mut vars = BTreeMap::new();
+    vars.insert(
+        "PATH".into(),
+        format!(
+            "{}:{}",
+            bin.display(),
+            std::env::var("PATH").unwrap_or_default()
+        ),
+    );
+    b.env = HostEnv::from_parts(b.env.home.clone(), "tester".into(), 1000, 1000, vars);
+    record
+}
+
+#[test]
+fn the_approval_notification_keeps_the_detail_out_of_process_arguments() {
+    let (t, mut b, _) = setup(None, HostPolicy::default());
+    let record = fake_notify_send(&mut b, t.path());
+    let detail = format!("Set the host clipboard to:\n{SECRET}");
+    let p = pending_for(&b, &detail);
+    // No bar heartbeat, so the fallback notification is due.
+    assert!(!approval_ui_active(&b.env));
+    assert_eq!(
+        HostApprover.ask(&b.env, &p, Duration::from_millis(300)),
+        None
+    );
+    let argv = std::fs::read_to_string(&record).unwrap_or_default();
+    assert!(!argv.contains(SECRET), "{argv}");
+    // The detail goes to the D-Bus message body instead.
+    let n = approval_note(&p);
+    assert!(n.body.contains(SECRET));
+    assert!(!n.summary.contains(SECRET));
+    assert_eq!(
+        n.actions
+            .iter()
+            .map(|(k, _)| k.as_str())
+            .collect::<Vec<_>>(),
+        ["once", "session", "deny"]
+    );
+}
+
+#[test]
+fn the_notify_capability_keeps_its_text_out_of_process_arguments() {
+    let (t, mut b, _) = setup(None, HostPolicy::default());
+    let record = fake_notify_send(&mut b, t.path());
+    // The test environment has no session bus, so the request fails, but
+    // it never falls back to a process.
+    let r = b.handle(&req(
+        "notify",
+        serde_json::json!({ "title": SECRET, "body": SECRET }),
+    ));
+    assert_eq!(r.status, Status::Failed);
+    let argv = std::fs::read_to_string(&record).unwrap_or_default();
+    assert!(!argv.contains(SECRET), "{argv}");
 }
 
 #[test]

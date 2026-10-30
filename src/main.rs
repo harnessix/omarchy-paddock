@@ -730,6 +730,7 @@ fn real_main() -> Result<i32> {
         return Ok(0);
     }
     let env = HostEnv::detect()?;
+    paddock::privfs::secure_roots(&env);
     match cli.cmd {
         Cmd::Relay { .. } | Cmd::Host { .. } | Cmd::Inbound | Cmd::Portal => unreachable!(),
         Cmd::Approvals { json, cmd } => {

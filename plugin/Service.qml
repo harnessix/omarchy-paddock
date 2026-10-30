@@ -118,7 +118,7 @@ Item {
   // Tells paddock that this card is on screen, so it can skip the plain
   // desktop notification for the same request.
   function heartbeat() {
-    Quickshell.execDetached(["sh", "-c", "d=\"${XDG_RUNTIME_DIR:-/tmp}/paddock\"; mkdir -p \"$d\" && date +%s > \"$d/approval-ui\""])
+    Quickshell.execDetached(["sh", "-c", "umask 077; d=\"${XDG_RUNTIME_DIR:-/tmp}/paddock\"; mkdir -p \"$d\" && date +%s > \"$d/approval-ui\""])
   }
 
   Timer {

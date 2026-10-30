@@ -343,8 +343,7 @@ pub fn is_approved(env: &HostEnv, project_file: &Path, m: &Manifest) -> bool {
 
 pub fn approve(env: &HostEnv, project_file: &Path, m: &Manifest) -> Result<()> {
     let f = approval_file(env, project_file);
-    std::fs::create_dir_all(f.parent().unwrap())?;
-    std::fs::write(f, widening_hash(m))?;
+    crate::privfs::write(&f, widening_hash(m))?;
     Ok(())
 }
 

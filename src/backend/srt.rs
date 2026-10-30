@@ -305,7 +305,7 @@ impl Backend for Srt {
         // has at most 107 bytes. CLAUDE_CODE_TMPDIR is what srt gives the
         // sandboxed command as TMPDIR: a writable folder in the sandbox home.
         let bridge = bridge_dir(env, spec);
-        std::fs::create_dir_all(&bridge)?;
+        crate::privfs::dir(&bridge)?;
         let tmp = private_tmp(env, spec);
         // In the sandbox home: a planted .paddock-tmp link must not make
         // paddock create a folder elsewhere and allow writes to it.
