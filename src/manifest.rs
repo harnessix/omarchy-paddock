@@ -72,6 +72,11 @@ pub struct AppCfg {
     /// `host-filtered`: the host bus through a filter that passes only the
     /// desktop portals, notifications and the tray, without a keyring.
     pub bus: Option<AppBus>,
+    /// Flatpak apps only: start even when secret files in the workspace
+    /// folders stay visible, because flatpak cannot hide a single file.
+    /// Off by default; paddock warns on every start.
+    #[serde(default)]
+    pub unprotected_workspaces: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]

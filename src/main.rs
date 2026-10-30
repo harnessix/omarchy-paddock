@@ -362,6 +362,7 @@ after your approval, and its notifications appear on your desktop. With
 bus is the host bus, filtered to the desktop portals, notifications and the
 tray, without a keyring. It sees only its workspace folders, with the same git hook, secrets and network
 rules as `paddock <harness>`. The host passthrough (paddock-host) works too.
+Flatpak apps differ in some of this; see below.
 
 Examples:
   paddock app run chatgpt-desktop ~/src/api ~/src/web
@@ -371,8 +372,16 @@ Examples:
 Electron apps run with --no-sandbox: their own sandbox needs nested user
 namespaces, which paddock blocks, so paddock is the boundary. Flatpak apps
 (profiles with [app] flatpak = \"ID\") run with flatpak run --sandbox inside
-the same network isolation. To add folders later, change [apps.NAME] roots
-and start the app again.";
+the same network isolation (egress or none), with flatpak's own Wayland
+socket and filtered host bus, without the host passthrough or worktrees.
+Their folders get the same path policy, read-only git config, hooks and
+pointer files, and host environment filter as other apps. flatpak can hide
+a folder but not a single file, so paddock refuses to start a flatpak app
+when the secrets detector finds a file such as .env in its folders, and
+names the files. `[apps.NAME] unprotected_workspaces = true` in
+~/.config/paddock/config.toml starts it anyway, with a warning on every
+start. To add folders later, change [apps.NAME] roots and start the app
+again.";
 
 #[derive(Subcommand)]
 enum ApproverCmd {
@@ -1972,6 +1981,14 @@ fn app_cmd(env: &HostEnv, cmd: AppCmd) -> Result<i32> {
                     "{name:<16} {found}\n{:<16} {launcher}; folders: {roots}",
                     ""
                 );
+                if app::unprotected_workspaces(env, &name).unwrap_or(false) {
+                    let what = if p.app.as_ref().is_some_and(|a| a.flatpak.is_some()) {
+                        "secret files in its folders are visible to it"
+                    } else {
+                        "has no effect: it applies only to flatpak apps"
+                    };
+                    println!("{:<16} warning: unprotected_workspaces is on: {what}", "");
+                }
             }
             Ok(0)
         }

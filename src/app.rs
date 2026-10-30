@@ -201,7 +201,7 @@ use crate::build::{self, Options};
 use crate::detect::{self, Detector};
 use crate::manifest::{AppBus, Manifest};
 use crate::profile::{HarnessFactory, Profile};
-use crate::spec::{GuiMode, Mount, Network};
+use crate::spec::{GuiMode, Mount, MountKind, Network};
 
 pub struct AppOptions {
     pub name: String,
@@ -398,11 +398,13 @@ fn report_worktree(env: &HostEnv, name: &str, w: &build::Worktree) {
 }
 
 /// Flatpak apps run in flatpak's own sandbox, with every permission the app
-/// asks for dropped (`--sandbox`) and only the workspace folders, the
-/// display, the GPU and the portals added back. Never `--socket=session-bus`:
-/// that is the unfiltered bus, through which `flatpak-spawn --host` runs
-/// commands on the host. pasta gives it the same network path as bwrap.
-pub fn flatpak_args(id: &str, command: Option<&str>, roots: &[PathBuf], gpu: bool) -> Vec<String> {
+/// asks for dropped (`--sandbox`, which also drops `flatpak override`
+/// permissions) and only the workspace folders, the display, the GPU and the
+/// portals added back. Never `--socket=session-bus`: that is the unfiltered
+/// bus, through which `flatpak-spawn --host` runs commands on the host.
+/// pasta gives it the same network path as bwrap. `fs` comes from
+/// [`flatpak_workspace`].
+pub fn flatpak_args(id: &str, command: Option<&str>, fs: &[String], gpu: bool) -> Vec<String> {
     let mut a: Vec<String> = [
         "run",
         "--sandbox",
@@ -420,14 +422,151 @@ pub fn flatpak_args(id: &str, command: Option<&str>, roots: &[PathBuf], gpu: boo
     for n in BUS_TALK {
         a.push(format!("--talk-name={n}"));
     }
-    for r in roots {
-        a.push(format!("--filesystem={}", r.display()));
-    }
+    a.extend(fs.iter().cloned());
     if let Some(c) = command {
         a.push(format!("--command={c}"));
     }
     a.push(id.to_string());
     a
+}
+
+/// The workspace folders of a flatpak app, as flatpak options.
+#[derive(Debug, Default)]
+pub struct FlatpakWorkspace {
+    /// `--filesystem` and `--nofilesystem` options.
+    pub args: Vec<String>,
+    /// Secret files that stay visible: flatpak can hide a folder below a
+    /// shared folder (it puts an empty tmpfs there), but not a file.
+    pub exposed: Vec<PathBuf>,
+}
+
+/// A path as flatpak reads it in `--filesystem=PATH[:MODE]`. A `:` would
+/// split the path, and `~` or a name such as `home` would mean something else.
+fn flatpak_path(p: &std::path::Path) -> Result<String> {
+    let s = p
+        .to_str()
+        .with_context(|| format!("{} is not valid UTF-8", p.display()))?;
+    if !s.starts_with('/') || s.contains([':', '\\']) || s.chars().any(|c| c.is_control()) {
+        bail!("{s}: flatpak cannot share a path with ':', '\\' or control characters; rename it");
+    }
+    Ok(s.to_string())
+}
+
+/// The same workspace protection as a bwrap app: each folder gets the git
+/// and secrets detectors, and the policy checks the result (no home
+/// directory, no protected path, git config, hooks and pointer files
+/// read-only). Then each mount becomes a flatpak option. flatpak binds the
+/// longest path last, so a read-only file inside a shared folder stays
+/// read-only, and the git directory is a mount point of its own, which the
+/// app cannot rename.
+pub fn flatpak_workspace(
+    env: &HostEnv,
+    spec: &mut SandboxSpec,
+    m: &Manifest,
+    roots: &[PathBuf],
+) -> Result<FlatpakWorkspace> {
+    add_roots(env, spec, m, roots)?;
+    crate::policy::enforce(env, spec)?;
+    let mut ws = FlatpakWorkspace::default();
+    for mnt in &spec.mounts {
+        if mnt.is_bind() && mnt.src.as_ref() != Some(&mnt.dst) {
+            bail!(
+                "flatpak cannot bind {} at another path (from {})",
+                mnt.dst.display(),
+                mnt.origin
+            );
+        }
+        let p = flatpak_path(&mnt.dst)?;
+        match mnt.kind {
+            MountKind::Rw => ws.args.push(format!("--filesystem={p}:rw")),
+            MountKind::Ro => ws.args.push(format!("--filesystem={p}:ro")),
+            MountKind::MaskDir => ws.args.push(format!("--nofilesystem={p}")),
+            MountKind::MaskFile => ws.exposed.push(mnt.dst.clone()),
+            MountKind::Tmpfs => bail!(
+                "flatpak cannot put an empty folder at {} (from {})",
+                p,
+                mnt.origin
+            ),
+        }
+    }
+    Ok(ws)
+}
+
+/// `[apps.NAME] unprotected_workspaces = true`, from the user configuration
+/// only: a project file cannot turn the protection off.
+pub fn unprotected_workspaces(env: &HostEnv, name: &str) -> Result<bool> {
+    let user = Manifest::load(env, &env.home.join(".paddock-no-project"))?.merged;
+    Ok(user
+        .apps
+        .get(name)
+        .is_some_and(|a| a.unprotected_workspaces))
+}
+
+/// Refuse a start that would show secret files to a flatpak app, unless the
+/// user turned the protection off for it. Returns the warning to print then.
+pub fn check_exposed(name: &str, exposed: &[PathBuf], unprotected: bool) -> Result<Option<String>> {
+    if exposed.is_empty() {
+        return Ok(None);
+    }
+    let list = exposed
+        .iter()
+        .map(|p| format!("  {}", p.display()))
+        .collect::<Vec<_>>()
+        .join("\n");
+    if !unprotected {
+        bail!(
+            "{name} is a flatpak app, and flatpak cannot hide single files, so it would read these secret files:\n{list}\n\
+             Move them out of the workspace folders, or put them in a folder and hide the folder with [secrets] hide. \
+             To start it anyway, with these files visible, set unprotected_workspaces = true in [apps.{name}] of ~/.config/paddock/config.toml."
+        );
+    }
+    Ok(Some(format!(
+        "unprotected_workspaces is on for {name}: it can read these secret files:\n{list}"
+    )))
+}
+
+/// Host variables that flatpak itself needs on the host to start the app.
+const FLATPAK_HOST_ENV: &[&str] = &[
+    "HOME",
+    "USER",
+    "LOGNAME",
+    "PATH",
+    "LANG",
+    "XDG_RUNTIME_DIR",
+    "DBUS_SESSION_BUS_ADDRESS",
+    "WAYLAND_DISPLAY",
+    "XDG_SESSION_TYPE",
+];
+
+/// The environment of `flatpak run`. flatpak passes almost all of it to the
+/// app, so it gets the same rules as a bwrap sandbox: no host control
+/// channels or sockets, no cloud credentials unless named in `[env] pass`,
+/// nothing named in `[env] hide`, and with `--env clean` nothing else.
+pub fn flatpak_env(
+    env: &HostEnv,
+    m: &Manifest,
+    profile: &Profile,
+    inherit: bool,
+) -> std::collections::BTreeMap<String, String> {
+    let mut out = std::collections::BTreeMap::new();
+    for k in FLATPAK_HOST_ENV {
+        if let Some(v) = env.var(k) {
+            out.insert(k.to_string(), v.to_string());
+        }
+    }
+    for (k, v) in &env.vars {
+        let named = m.env.pass.contains(k) || profile.state.env_pass.contains(k);
+        if out.contains_key(k)
+            || !crate::policy::inheritable_var(k, v)
+            || m.env.hide.contains(k)
+            || !(inherit || named)
+            || (crate::policy::is_cloud_secret(k) && !named)
+        {
+            continue;
+        }
+        out.insert(k.clone(), v.clone());
+    }
+    out
 }
 
 fn run_flatpak(
@@ -440,42 +579,81 @@ fn run_flatpak(
 ) -> Result<i32> {
     let flatpak = env.which("flatpak").context("this app needs flatpak")?;
     let net = o.network.unwrap_or(Network::Egress);
+    if !matches!(net, Network::Egress | Network::None) {
+        bail!("flatpak apps support network modes egress and none, not {net:?}");
+    }
+    let mut spec = SandboxSpec::new(
+        crate::state::new_id(&profile.name, &roots[0]),
+        &profile.name,
+        &roots[0],
+        env.home.clone(),
+        &env.home,
+        env.uid,
+        env.gid,
+        &env.user,
+    );
+    let m = Manifest::load(env, &roots[0])?.merged;
+    let ws = flatpak_workspace(env, &mut spec, &m, roots)?;
+    let warning = check_exposed(
+        &profile.name,
+        &ws.exposed,
+        unprotected_workspaces(env, &profile.name)?,
+    )?;
+    if let Some(w) = &warning {
+        eprintln!("paddock: warning: {w}");
+    }
     let mut cmd = flatpak_args(
         id,
         profile.app.as_ref().and_then(|a| a.command.as_deref()),
-        roots,
+        &ws.args,
         gpu,
     );
     cmd.extend(profile.launch.args.iter().cloned());
     cmd.extend(app_args(profile, roots, &o.args));
     let (program, args) = match net {
         Network::Egress => {
-            let spec = SandboxSpec::new(
-                crate::state::new_id(&profile.name, &roots[0]),
-                &profile.name,
-                &roots[0],
-                env.home.clone(),
-                &env.home,
-                env.uid,
-                env.gid,
-                &env.user,
-            );
             let (pasta, mut pa) = crate::backend::bwrap::pasta_prefix(env, &spec)?;
             pa.push(flatpak.display().to_string());
             pa.extend(cmd);
             (pasta, pa)
         }
-        Network::None => {
+        _ => {
             cmd.retain(|a| a != "--share=network");
             (flatpak, cmd)
         }
-        other => bail!("flatpak apps support network modes egress and none, not {other:?}"),
     };
-    let status = Command::new(&program)
+    let inherit = o.inherit_env.or(m.env.inherit).unwrap_or(true);
+    let mut child = Command::new(&program)
         .args(&args)
-        .status()
+        .env_clear()
+        .envs(flatpak_env(env, &m, profile, inherit))
+        .spawn()
         .with_context(|| format!("cannot start {}", program.display()))?;
-    Ok(status.code().unwrap_or(1))
+    // Listed with the other sandboxes, so the panel shows it and its warning.
+    let running = crate::state::Running {
+        id: spec.id.clone(),
+        harness: profile.name.clone(),
+        project: roots[0].clone(),
+        backend: "flatpak".into(),
+        network: format!("{net:?}").to_lowercase(),
+        gui: "app".into(),
+        pid: child.id(),
+        started: crate::state::now(),
+        auth: String::new(),
+        window_pid: None,
+        warnings: if warning.is_some() {
+            vec!["secret files visible (unprotected_workspaces)".to_string()]
+        } else {
+            Vec::new()
+        },
+        host_pid: std::process::id(),
+    };
+    if let Err(e) = running.register(env) {
+        log::warn!("cannot list the app with the running sandboxes: {e:#}");
+    }
+    let status = child.wait();
+    let _ = std::fs::remove_dir_all(env.paddock_run().join(&spec.id));
+    Ok(status?.code().unwrap_or(1))
 }
 
 pub fn desktop_file(env: &HostEnv, name: &str) -> PathBuf {
@@ -593,9 +771,11 @@ pub fn open(env: &HostEnv, name: &str, link: &str) -> Result<i32> {
         .map(|a| a.schemes.clone())
         .unwrap_or_default();
     valid_link(link, &schemes)?;
+    // A running flatpak app has no link socket: a second `flatpak run` hands
+    // the link to it.
     let running = crate::state::Running::list(env)
         .into_iter()
-        .find(|r| r.harness == name && r.gui == "app");
+        .find(|r| r.harness == name && r.gui == "app" && r.backend != "flatpak");
     if let Some(r) = running {
         let inbound = env.paddock_run().join(&r.id).join("inbound");
         let mut s = ports::connect_inside(&inbound, "open.sock")
@@ -1001,12 +1181,8 @@ mod tests {
 
     #[test]
     fn flatpak_never_gets_the_full_bus_or_host_commands() {
-        let a = flatpak_args(
-            "org.example.App",
-            None,
-            &[PathBuf::from("/w/one"), PathBuf::from("/w/two")],
-            false,
-        );
+        let fs = ["--filesystem=/w/two:rw".to_string()];
+        let a = flatpak_args("org.example.App", None, &fs, false);
         assert_eq!(&a[..2], ["run", "--sandbox"]);
         assert!(a.contains(&"--session-bus".to_string()));
         assert!(!a
@@ -1016,7 +1192,283 @@ mod tests {
         assert!(!a
             .iter()
             .any(|x| x.starts_with("--filesystem=home") || x.starts_with("--filesystem=host")));
-        assert!(a.contains(&"--filesystem=/w/two".to_string()));
+        assert!(a.contains(&"--filesystem=/w/two:rw".to_string()));
         assert_eq!(a.last().unwrap(), "org.example.App");
+    }
+
+    fn git(dir: &std::path::Path, args: &[&str]) {
+        let ok = Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(["-c", "user.name=t", "-c", "user.email=t@localhost"])
+            .args(args)
+            .stdout(Stdio::null())
+            .status()
+            .unwrap()
+            .success();
+        assert!(ok, "git {args:?}");
+    }
+
+    fn repo(dir: &std::path::Path) {
+        std::fs::create_dir_all(dir).unwrap();
+        git(dir, &["init", "-q", "-b", "main"]);
+        git(dir, &["commit", "-q", "--allow-empty", "-m", "one"]);
+    }
+
+    fn test_env(t: &std::path::Path) -> HostEnv {
+        HostEnv::from_parts(
+            t.join("home"),
+            "demo".into(),
+            1000,
+            1000,
+            Default::default(),
+        )
+    }
+
+    fn test_spec(env: &HostEnv, project: &std::path::Path) -> SandboxSpec {
+        SandboxSpec::new(
+            "t".into(),
+            "f",
+            project,
+            env.home.join("sandbox"),
+            &env.home,
+            1000,
+            1000,
+            "demo",
+        )
+    }
+
+    fn workspace(env: &HostEnv, m: &Manifest, roots: &[PathBuf]) -> Result<FlatpakWorkspace> {
+        let mut spec = test_spec(env, &roots[0]);
+        flatpak_workspace(env, &mut spec, m, roots)
+    }
+
+    #[test]
+    fn flatpak_folders_keep_git_files_read_only() {
+        let t = tempfile::tempdir().unwrap();
+        let env = test_env(t.path());
+        std::fs::create_dir_all(&env.home).unwrap();
+        let (a, b) = (t.path().join("a"), t.path().join("b"));
+        repo(&a);
+        repo(&b);
+        let ws = workspace(&env, &Manifest::default(), &[a.clone(), b.clone()]).unwrap();
+        assert!(ws.exposed.is_empty());
+        // The second folder is protected like the first.
+        for root in [&a, &b] {
+            let has = |p: PathBuf, mode: &str| {
+                let want = format!("--filesystem={}:{mode}", p.display());
+                assert!(ws.args.contains(&want), "{want} in {:?}", ws.args);
+            };
+            let dot = root.join(".git");
+            has(root.to_path_buf(), "rw");
+            // Its own mount point, so the app cannot rename it.
+            has(dot.clone(), "rw");
+            for f in [
+                "hooks",
+                "config",
+                "config.worktree",
+                "commondir",
+                "objects/info/alternates",
+            ] {
+                has(dot.join(f), "ro");
+            }
+        }
+    }
+
+    #[test]
+    fn flatpak_keeps_a_worktree_dot_git_file_read_only() {
+        let t = tempfile::tempdir().unwrap();
+        let env = test_env(t.path());
+        std::fs::create_dir_all(&env.home).unwrap();
+        let main = t.path().join("main");
+        repo(&main);
+        let wt = t.path().join("wt");
+        git(&main, &["worktree", "add", "-q", wt.to_str().unwrap()]);
+        let ws = workspace(&env, &Manifest::default(), std::slice::from_ref(&wt)).unwrap();
+        let want = format!("--filesystem={}:ro", wt.join(".git").display());
+        assert!(ws.args.contains(&want), "{:?}", ws.args);
+        let want = format!("--filesystem={}:ro", main.join(".git/config").display());
+        assert!(ws.args.contains(&want), "{:?}", ws.args);
+    }
+
+    #[test]
+    fn flatpak_refuses_secret_files_unless_the_user_opts_out() {
+        let t = tempfile::tempdir().unwrap();
+        let env = test_env(t.path());
+        std::fs::create_dir_all(&env.home).unwrap();
+        let (a, b) = (t.path().join("a"), t.path().join("b"));
+        std::fs::create_dir_all(b.join("deploy")).unwrap();
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::write(b.join("deploy/.env"), "TOKEN=x").unwrap();
+        std::fs::write(b.join(".env.example"), "TOKEN=").unwrap();
+        let ws = workspace(&env, &Manifest::default(), &[a, b.clone()]).unwrap();
+        assert_eq!(ws.exposed, [b.join("deploy/.env")]);
+        let e = check_exposed("f", &ws.exposed, false)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.contains(&b.join("deploy/.env").display().to_string()),
+            "{e}"
+        );
+        assert!(e.contains("unprotected_workspaces = true"), "{e}");
+        let w = check_exposed("f", &ws.exposed, true).unwrap().unwrap();
+        assert!(w.contains("deploy/.env"), "{w}");
+        assert_eq!(check_exposed("f", &[], false).unwrap(), None);
+    }
+
+    #[test]
+    fn flatpak_hides_a_secret_folder() {
+        let t = tempfile::tempdir().unwrap();
+        let env = test_env(t.path());
+        std::fs::create_dir_all(&env.home).unwrap();
+        let a = t.path().join("a");
+        std::fs::create_dir_all(a.join("private")).unwrap();
+        let mut m = Manifest::default();
+        m.secrets.hide.push("private".into());
+        let ws = workspace(&env, &m, std::slice::from_ref(&a)).unwrap();
+        let want = format!("--nofilesystem={}", a.join("private").display());
+        assert!(ws.args.contains(&want), "{:?}", ws.args);
+    }
+
+    #[test]
+    fn flatpak_refuses_denied_folders() {
+        let t = tempfile::tempdir().unwrap();
+        let env = test_env(t.path());
+        for d in [".ssh", ".config/gh", "src"] {
+            std::fs::create_dir_all(env.home.join(d)).unwrap();
+        }
+        for root in [
+            env.home.clone(),
+            env.home.join(".ssh"),
+            env.home.join(".config"),
+            t.path().to_path_buf(),
+        ] {
+            let e = workspace(
+                &env,
+                &Manifest::default(),
+                &[env.home.join("src"), root.clone()],
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(e.contains("policy"), "{}: {e}", root.display());
+        }
+        assert!(workspace(&env, &Manifest::default(), &[env.home.join("src")]).is_ok());
+        // flatpak would split a path at ':'.
+        let odd = t.path().join("a:ro");
+        std::fs::create_dir_all(&odd).unwrap();
+        assert!(workspace(&env, &Manifest::default(), &[odd]).is_err());
+    }
+
+    #[test]
+    fn the_flatpak_opt_out_comes_from_the_user_configuration_only() {
+        let t = tempfile::tempdir().unwrap();
+        let env = test_env(t.path());
+        let cfg = env.paddock_config();
+        std::fs::create_dir_all(&cfg).unwrap();
+        let project = t.path().join("p");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(
+            project.join(crate::manifest::PROJECT_FILE),
+            "[apps.f]\nunprotected_workspaces = true\n",
+        )
+        .unwrap();
+        // Even a manifest merged with the project file keeps it off.
+        let merged = Manifest::load(&env, &project).unwrap().merged;
+        assert!(!merged
+            .apps
+            .get("f")
+            .is_some_and(|a| a.unprotected_workspaces));
+        assert!(!unprotected_workspaces(&env, "f").unwrap());
+        std::fs::write(
+            cfg.join("config.toml"),
+            "[apps.f]\nunprotected_workspaces = true\n",
+        )
+        .unwrap();
+        assert!(unprotected_workspaces(&env, "f").unwrap());
+        assert!(!unprotected_workspaces(&env, "other").unwrap());
+    }
+
+    #[test]
+    fn flatpak_gets_the_filtered_host_environment() {
+        let t = tempfile::tempdir().unwrap();
+        let sock = t.path().join("ctl.sock");
+        let _l = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        let vars: std::collections::BTreeMap<String, String> = [
+            ("HOME", "/home/demo"),
+            ("PATH", "/usr/bin"),
+            ("DBUS_SESSION_BUS_ADDRESS", "unix:path=/run/user/1000/bus"),
+            ("XDG_RUNTIME_DIR", "/run/user/1000"),
+            ("EDITOR", "nvim"),
+            ("CLAUDE_CODE_MESSAGING_TOKEN", "x"),
+            ("HYPRLAND_INSTANCE_SIGNATURE", "x"),
+            ("SSH_AUTH_SOCK", "/run/user/1000/ssh"),
+            ("AWS_SECRET_ACCESS_KEY", "x"),
+            ("GITHUB_TOKEN", "x"),
+            ("HIDDEN_ONE", "x"),
+            ("ANY_CONTROL", sock.to_str().unwrap()),
+        ]
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+        let env = HostEnv::from_parts("/home/demo".into(), "demo".into(), 1000, 1000, vars);
+        let profile: Profile =
+            toml::from_str("name = \"f\"\n[app]\nflatpak = \"org.x\"\n").unwrap();
+        let mut m = Manifest::default();
+        m.env.hide.push("HIDDEN_ONE".into());
+        let e = flatpak_env(&env, &m, &profile, true);
+        for k in [
+            "HOME",
+            "PATH",
+            "DBUS_SESSION_BUS_ADDRESS",
+            "XDG_RUNTIME_DIR",
+            "EDITOR",
+        ] {
+            assert!(e.contains_key(k), "{k}");
+        }
+        for k in [
+            "CLAUDE_CODE_MESSAGING_TOKEN",
+            "HYPRLAND_INSTANCE_SIGNATURE",
+            "SSH_AUTH_SOCK",
+            "AWS_SECRET_ACCESS_KEY",
+            "GITHUB_TOKEN",
+            "HIDDEN_ONE",
+            "ANY_CONTROL",
+        ] {
+            assert!(!e.contains_key(k), "{k}");
+        }
+        m.env.pass.push("GITHUB_TOKEN".into());
+        assert!(flatpak_env(&env, &m, &profile, true).contains_key("GITHUB_TOKEN"));
+        let clean = flatpak_env(&env, &m, &profile, false);
+        assert!(!clean.contains_key("EDITOR"));
+        assert!(clean.contains_key("GITHUB_TOKEN") && clean.contains_key("HOME"));
+    }
+
+    /// The extra folders of a bwrap app get the git and secrets detectors,
+    /// and the policy refuses them without.
+    #[test]
+    fn bwrap_app_extra_folders_are_protected_like_the_first() {
+        let t = tempfile::tempdir().unwrap();
+        let env = test_env(t.path());
+        std::fs::create_dir_all(&env.home).unwrap();
+        let (a, b) = (t.path().join("a"), t.path().join("b"));
+        repo(&a);
+        repo(&b);
+        std::fs::write(b.join(".env"), "TOKEN=x").unwrap();
+        let mut bare = test_spec(&env, &a);
+        bare.add_mount(Mount::same(&b, true, "app workspace folder"));
+        assert!(crate::policy::enforce(&env, &bare).is_err());
+        let mut spec = test_spec(&env, &a);
+        add_roots(
+            &env,
+            &mut spec,
+            &Manifest::default(),
+            std::slice::from_ref(&b),
+        )
+        .unwrap();
+        crate::policy::enforce(&env, &spec).unwrap();
+        let kind = |p: PathBuf| spec.mounts.iter().find(|m| m.dst == p).map(|m| m.kind);
+        assert_eq!(kind(b.join(".env")), Some(MountKind::MaskFile));
+        assert_eq!(kind(b.join(".git/config")), Some(MountKind::Ro));
+        assert_eq!(kind(b.join(".git/hooks")), Some(MountKind::Ro));
     }
 }
