@@ -34,6 +34,7 @@ fn setup(answer: Option<Answer>, policy: HostPolicy) -> (tempfile::TempDir, Brok
         repo: None,
         chain: vec![],
         depth: 0,
+        role: None,
     };
     (tmp, Broker::new(env, ctx, policy, fixed.clone()), fixed)
 }

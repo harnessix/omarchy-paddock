@@ -23,7 +23,8 @@ When a task needs the host, use `paddock-host`. Each request goes to paddock on 
 | The host clipboard | `paddock-host clipboard get` or `paddock-host clipboard set TEXT` |
 | Open a page in the host browser | `paddock-host open https://...` |
 | Tell the user that work is done | `paddock-host notify "Title" "Body"` |
-| Give a task to another harness | `paddock-host spawn codex --worktree --prompt-file task.md` |
+| Give a task to another harness | `paddock-host spawn codex --prompt-file task.md` |
+| Get a review from another harness | `paddock-host spawn codex --role reviewer --from-head --prompt-file review.md` |
 
 ## Push and pull requests
 
@@ -49,16 +50,17 @@ Rules that you can rely on:
 `paddock-host spawn` starts an agent of another harness, for example codex, in its own sandbox. It runs one task and stops. Use it to give one part of the work to another harness, or to get a second opinion. Subagents of your own harness do not need it.
 
 1. Check `paddock-host capabilities --json`. Use spawn only if its mode is not `deny`. The `spawn` object lists the allowed harnesses and the limits.
-2. Commit first. The child starts from the commit that you have checked out, not from your uncommitted files.
+2. The child starts from the commit that you have checked out. Commit first, or add `--from-head`: then paddock makes a commit of your current files, uncommitted and new ones included, and the child starts from it. Your own files and branch do not change.
 3. Write the whole task to a file in the project, for example `task.md`. The child does not see this conversation. Tell it which files to change, how to check its work, and to commit its changes. Uncommitted changes stay in its worktree, and you cannot see them.
-4. Start it: `id=$(paddock-host spawn codex --worktree --prompt-file task.md --reason "...")`. The command prints only the id.
-5. Do other work, then run `paddock-host wait "$id" --timeout 600`. Exit code 0 means that the child finished with exit code 0. Exit code 1 means that it failed or was stopped. Exit code 5 means that it still runs.
-6. Read `.paddock/inbox/spawn-ID/result.json` and `output.txt`. Look at the branch with `git log --stat paddock/spawn-codex-ID`, and merge or cherry-pick what you want to keep.
+4. Choose a role. `--role implementer` (the default) gets its own writable worktree. `--role reviewer` gets the files read-only and cannot push or use `gh` to change anything. Use it to review or compare.
+5. Start it: `id=$(paddock-host spawn codex --prompt-file task.md --reason "...")`. The command prints only the id. To ask for lower limits, add `--timeout 30m`, `--mem 4G` or `--cpus 2`.
+6. Do other work, then run `paddock-host wait "$id" --timeout 600`. Exit code 0 means that the child finished with exit code 0. Exit code 1 means that it failed, was stopped or reached its time limit. Exit code 5 means that it still runs.
+7. The result is a branch. Look at it with `git log --stat paddock/spawn-codex-ID` or `git diff HEAD...paddock/spawn-codex-ID`, and merge or cherry-pick what you want to keep. `.paddock/inbox/spawn-ID/result.json` and `output.txt` hold a short summary and the end of the child's output.
 
 Limits that you can rely on:
 
-- The child gets no more than your sandbox: the same network, environment and mounts, no display, and host capabilities that are at most as open as yours. It uses its own login of its harness. You never see it.
-- The user decides which harnesses you may start, how many run at the same time, and how long one may run. By default a child cannot start children of its own.
+- The child gets no more than your sandbox: the same network and mounts, a clean environment, no display, and host capabilities that are at most as open as yours. It uses its own login of its harness. You never see it.
+- The user decides which harnesses you may start, how many run at the same time, and the most time, memory and CPUs of one child. You can ask for less, never for more. By default a child cannot start children of its own.
 - The first spawn of each harness asks the user. The user sees the task. Requests that the child sends show the user that you started it, and your session grants do not apply to it.
 - A child stops when your sandbox ends. Stop one yourself with `paddock-host kill ID`. `paddock-host status` lists your children.
 

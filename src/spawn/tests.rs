@@ -270,6 +270,8 @@ fn a_child_build_uses_the_snapshot_and_keeps_the_prompt_out_of_argv() {
             manifest: Manifest::default(),
             branch: branch_for("fake", if file { "0011aabc" } else { "0011aabb" }),
             base_from: repo.clone(),
+            base: None,
+            role: Role::Implementer,
         };
         let opts = Options {
             harness: "fake".into(),
@@ -389,6 +391,7 @@ fn broker(
         repo: None,
         chain,
         depth,
+        role: None,
     };
     let mut b = Broker::new(s.env.clone(), ctx, HostPolicy::default(), approver);
     let sp = Spawner::with_program(
@@ -492,7 +495,7 @@ fn max_running_is_enforced_on_the_host() {
     assert!(second.message.contains("max_running"), "{}", second.message);
     // The spawner checks again under its own lock.
     let sp = b.spawner.clone().unwrap();
-    assert!(sp.start("codex", b"x").is_err());
+    assert!(sp.start("codex", b"x", StartOpts::default()).is_err());
     let id = first.result["id"].as_str().unwrap().to_string();
     let killed = b.handle(&req(serde_json::json!({ "action": "kill", "id": id })));
     assert_eq!(killed.status, RStatus::Done);
@@ -772,4 +775,273 @@ fn ps_lists_children_under_their_parent() {
         .collect();
     assert_eq!(d.len(), 2);
     assert!(d.contains(&"a1x".to_string()));
+}
+
+#[test]
+fn sizes_times_and_cpus_parse() {
+    assert_eq!(parse_bytes("4G").unwrap(), 4 << 30);
+    assert_eq!(parse_bytes("512m").unwrap(), 512 << 20);
+    assert!(parse_bytes("10").is_err(), "too small for a harness");
+    assert!(parse_bytes("4X").is_err());
+    assert_eq!(format_bytes(4 << 30), "4G");
+    assert_eq!(parse_cpus("1.5").unwrap(), 150);
+    assert_eq!(format_cpus(150), "1.5");
+    assert_eq!(format_cpus(200), "2");
+    assert!(parse_cpus("0").is_err());
+    assert_eq!(parse_duration("30m").unwrap(), 1800);
+    assert_eq!(parse_duration("2h").unwrap(), 7200);
+    assert_eq!(parse_duration("90").unwrap(), 90);
+    assert!(parse_duration("soon").is_err());
+    let c =
+        SpawnCfg::from_doc(&toml::from_str("[spawn]\nmax_mem = \"4G\"\nmax_cpus = 2\n").unwrap())
+            .unwrap();
+    assert_eq!((c.max_mem, c.max_cpu_percent), (Some(4 << 30), Some(200)));
+    let c = SpawnCfg::from_doc(&toml::from_str("[spawn]\nmax_cpus = 0.5\n").unwrap()).unwrap();
+    assert_eq!(c.max_cpu_percent, Some(50));
+}
+
+#[test]
+fn limits_can_only_be_lower_than_the_configuration() {
+    let c = SpawnCfg {
+        timeout: 1800,
+        max_mem: Some(4 << 30),
+        max_cpu_percent: Some(200),
+        ..Default::default()
+    };
+    // Without a request, the child gets the configured limits.
+    let l = c.limits(None, None, None).unwrap();
+    assert_eq!(
+        (l.timeout, l.mem, l.cpu_percent),
+        (1800, Some(4 << 30), Some(200))
+    );
+    let l = c.limits(Some(600), Some(1 << 30), Some(50)).unwrap();
+    assert_eq!(
+        (l.timeout, l.mem, l.cpu_percent),
+        (600, Some(1 << 30), Some(50))
+    );
+    assert!(c.limits(Some(3600), None, None).is_err());
+    assert!(c.limits(Some(0), None, None).is_err());
+    assert!(c.limits(None, Some(8 << 30), None).is_err());
+    assert!(c.limits(None, None, Some(400)).is_err());
+    // With no configured maximum, a request only adds a limit.
+    let open = SpawnCfg::default();
+    let l = open.limits(None, Some(2 << 30), None).unwrap();
+    assert_eq!((l.mem, l.cpu_percent), (Some(2 << 30), None));
+}
+
+#[test]
+fn the_scope_holds_the_limits_and_never_the_prompt() {
+    let s = setup();
+    let sp = Spawner::with_program(
+        &s.env,
+        SpawnCfg::default(),
+        ceiling("p-1", 0, &s.project),
+        &s.project,
+        vec!["/usr/bin/paddock".into(), "spawn-child".into()],
+    );
+    let limits = Limits {
+        timeout: 600,
+        mem: Some(2 << 30),
+        cpu_percent: Some(150),
+    };
+    let log = std::fs::File::create(s.project.join("log")).unwrap();
+    let job = s.project.join("job.json");
+    let cmd = sp
+        .command(
+            &job,
+            log,
+            limits,
+            Some(Path::new("/usr/bin/systemd-run")),
+            "paddock-spawn-x",
+        )
+        .unwrap();
+    assert_eq!(cmd.get_program(), "/usr/bin/systemd-run");
+    let args: Vec<String> = cmd
+        .get_args()
+        .map(|a| a.to_string_lossy().into_owned())
+        .collect();
+    for want in [
+        "--user",
+        "--scope",
+        "paddock-spawn-x",
+        // paddock stops the child at 600 s; the scope is the backstop.
+        "RuntimeMaxSec=660",
+        "MemoryMax=2147483648",
+        "MemorySwapMax=0",
+        "CPUQuota=150%",
+        "/usr/bin/paddock",
+        "spawn-child",
+    ] {
+        assert!(args.iter().any(|a| a == want), "{want} missing in {args:?}");
+    }
+    assert_eq!(args.last().unwrap(), &job.display().to_string());
+    assert!(args.iter().all(|a| !a.contains("TASK-TEXT")));
+    // Without systemd-run, the program runs as it is.
+    let log = std::fs::File::create(s.project.join("log2")).unwrap();
+    let plain = sp.command(&job, log, limits, None, "u").unwrap();
+    assert_eq!(plain.get_program(), "/usr/bin/paddock");
+}
+
+#[test]
+fn memory_and_cpu_limits_are_refused_without_a_scope() {
+    let s = setup();
+    let r = Recorder::new(Answer::Once);
+    let b = broker(&s, "p-1", vec![], cfg(&["codex"], 2), &["true"], r.clone());
+    let mut q = start("codex");
+    q.args.insert("mem".into(), serde_json::json!(1u64 << 30));
+    let resp = b.handle(&q);
+    assert_eq!(resp.status, RStatus::Failed);
+    assert!(resp.message.contains("systemd-run"), "{}", resp.message);
+    // A timeout above the configuration and an unknown role are refused too.
+    let mut q = start("codex");
+    q.args.insert("timeout".into(), serde_json::json!(99_999));
+    assert_eq!(b.handle(&q).status, RStatus::Invalid);
+    let mut q = start("codex");
+    q.args.insert("role".into(), serde_json::json!("admin"));
+    assert_eq!(b.handle(&q).status, RStatus::Invalid);
+    // Nobody was asked.
+    assert_eq!(r.asked.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn roles_have_their_own_grants_and_show_on_the_card() {
+    let s = setup();
+    let r = Recorder::new(Answer::Session);
+    let b = broker(&s, "p-1", vec![], cfg(&["codex"], 2), &["true"], r.clone());
+    let sp = b.spawner.clone().unwrap();
+    let run = |q: Request| {
+        let resp = b.handle(&q);
+        assert_eq!(resp.status, RStatus::Done, "{}", resp.message);
+        let id = resp.result["id"].as_str().unwrap().to_string();
+        sp.wait(&id, Duration::from_secs(10)).unwrap()
+    };
+    let mut review = start("codex");
+    review
+        .args
+        .insert("role".into(), serde_json::json!("reviewer"));
+    review.args.insert("timeout".into(), serde_json::json!(300));
+    let done = run(review.clone());
+    assert_eq!(done.role, Role::Reviewer);
+    assert_eq!(done.limits.timeout, 300);
+    assert_eq!(done.enforced_by, "paddock");
+    let card = r.seen.lock().unwrap()[0].clone();
+    assert!(card.detail.contains("Role: reviewer"), "{}", card.detail);
+    assert!(
+        card.detail.contains("at most 300 seconds"),
+        "{}",
+        card.detail
+    );
+    run(review);
+    assert_eq!(r.asked.load(Ordering::SeqCst), 1);
+    // A grant for the reviewer does not cover the wider implementer role.
+    run(start("codex"));
+    assert_eq!(r.asked.load(Ordering::SeqCst), 2);
+}
+
+#[test]
+fn a_reviewer_cannot_push_and_its_files_are_read_only() {
+    let s = setup();
+    let r = Recorder::new(Answer::Once);
+    let mut b = broker(
+        &s,
+        "codex-spawn-1",
+        vec!["p-1".into()],
+        cfg(&[], 2),
+        &["true"],
+        r.clone(),
+    );
+    b.ctx.role = Some(Role::Reviewer);
+    let push = Request {
+        v: PROTOCOL,
+        cap: "git-push".into(),
+        args: [
+            ("remote".to_string(), serde_json::json!("origin")),
+            (
+                "refs".to_string(),
+                serde_json::json!([{ "src": "HEAD", "sha": "0123456789abcdef0123456789abcdef01234567", "dst": "refs/heads/x" }]),
+            ),
+        ]
+        .into_iter()
+        .collect(),
+        reason: String::new(),
+    };
+    let resp = b.handle(&push);
+    assert_eq!(resp.status, RStatus::Disabled);
+    assert!(resp.message.contains("reviewer"), "{}", resp.message);
+    assert_eq!(r.asked.load(Ordering::SeqCst), 0);
+
+    // Its files are read-only; a cache outside them stays writable.
+    let tmp = tempfile::tempdir().unwrap();
+    let env = env_in(tmp.path());
+    let project = tmp.path().join("app");
+    let cache = tmp.path().join("cache");
+    std::fs::create_dir_all(project.join("sub")).unwrap();
+    std::fs::create_dir_all(&cache).unwrap();
+    let mut built = parent_built(&env, &project);
+    built
+        .spec
+        .add_mount(Mount::same(project.join("sub"), true, "test"));
+    built
+        .spec
+        .add_mount(Mount::same(&cache, true, "test cache"));
+    make_read_only(&mut built.spec, std::slice::from_ref(&project));
+    let kinds = |p: &Path| {
+        built
+            .spec
+            .mounts
+            .iter()
+            .filter(|m| m.src.as_deref() == Some(p))
+            .map(|m| m.kind)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(kinds(&project), vec![MountKind::Ro]);
+    assert_eq!(kinds(&project.join("sub")), vec![MountKind::Ro]);
+    assert_eq!(kinds(&cache), vec![MountKind::Rw]);
+}
+
+#[test]
+fn from_head_commits_the_parents_files_without_touching_its_checkout() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    git(&repo, &["init", "-q", "-b", "main"]);
+    std::fs::write(repo.join("a.txt"), "one\n").unwrap();
+    std::fs::write(repo.join(".gitignore"), "secret.env\n").unwrap();
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-q", "-m", "one"]);
+    let repo = std::fs::canonicalize(&repo).unwrap();
+    let out = |args: &[&str]| {
+        let o = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(args)
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&o.stdout).trim().to_string()
+    };
+    let head = out(&["rev-parse", "HEAD"]);
+    let index = tmp.path().join("index");
+    // A clean checkout: the base is HEAD itself.
+    assert_eq!(snapshot_commit(&repo, &index, "x").unwrap(), head);
+
+    std::fs::write(repo.join("a.txt"), "two\n").unwrap();
+    std::fs::write(repo.join("new.txt"), "new\n").unwrap();
+    std::fs::write(repo.join("secret.env"), "TOKEN=1\n").unwrap();
+    let status = out(&["status", "--porcelain"]);
+    let refs = out(&["for-each-ref"]);
+    let c = snapshot_commit(&repo, &index, "x").unwrap();
+    assert_ne!(c, head);
+    assert_eq!(out(&["rev-parse", &format!("{c}^")]), head);
+    assert_eq!(out(&["show", &format!("{c}:a.txt")]), "two");
+    assert_eq!(out(&["show", &format!("{c}:new.txt")]), "new");
+    assert_eq!(out(&["ls-tree", "--name-only", &c, "secret.env"]), "");
+    // The checkout, its index and its refs are as they were.
+    assert_eq!(out(&["rev-parse", "HEAD"]), head);
+    assert_eq!(out(&["status", "--porcelain"]), status);
+    assert_eq!(out(&["for-each-ref"]), refs);
+    assert!(!index.exists());
+
+    // A configuration that can start a program is refused.
+    git(&repo, &["config", "core.fsmonitor", "/bin/false"]);
+    assert!(snapshot_commit(&repo, &index, "x").is_err());
 }

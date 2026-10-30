@@ -611,6 +611,16 @@ pub fn build_with(env: &HostEnv, opts: &Options, harness: Harness) -> Result<Bui
     }
     gui::apply(env, &mut spec)?;
 
+    // A reviewer child reads the files and reports. Its worktree and the
+    // repository are read-only; its own home and the caches stay writable.
+    if opts
+        .child
+        .as_ref()
+        .is_some_and(|c| c.role == crate::spawn::Role::Reviewer)
+    {
+        crate::spawn::make_read_only(&mut spec, &[project.clone(), home_key.clone()]);
+    }
+
     policy::enforce(env, &spec)?;
 
     let backend = opts

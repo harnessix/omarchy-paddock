@@ -30,7 +30,7 @@ USAGE
   paddock-host notify TITLE [BODY]
   paddock-host git push [REMOTE] [REFSPEC...]   (plain `git push` works too)
   paddock-host gh COMMAND [ARG...]              (plain `gh` works too)
-  paddock-host spawn HARNESS --prompt-file FILE [--worktree] [--reason TEXT]
+  paddock-host spawn HARNESS --prompt-file FILE [--role ROLE] [--from-head] [--reason TEXT]
   paddock-host status [ID]
   paddock-host wait ID [--timeout SECONDS]
   paddock-host kill ID
@@ -202,7 +202,9 @@ Extra options: --paddock-reason TEXT, --paddock-timeout SECONDS (default 120,
         "spawn" | "status" | "wait" | "kill" => {
             r#"paddock-host spawn: start another harness in its own sandbox with one task.
 
-  paddock-host spawn HARNESS --prompt-file FILE [--worktree] [--reason TEXT]
+  paddock-host spawn HARNESS --prompt-file FILE [--role implementer|reviewer]
+                     [--from-head] [--timeout TIME] [--mem SIZE] [--cpus N]
+                     [--worktree] [--reason TEXT]
   paddock-host status [ID]                 one child, or all of them
   paddock-host wait ID [--timeout SECONDS]
   paddock-host kill ID
@@ -216,14 +218,24 @@ and stops when the task is done.
     command line.
   - The child works in a new git worktree on the branch
     paddock/spawn-HARNESS-ID, from the commit that this sandbox has checked
-    out. Commit what you want it to start from first. --worktree is the
-    default and the only mode.
+    out. With --from-head, paddock first makes a commit of your files as they
+    are now, uncommitted and new files included (not the ignored ones), and
+    the child starts from it. Your files, index and branches stay as they
+    are. --worktree is the default and the only mode.
   - Tell the child to commit its work. Uncommitted changes stay in its
     worktree, and you cannot see them.
+  - --role sets fixed limits. implementer (the default): its own writable
+    worktree. reviewer: the files are read-only, and it cannot push or change
+    anything with gh; use it to review or compare. Both roles get a clean
+    environment: only the allowlist and the harness's own variables.
+  - --timeout (600, 30m, 2h), --mem (512M, 4G) and --cpus (2, 0.5) can only
+    lower the limits in the user's configuration. A systemd scope enforces
+    them when the host has `systemd-run --user`; without it, paddock enforces
+    the timeout and refuses --mem and --cpus.
   - The child uses its own login of that harness. You never see it.
-  - The child never gets more than this sandbox: the same network, backend,
-    environment and mounts, no display, and host capabilities that are at
-    most as open as yours. Its requests show the user that you started it.
+  - The child never gets more than this sandbox: the same network, backend
+    and mounts, no display, and host capabilities that are at most as open
+    as yours. Its requests show the user that you started it.
   - The user's configuration decides which harnesses are allowed, how many
     children run at the same time, how long one may run, and whether a child
     may start children of its own (by default it may not).
@@ -418,12 +430,13 @@ pub fn main(args: &[String]) -> i32 {
             }
             "spawn" => {
                 // A child always gets a worktree; the flag only says so.
+                let from_head = rest.iter().any(|a| a == "--from-head");
                 let args: Vec<String> = rest
                     .iter()
-                    .filter(|a| *a != "--worktree")
+                    .filter(|a| *a != "--worktree" && *a != "--from-head")
                     .cloned()
                     .collect();
-                let p = parse(&args, &["prompt-file"])?;
+                let p = parse(&args, &["prompt-file", "role", "timeout", "mem", "cpus"])?;
                 let [harness] = p.rest.as_slice() else {
                     return Err("spawn needs one harness name, for example: spawn codex --prompt-file task.md".into());
                 };
@@ -435,6 +448,24 @@ pub fn main(args: &[String]) -> i32 {
                 a.insert("action".into(), serde_json::json!("start"));
                 a.insert("harness".into(), serde_json::json!(harness));
                 a.insert("prompt_file".into(), serde_json::json!(file));
+                a.insert("from_head".into(), serde_json::json!(from_head));
+                if let Some(r) = p.opts.get("role") {
+                    let role: crate::spawn::Role = r.parse().map_err(|e| format!("{e:#}"))?;
+                    a.insert("role".into(), serde_json::json!(role.name()));
+                }
+                let bad = |e: anyhow::Error| format!("{e:#}");
+                if let Some(t) = p.opts.get("timeout") {
+                    let t = crate::spawn::parse_duration(t).map_err(bad)?;
+                    a.insert("timeout".into(), serde_json::json!(t));
+                }
+                if let Some(m) = p.opts.get("mem") {
+                    let m = crate::spawn::parse_bytes(m).map_err(bad)?;
+                    a.insert("mem".into(), serde_json::json!(m));
+                }
+                if let Some(c) = p.opts.get("cpus") {
+                    let c = crate::spawn::parse_cpus(c).map_err(bad)?;
+                    a.insert("cpu_percent".into(), serde_json::json!(c));
+                }
                 (req("spawn", p.reason, a), p.json)
             }
             "status" | "wait" | "kill" => {

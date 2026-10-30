@@ -62,8 +62,13 @@ pub struct SpawnCfg {
     pub max_running: u32,
     /// How many levels deep children can go. 1: a child cannot spawn.
     pub max_depth: u32,
-    /// Seconds that one child may run in total.
+    /// Seconds that one child may run in total. A spawn can ask for less.
     pub timeout: u64,
+    /// The most memory of one child, in bytes. None: no limit.
+    pub max_mem: Option<u64>,
+    /// The most CPU time of one child, in percent of one CPU (150: 1.5
+    /// CPUs). None: no limit.
+    pub max_cpu_percent: Option<u32>,
 }
 
 impl Default for SpawnCfg {
@@ -73,8 +78,152 @@ impl Default for SpawnCfg {
             max_running: DEFAULT_MAX_RUNNING,
             max_depth: DEFAULT_MAX_DEPTH,
             timeout: DEFAULT_TIMEOUT,
+            max_mem: None,
+            max_cpu_percent: None,
         }
     }
+}
+
+/// A fixed set of limits for a child. paddock chooses the set; the agent
+/// only names it, so it cannot combine its own.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Role {
+    /// Its own writable worktree, a clean environment.
+    #[default]
+    Implementer,
+    /// The project read-only, a clean environment, no push and no forge
+    /// writes. It reads and reports.
+    Reviewer,
+}
+
+impl std::str::FromStr for Role {
+    type Err = anyhow::Error;
+    fn from_str(s: &str) -> Result<Self> {
+        match s {
+            "implementer" => Ok(Self::Implementer),
+            "reviewer" => Ok(Self::Reviewer),
+            _ => bail!("unknown role '{s}': use implementer or reviewer"),
+        }
+    }
+}
+
+impl Role {
+    pub fn name(self) -> &'static str {
+        match self {
+            Role::Implementer => "implementer",
+            Role::Reviewer => "reviewer",
+        }
+    }
+
+    /// What the role means, for the approval card.
+    pub fn describe(self) -> &'static str {
+        match self {
+            Role::Implementer => "implementer: its own writable worktree, a clean environment",
+            Role::Reviewer => {
+                "reviewer: the files read-only, a clean environment, no push and no forge writes"
+            }
+        }
+    }
+}
+
+/// The time and resource limits of one child.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Limits {
+    /// Seconds in total.
+    pub timeout: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mem: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpu_percent: Option<u32>,
+}
+
+impl Limits {
+    pub fn describe(&self) -> String {
+        let mut v = vec![format!("at most {} seconds", self.timeout)];
+        if let Some(m) = self.mem {
+            v.push(format!("memory {}", format_bytes(m)));
+        }
+        if let Some(c) = self.cpu_percent {
+            v.push(format!("{} CPUs", format_cpus(c)));
+        }
+        v.join(", ")
+    }
+}
+
+/// Parse a size such as 512M, 4G or 1073741824.
+pub fn parse_bytes(s: &str) -> Result<u64> {
+    let s = s.trim();
+    let (num, mul) = match s.char_indices().last() {
+        Some((i, c)) if c.is_ascii_alphabetic() => {
+            let mul: u64 = match c.to_ascii_uppercase() {
+                'K' => 1 << 10,
+                'M' => 1 << 20,
+                'G' => 1 << 30,
+                'T' => 1 << 40,
+                _ => bail!("{s}: use a size such as 512M or 4G"),
+            };
+            (&s[..i], mul)
+        }
+        _ => (s, 1),
+    };
+    let n: u64 = num
+        .parse()
+        .with_context(|| format!("{s}: use a size such as 512M or 4G"))?;
+    let b = n
+        .checked_mul(mul)
+        .with_context(|| format!("{s} is too large"))?;
+    if b < 64 << 20 {
+        bail!("{s} is too small: a harness needs at least 64M");
+    }
+    Ok(b)
+}
+
+pub fn format_bytes(b: u64) -> String {
+    for (unit, size) in [("T", 1u64 << 40), ("G", 1 << 30), ("M", 1 << 20)] {
+        if b >= size && b.is_multiple_of(size) {
+            return format!("{}{unit}", b / size);
+        }
+    }
+    format!("{}M", b >> 20)
+}
+
+/// Parse a CPU count such as 2 or 1.5 into percent of one CPU.
+pub fn parse_cpus(s: &str) -> Result<u32> {
+    let f: f64 = s
+        .trim()
+        .parse()
+        .with_context(|| format!("{s}: use a number of CPUs such as 2 or 0.5"))?;
+    if !(0.1..=256.0).contains(&f) {
+        bail!("{s}: use a number of CPUs from 0.1 to 256");
+    }
+    Ok((f * 100.0).round() as u32)
+}
+
+pub fn format_cpus(p: u32) -> String {
+    if p.is_multiple_of(100) {
+        format!("{}", p / 100)
+    } else {
+        format!("{:.2}", p as f64 / 100.0)
+            .trim_end_matches('0')
+            .to_string()
+    }
+}
+
+/// Parse a duration such as 90, 90s, 30m or 2h into seconds.
+pub fn parse_duration(s: &str) -> Result<u64> {
+    let s = s.trim();
+    let (num, mul) = match s.chars().last() {
+        Some('s') => (&s[..s.len() - 1], 1),
+        Some('m') => (&s[..s.len() - 1], 60),
+        Some('h') => (&s[..s.len() - 1], 3600),
+        _ => (s, 1),
+    };
+    let n: u64 = num
+        .parse()
+        .with_context(|| format!("{s}: use a time such as 600, 30m or 2h"))?;
+    n.checked_mul(mul)
+        .with_context(|| format!("{s} is too long"))
 }
 
 fn valid_name(s: &str) -> bool {
@@ -125,12 +274,70 @@ impl SpawnCfg {
                 "max_running" => c.max_running = int(k, v, 1, 8)? as u32,
                 "max_depth" => c.max_depth = int(k, v, 0, 4)? as u32,
                 "timeout" => c.timeout = int(k, v, 60, 86_400)? as u64,
+                "max_mem" => {
+                    let b = match v {
+                        toml::Value::String(s) => parse_bytes(s),
+                        toml::Value::Integer(n) if *n > 0 => parse_bytes(&n.to_string()),
+                        _ => bail!("[spawn] max_mem must be a size such as \"4G\""),
+                    };
+                    c.max_mem = Some(b.context("[spawn] max_mem")?);
+                }
+                "max_cpus" => {
+                    let s = match v {
+                        toml::Value::Integer(n) => n.to_string(),
+                        toml::Value::Float(f) => f.to_string(),
+                        _ => bail!("[spawn] max_cpus must be a number such as 2"),
+                    };
+                    c.max_cpu_percent = Some(parse_cpus(&s).context("[spawn] max_cpus")?);
+                }
                 other => bail!(
-                    "[spawn] {other}: unknown setting. Known: harnesses, max_running, max_depth, timeout"
+                    "[spawn] {other}: unknown setting. Known: harnesses, max_running, max_depth, timeout, max_mem, max_cpus"
                 ),
             }
         }
         Ok(c)
+    }
+
+    /// The limits for one child. A spawn can ask for less than the user
+    /// configuration allows, never for more. Without a request, the child
+    /// gets the configured limit.
+    pub fn limits(
+        &self,
+        timeout: Option<u64>,
+        mem: Option<u64>,
+        cpu_percent: Option<u32>,
+    ) -> Result<Limits> {
+        if let Some(t) = timeout {
+            if t == 0 || t > self.timeout {
+                bail!(
+                    "--timeout {t} is more than [spawn] timeout = {} of the user configuration",
+                    self.timeout
+                );
+            }
+        }
+        if let (Some(m), Some(max)) = (mem, self.max_mem) {
+            if m > max {
+                bail!(
+                    "--mem {} is more than [spawn] max_mem = {}",
+                    format_bytes(m),
+                    format_bytes(max)
+                );
+            }
+        }
+        if let (Some(c), Some(max)) = (cpu_percent, self.max_cpu_percent) {
+            if c > max {
+                bail!(
+                    "--cpus {} is more than [spawn] max_cpus = {}",
+                    format_cpus(c),
+                    format_cpus(max)
+                );
+            }
+        }
+        Ok(Limits {
+            timeout: timeout.unwrap_or(self.timeout),
+            mem: mem.or(self.max_mem),
+            cpu_percent: cpu_percent.or(self.max_cpu_percent),
+        })
     }
 
     pub fn allows(&self, harness: &str) -> bool {
@@ -329,6 +536,8 @@ pub struct ChildInfo {
     /// started.
     pub depth: u32,
     pub modes: BTreeMap<String, Mode>,
+    #[serde(default)]
+    pub role: Role,
 }
 
 /// What `build` needs to make a child sandbox.
@@ -339,6 +548,10 @@ pub struct ChildPlan {
     pub branch: String,
     /// The folder whose HEAD is the base commit.
     pub base_from: PathBuf,
+    /// The base commit, when paddock made one from the parent's files
+    /// (`--from-head`). None: HEAD of `base_from`.
+    pub base: Option<String>,
+    pub role: Role,
 }
 
 /// The host modes for a child: the user configuration as it is now, and at
@@ -364,6 +577,22 @@ pub struct Job {
     pub harness: String,
     pub branch: String,
     pub ceiling: Ceiling,
+    #[serde(default)]
+    pub role: Role,
+    #[serde(default)]
+    pub limits: Limits,
+    /// The commit that paddock made from the parent's files (`--from-head`).
+    #[serde(default)]
+    pub base: Option<String>,
+}
+
+/// What a spawn request asks for, after the host checked it.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct StartOpts {
+    pub role: Role,
+    pub limits: Limits,
+    /// Start from the parent's files, uncommitted changes included.
+    pub from_head: bool,
 }
 
 /// What the child's host process reports back.
@@ -422,6 +651,17 @@ pub struct Status {
     pub inbox: Option<String>,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub message: String,
+    #[serde(default)]
+    pub role: Role,
+    #[serde(default)]
+    pub limits: Limits,
+    /// systemd-run when a scope enforces the limits, otherwise paddock.
+    #[serde(default)]
+    pub enforced_by: String,
+    /// The commit that the child started from, when paddock made it from
+    /// the parent's uncommitted files.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from_head: Option<String>,
 }
 
 struct Entry {
@@ -441,6 +681,9 @@ pub struct Spawner {
     dir: PathBuf,
     /// The command that runs a job. The job file is its last argument.
     program: Vec<OsString>,
+    /// Whether to look for `systemd-run --user`; tests turn it off.
+    use_scope: bool,
+    scope: std::sync::OnceLock<Option<PathBuf>>,
     children: Mutex<BTreeMap<String, Entry>>,
     changed: Condvar,
 }
@@ -474,13 +717,37 @@ pub fn inbox_name(id: &str) -> String {
 impl Spawner {
     pub fn new(env: &HostEnv, cfg: SpawnCfg, ceiling: Ceiling, project: &Path) -> Result<Self> {
         let me = std::env::current_exe().context("cannot find the paddock executable")?;
-        Ok(Self::with_program(
+        let mut s = Self::with_program(
             env,
             cfg,
             ceiling,
             project,
             vec![me.into_os_string(), "spawn-child".into()],
-        ))
+        );
+        s.use_scope = true;
+        Ok(s)
+    }
+
+    /// `systemd-run` when it can start a user scope here. A scope holds the
+    /// child's host process and its sandbox, so its limits cover both.
+    pub fn scope_tool(&self) -> Option<PathBuf> {
+        if !self.use_scope {
+            return None;
+        }
+        self.scope
+            .get_or_init(|| {
+                let tool = self.env.which("systemd-run")?;
+                let mut c = std::process::Command::new(&tool);
+                c.args(["--user", "--scope", "--quiet", "--collect", "--", "true"]);
+                match crate::broker::run_capture(&mut c, Duration::from_secs(10)) {
+                    Ok((0, _, _)) => Some(tool),
+                    _ => {
+                        log::info!("systemd-run --user --scope does not work here; paddock enforces the spawn timeout itself");
+                        None
+                    }
+                }
+            })
+            .clone()
     }
 
     /// A spawner that runs `program JOB_FILE` for each child. Tests use a
@@ -500,6 +767,8 @@ impl Spawner {
             project: project.to_path_buf(),
             dir,
             program,
+            use_scope: false,
+            scope: std::sync::OnceLock::new(),
             children: Mutex::new(BTreeMap::new()),
             changed: Condvar::new(),
         }
@@ -533,7 +802,11 @@ impl Spawner {
 
     /// Start one child. The limit on running children is checked here, under
     /// the same lock that adds the child.
-    pub fn start(self: &Arc<Self>, harness: &str, prompt: &[u8]) -> Result<Status> {
+    pub fn start(self: &Arc<Self>, harness: &str, prompt: &[u8], o: StartOpts) -> Result<Status> {
+        let scope = self.scope_tool();
+        if scope.is_none() && (o.limits.mem.is_some() || o.limits.cpu_percent.is_some()) {
+            bail!("paddock needs `systemd-run --user` to limit memory and CPUs, and it does not work here. Remove --mem and --cpus, or [spawn] max_mem and max_cpus");
+        }
         let id = new_spawn_id();
         let sandbox = sandbox_id_for(harness, &id);
         let branch = branch_for(harness, &id);
@@ -561,6 +834,15 @@ impl Spawner {
                         ended: None,
                         inbox: None,
                         message: String::new(),
+                        role: o.role,
+                        limits: o.limits,
+                        enforced_by: if scope.is_some() {
+                            "systemd-run"
+                        } else {
+                            "paddock"
+                        }
+                        .into(),
+                        from_head: None,
                     },
                     pid: 0,
                     stop: None,
@@ -572,15 +854,27 @@ impl Spawner {
             let _ = std::fs::remove_dir_all(&job_dir);
             e
         };
-        let job = Job {
+        let mut job = Job {
             spawn_id: id.clone(),
             sandbox_id: sandbox,
             harness: harness.to_string(),
             branch,
             ceiling: self.ceiling.clone(),
+            role: o.role,
+            limits: o.limits,
+            base: None,
         };
+        crate::privfs::dir(&job_dir).map_err(|e| fail(e.into()))?;
+        if o.from_head {
+            let c = snapshot_commit(&self.ceiling.head_from, &job_dir.join("index"), &id)
+                .context("--from-head")
+                .map_err(fail)?;
+            if let Some(e) = self.children.lock().unwrap().get_mut(&id) {
+                e.status.from_head = Some(c.clone());
+            }
+            job.base = Some(c);
+        }
         let write = || -> Result<PathBuf> {
-            crate::privfs::dir(&job_dir)?;
             crate::privfs::write(&job_dir.join("prompt.md"), prompt)?;
             let f = job_dir.join("job.json");
             crate::privfs::write(&f, serde_json::to_vec(&job)?)?;
@@ -592,7 +886,7 @@ impl Spawner {
         let (tx, rx) = std::sync::mpsc::channel();
         let me = self.clone();
         let (id2, dir2) = (id.clone(), job_dir.clone());
-        std::thread::spawn(move || me.watch(&id2, &dir2, &job_file, tx));
+        std::thread::spawn(move || me.watch(&id2, &dir2, &job_file, o.limits, scope, tx));
         match rx.recv() {
             Ok(Ok(pid)) => {
                 let mut ch = self.children.lock().unwrap();
@@ -609,10 +903,38 @@ impl Spawner {
         }
     }
 
-    fn command(&self, job_file: &Path, log: std::fs::File) -> Result<std::process::Command> {
+    fn command(
+        &self,
+        job_file: &Path,
+        log: std::fs::File,
+        limits: Limits,
+        scope: Option<&Path>,
+        unit: &str,
+    ) -> Result<std::process::Command> {
         use std::os::unix::process::CommandExt;
         let (first, rest) = self.program.split_first().context("no program")?;
-        let mut cmd = std::process::Command::new(first);
+        let mut cmd = match scope {
+            // The scope runs the program in the same process, so the
+            // settings below apply to it. paddock stops the child itself at
+            // the timeout, so it can save its login; the scope's runtime
+            // limit is the backstop a minute later.
+            Some(tool) => {
+                let mut c = std::process::Command::new(tool);
+                c.args(["--user", "--scope", "--quiet", "--collect", "--unit", unit]);
+                c.arg("-p")
+                    .arg(format!("RuntimeMaxSec={}", limits.timeout + 60));
+                if let Some(m) = limits.mem {
+                    c.arg("-p").arg(format!("MemoryMax={m}"));
+                    c.arg("-p").arg("MemorySwapMax=0");
+                }
+                if let Some(p) = limits.cpu_percent {
+                    c.arg("-p").arg(format!("CPUQuota={p}%"));
+                }
+                c.arg("--").arg(first);
+                c
+            }
+            None => std::process::Command::new(first),
+        };
         cmd.args(rest)
             .arg(job_file)
             .stdin(std::process::Stdio::null())
@@ -638,11 +960,14 @@ impl Spawner {
         id: &str,
         job_dir: &Path,
         job_file: &Path,
+        limits: Limits,
+        scope: Option<PathBuf>,
         started: std::sync::mpsc::Sender<Result<u32>>,
     ) {
+        let unit = format!("paddock-spawn-{id}");
         let spawned = crate::privfs::append(&job_dir.join("log"))
             .map_err(anyhow::Error::from)
-            .and_then(|log| self.command(job_file, log))
+            .and_then(|log| self.command(job_file, log, limits, scope.as_deref(), &unit))
             .and_then(|mut c| c.spawn().context("cannot start the child"));
         let mut child = match spawned {
             Ok(c) => c,
@@ -654,7 +979,7 @@ impl Spawner {
         let pid = child.id();
         let _ = started.send(Ok(pid));
         let begin = Instant::now();
-        let timeout = Duration::from_secs(self.cfg.timeout);
+        let timeout = Duration::from_secs(limits.timeout);
         let code = loop {
             match child.try_wait() {
                 Ok(Some(s)) => break s.code(),
@@ -700,6 +1025,12 @@ impl Spawner {
             (e.status.clone(), e.stop.map(|(s, _)| s))
         };
         let r = result.unwrap_or_default();
+        // The scope's runtime limit ends the child without a result.
+        let ran = state::now().saturating_sub(status.started);
+        let stop = stop.or((r.exit_code.is_none()
+            && r.error.is_none()
+            && ran >= status.limits.timeout)
+            .then_some(State::TimedOut));
         let state = match (stop, &r.error, r.exit_code) {
             (Some(s), _, _) => s,
             (None, Some(_), _) => State::Failed,
@@ -709,8 +1040,8 @@ impl Spawner {
         let message = match (&r.error, state) {
             (Some(e), _) => e.clone(),
             (None, State::TimedOut) => format!(
-                "stopped after [spawn] timeout of {} seconds",
-                self.cfg.timeout
+                "stopped by {} after the time limit of {} seconds",
+                status.enforced_by, status.limits.timeout
             ),
             (None, State::Stopped) => "stopped before it finished".into(),
             (None, State::Failed) => format!(
@@ -762,6 +1093,8 @@ impl Spawner {
             "ended": s.ended,
             "output_file": "output.txt",
             "output_truncated": r.output_truncated,
+            "role": s.role,
+            "from_head": s.from_head,
         });
         let mut f = dir.create_new(std::ffi::OsStr::new("result.json"), 0o644)?;
         f.write_all(serde_json::to_string_pretty(&summary)?.as_bytes())?;
@@ -816,6 +1149,10 @@ impl Spawner {
             "ended": ended,
             "duration_s": ended.saturating_sub(s.started),
             "run_s": ran,
+            "role": s.role,
+            "limits": s.limits,
+            "enforced_by": s.enforced_by,
+            "from_head": s.from_head.is_some(),
         });
         crate::broker::audit_line(&self.env, &line);
     }
@@ -946,9 +1283,14 @@ fn run_child(env: &HostEnv, job: &Job, prompt: Vec<u8>, result: &mut ChildResult
         harness: job.harness.clone(),
         project: Some(c.repo.clone()),
         backend: Some(c.backend.clone()),
+        // TODO: a reviewer gets network mode "api" (only the model API
+        // hosts of its profile) once that mode exists. Until then it keeps
+        // the parent's mode, which `Ceiling::check` caps.
         network: Some(c.network),
         gui: Some(GuiMode::Off),
-        inherit_env: Some(c.inherit_env),
+        // Both roles get a clean environment: only the allowlist and the
+        // harness's own variables pass.
+        inherit_env: Some(false),
         auth: Some(c.auth.clone()),
         worktree: true,
         child: Some(ChildPlan {
@@ -956,6 +1298,8 @@ fn run_child(env: &HostEnv, job: &Job, prompt: Vec<u8>, result: &mut ChildResult
             manifest: c.manifest.clone(),
             branch: job.branch.clone(),
             base_from: c.head_from.clone(),
+            base: job.base.clone(),
+            role: job.role,
         }),
         ..Default::default()
     };
@@ -983,6 +1327,7 @@ fn run_child(env: &HostEnv, job: &Job, prompt: Vec<u8>, result: &mut ChildResult
             chain: c.chain.clone(),
             depth: c.depth + 1,
             modes,
+            role: job.role,
         });
         match oneshot.prompt {
             crate::profile::PromptVia::Stdin => built.stdin = Some(prompt.clone()),
@@ -1044,7 +1389,10 @@ pub fn create_worktree(
             repo.display()
         );
     }
-    let base = base_commit(&plan.base_from)?;
+    let base = match &plan.base {
+        Some(b) => b.clone(),
+        None => base_commit(&plan.base_from)?,
+    };
     let path = env
         .paddock_data()
         .join("worktrees")
@@ -1066,6 +1414,46 @@ pub fn create_worktree(
         branch: plan.branch.clone(),
         base,
     })
+}
+
+/// `--from-head`: a commit of the parent's files as they are now, with
+/// uncommitted and untracked changes, on top of HEAD. It goes through a
+/// private index file, so the parent's index and work tree stay as they are,
+/// and no ref changes. The git call is the hardened one that refuses a
+/// repository configuration that can start a program.
+pub fn snapshot_commit(dir: &Path, index: &Path, id: &str) -> Result<String> {
+    let co = crate::hostgit::Checkout::open(dir)?;
+    let head = co.layout.query(&["rev-parse", "--verify", "HEAD"])?;
+    let head = head.trim();
+    let _ = std::fs::remove_file(index);
+    co.run_with_index(index, &["read-tree", head])?;
+    co.run_with_index(index, &["add", "-A", "--", "."])?;
+    let tree = co.run_with_index(index, &["write-tree"])?;
+    let tree = tree.trim();
+    let _ = std::fs::remove_file(index);
+    let head_tree = co
+        .layout
+        .query(&["rev-parse", &format!("{head}^{{tree}}")])?;
+    if head_tree.trim() == tree {
+        return Ok(head.to_string());
+    }
+    let msg = format!("paddock: uncommitted files for spawn {id}");
+    let c = co.run_with_index(index, &["commit-tree", tree, "-p", head, "-m", &msg])?;
+    Ok(c.trim().to_string())
+}
+
+/// Turn every writable mount below one of `roots` into a read-only one.
+pub fn make_read_only(spec: &mut crate::spec::SandboxSpec, roots: &[PathBuf]) {
+    for m in spec.mounts.iter_mut() {
+        let under = m
+            .src
+            .as_ref()
+            .is_some_and(|s| roots.iter().any(|r| s.starts_with(r)));
+        if m.kind == MountKind::Rw && under {
+            m.kind = MountKind::Ro;
+            m.origin = format!("{} (read-only: reviewer)", m.origin);
+        }
+    }
 }
 
 /// The chain line on an approval card for a request from a child.

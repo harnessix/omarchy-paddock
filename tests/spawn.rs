@@ -52,7 +52,7 @@ fn world(parent_script: &str) -> World {
     std::fs::create_dir_all(root.join("run")).unwrap();
     std::fs::write(
         cfg.join("config.toml"),
-        "[host]\nspawn = \"allow\"\n[spawn]\nharnesses = [\"childfake\", \"childsleep\"]\ntimeout = 120\n",
+        "[host]\nspawn = \"allow\"\n[spawn]\nharnesses = [\"childfake\", \"childsleep\", \"childreview\"]\ntimeout = 120\n",
     )
     .unwrap();
     std::fs::write(
@@ -83,6 +83,20 @@ fn world(parent_script: &str) -> World {
         profile(
             "childsleep",
             "[oneshot]\nargs = [\"-c\", \"cat >/dev/null; sleep 300\"]\nprompt = \"stdin\"\n",
+        ),
+    )
+    .unwrap();
+    // Reports whether it can write its files, and reads the parent's draft.
+    let review = "cat >/dev/null; if touch probe-write 2>/dev/null; then echo WRITABLE; \
+                  else echo READONLY; fi; cat draft.txt";
+    std::fs::write(
+        cfg.join("harness.d/childreview.toml"),
+        profile(
+            "childreview",
+            &format!(
+                "[oneshot]\nargs = [\"-c\", {}]\nprompt = \"stdin\"\n",
+                toml_str(review)
+            ),
         ),
     )
     .unwrap();
@@ -241,4 +255,176 @@ fn stopping_the_parent_stops_the_child() {
     let result: serde_json::Value =
         serde_json::from_slice(&std::fs::read(dir.join("result.json")).unwrap()).unwrap();
     assert_eq!(result["state"], "stopped", "{result}");
+}
+
+fn inbox_result(w: &World) -> (serde_json::Value, String) {
+    let dir = std::fs::read_dir(w.repo.join(".paddock/inbox"))
+        .unwrap()
+        .flatten()
+        .find(|e| e.file_name().to_string_lossy().starts_with("spawn-"))
+        .expect("no spawn results in the inbox")
+        .path();
+    let result = serde_json::from_slice(&std::fs::read(dir.join("result.json")).unwrap()).unwrap();
+    let output = std::fs::read_to_string(dir.join("output.txt")).unwrap();
+    (result, output)
+}
+
+#[test]
+fn a_reviewer_reads_the_parents_uncommitted_files_and_cannot_write() {
+    if !bwrap_works() {
+        eprintln!("skipped: bwrap cannot create a user namespace here");
+        return;
+    }
+    let w = world(
+        "echo draft-content-9 > draft.txt; \
+         id=$(paddock-host spawn childreview --role reviewer --from-head --prompt-file task.md) || exit 11; \
+         paddock-host wait \"$id\" --timeout 100",
+    );
+    let out = start_parent(&w).wait_with_output().unwrap();
+    assert!(
+        out.status.success(),
+        "parent failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let (result, output) = inbox_result(&w);
+    assert_eq!(result["role"], "reviewer", "{result}");
+    assert!(result["from_head"].is_string(), "{result}");
+    assert_eq!(result["commits"], 0, "{result}");
+    // The child saw the uncommitted file and could not write.
+    assert!(output.contains("READONLY"), "{output}");
+    assert!(output.contains("draft-content-9"), "{output}");
+    // The parent's file is still uncommitted, and its branch did not move.
+    assert!(git(&w.repo, &["status", "--porcelain"]).contains("?? draft.txt"));
+    assert_eq!(
+        git(&w.repo, &["log", "--oneline", "main"]).lines().count(),
+        1
+    );
+}
+
+#[test]
+fn a_child_stops_at_its_time_limit_and_the_log_says_why() {
+    if !bwrap_works() {
+        eprintln!("skipped: bwrap cannot create a user namespace here");
+        return;
+    }
+    let w = world(
+        "id=$(paddock-host spawn childsleep --timeout 3 --prompt-file task.md) || exit 11; \
+         paddock-host wait \"$id\" --timeout 100; echo \"wait exit $?\"",
+    );
+    let start = Instant::now();
+    let out = start_parent(&w).wait_with_output().unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{stdout}");
+    // wait reports a child that did not finish well with exit code 1.
+    assert!(stdout.contains("wait exit 1"), "{stdout}");
+    assert!(start.elapsed() < Duration::from_secs(60));
+    let (result, _) = inbox_result(&w);
+    assert_eq!(result["state"], "timed-out", "{result}");
+    let log = std::fs::read_to_string(w.root.join("state/paddock/host-audit.jsonl")).unwrap();
+    let end = log
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .find(|v| v["decision"] == "child ended")
+        .unwrap();
+    assert_eq!(end["state"], "timed-out", "{end}");
+    assert!(
+        end["message"]
+            .as_str()
+            .unwrap()
+            .contains("time limit of 3 seconds"),
+        "{end}"
+    );
+    assert_eq!(end["limits"]["timeout"], 3);
+}
+
+/// With `systemd-run --user`, the child's host process and its sandbox run in
+/// one scope with the requested limits. Skipped without a user manager. This
+/// test uses the real runtime folder, because the user manager lives there.
+#[test]
+fn a_systemd_scope_holds_the_child_and_its_limits() {
+    if !bwrap_works() {
+        eprintln!("skipped: bwrap cannot create a user namespace here");
+        return;
+    }
+    let scope_works = Command::new("systemd-run")
+        .args(["--user", "--scope", "--quiet", "--collect", "--", "true"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success());
+    if !scope_works {
+        eprintln!("skipped: systemd-run --user --scope does not work here");
+        return;
+    }
+    let w = world(
+        "id=$(paddock-host spawn childsleep --timeout 20 --mem 256M --cpus 0.5 --prompt-file task.md) || exit 11; \
+         sleep 300",
+    );
+    let real = |w: &World| {
+        let mut c = paddock(w);
+        c.env_remove("XDG_RUNTIME_DIR");
+        c
+    };
+    let mut parent = real(&w)
+        .args([
+            "run",
+            "parentfake",
+            "--backend",
+            "bwrap",
+            "--network",
+            "none",
+            "--env",
+            "clean",
+            "-y",
+        ])
+        .arg(&w.repo)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let ours = |s: &serde_json::Value| {
+        s["project"]
+            .as_str()
+            .is_some_and(|p| p.starts_with(&w.root.display().to_string()))
+    };
+    let list = |w: &World| -> Vec<serde_json::Value> {
+        let out = real(w).args(["ps", "--json"]).output().unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap_or_default();
+        v["sandboxes"].as_array().cloned().unwrap_or_default()
+    };
+    let child = wait_for("the child sandbox", 90, || {
+        list(&w)
+            .into_iter()
+            .find(|s| ours(s) && s["parent"].is_string())
+    });
+    let cgroup =
+        |pid: u64| std::fs::read_to_string(format!("/proc/{pid}/cgroup")).unwrap_or_default();
+    let host = child["host_pid"].as_u64().unwrap();
+    let sandbox = child["pid"].as_u64().unwrap();
+    let id = child["spawn_id"].as_str().unwrap().to_string();
+    let unit = format!("paddock-spawn-{id}.scope");
+    let in_scope = cgroup(host).contains(&unit) && cgroup(sandbox).contains(&unit);
+    let props = Command::new("systemctl")
+        .args([
+            "--user",
+            "show",
+            &unit,
+            "-p",
+            "MemoryMax",
+            "-p",
+            "CPUQuotaPerSecUSec",
+        ])
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+        .unwrap_or_default();
+    let parent_id = child["parent"].as_str().unwrap().to_string();
+    let _ = real(&w).args(["stop", &parent_id]).output();
+    wait_for("the parent to exit", 60, || parent.try_wait().unwrap());
+    assert!(in_scope, "{unit}: {} / {}", cgroup(host), cgroup(sandbox));
+    assert!(props.contains("MemoryMax=268435456"), "{props}");
+    assert!(props.contains("CPUQuotaPerSecUSec=500ms"), "{props}");
+    wait_for("the child to end", 30, || {
+        list(&w).into_iter().all(|s| !ours(&s)).then_some(())
+    });
 }
