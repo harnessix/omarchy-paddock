@@ -123,6 +123,11 @@ pub enum Upstream {
         port: u16,
         auth: Option<(String, String)>,
     },
+    /// The host sets a proxy that paddock cannot use (an unknown scheme
+    /// such as `socks4://`, or an unparsable URL). Connecting directly would
+    /// change the exit address that the user chose, so every connection
+    /// fails instead.
+    Unsupported { scheme: String },
 }
 
 fn decode(s: &str) -> String {
@@ -153,6 +158,16 @@ fn upstream(raw: &str) -> Option<Upstream> {
         }),
         _ => None,
     }
+}
+
+/// A set proxy variable always becomes an upstream: one paddock can use, or
+/// `Unsupported`, which refuses connections rather than going direct.
+fn upstream_or_unsupported(raw: &str) -> Upstream {
+    upstream(raw).unwrap_or_else(|| Upstream::Unsupported {
+        scheme: parse_any(raw)
+            .map(|u| u.scheme().to_string())
+            .unwrap_or_else(|| "unknown".into()),
+    })
 }
 
 #[derive(Debug, Clone)]
@@ -197,8 +212,8 @@ impl HostProxy {
         let https = first(&["HTTPS_PROXY", "https_proxy"]).or_else(|| all.clone());
         let http = first(&["HTTP_PROXY", "http_proxy"]).or(all);
         Self {
-            https: https.and_then(|u| upstream(&u)),
-            http: http.and_then(|u| upstream(&u)),
+            https: https.map(|u| upstream_or_unsupported(&u)),
+            http: http.map(|u| upstream_or_unsupported(&u)),
             no_proxy: first(&["NO_PROXY", "no_proxy"]),
             ..Self::default()
         }
@@ -283,6 +298,7 @@ impl Upstream {
     pub fn host(&self) -> &str {
         match self {
             Upstream::Http { host, .. } | Upstream::Socks5 { host, .. } => host,
+            Upstream::Unsupported { .. } => "",
         }
     }
 }
@@ -494,6 +510,9 @@ fn open_tunnel(cfg: &HostProxy, host: &str, port: u16) -> Result<Box<dyn Duplex>
             .with_context(|| format!("upstream SOCKS proxy could not reach {host}:{port}"))?;
             Ok(Box::new(s.into_inner()))
         }
+        Some(Upstream::Unsupported { scheme }) => bail!(
+            "refused: the host proxy uses the {scheme}:// scheme, which paddock cannot use; it does not connect directly instead"
+        ),
     }
 }
 
