@@ -90,7 +90,7 @@ Item {
   }
   function glyph(c) {
     return ({ "screenshot": "󰹑", "exec": "󰆍", "fetch": "󰉋", "clipboard-read": "󰅇",
-              "clipboard-write": "󰅌", "open-url": "󰌹", "notify": "󰂞" })[c] || "󰀦"
+              "clipboard-write": "󰅌", "open-url": "󰌹", "notify": "󰂞", "spawn": "󰚩" })[c] || "󰀦"
   }
 
   function answer(r, decision) {
@@ -195,7 +195,9 @@ Item {
             reason: root.plain(r.reason, 1000),
             created: Number(r.created || 0),
             expires: Number(r.expires || 0),
-            sessionAllowed: r.session_allowed === true
+            sessionAllowed: r.session_allowed === true,
+            // The sandbox that started the asking sandbox (paddock-host spawn).
+            startedBy: Array.isArray(r.started_by) && r.started_by.length ? root.plain(r.started_by[r.started_by.length - 1], 64) : ""
           })
         }
         // Keep cards that are showing their result until they leave.
@@ -360,6 +362,18 @@ Item {
                 font.pixelSize: Style.font.body
                 font.bold: true
                 text: root.question(card.modelData)
+              }
+              // A child sandbox: name its parent. A grant for the parent does
+              // not cover it.
+              Text {
+                Layout.fillWidth: true
+                visible: card.modelData.startedBy !== undefined && card.modelData.startedBy !== ""
+                textFormat: Text.PlainText
+                wrapMode: Text.Wrap
+                color: Commons.Color.urgent
+                font.family: Style.font.family
+                font.pixelSize: Style.font.caption
+                text: visible ? strings.t("approve.startedBy").arg(card.modelData.startedBy) : ""
               }
               Rectangle {
                 Layout.fillWidth: true

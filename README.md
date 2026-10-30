@@ -517,7 +517,7 @@ These rules always hold:
 - paddock counts the running children and the depth on the host. A child stops when its parent ends, when you run `paddock stop` on the parent, after `timeout` seconds, or with `paddock-host kill`. No child keeps using your quota after the parent is gone.
 - The task never goes into the arguments of a process, which other users can see. The harness reads it on its standard input or from a private file. paddock reads the prompt file from the project without following symlinks, refuses pipes and devices, and allows at most 256 KiB.
 
-`paddock ps` shows children under their parent. `paddock log` records the parent, the child, the harness, the branch, the exit status and the durations. It never records the task or the output. Gemini CLI has no one-shot entry yet, because paddock did not check its flags on a real install.
+`paddock ps` and the bar panel show children under their parent, and the approval card names the sandbox that started a child. `paddock log` records the parent, the child, the harness, the branch, the exit status and the durations. It never records the task or the output. Gemini CLI has no one-shot entry yet, because paddock did not check its flags on a real install.
 
 You can let an agent on the host answer requests for you (`paddock approver`). paddock trusts that setting only from a root-owned file (`sudo paddock approver enable --system`) or from a file signed with a password that you type when a sandbox starts, so that a process on your computer cannot turn it on for itself. The agent approver can only answer the capabilities that you list, the rules above still hold, and if it does not answer clearly, the request comes to you.
 

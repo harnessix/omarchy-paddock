@@ -217,7 +217,7 @@ Panel {
   }
   function capabilityGlyph(c) {
     return ({ "screenshot": "󰹑", "exec": "󰆍", "fetch": "󰖟", "clipboard-read": "󰅇",
-              "clipboard-write": "󰅌", "open-url": "󰌹", "notify": "󰂞" })[c] || "󰀦"
+              "clipboard-write": "󰅌", "open-url": "󰌹", "notify": "󰂞", "spawn": "󰚩" })[c] || "󰀦"
   }
   // Seconds now, refreshed every second while requests wait, for countdowns.
   property real now: Date.now() / 1000
@@ -304,7 +304,10 @@ Panel {
     if (root.confirmId !== s.id) {
       root.confirmId = s.id
       confirmTimer.restart()
-      root.say(strings.t("msg.confirmStop").arg(s.harness).arg(s.projectName))
+      // The sandboxes that this one started stop with it.
+      root.say(s.children > 0
+        ? strings.tn("msg.confirmStopChildren", s.children).arg(s.harness).arg(s.projectName).arg(Commons.I18n.formatNumber(s.children))
+        : strings.t("msg.confirmStop").arg(s.harness).arg(s.projectName))
       return
     }
     root.confirmId = ""
@@ -469,8 +472,24 @@ Panel {
             auth: root.plain(r.auth || "", 40),
             started: Number(r.started || 0),
             windowPid: Number.isInteger(r.window_pid) && r.window_pid > 0 ? r.window_pid : 0,
-            warning: Array.isArray(r.warnings) && r.warnings.length ? root.plain(r.warnings[0], 200) : ""
+            warning: Array.isArray(r.warnings) && r.warnings.length ? root.plain(r.warnings[0], 200) : "",
+            // A sandbox that another sandbox started (paddock-host spawn).
+            // paddock ps lists it right after its parent.
+            parent: root.plain(r.parent || "", 64),
+            parentHarness: "",
+            depth: 0,
+            children: 0
           })
+        }
+        for (var c = 0; c < clean.length; c++) {
+          var p = clean[c]
+          for (var d = 0; p.parent !== "" && d < 4; d++) {
+            var up = clean.find(function(o) { return o.id === p.parent })
+            if (!up) break
+            if (d === 0) { clean[c].parentHarness = up.harness; up.children++ }
+            clean[c].depth++
+            p = up
+          }
         }
         root.sandboxes = clean
         root.runningCount = clean.length
@@ -584,7 +603,9 @@ Panel {
             reason: root.plain(r.reason, 1000),
             created: Number(r.created || 0),
             expires: Number(r.expires || 0),
-            sessionAllowed: r.session_allowed === true
+            sessionAllowed: r.session_allowed === true,
+            // The sandbox that started the asking sandbox, if any.
+            startedBy: Array.isArray(r.started_by) && r.started_by.length ? root.plain(r.started_by[r.started_by.length - 1], 64) : ""
           })
         }
         root.approvals = clean
@@ -669,6 +690,8 @@ Panel {
     property string caption2: ""
     property color caption2Color: root.dim
     property bool showActions: false
+    // Levels below a parent row: a sandbox that another sandbox started.
+    property int indent: 0
     default property alias actions: actionRow.data
     signal activated()
 
@@ -696,7 +719,7 @@ Panel {
       anchors.left: parent.left
       anchors.right: parent.right
       anchors.verticalCenter: parent.verticalCenter
-      anchors.leftMargin: Style.space(10)
+      anchors.leftMargin: Style.space(10 + 18 * Math.min(row.indent, 3))
       anchors.rightMargin: Style.space(8)
       implicitHeight: Math.max(texts.implicitHeight, actionRow.implicitHeight)
 
@@ -848,7 +871,7 @@ Panel {
                 glyphColor: root.urgent
                 title: modelData.summary
                 caption: strings.t("approve.meta").arg(modelData.harness).arg(modelData.projectName).arg(root.timeLeft(modelData))
-                caption2: strings.t("approve.openCard")
+                caption2: modelData.startedBy !== "" ? strings.t("approve.startedBy").arg(modelData.startedBy) : strings.t("approve.openCard")
                 onActivated: root.answerOnCard()
               }
             }
@@ -888,12 +911,16 @@ Panel {
                 required property var modelData
                 required property int index
                 rowIndex: index + root.approvals.length
-                glyph: modelData.warning !== "" ? "󰀦" : (modelData.gui === "off" ? "󰆍" : (modelData.gui === "app" ? "󰀻" : "󰍹"))
+                indent: modelData.depth
+                glyph: modelData.warning !== "" ? "󰀦" : (modelData.parent !== "" ? "󰚩" : (modelData.gui === "off" ? "󰆍" : (modelData.gui === "app" ? "󰀻" : "󰍹")))
                 glyphColor: modelData.warning !== "" ? root.urgent : root.fg
-                title: strings.t("row.title").arg(modelData.harness).arg(modelData.projectName)
+                title: modelData.parent !== ""
+                  ? strings.t("row.childTitle").arg(modelData.harness).arg(modelData.parentHarness || modelData.parent)
+                  : strings.t("row.title").arg(modelData.harness).arg(modelData.projectName)
                 caption: strings.t("row.detail").arg(modelData.backend).arg(modelData.network).arg(modelData.gui).arg(root.uptime(modelData.started))
                 caption2: modelData.warning !== "" ? modelData.warning
-                  : (modelData.auth !== "" && modelData.auth !== "shared" ? strings.t("row.auth").arg(modelData.auth) : "")
+                  : (modelData.parent !== "" ? strings.t("row.startedBy").arg(modelData.parent)
+                  : (modelData.auth !== "" && modelData.auth !== "shared" ? strings.t("row.auth").arg(modelData.auth) : ""))
                 caption2Color: modelData.warning !== "" ? root.urgent : root.dim
                 showActions: true
                 onActivated: root.goToTerminal(modelData)
