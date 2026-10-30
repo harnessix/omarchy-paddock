@@ -17,6 +17,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 fn tools_work() -> bool {
+    let _g = EXEC.lock().unwrap_or_else(|e| e.into_inner());
     let bwrap = Command::new("bwrap")
         .args(["--unshare-user", "--ro-bind", "/", "/", "true"])
         .status()
@@ -30,8 +31,14 @@ fn tools_work() -> bool {
     bwrap && pasta
 }
 
+/// Writing a script while another test thread starts a process lets the
+/// child inherit the open file, and running the script then fails with
+/// "Text file busy". Both happen under this lock.
+static EXEC: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 fn write_exec(p: &Path, text: &str) {
     use std::os::unix::fs::PermissionsExt;
+    let _g = EXEC.lock().unwrap_or_else(|e| e.into_inner());
     std::fs::create_dir_all(p.parent().unwrap()).unwrap();
     std::fs::write(p, text).unwrap();
     std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -84,14 +91,20 @@ impl World {
     }
 
     fn update(&self, args: &[&str]) -> std::process::Output {
-        Command::new(env!("CARGO_BIN_EXE_paddock"))
-            .arg("omarchy-usage-update")
-            .arg("--")
-            .args(args)
-            .env_clear()
-            .envs(&self.vars)
-            .output()
-            .unwrap()
+        let child = {
+            let _g = EXEC.lock().unwrap_or_else(|e| e.into_inner());
+            Command::new(env!("CARGO_BIN_EXE_paddock"))
+                .arg("omarchy-usage-update")
+                .arg("--")
+                .args(args)
+                .env_clear()
+                .envs(&self.vars)
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .unwrap()
+        };
+        child.wait_with_output().unwrap()
     }
 
     fn real_log(&self) -> String {
