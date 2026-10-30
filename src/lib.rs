@@ -10,6 +10,7 @@ pub mod detect;
 pub mod devices;
 pub mod doctor;
 pub mod env;
+pub mod gateway;
 pub mod gui;
 pub mod history;
 pub mod hostcli;
