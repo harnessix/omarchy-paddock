@@ -318,9 +318,10 @@ enum Cmd {
     /// Update the launcher entries, the Omarchy menu and the shell shims to
     /// the harnesses installed now. Only the parts that are turned on.
     Refresh {
-        /// Print nothing, and only add entries (for the background refresh).
+        /// Print nothing, and only add entries: the run that a harness start
+        /// begins.
         #[arg(long)]
-        quiet: bool,
+        background: bool,
     },
     /// The Omarchy agents panel's `omarchy-agent-usage-update`, through
     /// paddock: a login that a sandbox holds is checked from paddock's side.
@@ -1164,9 +1165,9 @@ fn real_main() -> Result<i32> {
             Ok(0)
         }
         Cmd::Pick { harness } => pick(&env, &harness),
-        Cmd::Refresh { quiet } => {
-            let r = paddock::refresh::sync(&env, !quiet)?;
-            if !quiet {
+        Cmd::Refresh { background } => {
+            let r = paddock::refresh::sync(&env, !background)?;
+            if !background {
                 match &r.launchers {
                     Some(l) => println!("menu entries: {}", l.join(", ")),
                     None => println!("menu entries: off (paddock launchers install)"),
