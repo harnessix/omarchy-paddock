@@ -391,6 +391,8 @@ pub fn run(
             })
         });
 
+    let live = LiveSync::start(auth, history, AUTH_EVERY, HISTORY_EVERY);
+
     // The child owns the terminal. Ctrl-C reaches it directly; paddock waits.
     let old_int = unsafe { libc::signal(libc::SIGINT, libc::SIG_IGN) };
     let old_quit = unsafe { libc::signal(libc::SIGQUIT, libc::SIG_IGN) };
@@ -417,11 +419,18 @@ pub fn run(
             late.join(", ")
         );
     }
-    let synced = auth.copy_out()?;
+    let (mut auth, history, mut synced, copied) = live.finish();
+    let last = auth.copy_out()?;
+    synced.saved.extend(last.saved);
+    synced.conflicts.extend(last.conflicts);
+    for v in [&mut synced.saved, &mut synced.conflicts] {
+        v.sort();
+        v.dedup();
+    }
     match history.as_ref().map(|h| h.copy_out()).unwrap_or(Ok(vec![])) {
-        Ok(files) if !files.is_empty() => log::info!(
+        Ok(files) if copied + files.len() > 0 => log::info!(
             "copied {} session file(s) back to the host history",
-            files.len()
+            copied + files.len()
         ),
         Ok(_) => {}
         Err(e) => log::warn!("cannot copy the session history back: {e:#}"),
@@ -676,4 +685,115 @@ fn provision(
         .status()
         .with_context(|| format!("cannot start {}", l.program.display()))?;
     Ok(status.success())
+}
+
+/// Logins and history synced while the sandbox runs, so the host sees a
+/// refreshed token and new sessions before the sandbox exits.
+struct LiveSync {
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    thread: std::thread::JoinHandle<(
+        AuthSync,
+        Option<crate::history::CopyBack>,
+        state::SyncResult,
+        usize,
+    )>,
+}
+
+/// How often a login is compared, and how often history is copied.
+const AUTH_EVERY: Duration = Duration::from_secs(60);
+const HISTORY_EVERY: Duration = Duration::from_secs(300);
+
+impl LiveSync {
+    fn start(
+        mut auth: AuthSync,
+        history: Option<crate::history::CopyBack>,
+        auth_every: Duration,
+        history_every: Duration,
+    ) -> Self {
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = stop.clone();
+        let thread = std::thread::spawn(move || {
+            let mut synced = state::SyncResult {
+                saved: vec![],
+                conflicts: vec![],
+            };
+            let mut copied = 0;
+            let (mut auth_at, mut history_at) = (Instant::now(), Instant::now());
+            while !flag.load(std::sync::atomic::Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_millis(200));
+                if auth_at.elapsed() >= auth_every {
+                    auth_at = Instant::now();
+                    match auth.sync_running() {
+                        Ok(r) => {
+                            for f in &r.saved {
+                                log::debug!("saved a refreshed login to {}", f.display());
+                            }
+                            synced.saved.extend(r.saved);
+                            synced.conflicts.extend(r.conflicts);
+                        }
+                        Err(e) => log::debug!("cannot sync the login: {e:#}"),
+                    }
+                }
+                if let Some(h) = history
+                    .as_ref()
+                    .filter(|_| history_at.elapsed() >= history_every)
+                {
+                    history_at = Instant::now();
+                    match h.copy_out() {
+                        Ok(files) => copied += files.len(),
+                        Err(e) => log::debug!("cannot copy the session history: {e:#}"),
+                    }
+                }
+            }
+            (auth, history, synced, copied)
+        });
+        Self { stop, thread }
+    }
+
+    /// Stop the thread and return what it synced.
+    fn finish(
+        self,
+    ) -> (
+        AuthSync,
+        Option<crate::history::CopyBack>,
+        state::SyncResult,
+        usize,
+    ) {
+        self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        self.thread.join().expect("the sync thread does not panic")
+    }
+}
+
+#[cfg(test)]
+mod live_sync_tests {
+    use super::*;
+    use crate::profile::Profile;
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn a_refresh_reaches_the_host_before_the_sandbox_exits() {
+        let t = tempfile::tempdir().unwrap();
+        let host_home = t.path().join("host");
+        let sb = t.path().join("sandbox");
+        std::fs::create_dir_all(host_home.join(".tool")).unwrap();
+        std::fs::create_dir_all(&sb).unwrap();
+        std::fs::write(host_home.join(".tool/token"), "t1").unwrap();
+        let env = HostEnv::from_parts(host_home.clone(), "demo".into(), 1, 1, BTreeMap::new());
+        let p: Profile =
+            toml::from_str("name = \"t\"\n[state]\nauth = [\".tool/token\"]\n").unwrap();
+        let auth = AuthSync::copy_in(&env, &p, &state::AuthMode::Shared, &sb).unwrap();
+        let live = LiveSync::start(auth, None, Duration::ZERO, Duration::MAX);
+        std::fs::write(sb.join(".tool/token"), "t2").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while std::fs::read_to_string(host_home.join(".tool/token")).unwrap() != "t2" {
+            assert!(
+                Instant::now() < deadline,
+                "the refresh did not reach the host"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let (_, _, synced, copied) = live.finish();
+        assert_eq!(synced.saved, vec![host_home.join(".tool/token")]);
+        assert_eq!(copied, 0);
+    }
 }
