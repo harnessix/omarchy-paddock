@@ -24,3 +24,10 @@ env_pass = ["GEMINI_API_KEY", "GOOGLE_API_KEY", "GOOGLE_CLOUD_PROJECT"]
 
 [network]
 endpoints = ["generativelanguage.googleapis.com", "oauth2.googleapis.com", "cloudcode-pa.googleapis.com"]
+
+# "Enable Telemetry" is saved with the account, not in settings.json, so no
+# file or variable can turn it off. It also covers the use of interactions
+# to improve Antigravity and models. https://antigravity.google/docs/settings
+[privacy.training]
+setting = "type /settings in agy and turn off Enable Telemetry"
+url = "https://antigravity.google/docs/settings"

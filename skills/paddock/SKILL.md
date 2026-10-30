@@ -1,6 +1,6 @@
 ---
 name: paddock
-description: Install, configure, troubleshoot, clean up or remove paddock on the host. paddock is a sandbox for coding agents (Claude Code, Codex, Copilot CLI, Gemini CLI, opencode) and desktop apps such as VS Code. Use it outside a sandbox, when the user asks for any of these tasks or asks to run an agent in a sandbox.
+description: Install, configure, troubleshoot, clean up or remove paddock on the host. paddock is a sandbox for coding agents (Claude Code, Codex, Copilot CLI, Gemini CLI, Grok Build, opencode) and desktop apps such as VS Code. Use it outside a sandbox, when the user asks for any of these tasks or asks to run an agent in a sandbox.
 ---
 
 # Setting up and using paddock on the host

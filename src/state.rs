@@ -302,7 +302,7 @@ pub fn json_get<'a>(v: &'a serde_json::Value, path: &[String]) -> Option<&'a ser
     path.iter().try_fold(v, |cur, k| cur.get(k))
 }
 
-fn json_set(v: &mut serde_json::Value, path: &[String], val: serde_json::Value) {
+pub(crate) fn json_set(v: &mut serde_json::Value, path: &[String], val: serde_json::Value) {
     let mut cur = v;
     for (i, k) in path.iter().enumerate() {
         if !cur.is_object() {

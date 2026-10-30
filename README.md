@@ -8,7 +8,7 @@
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-192327" alt="License: MIT"></a>
 </p>
 
-paddock runs coding agents with full auto-approval inside a sandbox: terminal harnesses such as Claude Code, Codex, Antigravity, Gemini CLI, opencode and Copilot CLI, and desktop apps such as ChatGPT, Claude Desktop and VS Code. The sandbox contains only what the agent needs: the project, the harness, a private home directory, and package caches. Everything else on the host is absent from the file system. The agent cannot read it, so you do not need to approve each command.
+paddock runs coding agents with full auto-approval inside a sandbox: terminal harnesses such as Claude Code, Codex, Antigravity, Gemini CLI, Grok Build, opencode and Copilot CLI, and desktop apps such as ChatGPT, Claude Desktop and VS Code. The sandbox contains only what the agent needs: the project, the harness, a private home directory, and package caches. Everything else on the host is absent from the file system. The agent cannot read it, so you do not need to approve each command.
 
 ```sh
 cd ~/src/my-app
@@ -176,7 +176,7 @@ paddock shell claude           # a shell in the sandbox that claude gets
 paddock explain claude         # every mount, variable and rule, and why it is there
 paddock ps                     # running sandboxes
 paddock files                  # files a sandbox saved outside the project
-paddock doctor                 # dependencies, backends, located harnesses
+paddock doctor                 # dependencies, backends, located harnesses, privacy settings
 paddock doctor --escape        # try to escape, and report each attempt
 paddock setup                  # first-run steps; a second run changes nothing
 paddock update --check         # is there a newer release
@@ -376,6 +376,41 @@ To pass only an allowlist (terminal, locale, the variables of the harness profil
 [env]
 inherit = false
 pass = ["MY_TOOL_TOKEN"]
+```
+
+## Privacy defaults
+
+paddock turns off vendor telemetry in every sandbox. It uses the switches that each vendor documents. It sets them only inside the sandbox: as environment variables, or in the sandbox's own copy of a settings file. Your host configuration does not change. `paddock explain` shows each switch and the profile that sets it.
+
+| Program | What paddock turns off |
+|---|---|
+| Claude Code | telemetry (`DISABLE_TELEMETRY`), error reports (`DISABLE_ERROR_REPORTING`), the session survey (`CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY`) |
+| Codex | analytics and the metrics exporter (`[analytics] enabled = false` in `~/.codex/config.toml`) |
+| Copilot CLI | the telemetry that the CLI sends (`--disable-client-telemetry`) |
+| Gemini CLI | usage statistics (`privacy.usageStatisticsEnabled` in `~/.gemini/settings.json`) and telemetry (`GEMINI_TELEMETRY_ENABLED`) |
+| Grok Build | telemetry, usage metrics, crash reports, Mixpanel and trace uploads (`GROK_TELEMETRY_*`, `DISABLE_TELEMETRY`, `DISABLE_ERROR_REPORTING`) |
+| opencode | automatic sharing of sessions from a project `opencode.json` (`share` stays `manual`). opencode documents no telemetry switch. |
+| VS Code | usage data, error telemetry and crash reports (`telemetry.telemetryLevel: off`), and experiments |
+
+`DISABLE_TELEMETRY` also stops the feature flags of Claude Code. Some features need them, for example Remote Control. The feedback commands of the harnesses still work. They send data only when you use them.
+
+Some settings belong to your account, and no program can change them. The use of your data for model training is one of them. The Antigravity telemetry switch is another. The Claude and ChatGPT desktop apps document no telemetry setting at all. `paddock doctor` prints, for each installed program, where you turn off training:
+
+| Vendor | Where |
+|---|---|
+| Anthropic (Claude Code, Claude app) | [claude.ai privacy settings](https://claude.ai/settings/data-privacy-controls), "Help improve Claude" |
+| OpenAI (Codex, ChatGPT app) | [ChatGPT data controls](https://chatgpt.com/#settings/DataControls), "Improve the model for everyone" |
+| GitHub (Copilot CLI, Copilot in VS Code) | [Copilot settings](https://github.com/settings/copilot), "Allow GitHub to use my data for AI model training" |
+| Google (Gemini CLI) | the [privacy notice](https://developers.google.com/gemini-code-assist/resources/privacy-notices) of your sign-in method |
+| Google (Antigravity) | `/settings` in agy, "Enable Telemetry" ([docs](https://antigravity.google/docs/settings)) |
+| xAI (Grok Build) | `/privacy` in grok, coding-data sharing ([docs](https://github.com/xai-org/grok-build/blob/main/crates/codegen/xai-grok-pager/docs/user-guide/02-authentication.md#related-settings)) |
+| opencode | the data settings of the model provider that you use |
+
+To keep the vendor defaults, set this in `~/.config/paddock/config.toml`. A project `paddock.toml` cannot change it, in either direction.
+
+```toml
+[privacy]
+telemetry = "vendor"   # default: "off"
 ```
 
 ## Desktop projects
@@ -584,6 +619,19 @@ yolo_args = ["--yes-to-everything"]
 auth = [".myagent/token.json"]
 import_ro = [".myagent/config.toml"]
 env_pass = ["MYAGENT_API_KEY"]
+
+# Telemetry switches, set only inside the sandbox. Cite the vendor's documentation.
+[privacy]
+env = { MYAGENT_TELEMETRY = "0" }
+
+[[privacy.settings]]
+file = ".myagent/settings.json"   # in the sandbox home; json or toml (format = "toml")
+path = ["telemetry", "enabled"]
+value = false
+
+[privacy.training]
+setting = "Settings, Data, Use my data for training"
+url = "https://example.com/settings/data"
 ```
 
 Before each start, paddock makes sure that the help text of the harness still mentions every flag in `yolo_args`. If a flag is renamed, paddock stops with an error and does not start a harness that waits for approvals.

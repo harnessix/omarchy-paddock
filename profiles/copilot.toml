@@ -25,3 +25,15 @@ env_pass = ["COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"]
 
 [network]
 endpoints = ["api.githubcopilot.com", "api.github.com", "github.com"]
+
+# The flag turns off the telemetry that the CLI sends. It is not saved in the
+# configuration, so it is passed on each start. GitHub's server side is not
+# affected.
+# https://docs.github.com/en/copilot/how-tos/copilot-cli/set-up-copilot-cli/configure-copilot-cli
+[privacy]
+args = ["--disable-client-telemetry"]
+
+# https://docs.github.com/en/copilot/how-tos/manage-your-account/manage-policies
+[privacy.training]
+setting = "GitHub Settings, Copilot, Allow GitHub to use my data for AI model training"
+url = "https://github.com/settings/copilot"

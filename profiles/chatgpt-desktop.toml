@@ -18,3 +18,9 @@ args = ["--ozone-platform=wayland", "--no-sandbox", "--password-store=gnome-libs
 display_name = "ChatGPT"
 icon = "chatgpt"
 schemes = ["codex"]
+
+# OpenAI documents no telemetry setting for the desktop app.
+# https://help.openai.com/en/articles/7730893-data-controls-faq
+[privacy.training]
+setting = "ChatGPT Settings, Data controls, Improve the model for everyone"
+url = "https://chatgpt.com/#settings/DataControls"

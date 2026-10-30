@@ -1,0 +1,64 @@
+name = "grok"
+description = "xAI Grok Build"
+
+# Entries that come from documentation, not from a test. paddock doctor lists them.
+unverified = [
+  "a login and a full run inside paddock",
+  "state.auth .grok/mcp_credentials.json: the file store for MCP OAuth tokens",
+  "privacy.env: the false values of the GROK_TELEMETRY_* variables",
+  "network.endpoints: the hosts for the allowlist network mode",
+]
+
+[locate]
+mise = "grok"
+commands = ["grok"]
+
+[launch]
+# Logs in through a browser and a loopback callback on a random port
+# (grok login --oauth). grok login --device-auth works without a callback.
+login_callback = true
+# The help text: "Auto-approve all tool executions".
+yolo_args = ["--always-approve"]
+
+[state]
+# The login token. MCP OAuth tokens are kept in mcp_credentials.json; there
+# is no keyring.
+auth = [".grok/auth.json", ".grok/mcp_credentials.json"]
+import_ro = [".grok/AGENTS.md", ".grok/rules", ".grok/skills", ".grok/agents", ".agents/skills"]
+# Writable copies: grok saves /settings into config.toml and pager.toml. Edits
+# made in the sandbox are not copied back, and the host copy replaces them
+# each start.
+seed = [".grok/config.toml", ".grok/pager.toml"]
+env_pass = ["XAI_API_KEY", "GROK_API_KEY"]
+
+[[mcp]]
+file = ".grok/config.toml"
+format = "toml"
+path = ["mcp_servers"]
+
+[[mcp]]
+file = ".grok/config.toml"
+in_project = true
+format = "toml"
+path = ["mcp_servers"]
+
+# Telemetry, from the Grok Build user guide, Configuration -> Telemetry and
+# Environment variables -> Telemetry:
+# https://github.com/xai-org/grok-build/blob/main/crates/codegen/xai-grok-pager/docs/user-guide/05-configuration.md
+# DISABLE_TELEMETRY (usage metrics) and DISABLE_ERROR_REPORTING (crash
+# reports) are in the copy of that guide that grok 1.0.70 installs in
+# ~/.grok/docs/user-guide/05-configuration.md: "Any non-empty value ...
+# works like 1". The public copy did not list them yet.
+[privacy]
+env = { GROK_TELEMETRY_ENABLED = "false", DISABLE_TELEMETRY = "1", DISABLE_ERROR_REPORTING = "1", GROK_TELEMETRY_TRACE_UPLOAD = "false", GROK_TELEMETRY_MIXPANEL_ENABLED = "false" }
+
+# "Coding data, retention, and training" is an account setting that /privacy
+# opens; telemetry switches do not change it. Same guide, Authentication ->
+# Related settings:
+# https://github.com/xai-org/grok-build/blob/main/crates/codegen/xai-grok-pager/docs/user-guide/02-authentication.md
+[privacy.training]
+setting = "type /privacy in grok and turn off coding-data sharing"
+url = "https://github.com/xai-org/grok-build/blob/main/crates/codegen/xai-grok-pager/docs/user-guide/02-authentication.md#related-settings"
+
+[network]
+endpoints = ["api.x.ai", "x.ai", "grok.com"]

@@ -15,3 +15,9 @@ args = ["--ozone-platform=wayland", "--no-sandbox", "--password-store=gnome-libs
 display_name = "Claude"
 icon = "claude-desktop"
 schemes = ["claude"]
+
+# Anthropic documents no telemetry setting for the desktop app.
+# https://code.claude.com/docs/en/data-usage
+[privacy.training]
+setting = "claude.ai Settings, Privacy, Help improve Claude"
+url = "https://claude.ai/settings/data-privacy-controls"

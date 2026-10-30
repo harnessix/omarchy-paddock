@@ -31,3 +31,15 @@ path = ["mcp"]
 file = "opencode.json"
 in_project = true
 path = ["mcp"]
+
+# opencode documents no telemetry switch. Inline configuration overrides the
+# project opencode.json, so a project file cannot turn on automatic sharing
+# of sessions; /share still works.
+# https://opencode.ai/docs/config/ and https://opencode.ai/docs/share/
+[privacy]
+env = { OPENCODE_CONFIG_CONTENT = '{"share":"manual"}' }
+
+# opencode is a client: the account settings of the model provider apply.
+[privacy.training]
+setting = "the data settings of the model provider you sign in to"
+url = "https://opencode.ai/docs/providers/"

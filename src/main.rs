@@ -704,6 +704,18 @@ fn explain(env: &HostEnv, a: &RunArgs, json: bool) -> Result<()> {
         };
         println!("  {k}={val}\n         {}", v.origin);
     }
+    if !s.home_settings.is_empty() {
+        println!("\nsettings written into the sandbox home (the host files stay as they are):");
+        for h in &s.home_settings {
+            println!(
+                "  ~/{}  {} = {}\n         {}",
+                h.file.display(),
+                h.path.join("."),
+                h.value,
+                h.origin
+            );
+        }
+    }
     if !s.setup.is_empty() {
         println!("\nsetup inside the sandbox:");
         for l in &s.setup {

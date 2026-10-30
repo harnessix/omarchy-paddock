@@ -47,3 +47,17 @@ path = ["mcpServers"]
 
 [network]
 endpoints = ["api.anthropic.com", "claude.ai", "console.anthropic.com", "statsig.anthropic.com"]
+
+# Telemetry and crash reports off, with the narrow variables. Any value
+# opts out, so vendor mode leaves them unset. DISABLE_TELEMETRY also stops
+# feature-flag fetching, which some features need (Remote Control).
+# https://code.claude.com/docs/en/env-vars and https://code.claude.com/docs/en/data-usage
+# The feedback commands stay: they send data only when the user runs them.
+[privacy]
+env = { DISABLE_TELEMETRY = "1", DISABLE_ERROR_REPORTING = "1", CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY = "1" }
+
+# Consumer accounts: "Help improve Claude". Commercial and API accounts are
+# not used for training by default. https://code.claude.com/docs/en/data-usage
+[privacy.training]
+setting = "claude.ai Settings, Privacy, Help improve Claude"
+url = "https://claude.ai/settings/data-privacy-controls"
