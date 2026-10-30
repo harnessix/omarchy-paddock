@@ -282,7 +282,10 @@ fn default_gateway() -> Option<std::net::IpAddr> {
 const KEYRINGS: &str = ".local/share/keyrings";
 
 fn doctor_harness() -> Result<Harness> {
-    let profile: Profile = toml::from_str("name = \"doctor\"\n")?;
+    // The doctor reads a project `.mcp.json`, as the claude profile does.
+    let profile: Profile = toml::from_str(
+        "name = \"doctor\"\n[[mcp]]\nfile = \".mcp.json\"\nin_project = true\npath = [\"mcpServers\"]\n",
+    )?;
     Ok(Harness {
         profile,
         exe: PathBuf::from("/bin/sh"),
@@ -404,6 +407,20 @@ pub fn escape(env: &HostEnv, o: &EscapeOpts) -> Result<usize> {
     std::fs::write(&other, "x")?;
     let host_file = root.join("host-canary");
     std::fs::write(&host_file, "x")?;
+    // Another repository with a package in its node_modules and a `.env`.
+    // The project `.mcp.json` names the package: without an approval, no
+    // part of that repository may appear in the sandbox.
+    let sibling = root.join("sibling");
+    let pkg = sibling.join("node_modules/paddock-probe-mcp");
+    std::fs::create_dir_all(&pkg)?;
+    std::fs::write(sibling.join(".env"), "TOKEN=paddock-sibling-canary\n")?;
+    let cli = pkg.join("cli.js");
+    std::fs::write(&cli, "#!/bin/sh\nexit 0\n")?;
+    std::fs::set_permissions(&cli, std::os::unix::fs::PermissionsExt::from_mode(0o755))?;
+    std::fs::write(
+        project.join(".mcp.json"),
+        serde_json::json!({ "mcpServers": { "probe": { "command": cli } } }).to_string(),
+    )?;
 
     let listener = TcpListener::bind("127.0.0.1:0")?;
     let port = listener.local_addr()?.port();
@@ -478,6 +495,11 @@ pub fn escape(env: &HostEnv, o: &EscapeOpts) -> Result<usize> {
         }
     }
     s.set_env("PADDOCK_PROBE_OTHER", other.display().to_string(), "doctor");
+    s.set_env(
+        "PADDOCK_PROBE_MCP_SIBLING",
+        sibling.display().to_string(),
+        "doctor",
+    );
     s.set_env(
         "PADDOCK_PROBE_HOSTFILE",
         host_file.display().to_string(),

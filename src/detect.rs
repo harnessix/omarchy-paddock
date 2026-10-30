@@ -354,6 +354,27 @@ fn walk_secrets(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
     }
 }
 
+/// Hide the credential-shaped files in a host folder that the sandbox sees,
+/// except the ones in `reveal`. Returns how many it hid.
+pub fn hide_secrets_in(
+    dir: &Path,
+    reveal: &[PathBuf],
+    spec: &mut SandboxSpec,
+    origin: &str,
+) -> usize {
+    let mut found = Vec::new();
+    walk_secrets(dir, 0, &mut found);
+    let mut n = 0;
+    for f in found {
+        if reveal.contains(&f) || spec.mounts.iter().any(|m| m.dst == f) {
+            continue;
+        }
+        spec.add_mount(Mount::mask(&f, false, origin));
+        n += 1;
+    }
+    n
+}
+
 impl Detector for Secrets {
     fn name(&self) -> &'static str {
         "secrets"
@@ -366,17 +387,28 @@ impl Detector for Secrets {
             .iter()
             .map(|r| cx.env.expand(r, cx.project))
             .collect();
-        let mut found = Vec::new();
-        walk_secrets(cx.project, 0, &mut found);
-        for f in found {
-            if reveal.contains(&f) {
-                continue;
-            }
-            spec.add_mount(Mount::mask(
-                &f,
-                false,
-                "detector secrets: credential-shaped file",
-            ));
+        hide_secrets_in(
+            cx.project,
+            &reveal,
+            spec,
+            "detector secrets: credential-shaped file",
+        );
+        // Folders from `[mounts]` get the same treatment: the approval was
+        // for the folder, not for the keys in it.
+        let extra: Vec<PathBuf> = spec
+            .mounts
+            .iter()
+            .filter(|m| m.origin.starts_with("manifest mounts"))
+            .filter_map(|m| m.src.clone())
+            .filter(|p| p.is_dir() && !p.starts_with(cx.project))
+            .collect();
+        for dir in extra {
+            hide_secrets_in(
+                &dir,
+                &reveal,
+                spec,
+                "detector secrets: credential-shaped file in a [mounts] folder",
+            );
         }
         for h in &cx.manifest.secrets.hide {
             let p = cx.env.expand(h, cx.project);
@@ -522,6 +554,53 @@ mod tests {
         for f in ["commondir", "gitdir"] {
             assert_eq!(kind(&entry.path().join(f)), Some(MountKind::Ro), "{f}");
         }
+    }
+
+    #[test]
+    fn secrets_are_hidden_in_extra_mounts_too() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("proj");
+        let data = tmp.path().join("data");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir_all(data.join("sub")).unwrap();
+        std::fs::write(project.join(".env"), "x").unwrap();
+        std::fs::write(data.join(".env"), "x").unwrap();
+        std::fs::write(data.join("sub/tls.key"), "x").unwrap();
+        std::fs::write(data.join("notes.txt"), "x").unwrap();
+        let env = HostEnv::from_parts(
+            tmp.path().join("home"),
+            "t".into(),
+            1000,
+            1000,
+            Default::default(),
+        );
+        let mut spec = SandboxSpec::new(
+            "t".into(),
+            "x",
+            &project,
+            env.home.join("sandbox"),
+            &env.home,
+            1000,
+            1000,
+            "t",
+        );
+        spec.add_mount(Mount::same(&data, false, "manifest mounts.ro"));
+        let mut manifest = crate::manifest::Manifest::default();
+        manifest
+            .secrets
+            .reveal
+            .push(data.join("sub/tls.key").display().to_string());
+        let cx = Context {
+            env: &env,
+            project: &project,
+            manifest: &manifest,
+        };
+        Secrets.apply(&cx, &mut spec).unwrap();
+        let kind = |p: &Path| spec.mounts.iter().find(|m| m.dst == p).map(|m| m.kind);
+        assert_eq!(kind(&project.join(".env")), Some(MountKind::MaskFile));
+        assert_eq!(kind(&data.join(".env")), Some(MountKind::MaskFile));
+        assert_eq!(kind(&data.join("sub/tls.key")), None);
+        assert_eq!(kind(&data.join("notes.txt")), None);
     }
 
     #[test]

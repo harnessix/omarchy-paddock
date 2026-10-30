@@ -381,16 +381,29 @@ pub fn runtime_closure(env: &HostEnv, exe: &Path) -> Result<(Vec<PathBuf>, Vec<P
     Ok((mounts, path_dirs))
 }
 
+/// Bin directories in the home that hold single, self-contained executables
+/// next to unrelated ones. The folder above them can hold credentials
+/// (`~/.cargo/credentials.toml`), so only the file is mounted.
+pub const HOME_BIN_DIRS: &[&str] = &[
+    ".local/bin",
+    ".cargo/bin",
+    "go/bin",
+    ".bun/bin",
+    ".deno/bin",
+];
+
 /// The directory to mount for an executable. For npm packages this is the
-/// prefix that holds `node_modules`. For a binary in a shared system directory
-/// it is the file itself, so the directory is not shadowed in an image.
+/// outermost `node_modules` folder: it holds the package and the packages it
+/// loads, and nothing else of the project or install around it (a `.env`, the
+/// sources). For a binary in a shared bin directory it is the file itself, so
+/// the directory is not shadowed in an image and its neighbours stay hidden.
 pub fn install_root(exe: &Path) -> PathBuf {
     let comps: Vec<_> = exe.components().collect();
     if let Some(i) = comps
         .iter()
         .position(|c| matches!(c, Component::Normal(s) if *s == "node_modules"))
     {
-        return comps[..i].iter().collect();
+        return comps[..=i].iter().collect();
     }
     let parent = exe.parent().unwrap_or(Path::new("/"));
     let shared = [
@@ -401,7 +414,9 @@ pub fn install_root(exe: &Path) -> PathBuf {
         "/usr/local/bin",
         "/usr/local/sbin",
     ];
-    if shared.iter().any(|d| parent == Path::new(d)) || parent.ends_with(".local/bin") {
+    if shared.iter().any(|d| parent == Path::new(d))
+        || HOME_BIN_DIRS.iter().any(|d| parent.ends_with(d))
+    {
         return exe.to_path_buf();
     }
     // A versioned install directory such as `<tool>/1.2.3/bin/<exe>`.
@@ -449,8 +464,18 @@ mod tests {
             install_root(Path::new(
                 "/x/opencode/2.2.0/node_modules/opencode/bin/cli.js"
             )),
-            PathBuf::from("/x/opencode/2.2.0")
+            PathBuf::from("/x/opencode/2.2.0/node_modules")
         );
+        // Another repository's package: its node_modules, never the repository.
+        assert_eq!(
+            install_root(Path::new(
+                "/home/demo/other/node_modules/pkg/node_modules/dep/cli.js"
+            )),
+            PathBuf::from("/home/demo/other/node_modules")
+        );
+        for single in ["/home/demo/.cargo/bin/tool", "/home/demo/go/bin/tool"] {
+            assert_eq!(install_root(Path::new(single)), PathBuf::from(single));
+        }
         assert_eq!(
             install_root(Path::new("/usr/bin/claude")),
             PathBuf::from("/usr/bin/claude")

@@ -297,16 +297,27 @@ paddock claude --auth isolated:work     # another one, named "work"
 paddock auth import claude --auth isolated:work   # start it from a copy of your login
 ```
 
-MCP servers come from the same configuration as on the host, and MCP OAuth tokens come with the login. paddock mounts the runtime of each stdio server read-only when its command is in a tool install directory (system directories, mise, node_modules, uv, `~/.local/bin`). A server that needs other host files, or a server on a host loopback port, stays off until you allow it:
+### MCP servers
+
+MCP servers come from the same configuration as on the host, and MCP OAuth tokens come with the login. A stdio server runs a command on your computer, so paddock must mount that command into the sandbox. paddock mounts only the smallest part that runs: the binary, the interpreter in its script header, or the `node_modules` folder of a package. It never mounts the whole repository or install folder around a package.
+
+paddock trusts the configuration in your home folder, such as `~/.claude.json`. A server there runs without a question when its command is in a tool install folder: system folders, mise, uv, pipx, a `node_modules` folder, or a single file in `~/.local/bin`.
+
+paddock does not trust a configuration file in the project, such as `.mcp.json`, `opencode.json` or `.gemini/settings.json`. Anyone who can change the project can change these files, and so can the agent in the sandbox. A server from a project file runs without a question only when its command is in the project, in a system folder, or in the shared tool installs in your home (mise, asdf, uv, pipx, `~/.local/bin`). A command anywhere else, for example in another repository's `node_modules`, stays off. The same applies to a script header that names an interpreter outside these folders.
+
+A server that needs other host paths, or a server on a host loopback port, stays off until you allow it. `paddock mcp` shows each server, where it comes from, and the exact host paths that paddock mounts when you allow it:
 
 ```sh
 paddock mcp claude     # each server, and whether it runs in the sandbox
 ```
 
+paddock hides `.env` files, keys and other credential-shaped files in every folder that it mounts for a server, as it does in the project. A folder in the shared tool installs is the exception. To show one such file, add it to `[secrets] reveal`.
+
 ```toml
 # ~/.config/paddock/config.toml or the project paddock.toml
 [mcp]
-allow = ["my-server"]   # mount the host paths that this server needs, read-only
+allow = ["my-server"]   # mount the host paths that this server needs, read-only.
+                        # In a project paddock.toml, you approve this once on the host.
 
 [network]
 host_ports = [8765]     # a local MCP server on the host loopback
