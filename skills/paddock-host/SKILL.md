@@ -1,6 +1,6 @@
 ---
 name: paddock-host
-description: Use when you run inside a paddock sandbox and a task needs the host machine, for example a screenshot of the real screen, a command on the host, a file outside the project, the host clipboard, opening a URL in the host browser, git push, or a pull request with gh.
+description: Use when you run inside a paddock sandbox and a task needs the host machine, for example a screenshot of the real screen, a command on the host, a file outside the project, the host clipboard, opening a URL in the host browser, git push, a pull request with gh, or starting an agent of another harness (spawn).
 ---
 
 # Asking the host for help from a paddock sandbox
@@ -23,6 +23,7 @@ When a task needs the host, use `paddock-host`. Each request goes to paddock on 
 | The host clipboard | `paddock-host clipboard get` or `paddock-host clipboard set TEXT` |
 | Open a page in the host browser | `paddock-host open https://...` |
 | Tell the user that work is done | `paddock-host notify "Title" "Body"` |
+| Give a task to another harness | `paddock-host spawn codex --worktree --prompt-file task.md` |
 
 ## Push and pull requests
 
@@ -42,6 +43,26 @@ Rules that you can rely on:
 - Reads run at once. `pr create` and the comment commands wait for the user.
 
 `paddock-host help git-push` and `paddock-host help forge` give the details.
+
+## Other agents
+
+`paddock-host spawn` starts an agent of another harness, for example codex, in its own sandbox. It runs one task and stops. Use it to give one part of the work to another harness, or to get a second opinion. Subagents of your own harness do not need it.
+
+1. Check `paddock-host capabilities --json`. Use spawn only if its mode is not `deny`. The `spawn` object lists the allowed harnesses and the limits.
+2. Commit first. The child starts from the commit that you have checked out, not from your uncommitted files.
+3. Write the whole task to a file in the project, for example `task.md`. The child does not see this conversation. Tell it which files to change, how to check its work, and to commit its changes. Uncommitted changes stay in its worktree, and you cannot see them.
+4. Start it: `id=$(paddock-host spawn codex --worktree --prompt-file task.md --reason "...")`. The command prints only the id.
+5. Do other work, then run `paddock-host wait "$id" --timeout 600`. Exit code 0 means that the child finished with exit code 0. Exit code 1 means that it failed or was stopped. Exit code 5 means that it still runs.
+6. Read `.paddock/inbox/spawn-ID/result.json` and `output.txt`. Look at the branch with `git log --stat paddock/spawn-codex-ID`, and merge or cherry-pick what you want to keep.
+
+Limits that you can rely on:
+
+- The child gets no more than your sandbox: the same network, environment and mounts, no display, and host capabilities that are at most as open as yours. It uses its own login of its harness. You never see it.
+- The user decides which harnesses you may start, how many run at the same time, and how long one may run. By default a child cannot start children of its own.
+- The first spawn of each harness asks the user. The user sees the task. Requests that the child sends show the user that you started it, and your session grants do not apply to it.
+- A child stops when your sandbox ends. Stop one yourself with `paddock-host kill ID`. `paddock-host status` lists your children.
+
+`paddock-host help spawn` gives the details.
 
 ## The sandbox display
 

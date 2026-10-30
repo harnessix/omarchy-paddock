@@ -31,6 +31,7 @@ pub mod run;
 pub mod safefs;
 pub mod setup;
 pub mod shims;
+pub mod spawn;
 pub mod spec;
 pub mod state;
 pub mod storage;

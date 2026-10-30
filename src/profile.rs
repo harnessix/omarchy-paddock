@@ -35,6 +35,48 @@ pub struct Profile {
     pub unverified: Vec<String>,
     /// Present for desktop apps, which `paddock app` runs.
     pub app: Option<AppProfile>,
+    /// The non-interactive mode that runs one task and exits. `paddock-host
+    /// spawn` starts a harness only with this command.
+    pub oneshot: Option<OneShot>,
+}
+
+/// How a prompt reaches a one-shot run. Never in the arguments: the
+/// arguments of a process are visible to every local user.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PromptVia {
+    /// The prompt is the standard input of the harness.
+    Stdin,
+    /// The prompt is a file in the sandbox home. `{prompt_file}` in `args`
+    /// becomes its path inside the sandbox.
+    File,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OneShot {
+    /// Arguments after the executable, including the auto-approval flags.
+    /// Fixed text only: the prompt never goes here.
+    pub args: Vec<String>,
+    pub prompt: PromptVia,
+    /// Arguments for the help output that must mention every flag in
+    /// `args`, the same check as for `yolo_args`.
+    #[serde(default = "default_probe")]
+    pub probe_args: Vec<String>,
+}
+
+/// The placeholder for the prompt file in `OneShot::args`.
+pub const PROMPT_FILE: &str = "{prompt_file}";
+
+impl OneShot {
+    /// The arguments with the prompt file path filled in.
+    pub fn render(&self, prompt_file: &Path) -> Vec<String> {
+        let f = prompt_file.display().to_string();
+        self.args
+            .iter()
+            .map(|a| a.replace(PROMPT_FILE, &f))
+            .collect()
+    }
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -536,6 +578,22 @@ mod tests {
                     s.file
                 );
             }
+        }
+    }
+
+    #[test]
+    fn one_shot_commands_never_carry_the_prompt_in_argv() {
+        for (name, text) in BUILTIN {
+            let p: Profile = toml::from_str(text).unwrap();
+            let Some(o) = p.oneshot else { continue };
+            let file_args = o.args.iter().filter(|a| a.contains(PROMPT_FILE)).count();
+            match o.prompt {
+                PromptVia::Stdin => assert_eq!(file_args, 0, "{name}"),
+                PromptVia::File => assert_eq!(file_args, 1, "{name} must name the prompt file"),
+            }
+            let secret = "PROMPT-TEXT-THAT-MUST-NOT-LEAK";
+            let argv = o.render(Path::new("/home/demo/.paddock-spawn/prompt.md"));
+            assert!(argv.iter().all(|a| !a.contains(secret)), "{name}");
         }
     }
 

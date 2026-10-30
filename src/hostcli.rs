@@ -30,6 +30,10 @@ USAGE
   paddock-host notify TITLE [BODY]
   paddock-host git push [REMOTE] [REFSPEC...]   (plain `git push` works too)
   paddock-host gh COMMAND [ARG...]              (plain `gh` works too)
+  paddock-host spawn HARNESS --prompt-file FILE [--worktree] [--reason TEXT]
+  paddock-host status [ID]
+  paddock-host wait ID [--timeout SECONDS]
+  paddock-host kill ID
   paddock-host help [CAPABILITY]
 
 Common options
@@ -60,6 +64,11 @@ PUSH AND PULL REQUESTS
   `git push` and `gh` still work: the host does the push or runs gh with the
   user's own login, after the user approves. Run `paddock-host help git-push`
   and `paddock-host help forge` for the rules.
+
+OTHER AGENTS
+  `paddock-host spawn` starts another harness, for example codex, in its own
+  sandbox with one task. It works on its own branch and returns its results
+  to .paddock/inbox/. Run `paddock-host help spawn` for the rules and limits.
 
 EXIT CODES
   0   done (for exec and gh: the command's own exit code is returned instead)
@@ -189,6 +198,46 @@ enters the sandbox. Only these commands exist:
 
 Extra options: --paddock-reason TEXT, --paddock-timeout SECONDS (default 120,
 1800 for watch), --paddock-json. The exit code is gh's own."#
+        }
+        "spawn" | "status" | "wait" | "kill" => {
+            r#"paddock-host spawn: start another harness in its own sandbox with one task.
+
+  paddock-host spawn HARNESS --prompt-file FILE [--worktree] [--reason TEXT]
+  paddock-host status [ID]                 one child, or all of them
+  paddock-host wait ID [--timeout SECONDS]
+  paddock-host kill ID
+
+spawn prints the id of the child. The child is a sibling sandbox on the host,
+not a sandbox inside this one. It runs the harness once, without a terminal,
+and stops when the task is done.
+
+  - FILE is a file in the project with the task. Write the whole task there:
+    the child does not see this conversation. The prompt never goes into a
+    command line.
+  - The child works in a new git worktree on the branch
+    paddock/spawn-HARNESS-ID, from the commit that this sandbox has checked
+    out. Commit what you want it to start from first. --worktree is the
+    default and the only mode.
+  - Tell the child to commit its work. Uncommitted changes stay in its
+    worktree, and you cannot see them.
+  - The child uses its own login of that harness. You never see it.
+  - The child never gets more than this sandbox: the same network, backend,
+    environment and mounts, no display, and host capabilities that are at
+    most as open as yours. Its requests show the user that you started it.
+  - The user's configuration decides which harnesses are allowed, how many
+    children run at the same time, how long one may run, and whether a child
+    may start children of its own (by default it may not).
+
+When the child ends, its results are in .paddock/inbox/spawn-ID/:
+  result.json  state, exit code, branch, commit count, diff summary
+  output.txt   the end of the child's final output
+
+Read the branch with git, for example `git log --stat paddock/spawn-codex-ID`,
+and merge what you want to keep.
+
+wait exits with 0 when the child ended with exit code 0, 1 when it failed or
+was stopped, and 5 when it still runs after --timeout. A child stops when this
+sandbox ends. Use `paddock-host capabilities --json` to see the limits."#
         }
         _ => return None,
     })
@@ -367,6 +416,50 @@ pub fn main(args: &[String]) -> i32 {
                 }
                 (req("notify", p.reason, a), p.json)
             }
+            "spawn" => {
+                // A child always gets a worktree; the flag only says so.
+                let args: Vec<String> = rest
+                    .iter()
+                    .filter(|a| *a != "--worktree")
+                    .cloned()
+                    .collect();
+                let p = parse(&args, &["prompt-file"])?;
+                let [harness] = p.rest.as_slice() else {
+                    return Err("spawn needs one harness name, for example: spawn codex --prompt-file task.md".into());
+                };
+                let file = p
+                    .opts
+                    .get("prompt-file")
+                    .ok_or("spawn needs --prompt-file FILE with the task")?;
+                let mut a = BTreeMap::new();
+                a.insert("action".into(), serde_json::json!("start"));
+                a.insert("harness".into(), serde_json::json!(harness));
+                a.insert("prompt_file".into(), serde_json::json!(file));
+                (req("spawn", p.reason, a), p.json)
+            }
+            "status" | "wait" | "kill" => {
+                let p = parse(rest, if cmd == "wait" { &["timeout"] } else { &[] })?;
+                let mut a = BTreeMap::new();
+                match (cmd, p.rest.as_slice()) {
+                    ("status", []) => {
+                        a.insert("action".into(), serde_json::json!("list"));
+                    }
+                    (_, [id]) => {
+                        a.insert("action".into(), serde_json::json!(cmd));
+                        a.insert("id".into(), serde_json::json!(id));
+                    }
+                    _ => return Err(format!("{cmd} needs the id that spawn printed")),
+                }
+                if let Some(t) = p.opts.get("timeout") {
+                    a.insert(
+                        "timeout".into(),
+                        serde_json::json!(t
+                            .parse::<u64>()
+                            .map_err(|_| "--timeout needs a number")?),
+                    );
+                }
+                (req("spawn", p.reason, a), p.json)
+            }
             other => return Err(format!("unknown command '{other}'")),
         })
     })();
@@ -392,10 +485,44 @@ pub fn main(args: &[String]) -> i32 {
     if resp.status == Status::Done && request.cap == "exec" {
         return resp.result["exit_code"].as_i64().unwrap_or(0) as i32;
     }
+    if resp.status == Status::Done && cmd == "wait" {
+        return wait_exit_code(&resp.result);
+    }
     resp.status.exit_code()
 }
 
+/// 0 when the child ended with exit code 0, else 1.
+pub fn wait_exit_code(status: &serde_json::Value) -> i32 {
+    let ok = status["state"] == "exited" && status["exit_code"] == 0;
+    if ok {
+        0
+    } else {
+        1
+    }
+}
+
+fn print_child(c: &serde_json::Value) {
+    let s = |k: &str| c[k].as_str().unwrap_or("").to_string();
+    let mut line = format!("{}  {:<10} {:<9}", s("id"), s("harness"), s("state"));
+    if let Some(code) = c["exit_code"].as_i64() {
+        line.push_str(&format!(" exit {code}"));
+    }
+    line.push_str(&format!("  {}", s("branch")));
+    if let Some(i) = c["inbox"].as_str() {
+        line.push_str(&format!("  results in {i}"));
+    }
+    if let Some(m) = c["message"].as_str() {
+        line.push_str(&format!("  ({m})"));
+    }
+    println!("{line}");
+}
+
 fn print_human(req: &Request, resp: &Response) {
+    if req.cap == "spawn" && resp.status == Status::Timeout && resp.result.is_object() {
+        eprintln!("paddock-host: {}", resp.message);
+        print_child(&resp.result);
+        return;
+    }
     if resp.status != Status::Done {
         let what = match resp.status {
             Status::Denied => "denied by the user",
@@ -431,6 +558,28 @@ fn print_human(req: &Request, resp: &Response) {
             eprint!("{}", r["stderr"].as_str().unwrap_or(""));
         }
         "clipboard-read" => print!("{}", r["text"].as_str().unwrap_or("")),
+        "spawn" => match req.args.get("action").and_then(|a| a.as_str()) {
+            Some("start") => {
+                // Only the id on stdout, so `id=$(paddock-host spawn ...)` works.
+                println!("{}", r["id"].as_str().unwrap_or(""));
+                eprintln!(
+                    "paddock-host: started {} on branch {}. Wait for it: paddock-host wait {}",
+                    r["harness"].as_str().unwrap_or(""),
+                    r["branch"].as_str().unwrap_or(""),
+                    r["id"].as_str().unwrap_or("")
+                );
+            }
+            Some("list") => {
+                let list = r["children"].as_array().cloned().unwrap_or_default();
+                if list.is_empty() {
+                    println!("No children.");
+                }
+                for c in &list {
+                    print_child(c);
+                }
+            }
+            _ => print_child(r),
+        },
         _ => {
             if let Some(p) = r["path"].as_str() {
                 println!("{p}");

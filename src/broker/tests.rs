@@ -32,6 +32,8 @@ fn setup(answer: Option<Answer>, policy: HostPolicy) -> (tempfile::TempDir, Brok
         harness: "claude".into(),
         project,
         repo: None,
+        chain: vec![],
+        depth: 0,
     };
     (tmp, Broker::new(env, ctx, policy, fixed.clone()), fixed)
 }
@@ -360,6 +362,7 @@ fn pending_for(b: &Broker, detail: &str) -> Pending {
         created: state::now(),
         expires: state::now() + 1,
         session_allowed: true,
+        started_by: vec![],
     }
 }
 
@@ -496,6 +499,7 @@ fn answers_go_through_the_approvals_directory() {
         created: 1,
         expires: 11,
         session_allowed: true,
+        started_by: vec![],
     };
     let env2 = env.clone();
     let t = std::thread::spawn(move || HostApprover.ask(&env2, &p, Duration::from_secs(10)));

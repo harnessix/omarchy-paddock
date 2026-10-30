@@ -61,6 +61,10 @@ pub const CAPABILITIES: &[(&str, &str)] = &[
         "forge",
         "run allowed gh commands (pull requests, issues, CI runs) on the project's repository",
     ),
+    (
+        "spawn",
+        "start another harness in its own sandbox and worktree with one task, and get its results",
+    ),
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -220,6 +224,10 @@ pub struct Pending {
     pub expires: u64,
     /// Whether "allow for this session" is offered.
     pub session_allowed: bool,
+    /// For a request from a sandbox that another sandbox started: the
+    /// sandboxes above it, the first one started by the user, the parent last.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub started_by: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -352,7 +360,14 @@ pub fn audit_detail(req: &Request, project: &Path, prepared: Option<&str>) -> St
                 Err(_) => format!("open a URL ({} characters)", u.chars().count()),
             }
         }
-        "fetch" | "git-push" if prepared.is_some() => prepared.unwrap_or_default().to_string(),
+        "fetch" | "git-push" | "spawn" if prepared.is_some() => {
+            prepared.unwrap_or_default().to_string()
+        }
+        "spawn" => format!(
+            "spawn {} {}",
+            arg_str(req, "action").unwrap_or("start"),
+            arg_str(req, "harness").or(arg_str(req, "id")).unwrap_or("")
+        ),
         "fetch" => format!(
             "copy {} into the sandbox",
             arg_str(req, "path").unwrap_or("")
@@ -385,6 +400,16 @@ fn audit(
         "status": resp.status,
         "message": resp.message,
     });
+    let mut line = line;
+    if let Some(parent) = ctx.chain.last() {
+        line["parent"] = parent.clone().into();
+        line["chain"] = serde_json::json!(ctx.chain);
+    }
+    audit_line(env, &line);
+}
+
+/// Append one line to the audit log.
+pub fn audit_line(env: &HostEnv, line: &serde_json::Value) {
     let f = audit_file(env);
     match crate::privfs::append(&f) {
         Ok(mut file) => {
@@ -404,6 +429,11 @@ pub struct Context {
     pub project: PathBuf,
     /// The project repository as it was when the sandbox started.
     pub repo: Option<git::Repo>,
+    /// For a sandbox that another sandbox started: the sandboxes above it,
+    /// root first. Empty when the user started it.
+    pub chain: Vec<String>,
+    /// 0 when the user started the sandbox, 1 for its child, and so on.
+    pub depth: u32,
 }
 
 /// The answer source. The real one waits for `paddock approvals answer` or a
@@ -493,10 +523,15 @@ pub fn approval_note(p: &Pending) -> notify::Note {
     actions.push(("deny".into(), "Deny".into()));
     notify::Note {
         summary: format!("paddock: {} asks for {}", p.harness, p.capability),
-        body: if p.reason.is_empty() {
-            p.detail.clone()
-        } else {
-            format!("{}\n\nReason: {}", p.detail, p.reason)
+        body: {
+            let mut b = match crate::spawn::chain_text(&p.started_by) {
+                Some(c) => format!("{c}\n\n{}", p.detail),
+                None => p.detail.clone(),
+            };
+            if !p.reason.is_empty() {
+                b.push_str(&format!("\n\nReason: {}", p.reason));
+            }
+            b
         },
         actions,
         critical: true,
@@ -703,6 +738,31 @@ fn validate(req: &Request) -> Result<()> {
                 bail!("forge needs a command, for example pr view");
             }
         }
+        "spawn" => {
+            let name_ok = |s: &str| {
+                !s.is_empty()
+                    && s.len() <= 64
+                    && s.chars()
+                        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+            };
+            match arg_str(req, "action").unwrap_or("start") {
+                "start" => {
+                    if !arg_str(req, "harness").is_some_and(name_ok) {
+                        bail!("spawn needs a harness name, for example codex");
+                    }
+                    if arg_str(req, "prompt_file").is_none_or(str::is_empty) {
+                        bail!("spawn needs --prompt-file FILE");
+                    }
+                }
+                "status" | "wait" | "kill" => {
+                    if !arg_str(req, "id").is_some_and(name_ok) {
+                        bail!("give the spawn id that `paddock-host spawn` printed");
+                    }
+                }
+                "list" => {}
+                other => bail!("unknown spawn action {other}"),
+            }
+        }
         other => bail!("unknown capability {other}"),
     }
     Ok(())
@@ -733,7 +793,7 @@ fn safe_name(raw: &str, fallback: &str) -> String {
 /// The inbox in the project. The project is sandbox-writable, so the folder
 /// is opened one step at a time without following symlinks, and every result
 /// is written through it (see safefs).
-fn inbox(project: &Path) -> Result<crate::safefs::Dir> {
+pub(crate) fn inbox(project: &Path) -> Result<crate::safefs::Dir> {
     let root = crate::safefs::Root::open(project)?;
     let dot = root.dir(Path::new(".paddock"), true)?;
     // Keep results out of commits. An existing entry, whatever it is, stays.
@@ -803,6 +863,7 @@ pub fn run_capture_input(
 /// Do the approved work on the host.
 fn perform(env: &HostEnv, ctx: &Context, req: &Request, work: &Work) -> Result<serde_json::Value> {
     match work {
+        Work::Spawn { .. } | Work::SpawnControl => bail!("spawn was not prepared"),
         Work::Push(plan) => return git::push(plan),
         Work::Forge(call) => return run_forge(env, ctx, req, call),
         Work::Fetch(f) => return fetch(env, ctx, req, f),
@@ -995,6 +1056,13 @@ fn fetch(env: &HostEnv, ctx: &Context, req: &Request, f: &FetchPlan) -> Result<s
 /// The work behind a request, worked out before the user is asked.
 enum Work {
     Plain,
+    /// Start a child with this prompt.
+    Spawn {
+        harness: String,
+        prompt: Vec<u8>,
+    },
+    /// status, wait, kill or list of this sandbox's own children.
+    SpawnControl,
     Push(git::PushPlan),
     Forge(forge::Call),
     Fetch(FetchPlan),
@@ -1013,6 +1081,8 @@ struct Prepared {
     always_ask: bool,
     /// Allowed without asking unless the capability is denied (forge reads).
     read_only: bool,
+    /// What the audit log may keep, when it differs from `audit_detail`.
+    audit: Option<String>,
     work: Work,
 }
 
@@ -1032,6 +1102,7 @@ fn prepare(env: &HostEnv, ctx: &Context, req: &Request) -> Result<Prepared> {
                 session_allowed,
                 always_ask: !session_allowed,
                 read_only: false,
+                audit: None,
                 work: Work::Push(plan),
             })
         }
@@ -1065,6 +1136,7 @@ fn prepare(env: &HostEnv, ctx: &Context, req: &Request) -> Result<Prepared> {
                 session_allowed: true,
                 always_ask: false,
                 read_only: !write,
+                audit: None,
                 work: Work::Forge(call),
             })
         }
@@ -1086,6 +1158,7 @@ fn prepare(env: &HostEnv, ctx: &Context, req: &Request) -> Result<Prepared> {
                 session_allowed: true,
                 always_ask: false,
                 read_only: false,
+                audit: None,
                 work: Work::Fetch(plan),
             })
         }
@@ -1098,6 +1171,7 @@ fn prepare(env: &HostEnv, ctx: &Context, req: &Request) -> Result<Prepared> {
                 session_allowed: true,
                 always_ask: false,
                 read_only: false,
+                audit: None,
                 work: Work::Plain,
             })
         }
@@ -1154,6 +1228,8 @@ pub struct Broker {
     pub ctx: Context,
     pub policy: HostPolicy,
     pub approver: Arc<dyn Approver>,
+    /// This sandbox's children. None: spawn is not available here.
+    pub spawner: Option<Arc<crate::spawn::Spawner>>,
     grants: Mutex<Vec<String>>,
 }
 
@@ -1169,7 +1245,186 @@ impl Broker {
             ctx,
             policy,
             approver,
+            spawner: None,
             grants: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// The mode of a capability for this sandbox. Spawn is off when this
+    /// sandbox has no spawner, when it is as deep as `[spawn] max_depth`
+    /// allows, or when `[spawn] harnesses` names no harness. The depth comes
+    /// from the host, never from the sandbox.
+    pub fn mode(&self, cap: &str) -> Mode {
+        let m = self.policy.mode(cap);
+        if cap != "spawn" {
+            return m;
+        }
+        match &self.spawner {
+            Some(s) if s.cfg.depth_allows(self.ctx.depth) && !s.cfg.harnesses.is_empty() => m,
+            _ => Mode::Deny,
+        }
+    }
+
+    fn spawn_off_reason(&self) -> String {
+        match &self.spawner {
+            None => "spawn is not available in this sandbox".into(),
+            Some(s) if !s.cfg.depth_allows(self.ctx.depth) => format!(
+                "this sandbox was started by {}; [spawn] max_depth = {} does not let it start more",
+                self.ctx.chain.last().map_or("the user", |p| p.as_str()),
+                s.cfg.max_depth
+            ),
+            Some(s) if s.cfg.harnesses.is_empty() => {
+                "no harness is allowed: the user lists them in [spawn] harnesses".into()
+            }
+            _ => "spawn is set to deny in [host] of the user configuration".into(),
+        }
+    }
+
+    /// Work out a spawn request before the user is asked. Err is the
+    /// response to send instead.
+    fn prepare_spawn(&self, req: &Request) -> std::result::Result<Prepared, Response> {
+        let Some(sp) = &self.spawner else {
+            return Err(Response::new(Status::Disabled, self.spawn_off_reason()));
+        };
+        let action = arg_str(req, "action").unwrap_or("start");
+        if action != "start" {
+            return Ok(Prepared {
+                summary: format!("spawn {action}"),
+                detail: format!("spawn {action}"),
+                keys: vec![],
+                session_allowed: false,
+                always_ask: false,
+                read_only: true,
+                audit: None,
+                work: Work::SpawnControl,
+            });
+        }
+        let harness = arg_str(req, "harness").unwrap_or_default().to_string();
+        if !sp.cfg.allows(&harness) {
+            return Err(Response::new(
+                Status::Disabled,
+                format!(
+                    "{harness} is not in [spawn] harnesses of the user configuration (allowed: {})",
+                    if sp.cfg.harnesses.is_empty() {
+                        "none".to_string()
+                    } else {
+                        sp.cfg.harnesses.join(", ")
+                    }
+                ),
+            ));
+        }
+        let invalid = |m: String| Response::new(Status::Invalid, m);
+        let has_oneshot = crate::profile::HarnessFactory::new(&self.env)
+            .ok()
+            .and_then(|f| f.profile(&harness).map(|p| p.oneshot.is_some()));
+        match has_oneshot {
+            None => return Err(invalid(format!("unknown harness {harness}"))),
+            Some(false) => {
+                return Err(invalid(format!(
+                    "{harness} has no one-shot mode in its profile, so it cannot run a task without a terminal"
+                )))
+            }
+            Some(true) => {}
+        }
+        if sp.running() as u32 >= sp.cfg.max_running {
+            return Err(Response::new(
+                Status::Failed,
+                format!(
+                    "{} children run already; [spawn] max_running is {}. Wait for one with `paddock-host wait`",
+                    sp.running(),
+                    sp.cfg.max_running
+                ),
+            ));
+        }
+        let prompt = read_prompt(&self.ctx.project, arg_str(req, "prompt_file").unwrap_or(""))
+            .map_err(|e| invalid(format!("{e:#}")))?;
+        let text = String::from_utf8_lossy(&prompt);
+        let chars = text.chars().count();
+        let shown: String = text.chars().take(crate::spawn::PROMPT_SHOWN).collect();
+        let c = &sp.ceiling;
+        let detail = format!(
+            "Start {harness} in a new sandbox with this task. It runs once and stops.\n\
+             Login: {} (the {harness} login of this computer; this sandbox never sees it)\n\
+             Branch: a new worktree of {} from the current commit of this sandbox\n\
+             Limits: network {}, backend {}, no display, at most {} seconds, at most {} at a time\n\
+             Results go to {}/{INBOX}.\n\n\
+             Task ({chars} characters{}):\n{shown}",
+            c.auth,
+            c.repo.display(),
+            format!("{:?}", c.network).to_lowercase(),
+            c.backend,
+            sp.cfg.timeout,
+            sp.cfg.max_running,
+            self.ctx.project.display(),
+            if chars > crate::spawn::PROMPT_SHOWN {
+                format!(", the first {} shown", crate::spawn::PROMPT_SHOWN)
+            } else {
+                String::new()
+            },
+        );
+        Ok(Prepared {
+            summary: format!("start {harness} with a task"),
+            detail,
+            // A session grant covers this harness only.
+            keys: vec![format!("spawn\0{harness}")],
+            session_allowed: true,
+            always_ask: false,
+            read_only: false,
+            audit: Some(format!(
+                "start {harness} in a new sandbox (login {}; task {chars} characters, not logged)",
+                c.auth
+            )),
+            work: Work::Spawn { harness, prompt },
+        })
+    }
+
+    fn perform_spawn(&self, req: &Request, work: &Work) -> Response {
+        let Some(sp) = &self.spawner else {
+            return Response::new(Status::Disabled, self.spawn_off_reason());
+        };
+        let to_json = |s: &crate::spawn::Status| serde_json::to_value(s).unwrap_or_default();
+        let id = arg_str(req, "id").unwrap_or("");
+        let missing = || Response::new(Status::Invalid, format!("no child {id} of this sandbox"));
+        match (work, arg_str(req, "action").unwrap_or("start")) {
+            (Work::Spawn { harness, prompt }, _) => match sp.start(harness, prompt) {
+                Ok(s) => Response::done(to_json(&s)),
+                Err(e) => Response::new(Status::Failed, format!("{e:#}")),
+            },
+            (_, "list") => Response::done(serde_json::json!({
+                "children": sp.list(),
+                "max_running": sp.cfg.max_running,
+            })),
+            (_, "status") => match sp.status(id) {
+                Some(s) => Response::done(to_json(&s)),
+                None => missing(),
+            },
+            (_, "kill") => match sp.status(id) {
+                Some(_) => {
+                    sp.stop_one(id, crate::spawn::State::Stopped);
+                    let s = sp.wait(id, Duration::from_secs(20)).or(sp.status(id));
+                    Response::done(s.as_ref().map(to_json).unwrap_or_default())
+                }
+                None => missing(),
+            },
+            (_, "wait") => {
+                let max = sp.cfg.timeout + 120;
+                let t = req
+                    .args
+                    .get("timeout")
+                    .and_then(|t| t.as_u64())
+                    .unwrap_or(max)
+                    .min(max);
+                match sp.wait(id, Duration::from_secs(t)) {
+                    Some(s) if s.state.active() => Response {
+                        status: Status::Timeout,
+                        message: format!("{id} still runs after {t} seconds"),
+                        result: to_json(&s),
+                    },
+                    Some(s) => Response::done(to_json(&s)),
+                    None => missing(),
+                }
+            }
+            (_, other) => Response::new(Status::Invalid, format!("unknown spawn action {other}")),
         }
     }
 
@@ -1181,13 +1436,27 @@ impl Broker {
             .map(|(c, desc)| {
                 serde_json::json!({
                     "name": c,
-                    "mode": self.policy.mode(c),
+                    "mode": self.mode(c),
                     "session_granted": grants.iter().any(|g| g == c || g.starts_with(&format!("{c}\0"))),
                     "description": desc,
                 })
             })
             .collect();
-        serde_json::json!({ "protocol": PROTOCOL, "wait_seconds": self.policy.wait, "capabilities": caps })
+        let mut v = serde_json::json!({ "protocol": PROTOCOL, "wait_seconds": self.policy.wait, "capabilities": caps });
+        if let Some(s) = &self.spawner {
+            v["spawn"] = serde_json::json!({
+                "harnesses": s.cfg.harnesses,
+                "max_running": s.cfg.max_running,
+                "running": s.running(),
+                "max_depth": s.cfg.max_depth,
+                "depth": self.ctx.depth,
+                "timeout_seconds": s.cfg.timeout,
+            });
+        }
+        if let Some(p) = self.ctx.chain.last() {
+            v["started_by"] = p.clone().into();
+        }
+        v
     }
 
     pub fn handle(&self, req: &Request) -> Response {
@@ -1215,14 +1484,18 @@ impl Broker {
         if let Err(e) = validate(req) {
             return invalid(e);
         }
-        let mode = self.policy.mode(&req.cap);
+        let mode = self.mode(&req.cap);
         if mode == Mode::Deny {
             let r = Response::new(
                 Status::Disabled,
-                format!(
-                    "{} is set to deny in [host] of the user configuration",
-                    req.cap
-                ),
+                if req.cap == "spawn" {
+                    self.spawn_off_reason()
+                } else {
+                    format!(
+                        "{} is set to deny in [host] of the user configuration",
+                        req.cap
+                    )
+                },
             );
             audit(
                 &self.env,
@@ -1235,9 +1508,27 @@ impl Broker {
             );
             return r;
         }
-        let prep = match prepare(&self.env, &self.ctx, req) {
-            Ok(p) => p,
-            Err(e) => return invalid(e),
+        let prep = if req.cap == "spawn" {
+            match self.prepare_spawn(req) {
+                Ok(p) => p,
+                Err(r) => {
+                    audit(
+                        &self.env,
+                        &self.ctx,
+                        req,
+                        &audit_detail(req, &self.ctx.project, None),
+                        None,
+                        "refused",
+                        &r,
+                    );
+                    return r;
+                }
+            }
+        } else {
+            match prepare(&self.env, &self.ctx, req) {
+                Ok(p) => p,
+                Err(e) => return invalid(e),
+            }
         };
         let granted = || {
             let g = self.grants.lock().unwrap();
@@ -1264,6 +1555,7 @@ impl Broker {
                 created: state::now(),
                 expires: state::now() + self.policy.wait,
                 session_allowed: prep.session_allowed,
+                started_by: self.ctx.chain.clone(),
             };
             match self.approver.ask_with_source(
                 &self.env,
@@ -1299,12 +1591,26 @@ impl Broker {
                 format!("nobody answered within {} seconds", self.policy.wait),
             ),
             (_, Some(false)) => Response::new(Status::Denied, "the user denied the request"),
+            _ if matches!(prep.work, Work::Spawn { .. } | Work::SpawnControl) => {
+                self.perform_spawn(req, &prep.work)
+            }
             _ => match perform(&self.env, &self.ctx, req, &prep.work) {
                 Ok(result) => Response::done(result),
                 Err(e) => Response::new(Status::Failed, format!("{e:#}")),
             },
         };
-        let safe = matches!(req.cap.as_str(), "fetch" | "git-push").then_some(prep.detail.as_str());
+        // Status and wait calls are reads of this sandbox's own children.
+        if matches!(prep.work, Work::SpawnControl)
+            && arg_str(req, "action").is_some_and(|a| a != "kill")
+        {
+            return resp;
+        }
+        let safe = match &prep.audit {
+            Some(a) => Some(a.as_str()),
+            None => {
+                matches!(req.cap.as_str(), "fetch" | "git-push").then_some(prep.detail.as_str())
+            }
+        };
         audit(
             &self.env,
             &self.ctx,
@@ -1344,6 +1650,34 @@ impl Broker {
         writeln!(w, "{}", serde_json::to_string(&resp)?)?;
         Ok(())
     }
+}
+
+/// Read a prompt file that the sandbox names. The project is
+/// sandbox-writable: the path must stay inside it, no symlink is followed, a
+/// FIFO or a device is never opened, and the size is limited.
+pub fn read_prompt(project: &Path, raw: &str) -> Result<Vec<u8>> {
+    let p = Path::new(raw);
+    let rel = if p.is_absolute() {
+        p.strip_prefix(project)
+            .with_context(|| {
+                format!(
+                    "the prompt file must be inside the project {}",
+                    project.display()
+                )
+            })?
+            .to_path_buf()
+    } else {
+        p.to_path_buf()
+    };
+    let root = crate::safefs::Root::open(project)?;
+    let bytes = root
+        .read(&rel, crate::spawn::MAX_PROMPT)
+        .with_context(|| format!("cannot read the prompt file {raw}"))?
+        .with_context(|| format!("the prompt file {raw} does not exist"))?;
+    if bytes.iter().all(u8::is_ascii_whitespace) {
+        bail!("the prompt file {raw} is empty");
+    }
+    Ok(bytes)
 }
 
 fn new_request_id() -> String {

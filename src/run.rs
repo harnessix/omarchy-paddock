@@ -26,23 +26,39 @@ pub fn write_files(launch: &Launch) -> Result<()> {
 /// renamed between versions; without this check a harness could start in a
 /// mode that waits for approvals that nobody gives.
 pub fn probe_flags(env: &HostEnv, built: &Built) -> Result<()> {
-    let flags: Vec<&String> = built
-        .profile
-        .launch
-        .yolo_args
+    probe_args(
+        env,
+        &built.harness_exe,
+        &built.profile.launch.yolo_args,
+        &built.profile.launch.probe_args,
+        "yolo_args",
+    )
+}
+
+/// Make sure that the help output (`exe probe`) still mentions every flag
+/// in `args`. `what` names the profile entry in the error.
+pub fn probe_args(
+    env: &HostEnv,
+    exe: &Path,
+    args: &[String],
+    probe: &[String],
+    what: &str,
+) -> Result<()> {
+    let flags: Vec<&String> = args
         .iter()
-        .filter(|a| a.starts_with('-'))
+        .filter(|a| a.starts_with('-') && a.len() > 1)
         .collect();
     if flags.is_empty() {
         return Ok(());
     }
-    let meta = std::fs::metadata(&built.harness_exe)?;
+    let meta = std::fs::metadata(exe)?;
     let key = format!(
-        "{}|{}|{}|{:?}",
-        built.harness_exe.display(),
+        "{}|{}|{}|{:?}|{:?}",
+        exe.display(),
         meta.len(),
         meta.mtime(),
-        flags
+        flags,
+        probe
     );
     let cache = env
         .paddock_state()
@@ -51,7 +67,7 @@ pub fn probe_flags(env: &HostEnv, built: &Built) -> Result<()> {
     if cache.is_file() {
         return Ok(());
     }
-    let text = help_text(&built.harness_exe, &built.profile.launch.probe_args)?;
+    let text = help_text(exe, probe)?;
     let missing: Vec<&str> = flags
         .iter()
         .filter(|f| !text.contains(f.as_str()))
@@ -59,10 +75,10 @@ pub fn probe_flags(env: &HostEnv, built: &Built) -> Result<()> {
         .collect();
     if !missing.is_empty() {
         bail!(
-            "{} {} no longer mentions {}. The harness may have renamed its auto-approval flag. \
-             Update yolo_args in a profile override under {}",
-            built.harness_exe.display(),
-            built.profile.launch.probe_args.join(" "),
+            "{} {} no longer mentions {}. The harness may have renamed a flag. \
+             Update {what} in a profile override under {}",
+            exe.display(),
+            probe.join(" "),
             missing.join(", "),
             env.paddock_config().join("harness.d").display()
         );
@@ -135,7 +151,7 @@ pub fn run(
         None
     };
     backend.prepare(env, &built.spec, interactive)?;
-    let repo = start_broker(env, &mut built, interactive)?;
+    let (repo, spawner) = start_broker(env, &mut built, interactive, backend.name())?;
     // Terminal harnesses that log in through a browser and a localhost callback.
     let _login = if built.profile.launch.login_callback && built.spec.gui.mode != GuiMode::App {
         crate::login::prepare(env, &mut built.spec, backend.name() == "srt")?
@@ -226,9 +242,31 @@ pub fn run(
     if capture {
         cmd.stdout(Stdio::piped());
     }
+    let stdin = built.stdin.take();
+    if stdin.is_some() {
+        cmd.stdin(Stdio::piped());
+    }
+    if built.spawn.is_some() {
+        use std::os::unix::process::CommandExt;
+        // A child sandbox ends with the paddock process that runs it, even
+        // when that one is killed. SIGTERM, so a container CLI passes it on.
+        // SAFETY: prctl is async-signal-safe.
+        unsafe {
+            cmd.pre_exec(|| {
+                libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM);
+                Ok(())
+            });
+        }
+    }
     let mut child = cmd
         .spawn()
         .with_context(|| format!("cannot start {}", launch.program.display()))?;
+    if let (Some(data), Some(mut w)) = (stdin, child.stdin.take()) {
+        // A thread, so a harness that does not read cannot block paddock.
+        std::thread::spawn(move || {
+            let _ = std::io::Write::write_all(&mut w, &data);
+        });
+    }
     let running = Running {
         id: spec.id.clone(),
         harness: spec.harness.clone(),
@@ -253,6 +291,8 @@ pub fn run(
             Vec::new()
         },
         host_pid: std::process::id(),
+        parent: built.spawn.as_ref().map(|c| c.parent.clone()),
+        spawn_id: built.spawn.as_ref().map(|c| c.spawn_id.clone()),
     };
     running.register(env)?;
     // Kept after exit, so `paddock files` can list what the sandbox left.
@@ -320,9 +360,7 @@ pub fn run(
     let old_quit = unsafe { libc::signal(libc::SIGQUIT, libc::SIG_IGN) };
     let mut out = None;
     if capture {
-        let mut s = String::new();
-        child.stdout.take().unwrap().read_to_string(&mut s)?;
-        out = Some(s);
+        out = Some(read_capped(child.stdout.take().unwrap()));
     }
     let status = child.wait()?;
     unsafe {
@@ -330,6 +368,10 @@ pub fn run(
         libc::signal(libc::SIGQUIT, old_quit);
     }
 
+    // The children of this sandbox end with it.
+    if let Some(s) = &spawner {
+        s.stop_all(Duration::from_secs(30));
+    }
     stop.store(true, std::sync::atomic::Ordering::SeqCst);
     drop(monitor);
     let late = new_addrs.lock().unwrap().clone();
@@ -416,15 +458,25 @@ pub fn select_backend(env: &HostEnv, built: &Built) -> Result<Box<dyn Backend>> 
 /// Start the host passthrough for this sandbox and give the sandbox the
 /// `paddock-host` command. See broker.rs.
 /// Returns the repository snapshot that `git-push` and `forge` work from.
+type BrokerStart = (
+    Option<crate::broker::git::Repo>,
+    Option<std::sync::Arc<crate::spawn::Spawner>>,
+);
+
 fn start_broker(
     env: &HostEnv,
     built: &mut Built,
     interactive: bool,
-) -> Result<Option<crate::broker::git::Repo>> {
+    backend: &str,
+) -> Result<BrokerStart> {
     let run_dir = env.paddock_run().join(&built.spec.id);
     crate::privfs::dir(&run_dir)?;
     let sock = run_dir.join("host.sock");
-    let policy = crate::broker::HostPolicy::load(env)?;
+    let mut policy = crate::broker::HostPolicy::load(env)?;
+    // A child never gets a mode that its parent did not have.
+    if let Some(c) = &built.spawn {
+        policy.modes = crate::spawn::child_modes(&policy.modes, &c.modes);
+    }
     let human: std::sync::Arc<dyn crate::broker::Approver> =
         std::sync::Arc::new(crate::broker::HostApprover);
     let approver: std::sync::Arc<dyn crate::broker::Approver> = match built.approver.clone() {
@@ -457,11 +509,34 @@ fn start_broker(
         harness: built.spec.harness.clone(),
         project: built.spec.project.clone(),
         repo: repo.clone(),
+        chain: built
+            .spawn
+            .as_ref()
+            .map(|c| c.chain.clone())
+            .unwrap_or_default(),
+        depth: built.spawn.as_ref().map_or(0, |c| c.depth),
     };
-    crate::broker::serve(
-        &sock,
-        crate::broker::Broker::new(env.clone(), ctx, policy, approver),
-    )?;
+    // Children of this sandbox (`paddock-host spawn`). A bad [spawn] table
+    // turns spawn off for this run; the rest of the broker still works.
+    let spawner = match crate::spawn::SpawnCfg::load(env) {
+        Ok(cfg) => {
+            let ceiling = crate::spawn::Ceiling::of(built, backend, &policy.modes);
+            match crate::spawn::Spawner::new(env, cfg, ceiling, &built.spec.project) {
+                Ok(s) => Some(std::sync::Arc::new(s)),
+                Err(e) => {
+                    log::warn!("spawn is off for this run: {e:#}");
+                    None
+                }
+            }
+        }
+        Err(e) => {
+            eprintln!("paddock: spawn is off for this run: {e:#}");
+            None
+        }
+    };
+    let mut broker = crate::broker::Broker::new(env.clone(), ctx, policy, approver);
+    broker.spawner = spawner.clone();
+    crate::broker::serve(&sock, broker)?;
     built.spec.host_socket = Some(sock);
     // The client is paddock itself. A small wrapper gives it the name that
     // agents use, the same way on every backend.
@@ -490,7 +565,30 @@ fn start_broker(
     let gh = run_dir.join("gh");
     gui::write_file(&gh, "#!/bin/sh\nexec paddock host gh \"$@\"\n", 0o755)?;
     built.spec.add_tool("gh", gh, "gh through the host");
-    Ok(repo)
+    Ok((repo, spawner))
+}
+
+/// The captured output of a sandbox. Everything is read, so the sandbox
+/// never blocks on a full pipe, but only the last 4 MiB are kept.
+fn read_capped(mut r: impl Read) -> String {
+    const KEEP: usize = 4 << 20;
+    let mut kept: Vec<u8> = Vec::new();
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        match r.read(&mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                kept.extend_from_slice(&buf[..n]);
+                if kept.len() > 2 * KEEP {
+                    kept.drain(..kept.len() - KEEP);
+                }
+            }
+        }
+    }
+    if kept.len() > KEEP {
+        kept.drain(..kept.len() - KEEP);
+    }
+    String::from_utf8_lossy(&kept).into_owned()
 }
 
 /// Run one provision sandbox to the end. Its output goes to stderr. Returns

@@ -17,6 +17,7 @@ You configure a security boundary for the user. Some changes make it weaker. For
 - Approving a project file: `paddock approve`, or `-y` / `--yes` on a run. The agent in the sandbox can write `paddock.toml`, so the user must read what it asks for.
 - An agent approver: `paddock approver enable`, and anything with `sudo`.
 - Setting a capability to `allow` in `[host]`, `network = "host"`, `--gui host`, `[mcp] allow`, `[network] host_ports`, or `[env] pass` for a secret.
+- Turning on spawn: adding a harness to `[spawn] harnesses`, `[host] spawn = "allow"`, or a higher `max_running`, `max_depth` or `timeout`. Spawn lets a sandbox use the login and the quota of another harness. Ask the user first, and name the harnesses and the limits.
 
 Do not edit files under `~/.local/share/paddock`, `~/.local/state/paddock` or `~/.cache/paddock` by hand. Use the commands.
 
@@ -114,6 +115,8 @@ After a configuration change, run `paddock explain <harness>` and make sure that
 ## Host requests
 
 An agent in a sandbox can ask the host for a screenshot, one command, one file, the clipboard, or a link in the browser. The user answers on the approval card, in the bar panel, or with `paddock approvals`. `paddock log` shows every request and its answer. Report pending requests to the user. Do not answer them.
+
+An agent in a sandbox can also start an agent of another harness in a second sandbox (`paddock-host spawn`). It is off until the user lists harnesses in `[spawn] harnesses` of `~/.config/paddock/config.toml`. A project `paddock.toml` cannot turn it on. Before you add a harness there, ask the user and explain: the child uses the user's own login and quota of that harness, it never gets more access than its parent, and it stops when its parent stops. The defaults are `[host] spawn = "ask"`, `max_running = 2`, `max_depth = 1` (a child cannot spawn) and `timeout = 1800` seconds. `paddock ps` shows children under their parent, and `paddock stop <parent>` stops them too.
 
 ## Disk space
 

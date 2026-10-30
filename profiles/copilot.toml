@@ -37,3 +37,10 @@ args = ["--disable-client-telemetry"]
 [privacy.training]
 setting = "GitHub Settings, Copilot, Allow GitHub to use my data for AI model training"
 url = "https://github.com/settings/copilot"
+
+# One task without a terminal, for `paddock-host spawn`. `copilot --help`:
+# -p runs one prompt and exits, --allow-all-tools is required for it, -s
+# prints only the answer. The prompt text is fixed and names the file.
+[oneshot]
+args = ["--allow-all-tools", "--allow-all-paths", "-s", "-p", "Read the file {prompt_file} and do the task that it describes."]
+prompt = "file"

@@ -53,6 +53,10 @@ pub struct Manifest {
     /// only; a project file cannot change it.
     #[serde(default)]
     pub privacy: PrivacyCfg,
+    /// Limits for `paddock-host spawn`. Read by spawn.rs from the user
+    /// configuration only; a project file cannot set them.
+    #[serde(default, skip_serializing)]
+    pub spawn: Option<toml::Value>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -244,15 +248,16 @@ impl Manifest {
     }
 
     fn merge(&mut self, o: Manifest) {
-        // [host], [apps], [recovery] and [privacy] are trusted only from the
-        // user configuration.
+        // [host], [apps], [recovery], [privacy] and [spawn] are trusted only
+        // from the user configuration.
         if o.host.is_some()
             || !o.apps.is_empty()
             || o.recovery.is_some()
             || o.privacy.telemetry.is_some()
+            || o.spawn.is_some()
         {
             log::warn!(
-                "[host], [apps], [recovery] and [privacy] in a project paddock.toml are ignored"
+                "[host], [apps], [recovery], [privacy] and [spawn] in a project paddock.toml are ignored"
             );
         }
         if o.default_harness.is_some() {
