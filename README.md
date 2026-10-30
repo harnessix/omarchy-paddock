@@ -52,7 +52,7 @@ paddock moves the boundary from "which commands can run" to "which files exist".
 
 2. Install the `paddock` command: the prebuilt binary from the [latest release](https://github.com/harnessix/omarchy-paddock/releases/latest), or `bin/install` from a clone. Both are described below.
 
-3. Run the setup. It checks the system packages, and offers the shell commands, the launchers, the bar widget and the default backend, one step at a time. Each step says what it changes and how to undo it. A second run shows the state and changes nothing unless you ask.
+3. Run the setup. It checks the system packages, and offers the shell commands, the launchers, the bar widget and the default backend, one step at a time. Each step says what it changes and how to undo it. A second run shows the state and changes nothing unless you ask. The last step lists where you turn off the use of your data for training (see [Privacy defaults](#privacy-defaults)).
 
    ```sh
    paddock setup
@@ -176,7 +176,7 @@ paddock shell claude           # a shell in the sandbox that claude gets
 paddock explain claude         # every mount, variable and rule, and why it is there
 paddock ps                     # running sandboxes
 paddock files                  # files a sandbox saved outside the project
-paddock doctor                 # dependencies, backends, located harnesses, privacy settings
+paddock doctor                 # dependencies, backends, located harnesses, training opt-outs
 paddock doctor --escape        # try to escape, and report each attempt
 paddock setup                  # first-run steps; a second run changes nothing
 paddock update --check         # is there a newer release
