@@ -18,7 +18,7 @@ pub struct Bwrap;
 pub const DNS_FORWARD: &str = "169.254.0.53";
 
 /// Top-level directories that may be symlinks into /usr (merged /usr) or real directories.
-const ROOT_LINKS: &[&str] = &["/bin", "/sbin", "/lib", "/lib64", "/lib32", "/libx32"];
+pub(crate) const ROOT_LINKS: &[&str] = &["/bin", "/sbin", "/lib", "/lib64", "/lib32", "/libx32"];
 
 fn arg(v: &mut Vec<String>, items: &[&str]) {
     v.extend(items.iter().map(|s| s.to_string()));
@@ -273,7 +273,7 @@ impl Backend for Bwrap {
 
 /// Where /etc/resolv.conf really lives. bwrap cannot mount over a symlink,
 /// so a replacement goes on the symlink's target.
-fn resolv_target() -> PathBuf {
+pub(crate) fn resolv_target() -> PathBuf {
     let link = Path::new("/etc/resolv.conf");
     match std::fs::read_link(link) {
         Ok(t) if t.is_absolute() => t,

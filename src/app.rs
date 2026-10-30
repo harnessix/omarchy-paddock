@@ -685,6 +685,7 @@ fn run_flatpak(
         host_pid: std::process::id(),
         parent: None,
         spawn_id: None,
+        logins: Vec::new(),
     };
     if let Err(e) = running.register(env) {
         log::warn!("cannot list the app with the running sandboxes: {e:#}");

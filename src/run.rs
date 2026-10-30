@@ -329,6 +329,7 @@ pub fn run(
         host_pid: std::process::id(),
         parent: built.spawn.as_ref().map(|c| c.parent.clone()),
         spawn_id: built.spawn.as_ref().map(|c| c.spawn_id.clone()),
+        logins: auth.host_logins(),
     };
     running.register(env)?;
     // Kept after exit, so `paddock files` can list what the sandbox left.

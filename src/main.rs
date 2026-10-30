@@ -315,6 +315,13 @@ enum Cmd {
     /// (`paddock-host spawn`). The parent's paddock starts this.
     #[command(hide = true)]
     SpawnChild { job: PathBuf },
+    /// The Omarchy agents panel's `omarchy-agent-usage-update`, through
+    /// paddock: a login that a sandbox holds is checked from paddock's side.
+    #[command(hide = true)]
+    OmarchyUsageUpdate {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
     /// Inside a container sandbox: pass connections to the host proxy socket.
     #[command(hide = true)]
     Relay {
@@ -1142,6 +1149,7 @@ fn real_main() -> Result<i32> {
             Ok(0)
         }
         Cmd::Pick { harness } => pick(&env, &harness),
+        Cmd::OmarchyUsageUpdate { args } => paddock::omarchy_usage::update(&env, &args),
         Cmd::Wrap { command } => paddock::wrap::main(env, &command),
         Cmd::Shims {
             cmd: ShimsCmd::Exec { program, args },
@@ -1164,6 +1172,11 @@ fn real_main() -> Result<i32> {
                 r.config.display()
             );
             println!("Wrote the shim folder {}.", r.shims.display());
+            let usage = paddock::omarchy_usage::install(&env)?;
+            println!(
+                "Wrote {}: the agents panel checks the limits of a login that a sandbox holds from paddock's side. It takes effect at your next login.",
+                usage[0].display()
+            );
             if let Err(e) = &r.reshim {
                 println!("mise reshim did not run: {e}. Run it yourself, or the key keeps starting agents without a sandbox.");
             }
@@ -1232,7 +1245,10 @@ fn real_main() -> Result<i32> {
                         println!("removed {}", p.display());
                     }
                     let (removed, reshim) = paddock::omarchy::remove(&env)?;
-                    for p in removed {
+                    for p in removed
+                        .into_iter()
+                        .chain(paddock::omarchy_usage::remove(&env)?)
+                    {
                         println!("removed {}", p.display());
                     }
                     if let Some(Err(e)) = reshim {
