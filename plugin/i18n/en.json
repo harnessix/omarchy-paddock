@@ -96,6 +96,7 @@
   "popup.ask.open-url": "Allow %1 in %2 to open this link?",
   "popup.ask.notify": "Allow %1 in %2 to show a notification?",
   "popup.ask.spawn": "Allow %1 in %2 to start another agent with this task?",
+  "popup.ask.kv-user": "Allow %1 in %2 to use the paddock kv scope that all your projects share?",
   "popup.ask.other": "Allow %1 in %2 to do this on your computer?",
   "approve.gone": "This request is no longer waiting: it timed out or was answered elsewhere.",
   "approve.denied": "Denied.",

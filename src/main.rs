@@ -261,6 +261,11 @@ enum Cmd {
         #[command(subcommand)]
         cmd: Option<ApprovalsCmd>,
     },
+    /// Read what agents wrote to paddock kv, and free their leases.
+    Kv {
+        #[command(subcommand)]
+        cmd: KvCmd,
+    },
     /// Show the audit log of host requests.
     Log {
         /// Print one JSON object per line.
@@ -341,6 +346,66 @@ enum EnvCmd {
     Hide { names: Vec<String> },
     /// Pass these variables again.
     Unhide { names: Vec<String> },
+}
+
+/// Which scope a `paddock kv` command reads. Without a flag: the project
+/// of the current folder.
+#[derive(Args)]
+struct KvScope {
+    /// The project scope of this folder.
+    #[arg(long, conflicts_with_all = ["user", "sandbox"])]
+    project: Option<PathBuf>,
+    /// The scope that all projects share.
+    #[arg(long, conflicts_with = "sandbox")]
+    user: bool,
+    /// The self scope of one sandbox, by id.
+    #[arg(long)]
+    sandbox: Option<String>,
+}
+
+impl KvScope {
+    fn target(&self) -> Result<paddock::kv::host::Target> {
+        use paddock::kv::host::{project_of, Target};
+        Ok(if self.user {
+            Target::User
+        } else if let Some(id) = &self.sandbox {
+            Target::Sandbox(id.clone())
+        } else {
+            Target::Project(project_of(self.project.as_deref())?)
+        })
+    }
+}
+
+#[derive(Subcommand)]
+enum KvCmd {
+    /// List keys, with the sandbox that wrote each one.
+    List {
+        prefix: Option<String>,
+        #[command(flatten)]
+        scope: KvScope,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Print one value.
+    Get {
+        key: String,
+        #[command(flatten)]
+        scope: KvScope,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Delete one key.
+    Delete {
+        key: String,
+        #[command(flatten)]
+        scope: KvScope,
+    },
+    /// Free the lease lease:NAME, whatever sandbox holds it.
+    Release {
+        name: String,
+        #[command(flatten)]
+        scope: KvScope,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1279,6 +1344,24 @@ fn real_main() -> Result<i32> {
             Ok(0)
         }
         Cmd::Files { id, json } => files_cmd(&env, id.as_deref(), json),
+        Cmd::Kv { cmd } => {
+            use paddock::kv::host;
+            match cmd {
+                KvCmd::List {
+                    prefix,
+                    scope,
+                    json,
+                } => host::list(
+                    &env,
+                    &scope.target()?,
+                    prefix.as_deref().unwrap_or(""),
+                    json,
+                ),
+                KvCmd::Get { key, scope, json } => host::get(&env, &scope.target()?, &key, json),
+                KvCmd::Delete { key, scope } => host::delete(&env, &scope.target()?, &key),
+                KvCmd::Release { name, scope } => host::release(&env, &scope.target()?, &name),
+            }
+        }
         Cmd::Du { json } => du_cmd(&env, json),
         Cmd::Gc {
             yes,
@@ -1614,6 +1697,12 @@ fn gc_cmd(env: &HostEnv, o: &paddock::storage::GcOptions, json: bool) -> Result<
     let mut inv = storage::scan(env, &host, false);
     let mut items = storage::plan(&inv, o, state::now());
     storage::measure_plan(&mut inv, &mut items);
+    match paddock::kv::gc_items(env, state::now()) {
+        Ok(kv) => items.extend(kv),
+        Err(e) => inv
+            .notes
+            .push(format!("cannot read the paddock kv store: {e:#}")),
+    }
     let removed = if o.yes {
         storage::apply(env, &containers, &items)
     } else {

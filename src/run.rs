@@ -152,6 +152,26 @@ pub fn run(
     };
     backend.prepare(env, &built.spec, interactive)?;
     let (repo, spawner) = start_broker(env, &mut built, interactive, backend.name())?;
+    // paddock kv and the devices. Each one is optional: when it cannot start,
+    // the sandbox starts without it and a notice says why.
+    let kv_approver: std::sync::Arc<dyn crate::broker::Approver> = built
+        .approver
+        .clone()
+        .unwrap_or_else(|| std::sync::Arc::new(crate::broker::HostApprover));
+    let kv_project = built
+        .worktree
+        .as_ref()
+        .map(|w| w.repo.clone())
+        .unwrap_or_else(|| built.spec.project.clone());
+    let kv = crate::kv::start(
+        env,
+        &mut built.spec,
+        kv_project,
+        kv_approver,
+        built.parent.clone(),
+    );
+    let mut devices =
+        crate::devices::start(env, &mut built.spec, backend.name(), built.test_devices);
     // Terminal harnesses that log in through a browser and a localhost callback.
     let _login = if built.profile.launch.login_callback && built.spec.gui.mode != GuiMode::App {
         crate::login::prepare(env, &mut built.spec, backend.name() == "srt")?
@@ -194,7 +214,9 @@ pub fn run(
         }
     }
     // The provision step, in the project sandbox with the harness's rights.
-    if let Some(p) = built.spec.provision_spec() {
+    if let Some(mut p) = built.spec.provision_spec() {
+        // The devices are for the harness, not for the install step.
+        p.devices = None;
         let what = built.spec.provision.join("; ");
         if !provision(env, backend, &p, quiet, &what)? && !quiet {
             eprintln!("paddock: warning: provisioning failed; the harness starts anyway");
@@ -266,6 +288,9 @@ pub fn run(
         std::thread::spawn(move || {
             let _ = std::io::Write::write_all(&mut w, &data);
         });
+    }
+    if let Some(d) = devices.as_mut() {
+        d.after_start(env, backend.name(), &spec.id);
     }
     let running = Running {
         id: spec.id.clone(),
@@ -399,6 +424,11 @@ pub fn run(
                 eprintln!("  {}", f.display());
             }
         }
+    }
+    // Unmount first: the removal must not walk into the device mount.
+    drop(devices);
+    if let Some(k) = kv {
+        k.finish();
     }
     let _ = std::fs::remove_dir_all(env.paddock_run().join(&spec.id));
     crate::recover::Session::end(env, &spec.id);

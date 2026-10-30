@@ -8,6 +8,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 
 mod git;
+pub mod kv;
 
 pub const EXIT_USAGE: i32 = 2;
 pub const EXIT_NO_HOST: i32 = 6;
@@ -34,6 +35,7 @@ USAGE
   paddock-host status [ID]
   paddock-host wait ID [--timeout SECONDS]
   paddock-host kill ID
+  paddock-host kv COMMAND [ARG...]              (key-value store, see `paddock-host kv --help`)
   paddock-host help [CAPABILITY]
 
 Common options
@@ -69,6 +71,13 @@ OTHER AGENTS
   `paddock-host spawn` starts another harness, for example codex, in its own
   sandbox with one task. It works on its own branch and returns its results
   to .paddock/inbox/. Run `paddock-host help spawn` for the rules and limits.
+
+STATE AND DEVICES
+  `paddock-host kv` keeps state on the host: for this sandbox, for every
+  sandbox of this project, or for the sandbox that started this one. It needs
+  no approval, except the scope that all projects share. Host devices, when
+  the user turns them on, are files in /dev/paddock. Read
+  /dev/paddock/.catalog for each device and its request format.
 
 EXIT CODES
   0   done (for exec and gh: the command's own exit code is returned instead)
@@ -327,6 +336,7 @@ pub fn main(args: &[String]) -> i32 {
         "git" => return git::git_main(rest),
         "git-remote-helper" => return git::remote_helper(rest),
         "gh" => return git::gh_main(rest),
+        "kv" => return kv::main(rest),
         "forge" if rest.first().is_some_and(|t| t == "gh") => return git::gh_main(&rest[1..]),
         _ => {}
     }

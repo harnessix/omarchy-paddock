@@ -218,6 +218,14 @@ pub fn report(env: &HostEnv) -> Result<bool> {
         }
     }
 
+    println!("\nDevices and paddock kv:");
+    for l in crate::devices::doctor_lines(env)
+        .into_iter()
+        .chain(crate::kv::doctor_lines(env))
+    {
+        println!("{l}");
+    }
+
     println!("\nHarnesses:");
     let factory = HarnessFactory::new(env)?;
     for name in factory.names() {
@@ -585,6 +593,15 @@ pub fn escape(env: &HostEnv, o: &EscapeOpts) -> Result<usize> {
     let recorder = std::sync::Arc::new(Recorder::default());
     built.approver = Some(recorder.clone());
     s_set_approvals(&mut built, env);
+    // paddock kv: a canary in another sandbox's self scope and that
+    // sandbox's socket on the host. Devices: the echo device is on.
+    let kv_probe = crate::kv::escape::EscapeProbe::setup(env, &random_hex()[..8])?;
+    for (k, v) in kv_probe.vars() {
+        built.spec.set_env(k, v, "doctor");
+    }
+    built.test_devices = true;
+    let kv_sandbox = built.spec.id.clone();
+    let kv_project = built.spec.project.clone();
     let env2 = HostEnv::detect()?;
     // A file in the host /tmp: srt shares the host /tmp unless it is denied.
     let host_tmp = std::path::PathBuf::from(format!("/tmp/paddock-doctor-{}", std::process::id()));
@@ -606,6 +623,15 @@ pub fn escape(env: &HostEnv, o: &EscapeOpts) -> Result<usize> {
         "doctor",
     );
     let b = run::select_backend(&env2, &built)?;
+    // Where the devices cannot appear, the probe skips their checks.
+    match crate::devices::fuse_available(&env2)
+        .and_then(|_| crate::devices::backend_support(&env2, b.name()))
+    {
+        Ok(()) => built.spec.set_env("PADDOCK_PROBE_DEVICES", "1", "doctor"),
+        Err(why) => built
+            .spec
+            .set_env("PADDOCK_PROBE_DEVICES_OFF", why, "doctor"),
+    }
     built
         .spec
         .set_env("PADDOCK_PROBE_BACKEND", b.name(), "doctor");
@@ -656,6 +682,7 @@ pub fn escape(env: &HostEnv, o: &EscapeOpts) -> Result<usize> {
     let _ = std::fs::remove_file(&host_tmp);
     let _ = std::fs::remove_file(&host_sock);
     if timed_out.load(std::sync::atomic::Ordering::SeqCst) {
+        kv_probe.cleanup(&kv_sandbox, &kv_project);
         println!("  FAIL probe-finished: the sandbox did not finish in 300 seconds");
         return Ok(1);
     }
@@ -676,6 +703,24 @@ pub fn escape(env: &HostEnv, o: &EscapeOpts) -> Result<usize> {
         }
     }
     for (name, problem) in git_host_checks(&env2, &project, &git_canary) {
+        seen += 1;
+        match problem {
+            None => println!("  ok {name}"),
+            Some(p) => {
+                failed += 1;
+                println!("  FAIL {name}: {p}");
+            }
+        }
+    }
+    let asked = recorder
+        .seen
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|p| p.capability == crate::kv::USER_CAPABILITY);
+    let kv_results = kv_probe.check(&kv_sandbox, &kv_project, asked);
+    kv_probe.cleanup(&kv_sandbox, &kv_project);
+    for (name, problem) in kv_results {
         seen += 1;
         match problem {
             None => println!("  ok {name}"),

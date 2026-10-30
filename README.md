@@ -538,6 +538,69 @@ These rules always hold:
 
 You can let an agent on the host answer requests for you (`paddock approver`). paddock trusts that setting only from a root-owned file (`sudo paddock approver enable --system`) or from a file signed with a password that you type when a sandbox starts, so that a process on your computer cannot turn it on for itself. The agent approver can only answer the capabilities that you list, the rules above still hold, and if it does not answer clearly, the request comes to you.
 
+## Shared state: paddock kv
+
+Agents need to keep state between runs and hand work to each other. paddock kv is a small key-value store for that. It lives on the host, in `~/.local/state/paddock/kv/store.db`. Each sandbox reaches it through its own socket. The socket tells paddock which sandbox asks, so an agent cannot claim to be another sandbox.
+
+Inside the sandbox, the agent uses `paddock-host kv`:
+
+```sh
+paddock-host kv put task:review '{"title":"review src/auth.rs","status":"todo"}' --scope project
+paddock-host kv claim review --ttl 600 --scope project
+paddock-host kv watch --prefix result: --scope project --timeout 300
+```
+
+Each key belongs to a scope:
+
+| Scope | Who reads and writes it | Default |
+| :--- | :--- | :--- |
+| `self` | This sandbox only | on |
+| `project` | Every sandbox of the same project. Each entry records the sandbox that wrote it. | on |
+| `parent` | Read-only: the `self` scope of the sandbox that started this one | empty until sandboxes can start sandboxes |
+| `user` | Every sandbox of every project | asks you at the first use |
+
+An agent with a prompt injection can write a false tip into the `project` scope, and the next agent reads it. So paddock records the writer of every entry, and the client marks what another sandbox wrote as untrusted.
+
+A write can depend on the current version of a key (`--if-version`). A key can expire (`--ttl`). `mget` and `mset` read and write several keys at once. `history` shows the last versions of a key. `watch` waits for a change of one key or of a prefix. A lease (`claim NAME --ttl SECONDS`) makes sure that only one agent does a task. paddock sets the owner of a lease from the socket. Only the owner releases it, or the parent of the owner with `--force`, or you on the host. A lease expires at the end of its time. Keep values small: put diffs, files and logs in a git branch or a file, and store the reference. `paddock-host kv --help` in the sandbox lists the key names that agents share: `task:`, `lease:`, `result:`, `heartbeat:` and `note:`.
+
+On the host, `paddock kv list`, `paddock kv get KEY`, `paddock kv delete KEY` and `paddock kv release NAME` read the project scope of the current folder. `--user` and `--sandbox ID` choose another scope.
+
+The limits and the `user` scope are in `~/.config/paddock/config.toml`. A project `paddock.toml` cannot change them.
+
+```toml
+[kv]
+user = "ask"           # ask | allow | deny
+max_value = 65536      # bytes per value
+self_bytes = 4194304   # bytes per scope; also project_bytes and user_bytes
+max_keys = 4096        # keys per scope
+keep_days = 30         # paddock gc removes the self scope of a run this many days after it ended
+enabled = true
+```
+
+`paddock gc` removes the `self` data of runs that ended more than `keep_days` ago, and keys whose time to live passed. The audit log `~/.local/state/paddock/kv-audit.jsonl` records each write with its key name and size. It never records a value.
+
+## Devices: /dev/paddock
+
+A device is a host service that the sandbox uses as a file. Each sandbox gets its own small file system at `/dev/paddock`. The paddock process on the host serves it, so paddock knows which sandbox calls. No root and no credentials enter the sandbox.
+
+One open is one request. The program opens the device for reading and writing, writes the request, and reads the response until the end of the file. The first read sends the request and waits for the answer. Closing the file early cancels the request. Each device has a time limit. After that time, the read fails with `ETIMEDOUT`. `/dev/paddock/.catalog` is read-only and describes each device: its request format, its limits and whether it is on.
+
+```sh
+exec 3<>/dev/paddock/echo; printf 'hello' >&3; cat <&3
+```
+
+All devices are off by default. The only device so far is `echo`, a test device that sends the request back. Turn a device on in `~/.config/paddock/config.toml`. A project `paddock.toml` cannot turn on a device, because the agent can edit that file.
+
+```toml
+[devices]
+echo = true
+mount = true   # false: no /dev/paddock at all
+```
+
+The mount needs FUSE: `/dev/fuse` and `fusermount3` (package `fuse3`). `paddock doctor` checks both. The bwrap backend binds the mount at the start. docker and podman bind an empty folder and paddock mounts the file system on it after the container starts. The container waits up to five seconds for it before the harness starts. This needs a shared mount for the paddock run folder, which is the systemd default. srt cannot place a mount at `/dev/paddock`: there, the devices are at the path in `$PADDOCK_DEVICES`. When FUSE is missing, the sandbox starts without devices, and `paddock doctor` says why.
+
+Programs must read the response with `read`. `cat` from coreutils, `dd`, shells, Python and Rust do that. busybox `cat` uses `sendfile` and sees an empty file: use `dd` there. Requests and responses never go into logs or process arguments. The log records the device name, the sizes and the result.
+
 ## App mode
 
 Desktop agent apps run in a sandbox too: ChatGPT with Codex, Claude Desktop, VS Code, and flatpak apps. They get the same file, git, secrets, environment and network rules as a terminal harness, and their windows are normal windows on your desktop. Flatpak apps have some limits, described at the end of this section.

@@ -333,6 +333,23 @@ impl Backend for Docker {
         } else {
             spec
         };
+        // The harness starts when the devices are there, or after 5 seconds.
+        let with_devices;
+        let spec = if spec.devices.is_some() {
+            let mut s = spec.clone();
+            s.setup.insert(
+                0,
+                format!(
+                    "i=0; while [ ! -e {}/{} ] && [ $i -lt 100 ]; do sleep 0.05; i=$((i+1)); done",
+                    crate::devices::MOUNT_IN_SANDBOX,
+                    crate::devices::CATALOG
+                ),
+            );
+            with_devices = s;
+            &with_devices
+        } else {
+            spec
+        };
         let tag = image_tag(&dockerfile(&Self::cfg())?);
         let run_dir = env.paddock_run().join(&spec.id);
         let (passwd, group) = identity_files(spec);
@@ -474,6 +491,26 @@ impl Backend for Docker {
                 true,
             )?);
         }
+        if let Some(sock) = &spec.kv_socket {
+            mounts.push(mount_arg(
+                "bind",
+                Some(sock),
+                Path::new(crate::kv::SOCKET_IN_SANDBOX),
+                true,
+            )?);
+        }
+        // An empty folder now. paddock mounts the devices on it after the
+        // container started, and slave propagation carries that mount in
+        // (devices.rs explains why).
+        if let Some(dir) = &spec.devices {
+            let m = mount_arg(
+                "bind",
+                Some(dir),
+                Path::new(crate::devices::MOUNT_IN_SANDBOX),
+                false,
+            )?;
+            mounts.push(format!("{m},bind-propagation=rslave"));
+        }
         if relay {
             mounts.push(mount_arg(
                 "bind",
@@ -495,6 +532,18 @@ impl Backend for Docker {
             vars.insert(
                 "PADDOCK_HOST_SOCKET".into(),
                 crate::broker::SOCKET_IN_SANDBOX.into(),
+            );
+        }
+        if spec.kv_socket.is_some() {
+            vars.insert(
+                "PADDOCK_KV_SOCKET".into(),
+                crate::kv::SOCKET_IN_SANDBOX.into(),
+            );
+        }
+        if spec.devices.is_some() {
+            vars.insert(
+                "PADDOCK_DEVICES".into(),
+                crate::devices::MOUNT_IN_SANDBOX.into(),
             );
         }
         if relay {

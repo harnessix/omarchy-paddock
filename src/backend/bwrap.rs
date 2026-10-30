@@ -179,6 +179,21 @@ impl Backend for Bwrap {
                 crate::broker::SOCKET_IN_SANDBOX.into(),
             ]);
         }
+        if let Some(sock) = &spec.kv_socket {
+            a.extend([
+                "--ro-bind".into(),
+                p(sock),
+                crate::kv::SOCKET_IN_SANDBOX.into(),
+            ]);
+        }
+        // Read-write: a request is a write to a device file.
+        if let Some(dir) = &spec.devices {
+            a.extend([
+                "--bind".into(),
+                p(dir),
+                crate::devices::MOUNT_IN_SANDBOX.into(),
+            ]);
+        }
         if spec.gui.enabled() {
             let rt = sandbox_runtime_dir(spec.uid);
             a.extend(["--perms".into(), "0700".into(), "--dir".into(), p(&rt)]);
@@ -218,6 +233,18 @@ impl Backend for Bwrap {
             env_map.insert(
                 "PADDOCK_HOST_SOCKET".into(),
                 crate::broker::SOCKET_IN_SANDBOX.into(),
+            );
+        }
+        if spec.kv_socket.is_some() {
+            env_map.insert(
+                "PADDOCK_KV_SOCKET".into(),
+                crate::kv::SOCKET_IN_SANDBOX.into(),
+            );
+        }
+        if spec.devices.is_some() {
+            env_map.insert(
+                "PADDOCK_DEVICES".into(),
+                crate::devices::MOUNT_IN_SANDBOX.into(),
             );
         }
 

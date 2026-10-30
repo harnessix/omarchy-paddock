@@ -1151,6 +1151,10 @@ pub enum Action {
         /// Remove with uncommitted changes.
         force: bool,
     },
+    /// paddock kv: the `self` data of these finished runs, and expired keys.
+    Kv {
+        sandboxes: Vec<String>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1554,6 +1558,9 @@ pub fn apply(env: &HostEnv, containers: &dyn Containers, items: &[Item]) -> Vec<
                 Err(anyhow::anyhow!("a sandbox started in it; skipped"))
             }
             Action::Path { path } => remove_path(env, path),
+            Action::Kv { sandboxes } => {
+                crate::kv::gc_apply(env, sandboxes, state::now()).map(|_| ())
+            }
             Action::Worktree { path, .. } if running.iter().any(|r| r.project == *path) => {
                 Err(anyhow::anyhow!("a sandbox started in it; skipped"))
             }

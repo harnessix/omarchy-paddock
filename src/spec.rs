@@ -260,6 +260,12 @@ pub struct SandboxSpec {
     /// The host passthrough socket on the host (see broker.rs). Backends make
     /// it reachable inside and set PADDOCK_HOST_SOCKET to where it appears.
     pub host_socket: Option<PathBuf>,
+    /// The key-value socket of this sandbox on the host (kv.rs). Backends
+    /// make it reachable inside and set PADDOCK_KV_SOCKET.
+    pub kv_socket: Option<PathBuf>,
+    /// The host folder where the device file system of this sandbox is
+    /// mounted (devices.rs). Backends bind it to `/dev/paddock`.
+    pub devices: Option<PathBuf>,
     /// Information for the user, printed at start.
     pub notices: Vec<String>,
     /// Host PATH entries, appended after the sandbox's own entries.
@@ -313,6 +319,8 @@ impl SandboxSpec {
             mise_shared: Vec::new(),
             bus_socket: None,
             host_socket: None,
+            kv_socket: None,
+            devices: None,
             notices: Vec::new(),
             inherit_path: Vec::new(),
             generated: Vec::new(),
