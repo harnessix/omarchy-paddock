@@ -803,6 +803,7 @@ fn ps_lists_children_under_their_parent() {
         host_pid: 1,
         parent: parent.map(str::to_string),
         spawn_id: None,
+        logins: Vec::new(),
     };
     let list = vec![
         r("a", None, 1),
