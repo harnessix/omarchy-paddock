@@ -43,3 +43,10 @@ env = { OPENCODE_CONFIG_CONTENT = '{"share":"manual"}' }
 [privacy.training]
 setting = "the data settings of the model provider you sign in to"
 url = "https://opencode.ai/docs/providers/"
+
+# One task without a terminal, for `paddock-host spawn`. `opencode run --help`:
+# --file attaches a file to the message; the message is fixed text.
+[oneshot]
+args = ["run", "--auto", "--file", "{prompt_file}", "Do the task that the attached file describes."]
+prompt = "file"
+probe_args = ["run", "--help"]

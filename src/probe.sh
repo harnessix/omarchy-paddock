@@ -212,6 +212,9 @@ if command -v paddock-host >/dev/null 2>&1; then
   first_denied=${PADDOCK_PROBE_DENIED%%:*}
   paddock-host fetch "$first_denied" >/dev/null 2>&1; rc=$?
   if [ "$rc" = 8 ]; then ok host-fetch-protected-refused; else fail host-fetch-protected-refused "exit code $rc, expected 8"; fi
+  # A spawn prompt must come from the project, and a denied spawn starts nothing.
+  paddock-host spawn codex --prompt-file /etc/passwd >/dev/null 2>&1; rc=$?
+  case "$rc" in 3|4|8) ok host-spawn-refused ;; *) fail host-spawn-refused "exit code $rc, expected 3, 4 or 8" ;; esac
   if [ -e "$PADDOCK_PROBE_APPROVALS" ]; then fail host-approvals-hidden "$PADDOCK_PROBE_APPROVALS is visible"; else ok host-approvals-hidden; fi
 else
   fail host-client-connects "paddock-host is not on PATH"

@@ -61,3 +61,9 @@ env = { DISABLE_TELEMETRY = "1", DISABLE_ERROR_REPORTING = "1", CLAUDE_CODE_DISA
 [privacy.training]
 setting = "claude.ai Settings, Privacy, Help improve Claude"
 url = "https://claude.ai/settings/data-privacy-controls"
+
+# One task without a terminal, for `paddock-host spawn`. `claude --help`:
+# -p/--print prints the response and exits; the prompt comes from stdin.
+[oneshot]
+args = ["-p", "--dangerously-skip-permissions"]
+prompt = "stdin"

@@ -36,6 +36,9 @@ pub struct Options {
     pub allow_domains: Vec<String>,
     /// App mode: the session bus, instead of `[apps.NAME] bus`.
     pub app_bus: Option<crate::manifest::AppBus>,
+    /// A sandbox that another sandbox asked for (`paddock-host spawn`). It
+    /// uses the parent's settings snapshot and runs the one-shot command.
+    pub child: Option<crate::spawn::ChildPlan>,
 }
 
 /// A worktree that paddock created for one run.
@@ -208,6 +211,16 @@ pub fn worktree_counts(env: &HostEnv, w: &Worktree) -> (usize, Option<usize>) {
 }
 
 pub struct Built {
+    /// For a child sandbox: where it came from. Its broker takes the depth
+    /// and the host modes from here.
+    pub spawn: Option<crate::spawn::ChildInfo>,
+    /// Bytes for the harness's standard input (a spawn prompt).
+    pub stdin: Option<Vec<u8>>,
+    /// The repository or folder that the settings and the home belong to.
+    /// With a worktree, the repository; otherwise the project.
+    pub home_key: PathBuf,
+    /// Whether the host environment was passed.
+    pub inherit_env: bool,
     /// Who answers host passthrough requests. None means the user, through
     /// the panel, a notification or `paddock approvals`.
     pub approver: Option<std::sync::Arc<dyn crate::broker::Approver>>,
@@ -293,14 +306,23 @@ pub fn build_with(env: &HostEnv, opts: &Options, harness: Harness) -> Result<Bui
             project.display()
         );
     }
-    let loaded = Manifest::load(env, &project)?;
-    manifest::require_approval(env, &loaded, opts.assume_yes)?;
-    let m = loaded.merged.clone();
+    // A child uses the settings that its parent had when it started. The
+    // project file may have changed since: the parent can write it.
+    let m = match &opts.child {
+        Some(c) => c.manifest.clone(),
+        None => {
+            let loaded = Manifest::load(env, &project)?;
+            manifest::require_approval(env, &loaded, opts.assume_yes)?;
+            loaded.merged
+        }
+    };
     let profile = harness.profile.clone();
     // The settings and the sandbox home belong to the repository; the agent
     // works in the worktree.
     let home_key = project.clone();
-    let worktree = if opts.worktree {
+    let worktree = if let Some(c) = &opts.child {
+        Some(crate::spawn::create_worktree(env, &project, c)?)
+    } else if opts.worktree {
         Some(create_worktree(
             env,
             &project,
@@ -317,7 +339,10 @@ pub fn build_with(env: &HostEnv, opts: &Options, harness: Harness) -> Result<Bui
         .or(m.auth.mode.clone())
         .unwrap_or_else(|| "shared".into())
         .parse()?;
-    let id = state::new_id(&profile.name, &project);
+    let id = match &opts.child {
+        Some(c) => c.id.clone(),
+        None => state::new_id(&profile.name, &project),
+    };
     let home_src = state::sandbox_home(env, &profile.name, &auth, &home_key)?;
     // For `paddock du` and `paddock gc`. The sandbox can rewrite it, so they
     // read it as a hint only.
@@ -326,7 +351,7 @@ pub fn build_with(env: &HostEnv, opts: &Options, harness: Harness) -> Result<Bui
         &crate::storage::Origin::new(&home_key, &profile.name, &auth, profile.app.is_some()),
     )?;
     let mut spec = SandboxSpec::new(
-        id,
+        id.clone(),
         &profile.name,
         &project,
         home_src,
@@ -499,6 +524,18 @@ pub fn build_with(env: &HostEnv, opts: &Options, harness: Harness) -> Result<Bui
             "sh"
         };
         vec![sh.to_string()]
+    } else if opts.child.is_some() {
+        // The one-shot command. The prompt arrives on stdin or as a file in
+        // the home, never as an argument.
+        let o = profile
+            .oneshot
+            .as_ref()
+            .with_context(|| format!("the {} profile has no [oneshot] command", profile.name))?;
+        let mut c = vec![harness.exe.display().to_string()];
+        // The privacy flags are global options: before a subcommand.
+        c.extend(crate::privacy::args(&profile, privacy));
+        c.extend(o.render(&spec.home.join(crate::spawn::PROMPT_IN_HOME)));
+        c
     } else {
         let mut c = vec![harness.exe.display().to_string()];
         if !opts.no_yolo {
@@ -582,6 +619,10 @@ pub fn build_with(env: &HostEnv, opts: &Options, harness: Harness) -> Result<Bui
         .or(m.backend.clone())
         .unwrap_or_else(|| "auto".into());
     Ok(Built {
+        spawn: None,
+        stdin: None,
+        home_key,
+        inherit_env: inherit,
         approver: None,
         worktree,
         auth,

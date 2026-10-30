@@ -423,6 +423,13 @@ pub struct Running {
     /// The paddock process. Its ancestors include the terminal that runs it.
     #[serde(default)]
     pub host_pid: u32,
+    /// For a sandbox that another sandbox started (`paddock-host spawn`):
+    /// the id of that sandbox.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent: Option<String>,
+    /// The id that the parent uses for it with `paddock-host status`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spawn_id: Option<String>,
 }
 
 /// A project where a sandbox started, for the panel's "start again" list.
@@ -509,6 +516,62 @@ impl Running {
 
 pub fn alive(pid: u32) -> bool {
     unsafe { libc::kill(pid as i32, 0) == 0 }
+}
+
+/// Running sandboxes with each child right after its parent, in start
+/// order. A child whose parent is gone is listed at the top level.
+pub fn tree_order(list: Vec<Running>) -> Vec<Running> {
+    fn add(r: &Running, all: &[Running], out: &mut Vec<Running>, depth: usize) {
+        if depth > 8 || out.iter().any(|o| o.id == r.id) {
+            return;
+        }
+        out.push(r.clone());
+        for c in all.iter().filter(|c| c.parent.as_deref() == Some(&r.id)) {
+            add(c, all, out, depth + 1);
+        }
+    }
+    let mut out = Vec::new();
+    for r in &list {
+        let has_parent = r
+            .parent
+            .as_deref()
+            .is_some_and(|p| list.iter().any(|o| o.id == p));
+        if !has_parent {
+            add(r, &list, &mut out, 0);
+        }
+    }
+    out
+}
+
+/// How many running ancestors a sandbox has in `list`.
+pub fn depth_in(list: &[Running], r: &Running) -> usize {
+    let mut d = 0;
+    let mut cur = r.parent.clone();
+    while let Some(p) = cur {
+        match list.iter().find(|o| o.id == p) {
+            Some(o) if d < 8 => {
+                d += 1;
+                cur = o.parent.clone();
+            }
+            _ => break,
+        }
+    }
+    d
+}
+
+/// Every running sandbox that `id` started, and the ones they started.
+pub fn descendants(list: &[Running], id: &str) -> Vec<Running> {
+    let mut out: Vec<Running> = Vec::new();
+    let mut queue = vec![id.to_string()];
+    while let Some(p) = queue.pop() {
+        for c in list.iter().filter(|c| c.parent.as_deref() == Some(&p)) {
+            if !out.iter().any(|o| o.id == c.id) && out.len() < 64 {
+                out.push(c.clone());
+                queue.push(c.id.clone());
+            }
+        }
+    }
+    out
 }
 
 pub fn now() -> u64 {

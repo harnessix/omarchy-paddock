@@ -54,3 +54,10 @@ value = false
 [privacy.training]
 setting = "ChatGPT Settings, Data controls, Improve the model for everyone"
 url = "https://chatgpt.com/#settings/DataControls"
+
+# One task without a terminal, for `paddock-host spawn`. `codex exec --help`:
+# with `-` as the prompt, codex reads the instructions from stdin.
+[oneshot]
+args = ["exec", "--dangerously-bypass-approvals-and-sandbox", "-"]
+prompt = "stdin"
+probe_args = ["exec", "--help"]

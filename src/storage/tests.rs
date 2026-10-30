@@ -562,6 +562,8 @@ fn gc_yes_removes_only_the_automatic_tier_and_spares_running_homes() {
         window_pid: None,
         warnings: vec![],
         host_pid: std::process::id(),
+        parent: None,
+        spawn_id: None,
     }
     .register(&env)
     .unwrap();

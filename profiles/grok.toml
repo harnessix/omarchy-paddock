@@ -62,3 +62,10 @@ url = "https://github.com/xai-org/grok-build/blob/main/crates/codegen/xai-grok-p
 
 [network]
 endpoints = ["api.x.ai", "x.ai", "grok.com"]
+
+# One task without a terminal, for `paddock-host spawn`. `grok --help`:
+# --prompt-file runs one turn with the prompt from a file and prints the
+# response; --always-approve approves every tool.
+[oneshot]
+args = ["--always-approve", "--prompt-file", "{prompt_file}"]
+prompt = "file"

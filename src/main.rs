@@ -293,6 +293,10 @@ enum Cmd {
     /// Inside an app sandbox: the link and notification services on its private bus.
     #[command(hide = true)]
     Portal,
+    /// On the host: run one child sandbox that another sandbox asked for
+    /// (`paddock-host spawn`). The parent's paddock starts this.
+    #[command(hide = true)]
+    SpawnChild { job: PathBuf },
     /// Inside a container sandbox: pass connections to the host proxy socket.
     #[command(hide = true)]
     Relay {
@@ -602,6 +606,7 @@ impl RunArgs {
             shell,
             assume_yes: self.yes,
             args: self.args.clone(),
+            child: None,
         })
     }
 }
@@ -793,6 +798,7 @@ fn real_main() -> Result<i32> {
     paddock::privfs::secure_roots(&env);
     match cli.cmd {
         Cmd::Relay { .. } | Cmd::Host { .. } | Cmd::Inbound | Cmd::Portal => unreachable!(),
+        Cmd::SpawnChild { job } => paddock::spawn::child_main(&env, &job),
         Cmd::Approvals { json, cmd } => {
             use paddock::broker;
             if let Some(ApprovalsCmd::Answer { id, answer }) = cmd {
@@ -811,6 +817,9 @@ fn real_main() -> Result<i32> {
             } else {
                 for p in list {
                     println!("{}  {} in {}", p.id, p.harness, p.project.display());
+                    if let Some(c) = paddock::spawn::chain_text(&p.started_by) {
+                        println!("    {c}");
+                    }
                     for l in p.detail.lines() {
                         println!("    {l}");
                     }
@@ -1242,7 +1251,8 @@ fn real_main() -> Result<i32> {
             Ok(0)
         }
         Cmd::Ps { json } => {
-            let list = Running::list(&env);
+            // Children follow their parent.
+            let list = state::tree_order(Running::list(&env));
             if json {
                 println!(
                     "{}",
@@ -1252,10 +1262,12 @@ fn real_main() -> Result<i32> {
                 println!("No running sandboxes.");
             } else {
                 let now = state::now();
-                for r in list {
+                let depth = |r: &Running| state::depth_in(&list, r);
+                for r in &list {
+                    let id = format!("{}{}", "  ".repeat(depth(r)), r.id);
                     println!(
                         "{:<28} {:<8} {:<7} {:<7} {:>5}m  {}",
-                        r.id,
+                        id,
                         r.harness,
                         r.backend,
                         r.gui,
@@ -1297,11 +1309,28 @@ fn real_main() -> Result<i32> {
         } => recover_cmd(&env, &id, paths, all, to.as_deref(), keep),
         Cmd::Discard { id, paths, all } => discard_cmd(&env, &id, paths, all),
         Cmd::Stop { id } => {
-            let Some(r) = Running::list(&env).into_iter().find(|r| r.id == id) else {
+            let all = Running::list(&env);
+            let Some(r) = all.iter().find(|r| r.id == id) else {
                 bail!("no running sandbox with id {id}")
             };
+            // The sandboxes that this one started stop with it. Its own
+            // paddock stops them too when it ends; this does not wait for that.
+            let children = state::descendants(&all, &id);
+            for c in &children {
+                unsafe { libc::kill(c.pid as i32, libc::SIGTERM) };
+            }
             unsafe { libc::kill(r.pid as i32, libc::SIGTERM) };
             println!("Sent SIGTERM to {id}.");
+            if !children.is_empty() {
+                println!(
+                    "Sent SIGTERM to the sandboxes it started: {}.",
+                    children
+                        .iter()
+                        .map(|c| c.id.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+            }
             Ok(0)
         }
         Cmd::Doctor {
@@ -1916,6 +1945,7 @@ fn approver_cmd(env: &HostEnv, cmd: ApproverCmd) -> Result<i32> {
                 created: paddock::state::now(),
                 expires: paddock::state::now() + 60,
                 session_allowed: true,
+                started_by: vec![],
             };
             let (a, note) = ap::run_hook(&hook, &p);
             match a {

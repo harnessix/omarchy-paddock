@@ -444,6 +444,7 @@ Sometimes the agent needs one thing from your computer: a screenshot of the real
 | `notify` | Shows a desktop notification | allow |
 | `git-push` | Pushes commits to a remote of the project, with your credentials | ask |
 | `forge` | Runs a fixed set of `gh` commands on the project's repository, with your login | reads allow, writes ask |
+| `spawn` | Starts another harness in its own sandbox with one task (see [Spawn other agents](#spawn-other-agents)) | ask, and off until `[spawn] harnesses` lists one |
 
 A request that asks waits for your answer for up to two minutes. You can answer in three places, and the first answer wins:
 
@@ -480,6 +481,43 @@ For `gh`, only these commands exist: `pr create`, `pr view`, `pr list`, `pr chec
 To make reads ask too, or to turn either capability off, set it in `[host]`, for example `forge = "deny"`. `forge = "allow"` also allows the write commands without a question. `git-push = "allow"` allows ordinary pushes, but force pushes, pushes to the default branch and pushes to a new remote still ask.
 
 `paddock log` shows every request with its decision and result. The log is `~/.local/state/paddock/host-audit.jsonl`. It does not keep text that can be private. For `clipboard-write`, it keeps only the length of the text. For `exec`, it keeps the program and the number of arguments, because arguments can hold tokens. For `forge`, it keeps the command without the body text. For `notify`, it keeps the lengths of the title and the body. For `open-url`, it keeps the scheme and the host. paddock makes its folders readable only by you (mode 0700) and its files too (mode 0600), and tightens older ones that other users can read. Request text never goes into the arguments of a host process, which other users can see: notifications go over the desktop bus, and `gh` reads the body on its standard input. To teach agents the client, run `paddock skill install`: it copies a short skill into the skill folders of your harnesses. Inside a sandbox, `paddock-host --help` is the full reference.
+
+### Spawn other agents
+
+An agent in a sandbox can start an agent of another harness. For example, Claude plans the work and Codex writes one part of it. The agent asks with `paddock-host spawn`. paddock then starts a second sandbox on the host, next to the first one. It does not put a sandbox inside a sandbox.
+
+```sh
+paddock-host spawn codex --worktree --prompt-file task.md   # prints an id
+paddock-host status <id>
+paddock-host wait <id> --timeout 600
+paddock-host kill <id>
+```
+
+The child runs the harness once, without a terminal (`claude -p`, `codex exec`, `opencode run`, `copilot -p`, `agy --print` or `grok --prompt-file`), and stops when the task is done. It works in a new worktree on the branch `paddock/spawn-<harness>-<id>`, from the commit that the parent has checked out. When it ends, paddock writes the results to `.paddock/inbox/spawn-<id>/` in the parent's project: `result.json` with the state, the exit code, the branch, the commit count and a diff summary, and `output.txt` with the end of the child's final output. The parent reads the branch with git and merges what it wants.
+
+Spawn is off until you turn it on. Only `~/.config/paddock/config.toml` can turn it on. A project `paddock.toml` cannot.
+
+```toml
+[host]
+spawn = "ask"            # deny | ask | allow; ask is the default
+
+[spawn]
+harnesses = ["codex"]    # the harnesses that a sandbox may start; empty by default
+max_running = 2          # children of one sandbox that run at the same time
+max_depth = 1            # 1: a child cannot start children of its own
+timeout = 1800           # seconds that one child may run in total
+```
+
+These rules always hold:
+
+- A child never gets more than its parent. It gets the same backend, network mode, LAN setting, environment mode and approved mounts, and the same project. It gets no display. Its host capability modes are at most those of the parent. paddock uses the settings that the parent had when it started, so a change to `paddock.toml` during the run does not reach the child.
+- No credentials move between sandboxes. The child uses its own login of its harness, in its own sandbox home. The parent never sees it. The parent gets only the results.
+- The first spawn of each harness in a session asks you. The card shows the harness, the login it uses and the task. "Allow for this session" covers only that harness.
+- Requests from a child, for example `git-push` or `exec`, show "Started by sandbox X" on the card. An "Allow for this session" answer for the parent does not apply to the child, and an answer for the child does not apply to the parent. Otherwise a sandbox could avoid a question by giving the work to a child.
+- paddock counts the running children and the depth on the host. A child stops when its parent ends, when you run `paddock stop` on the parent, after `timeout` seconds, or with `paddock-host kill`. No child keeps using your quota after the parent is gone.
+- The task never goes into the arguments of a process, which other users can see. The harness reads it on its standard input or from a private file. paddock reads the prompt file from the project without following symlinks, refuses pipes and devices, and allows at most 256 KiB.
+
+`paddock ps` shows children under their parent. `paddock log` records the parent, the child, the harness, the branch, the exit status and the durations. It never records the task or the output. Gemini CLI has no one-shot entry yet, because paddock did not check its flags on a real install.
 
 You can let an agent on the host answer requests for you (`paddock approver`). paddock trusts that setting only from a root-owned file (`sudo paddock approver enable --system`) or from a file signed with a password that you type when a sandbox starts, so that a process on your computer cannot turn it on for itself. The agent approver can only answer the capabilities that you list, the rules above still hold, and if it does not answer clearly, the request comes to you.
 
@@ -632,9 +670,15 @@ value = false
 [privacy.training]
 setting = "Settings, Data, Use my data for training"
 url = "https://example.com/settings/data"
+
+# The one-shot mode for `paddock-host spawn`. Optional.
+[oneshot]
+args = ["run", "--yes-to-everything", "--task-file", "{prompt_file}"]
+prompt = "file"          # or "stdin"
+probe_args = ["run", "--help"]
 ```
 
-Before each start, paddock makes sure that the help text of the harness still mentions every flag in `yolo_args`. If a flag is renamed, paddock stops with an error and does not start a harness that waits for approvals.
+Before each start, paddock makes sure that the help text of the harness still mentions every flag in `yolo_args`. If a flag is renamed, paddock stops with an error and does not start a harness that waits for approvals. A spawn makes the same check for the flags in `[oneshot] args`, with the help text of `probe_args`. The task never goes into `args`: with `prompt = "stdin"` the harness reads it on its standard input, and with `prompt = "file"` paddock replaces `{prompt_file}` with the path of a private file in the sandbox home.
 
 ## Limits
 

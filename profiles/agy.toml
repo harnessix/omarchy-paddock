@@ -31,3 +31,10 @@ endpoints = ["generativelanguage.googleapis.com", "oauth2.googleapis.com", "clou
 [privacy.training]
 setting = "type /settings in agy and turn off Enable Telemetry"
 url = "https://antigravity.google/docs/settings"
+
+# One task without a terminal, for `paddock-host spawn`. `agy --help`:
+# --print runs one prompt and prints the response; the prompt is the value
+# of --print, so it is fixed text that names the file.
+[oneshot]
+args = ["--dangerously-skip-permissions", "--print", "Read the file {prompt_file} and do the task that it describes."]
+prompt = "file"
