@@ -315,6 +315,13 @@ enum Cmd {
     /// (`paddock-host spawn`). The parent's paddock starts this.
     #[command(hide = true)]
     SpawnChild { job: PathBuf },
+    /// Update the launcher entries, the Omarchy menu and the shell shims to
+    /// the harnesses installed now. Only the parts that are turned on.
+    Refresh {
+        /// Print nothing, and only add entries (for the background refresh).
+        #[arg(long)]
+        quiet: bool,
+    },
     /// The Omarchy agents panel's `omarchy-agent-usage-update`, through
     /// paddock: a login that a sandbox holds is checked from paddock's side.
     #[command(hide = true)]
@@ -908,6 +915,14 @@ fn real_main() -> Result<i32> {
     }
     let env = HostEnv::detect()?;
     paddock::privfs::secure_roots(&env);
+    // A harness start: bring the menu and the shims up to date in the
+    // background when harnesses or paddock changed.
+    if matches!(
+        cli.cmd,
+        Cmd::Run(_) | Cmd::External(_) | Cmd::Wrap { .. } | Cmd::Shell(_)
+    ) {
+        paddock::refresh::spawn_if_changed(&env);
+    }
     match cli.cmd {
         Cmd::Relay { .. } | Cmd::Host { .. } | Cmd::Inbound | Cmd::Portal => unreachable!(),
         Cmd::SpawnChild { job } => paddock::spawn::child_main(&env, &job),
@@ -1149,6 +1164,20 @@ fn real_main() -> Result<i32> {
             Ok(0)
         }
         Cmd::Pick { harness } => pick(&env, &harness),
+        Cmd::Refresh { quiet } => {
+            let r = paddock::refresh::sync(&env, !quiet)?;
+            if !quiet {
+                match &r.launchers {
+                    Some(l) => println!("menu entries: {}", l.join(", ")),
+                    None => println!("menu entries: off (paddock launchers install)"),
+                }
+                match &r.shims {
+                    Some(s) => println!("shell shims: {}", s.join(", ")),
+                    None => println!("shell shims: off (paddock shims install)"),
+                }
+            }
+            Ok(0)
+        }
         Cmd::OmarchyUsageUpdate { args } => paddock::omarchy_usage::update(&env, &args),
         Cmd::Wrap { command } => paddock::wrap::main(env, &command),
         Cmd::Shims {
@@ -1764,6 +1793,11 @@ fn update_cmd(env: &HostEnv, check: bool, yes: bool) -> Result<i32> {
         update::install(env, &gh as &dyn Source, &rel, &target, None, &tar)?;
         println!("Updated {} to paddock {}.", target.display(), rel.version);
         println!("Running sandboxes keep the old version until they exit.");
+        // The new version may bring profiles: its menu entries and shims.
+        let _ = std::process::Command::new(&target)
+            .arg("refresh")
+            .stdin(std::process::Stdio::null())
+            .status();
     }
     if plugin {
         update::update_plugin(env)?;

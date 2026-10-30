@@ -31,6 +31,7 @@ pub mod privfs;
 pub mod profile;
 pub mod proxy;
 pub mod recover;
+pub mod refresh;
 pub mod report;
 pub mod run;
 pub mod safefs;
