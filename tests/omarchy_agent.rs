@@ -507,6 +507,30 @@ fn history_reaches_the_host_and_other_projects_stay_hidden() {
 }
 
 #[test]
+fn a_normal_run_keeps_its_history_in_the_sandbox() {
+    if !bwrap_works() {
+        eprintln!("skipped: bwrap cannot create a user namespace here");
+        return;
+    }
+    let w = world();
+    // Only `paddock wrap` starts share history with the host. A normal run
+    // keeps it in the sandbox home, so a sandbox-written transcript never
+    // reaches `claude --resume` or `codex resume` on the host.
+    write_exec(
+        &w.tools.join("claude"),
+        "#!/bin/sh\nmkdir -p \"$HOME/.claude/projects/p\"\nprintf '{\"t\":1}\\n' > \"$HOME/.claude/projects/p/s.jsonl\"\n",
+    );
+    ok(&w.paddock(&["run", "--no-yolo", "claude"]));
+    assert!(!w.home.join(".claude/projects/p").exists());
+    write_exec(
+        &w.tools.join("codex"),
+        "#!/bin/sh\nmkdir -p \"$HOME/.codex/sessions/2026/10/31\"\nprintf 'x\\n' > \"$HOME/.codex/sessions/2026/10/31/rollout-9.jsonl\"\n",
+    );
+    ok(&w.paddock(&["run", "--no-yolo", "codex"]));
+    assert!(!w.home.join(".codex/sessions/2026/10/31").exists());
+}
+
+#[test]
 fn a_start_in_the_home_folder_works_in_a_scratch_project() {
     if !bwrap_works() {
         eprintln!("skipped: bwrap cannot create a user namespace here");

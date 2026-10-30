@@ -750,7 +750,7 @@ paddock has a profile for every agent that `omarchy-agent` can start. `paddock d
 
 #### Usage statistics in the Omarchy agents panel
 
-The agents panel reads the session history of each agent from fixed places in your home folder. A sandbox keeps its history in its own home, so paddock brings it back:
+The agents panel reads the session history of each agent from fixed places in your home folder. A sandbox keeps its history in its own home. For starts through `omarchy-agent` (`paddock wrap`), paddock brings it back. Other runs keep their history in the sandbox home: a transcript that a sandbox wrote and that your host harness loads later, for example with `claude --resume`, could carry instructions out of the sandbox.
 
 - Claude Code keeps one folder per project in `~/.claude/projects`. paddock binds the host folder of the current project into the sandbox, read-write. The sandbox sees only this one folder, no other project's. `claude --resume` on the host also finds these sessions.
 - Codex (`~/.codex/sessions`) and Grok Build (`~/.grok/sessions`) keep their history by date or by session. At the end of a session, paddock copies new history files back. It copies a file only when the host has none, or when the sandbox only added to it. It never follows a symlink in the sandbox home.

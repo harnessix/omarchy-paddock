@@ -233,6 +233,8 @@ pub struct Built {
     pub parent: Option<String>,
     /// For a spawned sandbox: the devices of its parent. It gets no other.
     pub device_ceiling: Option<Vec<String>>,
+    /// The run shares session history with the host (`paddock wrap` starts).
+    pub shared_history: bool,
     /// Serve the built-in `echo` device whatever the user configuration says.
     /// `paddock doctor --escape` tests the device mount with it.
     pub test_devices: bool,
@@ -497,7 +499,15 @@ pub fn build_with(env: &HostEnv, opts: &Options, harness: Harness) -> Result<Bui
         }
     }
     check_harness_install(&harness, &sandbox_writable(env, &spec))?;
-    crate::history::apply(env, &profile, &auth, &mut spec)?;
+    // Host history only for starts through `paddock wrap` (omarchy-agent),
+    // where the Omarchy agents panel needs it. A sandbox-written transcript
+    // that the host harness loads later (`claude --resume`, `codex resume`)
+    // can carry instructions out of the sandbox, so other runs keep their
+    // history private in the sandbox home.
+    let shared_history = opts.transparent.is_some();
+    if shared_history {
+        crate::history::apply(env, &profile, &auth, &mut spec)?;
+    }
     if let state::AuthMode::Account { dir, .. } = &auth {
         // The host writes refreshed tokens back into the account folder. A
         // folder that a sandbox can write could lead those writes anywhere.
@@ -710,6 +720,7 @@ pub fn build_with(env: &HostEnv, opts: &Options, harness: Harness) -> Result<Bui
         parent: None,
         device_ceiling: None,
         test_devices: false,
+        shared_history,
         worktree,
         auth,
         spec,
