@@ -429,6 +429,9 @@ fn scan_reads_homes_sessions_and_keyrings() {
     let project = env.home.join("src/app");
     std::fs::create_dir_all(&project).unwrap();
     let live = make_home(&env, "claude", &project, false);
+    // Big enough for its own data blocks: btrfs keeps small files inline in
+    // its metadata, and `btrfs filesystem du` reports 0 exclusive bytes then.
+    std::fs::write(live.join("data.bin"), vec![7u8; 256 * 1024]).unwrap();
     let gone_project = env.home.join("src/removed");
     let gone = make_home(&env, "claude", &gone_project, false);
     let legacy = env
