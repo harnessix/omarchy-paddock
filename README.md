@@ -705,6 +705,7 @@ After `install`, typing `claude` in a new shell runs `paddock run claude` in the
 - In your home directory, the command stops with an error, because paddock does not use the home directory as a project. Go to a project first.
 - Shell functions win over PATH, so version managers such as mise do not bypass them. Scripts and programs that start `claude` themselves are not covered: only interactive bash and zsh shells. For the agents that Omarchy starts, see the next section.
 - If paddock or the script is gone, each function runs the real program, and the line in the rc file does nothing.
+- When you install another agent, or a newer paddock brings a profile, the next harness start updates the script in the background (see [Keeping the menu and the shims current](#keeping-the-menu-and-the-shims-current)).
 - `paddock doctor` lists the commands that start in a sandbox, the rc file that loads them, and how to turn them off. Each run also prints a `paddock:` line with the sandbox it started, so you always see when a shim takes over.
 
 ### Only the agents that Omarchy starts
@@ -786,6 +787,16 @@ paddock launchers list      # what install would create
 paddock launchers install
 paddock launchers remove    # removes everything that install wrote, and nothing else
 ```
+
+### Keeping the menu and the shims current
+
+The menu entries, the Omarchy menu block and the shell shims list the harnesses that were installed when you turned them on. paddock keeps them current:
+
+- On a harness start, paddock compares a cheap signal with the one of the last update: its version and the modification times of the folders on `PATH`. Installing an agent with mise or into `~/.local/bin` changes a folder on `PATH`. When the signal changed, paddock runs `paddock refresh --quiet` in the background, and the start does not wait.
+- `paddock update` runs `paddock refresh` with the new version.
+- `paddock refresh` adds the entries and shims of new harnesses and removes those of harnesses that are gone. The background run only adds: with a smaller `PATH`, it could miss a harness, and a missing shim would start that harness without the sandbox.
+- Only the parts that you turned on change. `~/.bashrc` and `~/.zshrc` do not change.
+- `paddock doctor` names the harnesses that the menu or the shims miss.
 
 ## Project settings
 

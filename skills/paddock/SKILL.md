@@ -75,7 +75,7 @@ Most users never type `paddock`. Turn on both of these, and tell the user what t
 paddock setup --yes --shims --launchers
 ```
 
-`--shims`: `claude`, `codex` and others start in a sandbox in bash and zsh. `--launchers`: menu entries in a "Paddock" folder (Super+Space on Omarchy). `paddock shims install` and `paddock launchers install` do the same one at a time.
+`--shims`: `claude`, `codex` and others start in a sandbox in bash and zsh. After the user installs another agent, the next harness start adds its menu entry and shim; `paddock refresh` does it at once, and `paddock doctor` names what is missing. `--launchers`: menu entries in a "Paddock" folder (Super+Space on Omarchy). `paddock shims install` and `paddock launchers install` do the same one at a time.
 
 On Omarchy, `paddock shims install --scope omarchy-agent` puts only the agents that `omarchy-agent` starts (the agent key, the console, the agents panel, the alias `a`) in a sandbox. Typed commands and scripts do not change. Ask the user before you run it, and tell them what it changes: one marked block in `~/.config/mise/config.toml`, one in `~/.config/hypr/hyprland.lua`, and from then on every agent start from Omarchy runs through `paddock wrap`. `paddock shims remove` undoes it. If paddock reports that the file already has its own `[wrappers.omarchy-agent]`, do not edit or remove the user's entry; tell the user.
 

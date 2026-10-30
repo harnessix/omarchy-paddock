@@ -111,6 +111,29 @@ pub struct Report {
     pub rc_files: Vec<PathBuf>,
 }
 
+/// Write the functions again for the harnesses installed now. The lines in
+/// ~/.bashrc and ~/.zshrc stay as they are.
+///
+/// Without `prune`, a command that has a function now and that detection
+/// does not find leaves the script as it is: a background refresh with a
+/// smaller PATH must never let a harness start without the sandbox.
+pub fn rewrite_script(env: &HostEnv, prune: bool) -> Result<Vec<(String, String)>> {
+    let paddock = launchers::launcher_exe(env)?;
+    let shims = detect(env)?;
+    if !prune {
+        let found: Vec<&String> = shims.iter().map(|(_, c)| c).collect();
+        if active(env).iter().any(|c| !found.contains(&c)) {
+            return Ok(shims);
+        }
+    }
+    let file = script_file(env);
+    let text = script(&shims, &paddock);
+    if std::fs::read_to_string(&file).ok().as_deref() != Some(text.as_str()) {
+        crate::privfs::write(&file, text)?;
+    }
+    Ok(shims)
+}
+
 pub fn install(env: &HostEnv) -> Result<Report> {
     let paddock = launchers::launcher_exe(env)?;
     let shims = detect(env)?;
