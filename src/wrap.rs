@@ -302,6 +302,17 @@ pub fn main(env: HostEnv, argv: &[String]) -> Result<i32> {
         tell_unsandboxed(&env, &argv[0], "paddock does not know this form of command");
         return exec_unchanged(&env, argv);
     };
+    if let Some(why) = profile_for(&env, parsed.name()).and_then(|p| {
+        HarnessFactory::new(&env)
+            .ok()?
+            .profile(&p)?
+            .launch
+            .wrap_on_host
+            .clone()
+    }) {
+        tell_unsandboxed(&env, parsed.name(), &why);
+        return exec_unchanged(&env, argv);
+    }
     let cwd = std::env::current_dir()?;
     let plan = match plan(&env, &parsed, &cwd) {
         Ok(Some(p)) => p,

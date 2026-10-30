@@ -549,6 +549,22 @@ pub fn build_with(env: &HostEnv, opts: &Options, harness: Harness) -> Result<Bui
         }
     }
     crate::mcp::apply(env, &profile, &m, &project, &mut spec);
+    crate::privacy::push_settings(
+        &profile,
+        &profile.state.settings,
+        &format!("{porigin} state.settings"),
+        &mut spec,
+    )?;
+    if spec.network != Network::None {
+        for p in &profile.network.publish {
+            if !spec.publish.contains(p) {
+                spec.publish.push(*p);
+            }
+        }
+    }
+    if let Some(why) = &profile.launch.wrap_on_host {
+        spec.warnings.push(format!("{}: {why}", profile.name));
+    }
     // Last, so neither the host environment nor a project file turns
     // telemetry back on. Only the user configuration can ([privacy]).
     let privacy = crate::privacy::mode(&m);
@@ -595,7 +611,10 @@ pub fn build_with(env: &HostEnv, opts: &Options, harness: Harness) -> Result<Bui
             c.extend(profile.launch.yolo_args.iter().cloned());
         }
         c.extend(crate::privacy::args(&profile, privacy));
-        c.extend(profile.launch.args.iter().cloned());
+        // Transparent: the command already has the arguments it needs.
+        if opts.transparent.is_none() {
+            c.extend(profile.launch.args.iter().cloned());
+        }
         // An editor that opens the repository opens the worktree instead.
         let repo_arg = home_key.display().to_string();
         c.extend(opts.args.iter().map(|a| match &worktree {
@@ -823,6 +842,27 @@ mod tests {
         // A project cannot turn vendor mode off either.
         let (_t, b) = privacy_spec("codex", vendor, off);
         assert!(b.spec.home_settings.is_empty());
+    }
+
+    #[test]
+    fn profile_ports_settings_and_host_notices_reach_the_spec() {
+        // dsh serves its UI to the host browser on one loopback port.
+        let (_t, b) = privacy_spec("dsh", "", "");
+        assert_eq!(b.spec.publish, vec![3080]);
+        let (_t, b) = privacy_spec("dsh", "[network]\nmode = \"none\"\n", "");
+        assert!(b.spec.publish.is_empty());
+        // A self-update switch goes into the sandbox copy of the settings.
+        let (_t, b) = privacy_spec("devin", "", "");
+        assert!(b
+            .spec
+            .home_settings
+            .iter()
+            .any(|s| s.path == ["auto_update"]
+                && s.value == serde_json::json!(false)
+                && s.origin.contains("state.settings")));
+        // muse keeps its own sandbox: `paddock muse` says what that means.
+        let (_t, b) = privacy_spec("muse", "", "");
+        assert!(b.spec.warnings.iter().any(|w| w.contains("own sandbox")));
     }
 
     #[test]

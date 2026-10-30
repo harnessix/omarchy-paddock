@@ -1,0 +1,36 @@
+name = "omp"
+description = "Oh My Pi"
+
+# Entries that come from documentation, not from a test. paddock doctor lists them.
+unverified = [
+  "every entry: omp was not installed when this profile was written",
+  "state.auth .omp/agent/auth.json: where the login is kept (pi, which omp is built on, keeps it there)",
+]
+
+# mise tool: oh-my-pi
+[locate]
+mise = "omp"
+commands = ["omp"]
+
+[launch]
+login_callback = true
+# --auto-approve forces the yolo approval mode; deny rules still apply.
+# https://github.com/can1357/oh-my-pi/blob/main/docs/approval-mode.md
+yolo_args = ["--auto-approve"]
+
+[state]
+auth = [".omp/agent/auth.json"]
+import_ro = [".omp/agent/skills", ".omp/agent/extensions", ".agents/skills"]
+seed = [".omp/agent/config.yml", ".omp/agent/models.yml"]
+env_pass = ["ANTHROPIC_API_KEY", "OPENAI_API_KEY", "GEMINI_API_KEY", "OPENROUTER_API_KEY"]
+
+# omp documents no telemetry switch.
+[privacy.training]
+setting = "the data settings of the model provider you sign in to"
+url = "https://github.com/can1357/oh-my-pi"
+
+# One task without a terminal: -p answers and exits. The prompt text is
+# fixed and names the file. https://github.com/can1357/oh-my-pi
+[oneshot]
+args = ["--auto-approve", "-p", "Read the file {prompt_file} and do the task that it describes."]
+prompt = "file"

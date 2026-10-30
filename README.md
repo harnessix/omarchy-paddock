@@ -737,6 +737,19 @@ paddock shims remove                          # removes both scopes
 
 Codex starts its own sandbox for each command. That sandbox cannot start inside paddock. With `--approve-for-me`, Codex runs the command again without it, inside paddock's sandbox.
 
+paddock has a profile for every agent that `omarchy-agent` can start. `paddock doctor` lists the entries of each profile that come from documentation and not from a test.
+
+| Agent | In a sandbox | Notes |
+| :--- | :--- | :--- |
+| claude, codex, copilot, opencode, agy, grok | yes | Tested. claude, codex and grok follow Omarchy's account switch. |
+| hermes, pi | yes | Tested: they start in the sandbox. Their code is read-only there, so `hermes update` runs on the host. |
+| crush, cursor-agent, omp, ori, kimi, qwen, mcode, kiro-cli, freebuff, kilo, devin, amp, commandcode | yes | From the vendors' documentation. They were not installed when the profiles were written. |
+| dsh | yes | `dsh web` serves its page on port 3080. paddock forwards that one port from 127.0.0.1 of your machine into the sandbox. |
+| muse | no | Muse runs each shell command in its own bubblewrap sandbox, and refuses the command when that sandbox cannot start. paddock blocks nested sandboxes, so muse starts on the host with its own sandbox, and paddock shows a notice. paddock never turns muse's sandbox off. |
+| openclaw | no | Its agent runs in the OpenClaw gateway, a service on your machine. The terminal UI only talks to it, so a sandbox around the UI protects nothing. Starts from `omarchy-agent` run as before, with a notice. `paddock openclaw` runs OpenClaw's embedded runtime in a sandbox, with its own state folder in the sandbox home. |
+
+Inside the sandbox, the installs of the agents are read-only. mise updates them on the host before each start (`auto_update`). Where a vendor documents a switch, paddock turns the agent's own self-update off in the sandbox. Other self-updates fail with "Read-only file system".
+
 ## Launchers
 
 `paddock launchers install` adds a launcher entry for every harness and app that paddock finds on this machine, with the paddock icon, in a "Paddock" folder:
@@ -807,6 +820,34 @@ url = "https://example.com/settings/data"
 args = ["run", "--yes-to-everything", "--task-file", "{prompt_file}"]
 prompt = "file"          # or "stdin"
 probe_args = ["run", "--help"]
+```
+
+More entries, for harnesses that need them:
+
+```toml
+[launch]
+# paddock wrap runs the harness on the host, with this notice.
+wrap_on_host = "it keeps its own sandbox, which cannot start inside paddock"
+
+[state]
+# An entry that ends with / is a folder: paddock copies every file in it.
+auth = [".myagent/credentials/"]
+
+# The folder that an account variable replaces, for paddock wrap.
+[state.account]
+env = "MYAGENT_HOME"
+dir = ".myagent"
+
+# Values written into the sandbox copy of a settings file, for example to
+# turn off a self-update that cannot work on the read-only install.
+[[state.settings]]
+file = ".myagent/settings.json"
+path = ["auto_update"]
+value = false
+
+[network]
+# A loopback port of the sandbox that the host browser reaches on 127.0.0.1.
+publish = [3080]
 ```
 
 Before each start, paddock makes sure that the help text of the harness still mentions every flag in `yolo_args`. If a flag is renamed, paddock stops with an error and does not start a harness that waits for approvals. A spawn makes the same check for the flags in `[oneshot] args`, with the help text of `probe_args`. The task never goes into `args`: with `prompt = "stdin"` the harness reads it on its standard input, and with `prompt = "file"` paddock replaces `{prompt_file}` with the path of a private file in the sandbox home.

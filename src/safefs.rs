@@ -464,6 +464,18 @@ impl Root {
 }
 
 impl Dir {
+    /// The names of the regular files directly in this folder. Symlinks and
+    /// everything else are left out.
+    pub fn file_names(&self) -> Result<Vec<OsString>> {
+        let mut out = Vec::new();
+        for n in list(&self.fd)? {
+            if self.kind(&n)? == Some(Kind::File) {
+                out.push(n);
+            }
+        }
+        Ok(out)
+    }
+
     pub fn path(&self) -> &Path {
         &self.path
     }

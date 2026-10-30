@@ -1,0 +1,36 @@
+name = "dsh"
+description = "DeepSeek Harness"
+
+# Entries that come from documentation, not from a test. paddock doctor lists them.
+unverified = [
+  "every entry: dsh was not installed when this profile was written",
+  "state.auth .dsh/.credentials.yaml and .dsh/.env: where the API key is kept",
+  "network.publish 3080: the port of `dsh web`",
+]
+
+# mise tool: npm:@deepseek-ai/dsh
+[locate]
+mise = "dsh"
+commands = ["dsh"]
+
+[launch]
+# No flag for no approvals: DSH_PERMISSION_MODE sets the mode, and
+# omarchy-agent sets it to danger-full-access. `dsh web` opens its page in
+# the browser; paddock opens it in the host browser after you allow it.
+login_callback = true
+
+[network]
+# `dsh web` serves its browser UI on http://127.0.0.1:3080. paddock forwards
+# this one port from 127.0.0.1 of the host into the sandbox, so the host
+# browser reaches it. https://github.com/deepseek-ai/deepseek-harness
+publish = [3080]
+
+[state]
+auth = [".dsh/.credentials.yaml", ".dsh/.env"]
+import_ro = [".dsh/skills", ".agents/skills"]
+env_pass = ["DEEPSEEK_API_KEY"]
+
+# DeepSeek documents no telemetry switch for dsh.
+[privacy.training]
+setting = "the data settings of your DeepSeek platform account"
+url = "https://github.com/deepseek-ai/deepseek-harness"

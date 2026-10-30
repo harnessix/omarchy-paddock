@@ -56,7 +56,18 @@ pub fn apply(profile: &Profile, mode: Telemetry, spec: &mut SandboxSpec) -> Resu
     for (k, v) in &profile.privacy.env {
         spec.set_env(k, v.clone(), &origin);
     }
-    for s in &profile.privacy.settings {
+    push_settings(profile, &profile.privacy.settings, &origin, spec)
+}
+
+/// Add settings entries of a profile to the values that paddock writes into
+/// the sandbox home.
+pub fn push_settings(
+    profile: &Profile,
+    settings: &[crate::profile::Setting],
+    origin: &str,
+    spec: &mut SandboxSpec,
+) -> Result<()> {
+    for s in settings {
         let file = PathBuf::from(&s.file);
         if file.as_os_str().is_empty()
             || !file.components().all(|c| matches!(c, Component::Normal(_)))
@@ -81,7 +92,7 @@ pub fn apply(profile: &Profile, mode: Telemetry, spec: &mut SandboxSpec) -> Resu
             format: s.format.clone(),
             path: crate::state::expand_path(&s.path, &spec.project),
             value,
-            origin: origin.clone(),
+            origin: origin.to_string(),
         });
     }
     Ok(())

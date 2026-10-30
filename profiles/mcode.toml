@@ -1,0 +1,37 @@
+name = "mcode"
+description = "MiniMax Code"
+
+# Entries that come from documentation, not from a test. paddock doctor lists them.
+unverified = [
+  "every entry: mcode was not installed when this profile was written",
+  "the login file: MiniMax documents only the folder ~/.minimax, so a login stays in the sandbox home",
+  "oneshot --permission full: the documentation lists the value without its meaning",
+]
+
+# mise tool: npm:@minimax-ai/code
+[locate]
+mise = "mcode"
+commands = ["mcode"]
+
+[launch]
+# `mcode login` opens the browser and waits on a callback port.
+# The terminal UI has no flag for no approvals.
+# https://agent.minimax.io/docs/cli/quick-start
+login_callback = true
+
+[state]
+seed = [".minimax/config.yaml"]
+import_ro = [".agents/skills"]
+env_pass = ["MCODE_PROVIDER_API_KEY"]
+
+# MiniMax documents no telemetry switch for the npm release.
+[privacy.training]
+setting = "the data settings of your MiniMax account"
+url = "https://agent.minimax.io/docs/cli/faq"
+
+# One task without a terminal: `mcode exec --input -` reads the prompt from
+# stdin. https://agent.minimax.io/docs/cli/faq
+[oneshot]
+args = ["exec", "--permission", "full", "--input", "-"]
+prompt = "stdin"
+probe_args = ["exec", "--help"]

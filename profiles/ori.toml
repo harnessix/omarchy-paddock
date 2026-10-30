@@ -1,0 +1,37 @@
+name = "ori"
+description = "OpenRouter Ori"
+
+# Entries that come from documentation, not from a test. paddock doctor lists them.
+unverified = [
+  "every entry: ori was not installed when this profile was written",
+  "launch.keyring: ori keeps its login in the system keyring by default",
+]
+
+# mise tool: ori
+[locate]
+mise = "ori"
+commands = ["ori"]
+
+[launch]
+# Ori is a launcher; `ori code` is its own coding agent, which asks no
+# approvals. omarchy-agent starts `ori code`.
+args = ["code"]
+login_callback = true
+# The login goes to the system keyring: a private one per sandbox.
+keyring = true
+# The install is read-only in the sandbox; mise updates it on the host.
+# https://openrouter.ai/docs/guides/ori/configuration
+env = { ORI_DISABLE_AUTOUPDATER = "1" }
+
+[state]
+seed = [".ori/config.json"]
+import_ro = [".agents/skills"]
+env_pass = ["OPENROUTER_API_KEY"]
+
+# https://openrouter.ai/docs/guides/ori/configuration
+[privacy]
+env = { ORI_TELEMETRY = "0" }
+
+[privacy.training]
+setting = "OpenRouter Settings, Privacy"
+url = "https://openrouter.ai/settings/privacy"

@@ -1,0 +1,49 @@
+name = "kimi"
+description = "Moonshot Kimi Code"
+
+# Entries that come from documentation, not from a test. paddock doctor lists them.
+unverified = [
+  "every entry: kimi was not installed when this profile was written",
+]
+
+# mise tool: npm:@moonshot-ai/kimi-code
+[locate]
+mise = "kimi"
+commands = ["kimi"]
+
+[launch]
+# `kimi login` uses a device code, without a localhost callback.
+# --yolo: approve tool calls without asking.
+# https://www.kimi.com/code/docs/kimi-code-cli/reference/kimi-command.html
+yolo_args = ["--yolo"]
+# The install is read-only in the sandbox; mise updates it on the host.
+# https://www.kimi.com/code/docs/en/kimi-code-cli/configuration/env-vars.html
+env = { KIMI_CODE_NO_AUTO_UPDATE = "1" }
+
+[state]
+# One login file per provider, and MCP tokens, in credentials/.
+# https://www.kimi.com/code/docs/en/kimi-code-cli/configuration/data-locations.html
+auth = [".kimi-code/credentials/", ".kimi-code/credentials/mcp/"]
+# A writable copy: config.toml can also hold provider keys.
+seed = [".kimi-code/config.toml", ".kimi-code/tui.toml"]
+import_ro = [".kimi-code/mcp.json", ".agents/skills"]
+env_pass = ["KIMI_MODEL_API_KEY", "KIMI_MODEL_NAME"]
+
+[[mcp]]
+file = ".kimi-code/mcp.json"
+path = ["mcpServers"]
+
+# https://www.kimi.com/code/docs/en/kimi-code-cli/configuration/env-vars.html
+[privacy]
+env = { KIMI_DISABLE_TELEMETRY = "1" }
+
+[privacy.training]
+setting = "the data settings of your Kimi account"
+url = "https://www.kimi.com/code/docs/en/kimi-code-cli/configuration/config-files"
+
+# One task without a terminal: --prompt prints the answer and exits, with the
+# auto permission policy. It cannot be combined with --yolo. The prompt text
+# is fixed and names the file.
+[oneshot]
+args = ["--prompt", "Read the file {prompt_file} and do the task that it describes."]
+prompt = "file"
