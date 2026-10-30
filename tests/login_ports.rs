@@ -3,6 +3,8 @@
 //! ports are not; without it, nothing is. Needs a Wayland session with
 //! wp_security_context_v1, so it is skipped elsewhere.
 
+mod common;
+
 use std::net::TcpStream;
 use std::process::{Child, Command};
 use std::time::{Duration, Instant};
@@ -53,7 +55,7 @@ fn login_ports_open_only_listening_ports_and_only_when_enabled() {
         eprintln!("skipped: needs a Wayland session with wp_security_context_v1 and python3");
         return;
     }
-    let tmp = tempfile::tempdir_in(std::env::var("HOME").unwrap()).unwrap();
+    let tmp = common::tempdir();
     let ws = tmp.path().join("ws");
     std::fs::create_dir_all(&ws).unwrap();
     let (port, other) = (47651, 47652);
