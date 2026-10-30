@@ -427,6 +427,24 @@ pub fn launch_tui(env: &HostEnv, args: &[String]) -> Result<i32> {
     Err(anyhow::Error::from(e).context(format!("cannot run {}", program.display())))
 }
 
+/// What `bash -lc 'command -v NAME'` finds when it starts with Omarchy's bin
+/// folder first on PATH, as the Omarchy shell does.
+fn login_shell_resolves(env: &HostEnv, name: &str) -> Option<PathBuf> {
+    let bash = env.which("bash")?;
+    let mut path = vec![PathBuf::from("/usr/share/omarchy/bin")];
+    path.extend(env.path.iter().cloned());
+    let joined = std::env::join_paths(path).ok()?;
+    let out = std::process::Command::new(bash)
+        .args(["-lc", "command -v -- \"$0\"", name])
+        .env("PATH", joined)
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    let p = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (out.status.success() && p.starts_with('/')).then(|| PathBuf::from(p))
+}
+
 /// The program that a command from `omarchy-agent` starts first, so doctor
 /// can check that `omarchy-agent` still starts agents the way paddock knows.
 pub fn agent_script_checks(text: &str) -> Vec<(&'static str, bool)> {
@@ -487,15 +505,23 @@ pub fn doctor_lines(env: &HostEnv) -> Vec<String> {
             " is missing: run mise reshim"
         }
     ));
+    // Omarchy starts agents from Hyprland (key, console) and from its shell
+    // through `bash -lc` (agents panel, prompts, crash reports). The shell
+    // itself puts Omarchy's bin folder first on PATH, so check what a login
+    // shell started from that order really runs.
     let wrappers = mise_wrapper_dir(env);
-    let first = env.path.first().map(|p| *p == wrappers).unwrap_or(false);
+    let resolved = login_shell_resolves(env, SCOPE);
+    let ok = resolved.as_ref().is_some_and(|p| p.starts_with(&wrappers));
     out.push(format!(
-        "{} mise's wrapper folder is first on PATH{}",
-        mark(first),
-        if first {
-            ""
-        } else {
-            " in this shell; Omarchy's session puts it first, so check the key starts a sandbox"
+        "{} a login shell from the Omarchy shell's PATH runs omarchy-agent through mise{}",
+        mark(ok),
+        match (&resolved, ok) {
+            (_, true) => String::new(),
+            (Some(p), false) => format!(
+                ": it runs {}, so starts from the agents panel bypass paddock",
+                p.display()
+            ),
+            (None, false) => ": the check could not run `bash -lc`".into(),
         }
     ));
     match real_program(env, &env.path, SCOPE) {
