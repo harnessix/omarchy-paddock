@@ -381,6 +381,45 @@ impl Store {
         Ok(out)
     }
 
+    /// Keys with `prefix` that expired after `after` and at or before
+    /// `upto`, as changes with the op `expire`. An expiry is not a write, so
+    /// it has no history entry and keeps the version of the last write.
+    pub fn expired_between(
+        &self,
+        ns: &str,
+        prefix: &str,
+        after: u64,
+        upto: u64,
+    ) -> Result<Vec<Change>> {
+        if upto <= after {
+            return Ok(Vec::new());
+        }
+        let mut st = self.conn.prepare(
+            "SELECT key, version, writer, writer_harness, expires FROM entries
+             WHERE ns = ?1 AND expires IS NOT NULL AND expires > ?2 AND expires <= ?3
+             ORDER BY expires, key",
+        )?;
+        let rows = st.query_map(params![ns, after, upto], |r| {
+            Ok(Change {
+                key: r.get(0)?,
+                version: r.get(1)?,
+                op: "expire".into(),
+                value: None,
+                writer: r.get(2)?,
+                writer_harness: r.get(3)?,
+                time: r.get(4)?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for c in rows {
+            let c = c?;
+            if c.key.starts_with(prefix) {
+                out.push(c);
+            }
+        }
+        Ok(out)
+    }
+
     /// The last versions of one key, newest first, with their values.
     pub fn history(&self, ns: &str, key: &str, limit: usize) -> Result<Vec<Change>> {
         let mut st = self.conn.prepare(

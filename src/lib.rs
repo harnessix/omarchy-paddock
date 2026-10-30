@@ -40,5 +40,6 @@ pub mod spec;
 pub mod state;
 pub mod storage;
 pub mod update;
+pub mod waiting;
 pub mod wlsec;
 pub mod wrap;

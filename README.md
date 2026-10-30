@@ -610,17 +610,45 @@ One open is one request. The program opens the device for reading and writing, w
 exec 3<>/dev/paddock/echo; printf 'hello' >&3; cat <&3
 ```
 
-All devices are off by default. The only device so far is `echo`, a test device that sends the request back. Turn a device on in `~/.config/paddock/config.toml`. A project `paddock.toml` cannot turn on a device, because the agent can edit that file.
+All devices are off by default. Turn a device on in `~/.config/paddock/config.toml`. A project `paddock.toml` cannot turn on a device, because the agent can edit that file.
+
+| Device | What it does |
+| :--- | :--- |
+| `echo` | A test device. It sends the request back. |
+| `wait` | The read returns at a time. The request is an RFC 3339 time, such as `2026-10-30T15:00:00Z`, or a duration, such as `15m`. At most seven days ahead. |
+| `ask` | The agent writes a question. The question appears on the approval card. The read returns your answer. |
 
 ```toml
 [devices]
-echo = true
+wait = true
+ask = true
 mount = true   # false: no /dev/paddock at all
 ```
+
+`paddock-host device NAME` in the sandbox sends one request and turns errors into exit codes. See "Wait without sleep" below.
 
 The mount needs FUSE: `/dev/fuse` and `fusermount3` (package `fuse3`). `paddock doctor` checks both. The bwrap backend binds the mount at the start. docker and podman bind an empty folder and paddock mounts the file system on it after the container starts. The container waits up to five seconds for it before the harness starts. This needs a shared mount for the paddock run folder, which is the systemd default. srt cannot place a mount at `/dev/paddock`: there, the devices are at the path in `$PADDOCK_DEVICES`. When FUSE is missing, the sandbox starts without devices, and `paddock doctor` says why.
 
 Programs must read the response with `read`. `cat` from coreutils, `dd`, shells, Python and Rust do that. busybox `cat` uses `sendfile` and sees an empty file: use `dd` there. Requests and responses never go into logs or process arguments. The log records the device name, the sizes and the result.
+
+### Wait without sleep
+
+Agents often wait: for CI, for a child agent, for your answer. Many agents wait with `sleep 60` and then check again. Each check costs a model turn, and a result that arrives between two checks waits for the next one.
+
+paddock gives agents blocking reads instead. The read waits until the event happens and returns at once. While it waits, the agent uses no CPU and no tokens.
+
+| Wait for | Command in the sandbox |
+| :--- | :--- |
+| A key in paddock kv | `paddock-host kv watch KEY --timeout 100`, or `--prefix PREFIX` |
+| A child agent | `paddock-host wait ID --timeout 100` |
+| A time | `paddock-host device wait 2026-10-30T15:00:00Z --timeout 100` |
+| Your answer | `paddock-host device ask "Deploy to staging?" --choice yes --choice no` |
+
+A tool call of a harness has a time limit, often two minutes. So each read has a longest wait, `--timeout`. When that time passes before the event, the command exits with 75, "still waiting", and the agent runs the same read again. Exit code 75 means the same for every one of these commands. A plain read of a waiting device fails with `ETIME` ("Timer expired") instead. The `paddock-host` skill tells agents to loop on the read and never to use `sleep`.
+
+A prefix watch also wakes when a key under the prefix expires. So `watch --prefix lease:` returns when a lease runs out and the task is free.
+
+A question from `ask` shows on the approval card in the bar, with the choices as buttons. Click the text field to type another answer, and press Enter. Escape gives the keyboard back. "Dismiss" ends the question, and the agent gets `EACCES` (exit code 3). Without the bar, a desktop notification shows the question and its choices. On the command line, use `paddock approvals` and `paddock approvals answer ID --text "ANSWER"`. Your answer goes to the agent only. The audit log records the sizes of the question and the answer, never the text. A question stays open while the agent reads it again; paddock removes it two minutes after the last read, or when the sandbox ends.
 
 ## App mode
 

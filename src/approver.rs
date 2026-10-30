@@ -384,6 +384,7 @@ mod tests {
             created: 1,
             expires: 2,
             session_allowed: true,
+            choices: Vec::new(),
             started_by: vec![],
         }
     }

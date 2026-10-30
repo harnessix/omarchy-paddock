@@ -163,6 +163,9 @@ pub enum Status {
     Timeout,
     Failed,
     Invalid,
+    /// A blocking read reached its time limit before the event, for example
+    /// `paddock-host wait` on a child that still runs. Run it again.
+    Waiting,
 }
 
 impl Status {
@@ -173,6 +176,7 @@ impl Status {
             Status::Denied => 3,
             Status::Disabled => 4,
             Status::Timeout => 5,
+            Status::Waiting => crate::waiting::EXIT_STILL_WAITING,
             Status::Failed => 7,
             Status::Invalid => 8,
         }
@@ -228,7 +232,18 @@ pub struct Pending {
     /// sandboxes above it, the first one started by the user, the parent last.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub started_by: Vec<String>,
+    /// For a question (`/dev/paddock/ask`): short answers that the card
+    /// offers as buttons. The user can always type another answer.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub choices: Vec<String>,
 }
+
+/// The capability name of a question from `/dev/paddock/ask` on the
+/// approval card. It is not a host capability: the answer is text for the
+/// agent, and nothing runs on the host.
+pub const ASK_CAPABILITY: &str = "ask";
+/// The longest typed answer to a question, in characters.
+pub const MAX_REPLY: usize = 4000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -287,12 +302,44 @@ pub fn answer(env: &HostEnv, id: &str, a: Answer) -> Result<()> {
         bail!("no pending request {id}");
     }
     let p: Pending = serde_json::from_str(&std::fs::read_to_string(&pending)?)?;
+    if p.capability == ASK_CAPABILITY && a != Answer::Deny {
+        bail!("{id} is a question: answer it with --text TEXT, or dismiss it with deny");
+    }
     if a == Answer::Session && !p.session_allowed {
         bail!("this request can only be allowed once");
     }
     crate::privfs::write(
         &dir.join(format!("{id}.answer")),
         serde_json::to_string(&a)?,
+    )?;
+    Ok(())
+}
+
+/// Answer a question from `/dev/paddock/ask` with text. The text goes to
+/// the agent that asked; nothing runs on the host. Only the host can call
+/// this, like `answer`.
+pub fn answer_reply(env: &HostEnv, id: &str, text: &str) -> Result<()> {
+    if id.is_empty() || !id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
+        bail!("invalid request id");
+    }
+    let dir = approvals_dir(env);
+    let pending = dir.join(format!("{id}.json"));
+    if !pending.is_file() {
+        bail!("no pending request {id}");
+    }
+    let p: Pending = serde_json::from_str(&std::fs::read_to_string(&pending)?)?;
+    if p.capability != ASK_CAPABILITY {
+        bail!("{id} is a host request, not a question: answer it with once, session or deny");
+    }
+    if text.trim().is_empty() {
+        bail!("the answer is empty");
+    }
+    if text.chars().count() > MAX_REPLY {
+        bail!("the answer is longer than {MAX_REPLY} characters");
+    }
+    crate::privfs::write(
+        &dir.join(format!("{id}.answer")),
+        serde_json::json!({ "reply": text }).to_string(),
     )?;
     Ok(())
 }
@@ -1499,8 +1546,8 @@ impl Broker {
                     .min(max);
                 match sp.wait(id, Duration::from_secs(t)) {
                     Some(s) if s.state.active() => Response {
-                        status: Status::Timeout,
-                        message: format!("{id} still runs after {t} seconds"),
+                        status: Status::Waiting,
+                        message: format!("still waiting: {id} still runs after {t} seconds; run the same wait again"),
                         result: to_json(&s),
                     },
                     Some(s) => Response::done(to_json(&s)),
@@ -1650,6 +1697,7 @@ impl Broker {
                 created: state::now(),
                 expires: state::now() + self.policy.wait,
                 session_allowed: prep.session_allowed,
+                choices: Vec::new(),
                 started_by: self.ctx.chain.clone(),
             };
             match self.approver.ask_with_source(
@@ -1775,7 +1823,7 @@ pub fn read_prompt(project: &Path, raw: &str) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
-fn new_request_id() -> String {
+pub(crate) fn new_request_id() -> String {
     use sha2::{Digest, Sha256};
     let seed = format!("{:?}-{}", Instant::now(), std::process::id());
     let h = crate::manifest::hex(&Sha256::digest(seed.as_bytes()));

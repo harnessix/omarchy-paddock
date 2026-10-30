@@ -73,8 +73,13 @@ WATCH
   --version N it returns at once when the version is not N already (0: the
   key does not exist). watch --prefix P waits until a key that starts with P
   is written or deleted, and prints one line per change; pass the printed
-  cursor as --version to the next watch so that no change is lost. It waits
-  at most --timeout seconds (default 60, at most 600), then exits with 5.
+  cursor as --version to the next watch so that no change is lost. A key
+  under the prefix that expires while the watch waits (a lease that runs
+  out) shows as an expire line. It waits at most --timeout seconds (default
+  60, at most 600). When nothing changed in that time, it exits with 75
+  (still waiting) and prints nothing on stdout: run the same watch again.
+  Choose a timeout below the time limit of your shell tool, and never
+  replace a watch with sleep.
 
 KEY NAMES
   task:NAME        one unit of work. JSON: title, status (todo, in_progress,
@@ -89,8 +94,9 @@ KEY NAMES
 
 EXIT CODES
   0 done   1 no such key   2 wrong usage   3 denied   4 off in the user's
-  configuration   5 timeout   6 no store connection   7 the host failed
-  8 invalid request   9 version conflict or lease taken   10 too large
+  configuration   5 nobody answered in time   6 no store connection
+  7 the host failed   8 invalid request   9 version conflict or lease taken
+  10 too large   75 still waiting: the watch timed out before a change
 
 EXAMPLES
   paddock-host kv put task:review '{"title":"review src/auth.rs","status":"todo"}' --scope project
@@ -303,6 +309,10 @@ fn finish(cmd: &str, scope: Option<Scope>, resp: Result<Response, String>, json:
             "{}",
             serde_json::to_string_pretty(&resp).unwrap_or_default()
         );
+        return resp.status.exit_code();
+    }
+    if resp.status == Status::Waiting {
+        eprintln!("paddock-host kv: {cmd}: {}", resp.message);
         return resp.status.exit_code();
     }
     if resp.status != Status::Done {

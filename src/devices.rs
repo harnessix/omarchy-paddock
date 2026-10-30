@@ -15,6 +15,11 @@
 //! request. `/dev/paddock/.catalog` is read-only and describes each device:
 //! its request format, its limits and whether it is on.
 //!
+//! Waiting devices (`wait`, `ask`, see blocking.rs) block until an event:
+//! a time, or the user's answer. Each read waits at most the `timeout` of
+//! its request; when that passes first, the read fails with ETIME ("still
+//! waiting", `crate::waiting`), and the agent sends the same request again.
+//!
 //! A sandbox that another one started (`spawn`) gets at most the devices
 //! of its parent: the parent's paddock records them in the child's job, and
 //! the child's own `/dev/paddock` serves only those that the user
@@ -40,6 +45,8 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
+
+pub mod blocking;
 
 /// Where the devices appear inside the sandbox.
 pub const MOUNT_IN_SANDBOX: &str = "/dev/paddock";
@@ -85,15 +92,22 @@ pub enum DevError {
     TooLarge,
     /// The client closed the file or the deadline passed (ECANCELED).
     Cancelled,
+    /// The time limit of this read passed before the event (ETIME, "still
+    /// waiting"). The client sends the same request again.
+    Waiting,
+    /// The user declined, for example dismissed a question (EACCES).
+    Denied,
 }
 
 impl DevError {
-    fn errno(self) -> Errno {
+    pub fn errno(self) -> Errno {
         match self {
             DevError::Invalid => Errno::EINVAL,
             DevError::Failed => Errno::EIO,
             DevError::TooLarge => Errno::EMSGSIZE,
             DevError::Cancelled => Errno::ECANCELED,
+            DevError::Waiting => Errno::from_i32(crate::waiting::ERRNO_STILL_WAITING),
+            DevError::Denied => Errno::EACCES,
         }
     }
 }
@@ -108,6 +122,15 @@ pub struct Call {
 }
 
 impl Call {
+    /// A call for tests of a device without a mount.
+    pub fn for_test(sandbox: &str, deadline: Duration) -> Self {
+        Self {
+            sandbox: sandbox.to_string(),
+            deadline: Instant::now() + deadline,
+            cancel: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
     /// True when the client closed the file or the deadline passed. A device
     /// that works for a long time checks this and stops early.
     pub fn cancelled(&self) -> bool {
@@ -145,16 +168,39 @@ impl Device for Echo {
     }
 }
 
-/// The names of the built-in devices, and their descriptions for the
-/// catalog when they are off.
-pub fn builtin(name: &str) -> Option<Arc<dyn Device>> {
+/// What a device may know about the sandbox it serves, from the host. The
+/// `ask` device needs it for the approval card.
+#[derive(Clone)]
+pub struct DeviceCtx {
+    pub env: HostEnv,
+    pub sandbox: String,
+    pub harness: String,
+    pub project: PathBuf,
+    /// The sandboxes above this one, root first, the parent last.
+    pub started_by: Vec<String>,
+}
+
+/// A built-in device, ready to serve.
+pub fn builtin(name: &str, ctx: &DeviceCtx) -> Option<Arc<dyn Device>> {
     match name {
         "echo" => Some(Arc::new(Echo)),
+        "wait" => Some(Arc::new(blocking::Wait)),
+        "ask" => Some(Arc::new(blocking::Ask::new(ctx.clone()))),
         _ => None,
     }
 }
 
-pub const BUILTIN: &[&str] = &["echo"];
+/// The description of a built-in device, for the catalog when it is off.
+pub fn builtin_info(name: &str) -> Option<Info> {
+    match name {
+        "echo" => Some(Echo.info()),
+        "wait" => Some(blocking::Wait.info()),
+        "ask" => Some(blocking::ask_info()),
+        _ => None,
+    }
+}
+
+pub const BUILTIN: &[&str] = &["echo", "ask", "wait"];
 
 /// `[devices]` of `~/.config/paddock/config.toml`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -223,14 +269,13 @@ pub fn catalog(on: &[Arc<dyn Device>]) -> Vec<u8> {
         }
     }
     for name in names {
-        let (state, dev) = match on.iter().find(|d| d.name() == name) {
-            Some(d) => ("on", d.clone()),
-            None => match builtin(name) {
-                Some(d) => ("off", d),
+        let (state, info) = match on.iter().find(|d| d.name() == name) {
+            Some(d) => ("on", d.info()),
+            None => match builtin_info(name) {
+                Some(i) => ("off", i),
                 None => continue,
             },
         };
-        let info = dev.info();
         let mut entry = serde_json::json!({
             "name": name,
             "state": state,
@@ -250,7 +295,7 @@ pub fn catalog(on: &[Arc<dyn Device>]) -> Vec<u8> {
     }
     let doc = serde_json::json!({
         "version": 1,
-        "protocol": "Open a device read-write, write the whole request, then read the response until end of file. One open is one request. The first read sends the request and blocks until the response is ready. Closing the file early cancels the request. A read fails with ETIMEDOUT after the deadline, EFBIG means the request is too large, EINVAL that the device rejected it.",
+        "protocol": "Open a device read-write, write the whole request, then read the response until end of file. One open is one request. The first read sends the request and blocks until the response is ready. Closing the file early cancels the request. A read fails with ETIMEDOUT after the deadline, EFBIG means the request is too large, EINVAL that the device rejected it. A waiting device (wait, ask) fails a read with ETIME (still waiting) when the timeout of the request passes before the event: send the same request again. EACCES means that the user declined. `paddock-host device NAME` does all of this and exits with 75 for still waiting.",
         "devices": devices,
     });
     let mut out = serde_json::to_vec_pretty(&doc).unwrap_or_default();
@@ -971,15 +1016,20 @@ pub fn enabled_names(cfg: &DevicesCfg, test: bool, ceiling: Option<&[String]>) -
     if test && !names.iter().any(|n| n == "echo") {
         names.push("echo".into());
     }
-    names.retain(|n| builtin(n).is_some() && ceiling.is_none_or(|c| c.contains(n)));
+    names.retain(|n| builtin_info(n).is_some() && ceiling.is_none_or(|c| c.contains(n)));
     names
 }
 
 /// The devices to serve. See `enabled_names`.
-pub fn enabled(cfg: &DevicesCfg, test: bool, ceiling: Option<&[String]>) -> Vec<Arc<dyn Device>> {
+pub fn enabled(
+    cfg: &DevicesCfg,
+    test: bool,
+    ceiling: Option<&[String]>,
+    ctx: &DeviceCtx,
+) -> Vec<Arc<dyn Device>> {
     enabled_names(cfg, test, ceiling)
         .iter()
-        .filter_map(|n| builtin(n))
+        .filter_map(|n| builtin(n, ctx))
         .collect()
 }
 
@@ -1053,13 +1103,15 @@ impl Drop for Devices {
 /// record the folder in the spec, for the backend. Container backends get
 /// the empty folder now and the mount after the start (`after_start`). A
 /// problem is a notice, not an error: the sandbox starts without devices.
-/// `ceiling` holds the devices of the parent, for a spawned sandbox.
+/// `ceiling` holds the devices of the parent, for a spawned sandbox, and
+/// `started_by` the sandboxes above it.
 pub fn start(
     env: &HostEnv,
     spec: &mut SandboxSpec,
     backend: &str,
     test: bool,
     ceiling: Option<&[String]>,
+    started_by: &[String],
 ) -> Option<Devices> {
     let cfg = match DevicesCfg::load(env) {
         Ok(c) => c,
@@ -1071,7 +1123,14 @@ pub fn start(
     if !cfg.mount {
         return None;
     }
-    let devices = enabled(&cfg, test, ceiling);
+    let ctx = DeviceCtx {
+        env: env.clone(),
+        sandbox: spec.id.clone(),
+        harness: spec.harness.clone(),
+        project: spec.project.clone(),
+        started_by: started_by.to_vec(),
+    };
+    let devices = enabled(&cfg, test, ceiling, &ctx);
     // Without an enabled device the mount is only a catalog, so a missing
     // FUSE is not worth a notice at each start.
     let quiet = devices.is_empty();

@@ -18,6 +18,10 @@ import qs.Ui
 //
 // The wording follows the permission prompts of agent CLIs: No, Yes once,
 // Yes for this session. No answer is styled as the primary one.
+//
+// A question from /dev/paddock/ask is a card too. Its answer is text for the
+// agent: a choice button, or a typed answer. The text field takes the
+// keyboard only after a click on it; Escape gives it back.
 Item {
   id: root
   property var shell: null
@@ -32,6 +36,8 @@ Item {
   property var settled: ({})
   property bool keyboardMode: false
   property int choice: 0
+  // The question whose answer field has the keyboard, or "".
+  property string typingId: ""
   property real now: Date.now() / 1000
 
   readonly property var visibleRequests: requests.slice(0, 3)
@@ -59,10 +65,18 @@ Item {
     var parts = String(path || "").split("/").filter(function(x) { return x.length > 0 })
     return parts.length ? parts[parts.length - 1] : ""
   }
+  function isQuestion(r) { return r && r.capability === "ask" }
   function answersFor(r) {
+    // A question: dismiss, or one of the agent's short answers.
+    if (isQuestion(r)) return ["deny"].concat((r.choices || []).map(function(c) { return "reply:" + c }))
     var list = ["deny", "once"]
     if (r && r.sessionAllowed) list.push("session")
     return list
+  }
+  function answerLabel(r, decision) {
+    if (decision.indexOf("reply:") === 0) return decision.slice(6)
+    if (isQuestion(r) && decision === "deny") return strings.t("popup.answer.dismiss")
+    return strings.t("popup.answer." + decision)
   }
   // The first http(s) link in a request's detail.
   function linkIn(r) {
@@ -90,10 +104,11 @@ Item {
   }
   function glyph(c) {
     return ({ "screenshot": "󰹑", "exec": "󰆍", "fetch": "󰉋", "clipboard-read": "󰅇",
-              "clipboard-write": "󰅌", "open-url": "󰌹", "notify": "󰂞", "spawn": "󰚩" })[c] || "󰀦"
+              "clipboard-write": "󰅌", "open-url": "󰌹", "notify": "󰂞", "spawn": "󰚩", "ask": "󰘥" })[c] || "󰀦"
   }
 
   function answer(r, decision) {
+    if (decision.indexOf("reply:") === 0) return answerText(r, decision.slice(6))
     if (root.settled[r.id]) return
     var s = Object.assign({}, root.settled)
     s[r.id] = { state: "sending", decision: decision }
@@ -102,11 +117,24 @@ Item {
     answerProc.command = ["sh", "-c", root.launcher, "paddock", "approvals", "answer", r.id, decision]
     answerProc.running = true
   }
+  // The answer to a question goes to paddock as one argument after --text.
+  function answerText(r, text) {
+    var t = String(text || "").trim()
+    if (t === "" || root.settled[r.id]) return
+    var s = Object.assign({}, root.settled)
+    s[r.id] = { state: "sending", decision: "reply" }
+    root.settled = s
+    root.typingId = ""
+    answerProc.pending = { id: r.id, decision: "reply" }
+    answerProc.command = ["sh", "-c", root.launcher, "paddock", "approvals", "answer", r.id, "--text", t.slice(0, 4000)]
+    answerProc.running = true
+  }
   function finish(id, ok, decision) {
     var s = Object.assign({}, root.settled)
-    s[id] = { state: ok ? (decision === "deny" ? "denied" : "allowed") : "gone", decision: decision }
+    s[id] = { state: ok ? (decision === "deny" ? "denied" : (decision === "reply" ? "answered" : "allowed")) : "gone", decision: decision }
     root.settled = s
     root.keyboardMode = false
+    if (root.typingId === id) root.typingId = ""
     clearTimer.ids = clearTimer.ids.concat([id])
     clearTimer.restart()
   }
@@ -196,6 +224,8 @@ Item {
             created: Number(r.created || 0),
             expires: Number(r.expires || 0),
             sessionAllowed: r.session_allowed === true,
+            // Short answers that a question offers as buttons.
+            choices: Array.isArray(r.choices) ? r.choices.slice(0, 8).map(function(c) { return root.plain(c, 64) }) : [],
             // The sandbox that started the asking sandbox (paddock-host spawn).
             startedBy: Array.isArray(r.started_by) && r.started_by.length ? root.plain(r.started_by[r.started_by.length - 1], 64) : ""
           })
@@ -207,6 +237,7 @@ Item {
         }
         root.requests = fresh
         if (fresh.length === 0) root.keyboardMode = false
+        if (root.typingId !== "" && !fresh.some(function(f) { return f.id === root.typingId })) root.typingId = ""
         root.lastWarning = ""
       } catch (e) {
         root.warnOnce("cannot read paddock approvals --json, keeping the old list: " + e)
@@ -252,8 +283,9 @@ Item {
 
       WlrLayershell.namespace: "paddock-approvals"
       WlrLayershell.layer: WlrLayer.Overlay
-      // Never take the keyboard on arrival; only in keyboard mode.
-      WlrLayershell.keyboardFocus: root.keyboardMode && showing ? WlrKeyboardFocus.Exclusive : WlrKeyboardFocus.None
+      // Never take the keyboard on arrival; only in keyboard mode, or while
+      // the answer field of a question is in use after a click.
+      WlrLayershell.keyboardFocus: (root.keyboardMode || root.typingId !== "") && showing ? WlrKeyboardFocus.Exclusive : WlrKeyboardFocus.None
       exclusionMode: ExclusionMode.Ignore
 
       anchors { top: true }
@@ -337,13 +369,15 @@ Item {
                     font.bold: true
                     text: (root.isLogin(card.modelData) ? "󰌆" : root.glyph(card.modelData.capability)) + "  " + (card.result
                       ? strings.t("popup.state." + card.result.state)
-                      : (root.isLogin(card.modelData) ? strings.t("popup.state.login") : strings.t("popup.state.pending")))
+                      : (root.isLogin(card.modelData) ? strings.t("popup.state.login")
+                        : (root.isQuestion(card.modelData) ? strings.t("popup.state.question") : strings.t("popup.state.pending"))))
                   }
                 }
                 Item { Layout.fillWidth: true }
                 Text {
                   textFormat: Text.PlainText
-                  visible: !card.result
+                  // A question has no time limit.
+                  visible: !card.result && card.modelData.expires > 0
                   color: card.secondsLeft < 20 ? Commons.Color.urgent : Qt.alpha(Commons.Color.foreground, 0.6)
                   font.family: Style.font.family
                   font.pixelSize: Style.font.caption
@@ -412,6 +446,50 @@ Item {
                 text: strings.t("approve.reason").arg(card.modelData.reason)
               }
 
+              // A question: type any answer. The field takes the keyboard
+              // only after a click.
+              Rectangle {
+                Layout.fillWidth: true
+                visible: root.isQuestion(card.modelData) && !card.result
+                radius: Style.cornerRadius
+                color: Qt.alpha(Commons.Color.foreground, 0.06)
+                border.width: 1
+                border.color: replyInput.activeFocus ? Commons.Color.accent : Qt.alpha(Commons.Color.foreground, 0.18)
+                implicitHeight: replyInput.implicitHeight + Style.space(14)
+                Text {
+                  anchors.fill: parent
+                  anchors.margins: Style.space(7)
+                  visible: replyInput.text === ""
+                  textFormat: Text.PlainText
+                  color: Qt.alpha(Commons.Color.foreground, 0.45)
+                  font.family: Style.font.family
+                  font.pixelSize: Style.font.caption
+                  text: strings.t("popup.reply.placeholder")
+                }
+                TextInput {
+                  id: replyInput
+                  anchors.fill: parent
+                  anchors.margins: Style.space(7)
+                  color: Commons.Color.foreground
+                  font.family: Style.font.family
+                  font.pixelSize: Style.font.caption
+                  wrapMode: TextInput.Wrap
+                  maximumLength: 4000
+                  selectByMouse: true
+                  focus: root.typingId === card.modelData.id
+                  onActiveFocusChanged: if (activeFocus) root.typingId = card.modelData.id
+                  Keys.onReturnPressed: root.answerText(card.modelData, text)
+                  Keys.onEnterPressed: root.answerText(card.modelData, text)
+                  Keys.onEscapePressed: { root.typingId = ""; focus = false }
+                }
+                MouseArea {
+                  anchors.fill: parent
+                  visible: root.typingId !== card.modelData.id
+                  cursorShape: Qt.IBeamCursor
+                  onClicked: { root.keyboardMode = false; root.typingId = card.modelData.id; replyInput.forceActiveFocus() }
+                }
+              }
+
               // Answers: equal weight, "No" first.
               RowLayout {
                 visible: !card.result
@@ -421,7 +499,7 @@ Item {
                   delegate: Button {
                     required property var modelData
                     required property int index
-                    text: strings.t("popup.answer." + modelData)
+                    text: root.answerLabel(card.modelData, modelData)
                     bordered: true
                     fontFamily: Style.font.family
                     hasCursor: root.keyboardMode && card.index === 0 && root.choice === index

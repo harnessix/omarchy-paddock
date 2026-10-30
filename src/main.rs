@@ -450,7 +450,15 @@ enum KvCmd {
 #[derive(Subcommand)]
 enum ApprovalsCmd {
     /// Answer one request: once, session (same request again in this sandbox), or deny.
-    Answer { id: String, answer: String },
+    /// Answer a question from /dev/paddock/ask with --text TEXT, or dismiss it with deny.
+    Answer {
+        id: String,
+        #[arg(required_unless_present = "text")]
+        answer: Option<String>,
+        /// The answer to a question (/dev/paddock/ask). It goes to the agent.
+        #[arg(long, conflicts_with = "answer")]
+        text: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -614,9 +622,14 @@ Modes come only from [host] in ~/.config/paddock/config.toml:
   notify = \"allow\"
   wait = 120                 # seconds before a request times out
 
+Questions from /dev/paddock/ask ([devices] ask = true) wait here too. Answer
+one with --text: the text goes to the agent, and nothing runs on the host.
+deny dismisses it.
+
 Examples:
   paddock approvals
   paddock approvals answer r-1793321234-1a2b3c4d once
+  paddock approvals answer r-1793321234-9f8e7d6c --text \"yes, staging only\"
   paddock approvals --json";
 
 #[derive(Subcommand)]
@@ -906,9 +919,18 @@ fn real_main() -> Result<i32> {
         Cmd::SpawnChild { job } => paddock::spawn::child_main(&env, &job),
         Cmd::Approvals { json, cmd } => {
             use paddock::broker;
-            if let Some(ApprovalsCmd::Answer { id, answer }) = cmd {
-                broker::answer(&env, &id, answer.parse()?)?;
-                println!("Answered {id}: {answer}");
+            if let Some(ApprovalsCmd::Answer { id, answer, text }) = cmd {
+                match (answer, text) {
+                    (_, Some(t)) => {
+                        broker::answer_reply(&env, &id, &t)?;
+                        println!("Answered {id} with {} characters.", t.chars().count());
+                    }
+                    (Some(a), None) => {
+                        broker::answer(&env, &id, a.parse()?)?;
+                        println!("Answered {id}: {a}");
+                    }
+                    (None, None) => bail!("give an answer, or --text TEXT for a question"),
+                }
                 return Ok(0);
             }
             let list = broker::pending(&env);
@@ -930,6 +952,16 @@ fn real_main() -> Result<i32> {
                     }
                     if !p.reason.is_empty() {
                         println!("    reason given by the agent: {}", p.reason);
+                    }
+                    if p.capability == broker::ASK_CAPABILITY {
+                        if !p.choices.is_empty() {
+                            println!("    choices: {}", p.choices.join(" | "));
+                        }
+                        println!(
+                            "    answer: paddock approvals answer {} --text 'ANSWER', or deny\n",
+                            p.id
+                        );
+                        continue;
                     }
                     println!(
                         "    answer: paddock approvals answer {} once|{}deny\n",
@@ -2171,6 +2203,7 @@ fn approver_cmd(env: &HostEnv, cmd: ApproverCmd) -> Result<i32> {
                 created: paddock::state::now(),
                 expires: paddock::state::now() + 60,
                 session_allowed: true,
+                choices: Vec::new(),
                 started_by: vec![],
             };
             let (a, note) = ap::run_hook(&hook, &p);

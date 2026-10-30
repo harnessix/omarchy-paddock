@@ -741,7 +741,9 @@ fn watch_wakes_on_a_change_from_another_sandbox() {
         },
         None,
     );
-    assert_eq!(r.status, Status::Timeout);
+    // The time passed first: still waiting, with its own exit code.
+    assert_eq!(r.status, Status::Waiting);
+    assert_eq!(r.status.exit_code(), crate::waiting::EXIT_STILL_WAITING);
     // A known version that is old already returns at once.
     let r = a.handle(
         &Request {
@@ -1042,4 +1044,62 @@ fn a_child_inherits_the_user_scope_grant_and_never_asks_itself() {
     let (c3, asked_c3) = node(&w, "c3", &["r"], false, cfg, Some(Answer::Session));
     assert_eq!(get(&c3, Scope::User, "k").status, Status::Denied);
     assert!(asked_c3.asked.lock().unwrap().is_empty());
+}
+
+#[test]
+fn a_prefix_watch_wakes_at_once_and_when_a_lease_runs_out() {
+    let w = world();
+    let (a, _) = service(&w, "a", None, KvCfg::default(), None);
+    let (b, _) = service(&w, "b", None, KvCfg::default(), None);
+    let b = Arc::new(b);
+    // A write from another sandbox wakes a prefix watch within a poll.
+    let b2 = b.clone();
+    let wrote = Arc::new(Mutex::new(None::<Instant>));
+    let wrote2 = wrote.clone();
+    let t = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(500));
+        *wrote2.lock().unwrap() = Some(Instant::now());
+        b2.handle(&put(Scope::Project, "result:z", "done"), None);
+    });
+    let r = a.handle(
+        &Request {
+            prefix: Some("result:".into()),
+            timeout: Some(10),
+            ..req("watch", Scope::Project, "")
+        },
+        None,
+    );
+    let woke = Instant::now();
+    t.join().unwrap();
+    assert_eq!(r.status, Status::Done);
+    assert_eq!(r.result["changes"][0]["key"], "result:z");
+    let lag = woke.duration_since(wrote.lock().unwrap().unwrap());
+    assert!(
+        lag < Duration::from_millis(600),
+        "woke {lag:?} after the write"
+    );
+    // A lease of another sandbox expires: a watch on lease: wakes for it.
+    let claim = Request {
+        ttl: Some(2),
+        ..req("claim", Scope::Project, "job")
+    };
+    assert_eq!(b.handle(&claim, None).status, Status::Done);
+    let cursor = r.result["cursor"].as_u64().unwrap() + 1;
+    let start = Instant::now();
+    let r = a.handle(
+        &Request {
+            prefix: Some("lease:".into()),
+            version: Some(cursor),
+            timeout: Some(10),
+            ..req("watch", Scope::Project, "")
+        },
+        None,
+    );
+    assert_eq!(r.status, Status::Done, "{:?}", r.message);
+    assert_eq!(r.result["changes"][0]["key"], "lease:job");
+    assert_eq!(r.result["changes"][0]["op"], "expire");
+    assert!(start.elapsed() < Duration::from_secs(4));
+    // The lease is free now.
+    let (c, _) = service(&w, "c", None, KvCfg::default(), None);
+    assert_eq!(c.handle(&claim, None).status, Status::Done);
 }
