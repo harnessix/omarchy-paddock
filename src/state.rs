@@ -309,9 +309,8 @@ struct AuthItem {
     stored: PathBuf,
     /// Relative to the sandbox home, which the sandbox can write.
     rel: PathBuf,
-    /// The hashes at the last sync: a side whose hash differs changed since.
-    inside_seen: Option<String>,
-    stored_seen: Option<String>,
+    inside_at_start: Option<String>,
+    stored_at_start: Option<String>,
 }
 
 /// Credentials are copied, not bind-mounted: harnesses replace token files
@@ -416,8 +415,8 @@ impl AuthSync {
                 home.remove(&rel)?;
             }
             items.push(AuthItem {
-                inside_seen: inside_hash(&home, &rel)?,
-                stored_seen: store.hash(&stored),
+                inside_at_start: inside_hash(&home, &rel)?,
+                stored_at_start: store.hash(&stored),
                 store,
                 stored,
                 rel,
@@ -434,28 +433,14 @@ impl AuthSync {
     /// Copy back every credential that changed inside the sandbox, for example
     /// after a login or a token refresh. If the store changed too (the harness
     /// also runs on the host), the store keeps its version.
-    pub fn copy_out(&mut self) -> Result<SyncResult> {
-        self.sync(false)
-    }
-
-    /// The same as `copy_out`, while the sandbox runs, so tools that read the
-    /// login on the host (the Omarchy agents panel) see a refreshed token. A
-    /// login that only the store changed is copied into the sandbox: a token
-    /// that the host refreshed can make the sandbox's copy invalid.
-    ///
-    /// Each login goes back only to the store that it came from: the host
-    /// login, an Omarchy account, or an isolated store of paddock.
-    pub fn sync_running(&mut self) -> Result<SyncResult> {
-        self.sync(true)
-    }
-
-    fn sync(&mut self, pull: bool) -> Result<SyncResult> {
+    pub fn copy_out(&self) -> Result<SyncResult> {
         let mut r = SyncResult {
             saved: vec![],
             conflicts: vec![],
         };
         let home = crate::safefs::Root::open(&self.home)?;
         // Logins that the sandbox added to a folder entry.
+        let mut added = Vec::new();
         for (dir, stored_dir) in &self.folders {
             for n in inside_file_names(&home, dir) {
                 let rel = dir.join(&n);
@@ -464,54 +449,36 @@ impl AuthSync {
                 }
                 let stored = stored_dir.join(&n);
                 let store = Store::for_file(&self.mode, &stored);
-                self.items.push(AuthItem {
-                    stored_seen: store.hash(&stored),
-                    inside_seen: None,
+                added.push(AuthItem {
+                    stored_at_start: store.hash(&stored),
+                    inside_at_start: None,
                     store,
                     stored,
                     rel,
                 });
             }
         }
-        for it in self.items.iter_mut() {
+        for it in self.items.iter().chain(added.iter()) {
             // A symlink or special file in place of a credential is refused:
             // reading through it would copy a host file into the store.
             let bytes = match home.read(&it.rel, crate::safefs::MAX_READ) {
-                Ok(b) => b,
+                Ok(Some(b)) => b,
+                Ok(None) => continue,
                 Err(e) => {
                     log::warn!("not saving the credential {}: {e:#}", it.rel.display());
                     continue;
                 }
             };
-            let inside = bytes.as_ref().map(|b| hex(&Sha256::digest(b)));
-            let stored = it.store.hash(&it.stored);
-            let inside_changed = inside.is_some() && inside != it.inside_seen;
-            let stored_changed = stored != it.stored_seen;
-            match (inside_changed, stored_changed) {
-                (true, false) => {
-                    it.store
-                        .write(&it.stored, bytes.as_deref().unwrap_or_default())?;
-                    it.stored_seen = it.store.hash(&it.stored);
-                    r.saved.push(it.stored.clone());
-                }
-                (true, true) => {
-                    // The store wins. Both sides are seen now, so the next
-                    // change on one side is synced again.
-                    r.conflicts.push(it.stored.clone());
-                    it.stored_seen = stored;
-                }
-                (false, true) if pull => {
-                    if let Some(b) = it.store.read(&it.stored)? {
-                        home.write(&it.rel, &b, 0o600)
-                            .with_context(|| format!("credential {}", it.rel.display()))?;
-                    }
-                    it.stored_seen = stored;
-                    it.inside_seen = inside_hash(&home, &it.rel)?;
-                    continue;
-                }
-                _ => {}
+            let now = Some(hex(&Sha256::digest(&bytes)));
+            if now == it.inside_at_start {
+                continue;
             }
-            it.inside_seen = inside;
+            if it.store.hash(&it.stored) != it.stored_at_start {
+                r.conflicts.push(it.stored.clone());
+                continue;
+            }
+            it.store.write(&it.stored, &bytes)?;
+            r.saved.push(it.stored.clone());
         }
         Ok(r)
     }
@@ -1017,7 +984,7 @@ mod auth_sync_tests {
             acct.join("settings")
         );
         assert_eq!(host_file(&env, &p, &mode, ".x"), host_home.join(".x"));
-        let mut sync = AuthSync::copy_in(&env, &p, &mode, &sb).unwrap();
+        let sync = AuthSync::copy_in(&env, &p, &mode, &sb).unwrap();
         seed(&env, &p, &mode, &sb).unwrap();
         // Inside, the files keep their usual places.
         assert_eq!(
@@ -1068,7 +1035,7 @@ mod auth_sync_tests {
         let secret = t.path().join("id_key");
         std::fs::write(&secret, "PRIVATE KEY").unwrap();
         symlink(&secret, creds.join("link.json")).unwrap();
-        let mut sync = AuthSync::copy_in(&env, &p, &AuthMode::Shared, &sb).unwrap();
+        let sync = AuthSync::copy_in(&env, &p, &AuthMode::Shared, &sb).unwrap();
         assert_eq!(
             std::fs::read_to_string(sb.join(".tool/creds/a.json")).unwrap(),
             "a1"
@@ -1086,77 +1053,12 @@ mod auth_sync_tests {
     }
 
     #[test]
-    fn a_running_sandbox_saves_each_refresh_and_takes_the_host_refresh() {
-        let (_t, env, p, host_home, sb) = setup();
-        let host = host_home.join(".tool/token");
-        std::fs::write(&host, "t1").unwrap();
-        let mut sync = AuthSync::copy_in(&env, &p, &AuthMode::Shared, &sb).unwrap();
-        let inside = sb.join(".tool/token");
-        std::fs::write(&inside, "t2").unwrap();
-        assert_eq!(sync.sync_running().unwrap().saved, vec![host.clone()]);
-        assert_eq!(std::fs::read_to_string(&host).unwrap(), "t2");
-        std::fs::write(&inside, "t3").unwrap();
-        assert_eq!(sync.sync_running().unwrap().saved.len(), 1);
-        assert_eq!(std::fs::read_to_string(&host).unwrap(), "t3");
-        // The host refreshes: the sandbox gets the new token.
-        std::fs::write(&host, "h4").unwrap();
-        let r = sync.sync_running().unwrap();
-        assert!(r.saved.is_empty() && r.conflicts.is_empty());
-        assert_eq!(std::fs::read_to_string(&inside).unwrap(), "h4");
-        // Nothing changed since: the exit sync writes nothing.
-        let r = sync.copy_out().unwrap();
-        assert!(r.saved.is_empty() && r.conflicts.is_empty());
-    }
-
-    #[test]
-    fn a_conflict_keeps_the_store_once_and_the_next_refresh_syncs() {
-        let (_t, env, p, host_home, sb) = setup();
-        let host = host_home.join(".tool/token");
-        std::fs::write(&host, "t1").unwrap();
-        let mut sync = AuthSync::copy_in(&env, &p, &AuthMode::Shared, &sb).unwrap();
-        let inside = sb.join(".tool/token");
-        std::fs::write(&inside, "s2").unwrap();
-        std::fs::write(&host, "h2").unwrap();
-        assert_eq!(sync.sync_running().unwrap().conflicts, vec![host.clone()]);
-        assert_eq!(std::fs::read_to_string(&host).unwrap(), "h2");
-        assert!(sync.sync_running().unwrap().conflicts.is_empty());
-        std::fs::write(&inside, "s3").unwrap();
-        assert_eq!(sync.sync_running().unwrap().saved, vec![host.clone()]);
-        assert_eq!(std::fs::read_to_string(&host).unwrap(), "s3");
-    }
-
-    #[test]
-    fn an_isolated_login_never_reaches_the_host_login() {
-        let (_t, env, p, host_home, sb) = setup();
-        let host = host_home.join(".tool/token");
-        std::fs::write(&host, "host").unwrap();
-        let mode = AuthMode::Isolated("work".into());
-        let mut sync = AuthSync::copy_in(&env, &p, &mode, &sb).unwrap();
-        // The isolated store is empty: the sandbox logs in.
-        assert!(!sb.join(".tool/token").exists());
-        std::fs::create_dir_all(sb.join(".tool")).unwrap();
-        std::fs::write(sb.join(".tool/token"), "work2").unwrap();
-        let r = sync.sync_running().unwrap();
-        assert_eq!(r.saved.len(), 1);
-        assert!(!r.saved[0].starts_with(host_home.join(".tool")));
-        assert_eq!(std::fs::read_to_string(&r.saved[0]).unwrap(), "work2");
-        assert_eq!(std::fs::read_to_string(&host).unwrap(), "host");
-        // A host refresh is not an isolated login: it is not pulled in.
-        std::fs::write(&host, "host2").unwrap();
-        sync.sync_running().unwrap();
-        assert_eq!(
-            std::fs::read_to_string(sb.join(".tool/token")).unwrap(),
-            "work2"
-        );
-    }
-
-    #[test]
     fn copy_out_refuses_a_symlinked_credential() {
         let (t, env, p, host_home, sb) = setup();
         std::fs::write(host_home.join(".tool/token"), "old").unwrap();
         let secret = t.path().join("id_key");
         std::fs::write(&secret, "PRIVATE KEY").unwrap();
-        let mut sync = AuthSync::copy_in(&env, &p, &AuthMode::Shared, &sb).unwrap();
+        let sync = AuthSync::copy_in(&env, &p, &AuthMode::Shared, &sb).unwrap();
         // The sandbox swaps its token for a link to a host file.
         std::fs::remove_file(sb.join(".tool/token")).unwrap();
         symlink(&secret, sb.join(".tool/token")).unwrap();
