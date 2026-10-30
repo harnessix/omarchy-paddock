@@ -760,12 +760,12 @@ The agents panel reads the session history of each agent from fixed places in yo
 
 The panel also shows each agent's limits. Its collectors ask the vendor, with the login on the host. While a sandbox runs, it has a copy of that login, so a check from the host would use one login in two places at once. With this scope, a login is checked from one side only:
 
-- paddock writes `~/.config/uwsm/env.d/60-paddock-usage`, the place where Omarchy reads your own session settings. It puts one folder first on `PATH`, with one command in it: `omarchy-agent-usage-update`, which the panel runs for each refresh. It takes effect at your next login.
+- paddock adds one marked block at the end of `~/.config/hypr/hyprland.lua`, where Omarchy asks for your own configuration. The block loads a file of paddock, which puts one folder first on the `PATH` of the programs that Hyprland starts, ahead of Omarchy's `bin` folder. The folder has one command in it: `omarchy-agent-usage-update`, which the panel runs for each refresh. Before paddock writes the file, `luac -p` (if installed) checks that it still compiles. It takes effect at your next login.
 - If no sandbox holds a login, Omarchy's command runs as before.
 - If a sandbox holds the login of Claude Code or Grok Build, the host skips that agent (`--except`), and paddock runs Omarchy's own collector in a sandbox instead. That sandbox has network mode egress, sees your home read-only, and sees the sandbox's copy of the login in place of the host file. Its record goes where Omarchy's goes. These collectors only read a login. They never refresh it.
 - The Codex collector starts `codex app-server`, which can refresh the login itself. So while a sandbox holds a Codex login, nobody checks it. The panel shows the last numbers, marked "Limits paused", until the sandbox exits.
 - paddock checks only when the panel asks. It adds no timer of its own.
-- `paddock shims remove` deletes the file and the folder. `paddock doctor` shows whether the panel's checks go through paddock.
+- `paddock shims remove` removes the block, byte for byte, and the folder. `paddock doctor` shows whether the panel's checks go through paddock.
 
 Inside the sandbox, the installs of the agents are read-only. mise updates them on the host before each start (`auto_update`). Where a vendor documents a switch, paddock turns the agent's own self-update off in the sandbox. Other self-updates fail with "Read-only file system".
 

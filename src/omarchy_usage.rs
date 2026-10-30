@@ -4,9 +4,11 @@
 //! an agent's login on the host and asks the vendor for its limits. While a
 //! paddock sandbox holds a copy of that login, the host must not use it too.
 //!
-//! - One file in `~/.config/uwsm/env.d/`, the place where Omarchy reads the
-//!   user's session environment, puts a folder first on PATH. The folder
-//!   holds one command, `omarchy-agent-usage-update`, which runs
+//! - One marked block at the end of `~/.config/hypr/hyprland.lua`, where
+//!   Omarchy asks for the user's own configuration, loads a file of paddock.
+//!   It puts a folder first on the PATH of everything that Hyprland starts,
+//!   ahead of `$OMARCHY_PATH/bin`, the same way as Omarchy's `envs.lua`. The
+//!   folder holds one command, `omarchy-agent-usage-update`, which runs
 //!   `paddock omarchy-usage-update`.
 //! - Without a held login, that runs Omarchy's command unchanged.
 //! - For an agent whose login a sandbox holds, it adds `--except AGENT`, so
@@ -68,13 +70,28 @@ pub fn hook_bin(env: &HostEnv) -> PathBuf {
     env.paddock_data().join("omarchy-usage").join("bin")
 }
 
-/// The session environment file.
-pub fn dropin(env: &HostEnv) -> PathBuf {
+/// The Lua file that Hyprland loads.
+pub fn hypr_file(env: &HostEnv) -> PathBuf {
+    env.paddock_data().join("omarchy-usage").join("hypr.lua")
+}
+
+/// The user's Hyprland configuration.
+pub fn hypr_config(env: &HostEnv) -> PathBuf {
+    env.config_dir.join("hypr").join("hyprland.lua")
+}
+
+/// The session file of the first version (uwsm), which Hyprland's PATH
+/// overrides. install and remove delete it.
+fn old_dropin(env: &HostEnv) -> PathBuf {
     env.config_dir
         .join("uwsm")
         .join("env.d")
         .join("60-paddock-usage")
 }
+
+const BEGIN: &str = "-- paddock: begin (managed by paddock, remove with `paddock shims remove`)";
+const END: &str = "-- paddock: end";
+const LUA_MARK: &str = "-- Written by paddock (paddock shims remove deletes it).";
 
 fn omarchy_path(env: &HostEnv) -> PathBuf {
     PathBuf::from(env.var("OMARCHY_PATH").unwrap_or("/usr/share/omarchy"))
@@ -89,14 +106,74 @@ fn sh_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
-pub fn dropin_text(bin: &Path) -> String {
-    let d = sh_quote(&bin.display().to_string());
+fn lua_quote(s: &str) -> String {
+    let mut out = String::from("\"");
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// The block in the user's Hyprland configuration. A missing file is no
+/// error, so Hyprland starts the same after paddock is gone.
+pub fn hypr_block(file: &Path) -> String {
     format!(
-        "{MARK}\n\
-         # The Omarchy agents panel checks limits through paddock, so a login that a\n\
-         # paddock sandbox holds is checked from one side only.\n\
-         case \":$PATH:\" in *:{d}:*) ;; *) export PATH={d}:\"$PATH\" ;; esac\n"
+        "{BEGIN}\n-- The Omarchy agents panel checks limits through paddock.\npcall(dofile, {})\n{END}\n",
+        lua_quote(&file.display().to_string())
     )
+}
+
+/// The Lua file: paddock's folder first, then Omarchy's, then the rest.
+pub fn hypr_lua(bin: &Path) -> String {
+    format!(
+        "{LUA_MARK}\n\
+         -- paddock's omarchy-agent-usage-update goes before Omarchy's on PATH, so a\n\
+         -- login that a paddock sandbox holds is checked from one side only.\n\
+         local ours = {}\n\
+         local omarchy = (os.getenv(\"OMARCHY_PATH\") or \"/usr/share/omarchy\") .. \"/bin\"\n\
+         local kept = {{ ours, omarchy }}\n\
+         for entry in (os.getenv(\"PATH\") or \"/usr/local/bin:/usr/bin\"):gmatch(\"[^:]+\") do\n\
+         \x20 if entry ~= ours and entry ~= omarchy then table.insert(kept, entry) end\n\
+         end\n\
+         hl.env(\"PATH\", table.concat(kept, \":\"))\n",
+        lua_quote(&bin.display().to_string())
+    )
+}
+
+pub fn strip_block(text: &str) -> String {
+    let mut out = String::new();
+    let mut inside = false;
+    for line in text.split_inclusive('\n') {
+        let l = line.trim_end();
+        if l == BEGIN {
+            inside = true;
+        } else if inside && l == END {
+            inside = false;
+        } else if !inside {
+            out.push_str(line);
+        }
+    }
+    out
+}
+
+/// The configuration with the block at its end, where Omarchy asks for the
+/// user's own configuration. Running it again changes nothing.
+pub fn insert_block(text: &str, block: &str) -> String {
+    let mut out = strip_block(text);
+    if !out.is_empty() && !out.ends_with('\n') {
+        out.push('\n');
+    }
+    if !out.is_empty() && !out.ends_with("\n\n") {
+        out.push('\n');
+    }
+    out.push_str(block);
+    out
 }
 
 pub fn hook_script(paddock: &Path) -> String {
@@ -112,73 +189,139 @@ pub fn hook_script(paddock: &Path) -> String {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Status {
-    pub dropin: bool,
-    pub script: bool,
-    /// The folder is on PATH in this session (it needs a new login).
+    /// The block in hyprland.lua.
+    pub block: bool,
+    /// The Lua file and the command.
+    pub files: bool,
+    /// `omarchy-agent-usage-update` on this PATH is paddock's (it needs a
+    /// new login, or a reload of Hyprland and the Omarchy shell).
     pub active: bool,
 }
 
 pub fn status(env: &HostEnv) -> Status {
-    let ours = |p: &Path| {
+    let has = |p: &Path, mark: &str| {
         std::fs::read_to_string(p)
-            .map(|t| t.contains(MARK))
+            .map(|t| t.contains(mark))
             .unwrap_or(false)
     };
-    let bin = hook_bin(env);
+    let script = hook_bin(env).join(COMMAND);
     Status {
-        dropin: ours(&dropin(env)),
-        script: ours(&bin.join(COMMAND)),
-        active: env.path.iter().any(|d| d == &bin),
+        block: has(&hypr_config(env), BEGIN),
+        files: has(&hypr_file(env), LUA_MARK) && has(&script, MARK),
+        active: env.which(COMMAND).as_deref() == Some(script.as_path()),
     }
 }
 
-/// Write the folder and the session file.
+fn write_keep_mode(path: &Path, text: &str) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let mode = std::fs::metadata(path)
+        .map(|m| m.permissions().mode() & 0o7777)
+        .unwrap_or(0o644);
+    let tmp = path.with_extension("paddock-tmp");
+    let _ = std::fs::remove_file(&tmp);
+    std::fs::write(&tmp, text)?;
+    std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(mode))?;
+    std::fs::rename(&tmp, path)?;
+    Ok(())
+}
+
+fn remove_old_dropin(env: &HostEnv) -> Result<Option<PathBuf>> {
+    let f = old_dropin(env);
+    if std::fs::read_to_string(&f)
+        .map(|t| t.contains(MARK))
+        .unwrap_or(false)
+    {
+        std::fs::remove_file(&f)?;
+        return Ok(Some(f));
+    }
+    Ok(None)
+}
+
+/// Check Lua source with `luac -p` when a Lua compiler is installed. A
+/// broken hyprland.lua would break the desktop.
+fn lua_compiles(env: &HostEnv, text: &str) -> Result<()> {
+    let Some(luac) = ["luac", "luac5.4", "luac5.3"]
+        .iter()
+        .find_map(|n| env.which(n))
+    else {
+        return Ok(());
+    };
+    let run = env.paddock_run();
+    crate::privfs::dir(&run)?;
+    let f = run.join(format!("hyprland-check-{}.lua", std::process::id()));
+    crate::privfs::write(&f, text)?;
+    let out = Command::new(luac).arg("-p").arg(&f).output();
+    let _ = std::fs::remove_file(&f);
+    let out = out.context("cannot run luac")?;
+    if !out.status.success() {
+        bail!("{}", String::from_utf8_lossy(&out.stderr).trim());
+    }
+    Ok(())
+}
+
+/// Write the folder, the Lua file and the block. Returns the changed
+/// files. Without a `hyprland.lua`, nothing is changed.
 pub fn install(env: &HostEnv) -> Result<Vec<PathBuf>> {
     use std::os::unix::fs::PermissionsExt;
+    let config = hypr_config(env);
+    let text = match std::fs::read_to_string(&config) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            bail!(
+                "{} does not exist, so the panel's limit checks stay on the host",
+                config.display()
+            )
+        }
+        Err(e) => return Err(e).with_context(|| format!("cannot read {}", config.display())),
+    };
     let paddock = crate::launchers::launcher_exe(env)?;
     let bin = hook_bin(env);
     crate::privfs::dir(&bin)?;
     let script = bin.join(COMMAND);
     crate::privfs::write_atomic(&script, hook_script(&paddock))?;
     std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700))?;
-    let f = dropin(env);
-    if f.exists()
-        && !std::fs::read_to_string(&f)
-            .map(|t| t.contains(MARK))
-            .unwrap_or(false)
-    {
-        bail!(
-            "{} exists and paddock did not write it; nothing was changed",
-            f.display()
-        );
+    let lua = hypr_file(env);
+    crate::privfs::write_atomic(&lua, hypr_lua(&bin))?;
+    let mut changed = vec![];
+    let new = insert_block(&text, &hypr_block(&lua));
+    if new != text {
+        lua_compiles(env, &new).with_context(|| {
+            format!(
+                "paddock's block would make {} invalid; nothing was changed",
+                config.display()
+            )
+        })?;
+        write_keep_mode(&config, &new)?;
+        changed.push(config);
     }
-    if let Some(d) = f.parent() {
-        std::fs::create_dir_all(d)?;
-    }
-    let tmp = f.with_extension("paddock-tmp");
-    std::fs::write(&tmp, dropin_text(&bin))?;
-    std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o644))?;
-    std::fs::rename(&tmp, &f)?;
-    Ok(vec![f, script])
+    changed.push(lua);
+    changed.push(script);
+    changed.extend(remove_old_dropin(env)?);
+    Ok(changed)
 }
 
-/// Remove what `install` wrote. A session file that paddock did not write
-/// stays.
+/// Remove what `install` wrote, and keep the rest of hyprland.lua byte
+/// for byte.
 pub fn remove(env: &HostEnv) -> Result<Vec<PathBuf>> {
     let mut removed = Vec::new();
-    let f = dropin(env);
-    if std::fs::read_to_string(&f)
-        .map(|t| t.contains(MARK))
-        .unwrap_or(false)
-    {
-        std::fs::remove_file(&f)?;
-        removed.push(f);
+    let config = hypr_config(env);
+    if let Ok(text) = std::fs::read_to_string(&config) {
+        let mut clean = strip_block(&text);
+        // insert_block added one empty line before the block.
+        if text.contains(BEGIN) && clean.ends_with("\n\n") {
+            clean.pop();
+        }
+        if clean != text {
+            write_keep_mode(&config, &clean)?;
+            removed.push(config);
+        }
     }
     let root = env.paddock_data().join("omarchy-usage");
     if root.exists() {
         crate::safefs::remove_tree_path(&root)?;
         removed.push(root);
     }
+    removed.extend(remove_old_dropin(env)?);
     Ok(removed)
 }
 
@@ -527,7 +670,7 @@ fn run_capped(cmd: &mut Command) -> Result<Vec<u8>> {
 pub fn doctor_lines(env: &HostEnv) -> Vec<String> {
     let s = status(env);
     let mark = |ok: bool| if ok { "  ok      " } else { "  CHECK   " };
-    if !s.dropin && !s.script {
+    if !s.block && !s.files {
         return vec![
             "  off      the agents panel checks limits on the host, also for a login that a sandbox holds; paddock shims install --scope omarchy-agent changes that"
                 .into(),
@@ -535,12 +678,13 @@ pub fn doctor_lines(env: &HostEnv) -> Vec<String> {
     }
     let mut out = vec![
         format!(
-            "{} the session file {}",
-            mark(s.dropin && s.script),
-            dropin(env)
-                .display()
-                .to_string()
-                .replacen(&env.home.display().to_string(), "~", 1)
+            "{} the paddock block in {}",
+            mark(s.block && s.files),
+            hypr_config(env).display().to_string().replacen(
+                &env.home.display().to_string(),
+                "~",
+                1
+            )
         ),
         format!(
             "{} the panel's limit checks go through paddock{}",
@@ -633,52 +777,115 @@ mod tests {
         assert_eq!(homes, vec![PathBuf::from("/acct"), PathBuf::from("/new")]);
     }
 
+    const USER_HYPR: &str = "-- Learn how to configure Hyprland\nrequire(\"default.hypr.omarchy\")\n\n-- Add any other personal Hyprland configuration below.\n-- o.window(\"qemu\", { workspace = \"5\" })\n";
+
     #[test]
-    fn install_and_remove_touch_only_paddock_s_files() {
+    fn install_and_remove_keep_the_user_s_hyprland_config() {
         let t = tempfile::tempdir().unwrap();
         let e = env(t.path());
-        let f = dropin(&e);
-        std::fs::create_dir_all(f.parent().unwrap()).unwrap();
-        std::fs::write(f.parent().unwrap().join("50-mine"), "export A=1\n").unwrap();
-        // A file of the same name that paddock did not write stays.
-        std::fs::write(&f, "export MINE=1\n").unwrap();
+        // No hyprland.lua: nothing is written.
         assert!(install(&e).is_err());
-        assert_eq!(std::fs::read_to_string(&f).unwrap(), "export MINE=1\n");
-        assert!(remove(&e).unwrap().iter().all(|p| p != &f));
-        std::fs::remove_file(&f).unwrap();
+        assert!(!hook_bin(&e).exists());
+
+        let config = hypr_config(&e);
+        std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+        std::fs::write(&config, USER_HYPR).unwrap();
+        // The file of the first version goes away.
+        let old = old_dropin(&e);
+        std::fs::create_dir_all(old.parent().unwrap()).unwrap();
+        std::fs::write(&old, format!("{MARK}\nexport PATH=x\n")).unwrap();
+        let mine = old.parent().unwrap().join("50-mine");
+        std::fs::write(&mine, "export A=1\n").unwrap();
 
         install(&e).unwrap();
+        let once = std::fs::read_to_string(&config).unwrap();
+        assert!(once.starts_with(USER_HYPR));
+        assert!(once.ends_with(&hypr_block(&hypr_file(&e))));
+        assert!(!old.exists() && mine.exists());
+        install(&e).unwrap();
+        assert_eq!(std::fs::read_to_string(&config).unwrap(), once);
         let s = status(&e);
-        assert!(s.dropin && s.script && !s.active);
-        let text = std::fs::read_to_string(&f).unwrap();
-        assert!(text.contains(&hook_bin(&e).display().to_string()));
+        assert!(s.block && s.files && !s.active);
+
         remove(&e).unwrap();
-        assert!(!f.exists() && !hook_bin(&e).exists());
-        assert_eq!(
-            std::fs::read_to_string(f.parent().unwrap().join("50-mine")).unwrap(),
-            "export A=1\n"
-        );
+        assert_eq!(std::fs::read_to_string(&config).unwrap(), USER_HYPR);
+        assert!(!hook_bin(&e).exists());
+        assert_eq!(std::fs::read_to_string(&mine).unwrap(), "export A=1\n");
     }
 
     #[test]
-    fn the_session_file_adds_the_folder_once() {
-        let bin = Path::new("/h/.local/share/paddock/omarchy-usage/bin");
-        let text = dropin_text(bin);
+    fn a_config_that_would_not_compile_is_left_alone() {
+        let t = tempfile::tempdir().unwrap();
+        let mut e = env(t.path());
+        e.path = vec![PathBuf::from("/usr/bin")];
+        if e.which("luac").is_none() {
+            eprintln!("skipped: no luac");
+            return;
+        }
+        let config = hypr_config(&e);
+        std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+        // An open long comment: anything appended stays inside it.
+        let broken = "x = 1\n--[[ unfinished\n";
+        std::fs::write(&config, broken).unwrap();
+        assert!(install(&e).is_err());
+        assert_eq!(std::fs::read_to_string(&config).unwrap(), broken);
+    }
+
+    #[test]
+    fn a_config_without_a_final_newline_gets_the_block_on_its_own_lines() {
+        let block = hypr_block(Path::new("/h/hypr.lua"));
+        let out = insert_block("x = 1", &block);
+        assert_eq!(out, format!("x = 1\n\n{block}"));
+        assert_eq!(strip_block(&out), "x = 1\n\n");
+    }
+
+    /// The Lua file with the system Lua, with a stand-in for Hyprland's `hl`.
+    #[test]
+    fn the_lua_file_puts_paddock_first_and_omarchy_second() {
+        let Some(lua) = ["lua5.4", "lua", "luajit"]
+            .iter()
+            .map(|l| Path::new("/usr/bin").join(l))
+            .find(|p| p.exists())
+        else {
+            eprintln!("skipped: no lua");
+            return;
+        };
+        let t = tempfile::tempdir().unwrap();
+        let f = t.path().join("hypr.lua");
+        std::fs::write(
+            &f,
+            hypr_lua(Path::new("/h/.local/share/paddock/omarchy-usage/bin")),
+        )
+        .unwrap();
         let run = |path: &str| {
-            let out = Command::new("sh")
-                .arg("-c")
-                .arg(format!("{text}\nprintf %s \"$PATH\""))
+            let out = Command::new(&lua)
+                .arg("-e")
+                .arg(format!(
+                    "hl = {{ env = function(k, v) io.write(k .. '=' .. v) end }} dofile({})",
+                    lua_quote(&f.display().to_string())
+                ))
                 .env("PATH", path)
+                .env_remove("OMARCHY_PATH")
                 .output()
                 .unwrap();
             String::from_utf8(out.stdout).unwrap()
         };
-        let once = run("/usr/share/omarchy/bin:/usr/bin");
+        let want = "PATH=/h/.local/share/paddock/omarchy-usage/bin:/usr/share/omarchy/bin:/usr/bin";
+        assert_eq!(run("/usr/bin"), want);
         assert_eq!(
-            once,
-            format!("{}:/usr/share/omarchy/bin:/usr/bin", bin.display())
+            run("/usr/share/omarchy/bin:/h/.local/share/paddock/omarchy-usage/bin:/usr/bin"),
+            want
         );
-        assert_eq!(run(&once), once);
+        // pcall(dofile, ...) of a missing file is no error.
+        let out = Command::new(&lua)
+            .arg("-e")
+            .arg(format!(
+                "\n{} print('ok')",
+                hypr_block(&t.path().join("gone.lua"))
+            ))
+            .output()
+            .unwrap();
+        assert_eq!(String::from_utf8(out.stdout).unwrap(), "ok\n");
     }
 
     #[test]
