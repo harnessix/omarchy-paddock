@@ -39,6 +39,9 @@ pub struct Options {
     /// A sandbox that another sandbox asked for (`paddock-host spawn`). It
     /// uses the parent's settings snapshot and runs the one-shot command.
     pub child: Option<crate::spawn::ChildPlan>,
+    /// `paddock wrap`: the command runs as given, with its `env` prefix and
+    /// shell form, and the login comes from its account folder.
+    pub transparent: Option<crate::wrap::Transparent>,
 }
 
 /// A worktree that paddock created for one run.
@@ -230,6 +233,8 @@ pub struct Built {
     pub parent: Option<String>,
     /// For a spawned sandbox: the devices of its parent. It gets no other.
     pub device_ceiling: Option<Vec<String>>,
+    /// The run shares session history with the host (`paddock wrap` starts).
+    pub shared_history: bool,
     /// Serve the built-in `echo` device whatever the user configuration says.
     /// `paddock doctor --escape` tests the device mount with it.
     pub test_devices: bool,
@@ -342,12 +347,21 @@ pub fn build_with(env: &HostEnv, opts: &Options, harness: Harness) -> Result<Bui
     };
     let project = worktree.as_ref().map(|w| w.path.clone()).unwrap_or(project);
 
-    let auth: state::AuthMode = opts
-        .auth
-        .clone()
-        .or(m.auth.mode.clone())
-        .unwrap_or_else(|| "shared".into())
-        .parse()?;
+    let account = opts.transparent.as_ref().and_then(|t| t.account.as_ref());
+    let auth: state::AuthMode = match account {
+        Some(dir) => state::AuthMode::account(dir),
+        None => opts
+            .auth
+            .clone()
+            .or(m.auth.mode.clone())
+            .unwrap_or_else(|| "shared".into())
+            .parse()?,
+    };
+    if let state::AuthMode::Account { dir, .. } = &auth {
+        if dir.as_os_str().is_empty() {
+            bail!("the account mode is only for `paddock wrap`; use shared or isolated:NAME");
+        }
+    }
     let id = match &opts.child {
         Some(c) => c.id.clone(),
         None => state::new_id(&profile.name, &project),
@@ -460,7 +474,7 @@ pub fn build_with(env: &HostEnv, opts: &Options, harness: Harness) -> Result<Bui
         }
     }
     for rel in &profile.state.import_ro {
-        let host = env.home.join(rel);
+        let host = state::host_file(env, &profile, &auth, rel);
         if host.exists() {
             spec.add_mount(Mount::same(&host, false, &format!("{porigin} import_ro")));
         }
@@ -485,6 +499,30 @@ pub fn build_with(env: &HostEnv, opts: &Options, harness: Harness) -> Result<Bui
         }
     }
     check_harness_install(&harness, &sandbox_writable(env, &spec))?;
+    // Host history only for starts through `paddock wrap` (omarchy-agent),
+    // where the Omarchy agents panel needs it. A sandbox-written transcript
+    // that the host harness loads later (`claude --resume`, `codex resume`)
+    // can carry instructions out of the sandbox, so other runs keep their
+    // history private in the sandbox home.
+    let shared_history = opts.transparent.is_some();
+    if shared_history {
+        crate::history::apply(env, &profile, &auth, &mut spec)?;
+    }
+    if let state::AuthMode::Account { dir, .. } = &auth {
+        // The host writes refreshed tokens back into the account folder. A
+        // folder that a sandbox can write could lead those writes anywhere.
+        let real = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.clone());
+        if let Some(w) = sandbox_writable(env, &spec)
+            .iter()
+            .find(|w| real.starts_with(w))
+        {
+            bail!(
+                "the account folder {} is inside {}, which a sandbox can write; paddock does not use it as a login",
+                dir.display(),
+                w.display()
+            );
+        }
+    }
     for k in &m.env.pass {
         if let Some(v) = env.var(k) {
             spec.set_secret_env(k, v, "manifest env.pass");
@@ -492,6 +530,16 @@ pub fn build_with(env: &HostEnv, opts: &Options, harness: Harness) -> Result<Bui
     }
     for (k, v) in &m.env.set {
         spec.set_env(k, v.clone(), "manifest env.set");
+    }
+    // The `env` prefix of a `paddock wrap` command, as the agent gets it on
+    // the host.
+    if let Some(t) = &opts.transparent {
+        for k in &t.env_unset {
+            spec.env.remove(k);
+        }
+        for (k, v) in &t.env_set {
+            spec.set_env(k, v.clone(), "command: env prefix");
+        }
     }
 
     // The detectors.
@@ -512,6 +560,22 @@ pub fn build_with(env: &HostEnv, opts: &Options, harness: Harness) -> Result<Bui
         }
     }
     crate::mcp::apply(env, &profile, &m, &project, &mut spec);
+    crate::privacy::push_settings(
+        &profile,
+        &profile.state.settings,
+        &format!("{porigin} state.settings"),
+        &mut spec,
+    )?;
+    if spec.network != Network::None {
+        for p in &profile.network.publish {
+            if !spec.publish.contains(p) {
+                spec.publish.push(*p);
+            }
+        }
+    }
+    if let Some(why) = &profile.launch.wrap_on_host {
+        spec.warnings.push(format!("{}: {why}", profile.name));
+    }
     // Last, so neither the host environment nor a project file turns
     // telemetry back on. Only the user configuration can ([privacy]).
     let privacy = crate::privacy::mode(&m);
@@ -545,13 +609,23 @@ pub fn build_with(env: &HostEnv, opts: &Options, harness: Harness) -> Result<Bui
         c.extend(crate::privacy::args(&profile, privacy));
         c.extend(o.render(&spec.home.join(crate::spawn::PROMPT_IN_HOME)));
         c
+    } else if let Some(t) = opts.transparent.as_ref().filter(|t| !t.shell.is_empty()) {
+        // The shell form: the script starts its `$0`, which is the harness.
+        // The script's arguments stay as they are.
+        let mut c = t.shell.clone();
+        c.push(harness.exe.display().to_string());
+        c.extend(opts.args.iter().cloned());
+        c
     } else {
         let mut c = vec![harness.exe.display().to_string()];
         if !opts.no_yolo {
             c.extend(profile.launch.yolo_args.iter().cloned());
         }
         c.extend(crate::privacy::args(&profile, privacy));
-        c.extend(profile.launch.args.iter().cloned());
+        // Transparent: the command already has the arguments it needs.
+        if opts.transparent.is_none() {
+            c.extend(profile.launch.args.iter().cloned());
+        }
         // An editor that opens the repository opens the worktree instead.
         let repo_arg = home_key.display().to_string();
         c.extend(opts.args.iter().map(|a| match &worktree {
@@ -646,6 +720,7 @@ pub fn build_with(env: &HostEnv, opts: &Options, harness: Harness) -> Result<Bui
         parent: None,
         device_ceiling: None,
         test_devices: false,
+        shared_history,
         worktree,
         auth,
         spec,
@@ -779,6 +854,27 @@ mod tests {
         // A project cannot turn vendor mode off either.
         let (_t, b) = privacy_spec("codex", vendor, off);
         assert!(b.spec.home_settings.is_empty());
+    }
+
+    #[test]
+    fn profile_ports_settings_and_host_notices_reach_the_spec() {
+        // dsh serves its UI to the host browser on one loopback port.
+        let (_t, b) = privacy_spec("dsh", "", "");
+        assert_eq!(b.spec.publish, vec![3080]);
+        let (_t, b) = privacy_spec("dsh", "[network]\nmode = \"none\"\n", "");
+        assert!(b.spec.publish.is_empty());
+        // A self-update switch goes into the sandbox copy of the settings.
+        let (_t, b) = privacy_spec("devin", "", "");
+        assert!(b
+            .spec
+            .home_settings
+            .iter()
+            .any(|s| s.path == ["auto_update"]
+                && s.value == serde_json::json!(false)
+                && s.origin.contains("state.settings")));
+        // muse keeps its own sandbox: `paddock muse` says what that means.
+        let (_t, b) = privacy_spec("muse", "", "");
+        assert!(b.spec.warnings.iter().any(|w| w.contains("own sandbox")));
     }
 
     #[test]

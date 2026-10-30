@@ -26,6 +26,17 @@ import_ro = [".codex/AGENTS.md", ".codex/prompts", ".agents/skills"]
 seed = [".codex/config.toml"]
 env_pass = ["OPENAI_API_KEY", "OPENAI_BASE_URL", "CODEX_API_KEY"]
 
+# Omarchy's account switch: CODEX_HOME replaces ~/.codex.
+[state.account]
+env = "CODEX_HOME"
+dir = ".codex"
+
+# Codex keeps its sessions by date. New ones are copied back at exit, so the
+# Omarchy agents panel counts them.
+[state.history]
+copy_back = [".codex/sessions", ".codex/archived_sessions"]
+files = ["*.jsonl"]
+
 # The project is already sandboxed: mark it trusted, so codex does not ask.
 [[state.toml_set]]
 file = ".codex/config.toml"

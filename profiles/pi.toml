@@ -1,0 +1,42 @@
+name = "pi"
+description = "pi coding agent"
+
+# Entries that come from documentation, not from a test. paddock doctor lists them.
+unverified = [
+  "a login and a full run inside paddock: `pi --version` was tested",
+]
+
+# mise tool: pi
+[locate]
+mise = "pi"
+commands = ["pi"]
+
+[launch]
+# pi asks no approvals. OAuth logins (/login) return to a localhost callback.
+login_callback = true
+# The install is read-only in the sandbox; mise updates it on the host.
+# https://github.com/badlogic/pi-mono/blob/main/packages/coding-agent/docs/environment-variables.md
+env = { PI_SKIP_VERSION_CHECK = "1" }
+
+[state]
+# API keys and OAuth tokens.
+# https://github.com/badlogic/pi-mono/blob/main/packages/coding-agent/docs/configuration.md
+auth = [".pi/agent/auth.json"]
+import_ro = [".pi/agent/skills", ".pi/agent/themes", ".pi/agent/extensions", ".agents/skills"]
+seed = [".pi/agent/settings.json"]
+env_pass = ["ANTHROPIC_API_KEY", "OPENAI_API_KEY", "GEMINI_API_KEY", "OPENROUTER_API_KEY", "DEEPSEEK_API_KEY", "MOONSHOT_API_KEY", "MINIMAX_API_KEY", "ZAI_API_KEY"]
+
+# Install and update telemetry, and the attribution headers, off.
+# https://github.com/badlogic/pi-mono/blob/main/packages/coding-agent/docs/environment-variables.md
+[privacy]
+env = { PI_TELEMETRY = "0" }
+
+[privacy.training]
+setting = "the data settings of the model provider you sign in to"
+url = "https://github.com/badlogic/pi-mono/blob/main/packages/coding-agent/docs/providers.md"
+
+# One task without a terminal (`pi --help`): -p processes the prompt and
+# exits, and @FILE puts a file into the message.
+[oneshot]
+args = ["-p", "@{prompt_file}", "Do the task that the attached file describes."]
+prompt = "file"

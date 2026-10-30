@@ -1,0 +1,62 @@
+name = "qwen"
+description = "Qwen Code"
+
+# Entries that come from documentation, not from a test. paddock doctor lists them.
+unverified = [
+  "every entry: qwen was not installed when this profile was written",
+  "state.auth .qwen/oauth_creds.json: the login file",
+]
+
+# mise tool: qwen
+[locate]
+mise = "qwen"
+commands = ["qwen"]
+
+[launch]
+login_callback = true
+# --yolo approves every tool call.
+# https://qwenlm.github.io/qwen-code-docs/en/users/configuration/settings/
+yolo_args = ["--yolo"]
+
+[state]
+auth = [".qwen/oauth_creds.json", ".qwen/.env"]
+import_ro = [".qwen/QWEN.md", ".agents/skills"]
+seed = [".qwen/settings.json"]
+env_pass = ["QWENCLOUD_API_KEY", "DASHSCOPE_API_KEY", "OPENAI_API_KEY", "OPENAI_BASE_URL", "OPENAI_MODEL", "OPENROUTER_API_KEY"]
+
+# The install is read-only in the sandbox; mise updates it on the host.
+[[state.settings]]
+file = ".qwen/settings.json"
+path = ["general", "enableAutoUpdate"]
+value = false
+
+[[mcp]]
+file = ".qwen/settings.json"
+path = ["mcpServers"]
+
+[[mcp]]
+file = ".qwen/settings.json"
+in_project = true
+path = ["mcpServers"]
+
+# Usage statistics and OpenTelemetry off in the sandbox copy of settings.json.
+# https://qwenlm.github.io/qwen-code-docs/en/users/configuration/settings/
+[[privacy.settings]]
+file = ".qwen/settings.json"
+path = ["privacy", "usageStatisticsEnabled"]
+value = false
+
+[[privacy.settings]]
+file = ".qwen/settings.json"
+path = ["telemetry", "enabled"]
+value = false
+
+[privacy.training]
+setting = "the data settings of the model provider you sign in to"
+url = "https://qwenlm.github.io/qwen-code-docs/en/users/configuration/auth/"
+
+# One task without a terminal: with a prompt from stdin, qwen answers and
+# exits. https://qwenlm.github.io/qwen-code-docs/en/users/features/headless/
+[oneshot]
+args = ["--yolo", "-p", "Do the task that the text above describes."]
+prompt = "stdin"

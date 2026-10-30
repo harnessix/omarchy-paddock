@@ -1,0 +1,47 @@
+name = "hermes"
+description = "Nous Research Hermes Agent"
+
+# Entries that come from documentation, not from a test. paddock doctor lists them.
+unverified = [
+  "a login and a full run inside paddock: `hermes --version` and `--help` were tested",
+  "state.auth .hermes/.env and .hermes/auth.json: API keys and OAuth logins",
+  "the terminal UI (--tui) inside the sandbox",
+]
+
+# Not a mise tool: its installer puts the code and a virtual environment in
+# ~/.hermes/hermes-agent and a launcher script in ~/.local/bin.
+# https://hermes-agent.nousresearch.com/docs/getting-started/installation
+[locate]
+commands = ["hermes"]
+paths = ["~/.hermes/hermes-agent/venv/bin/hermes"]
+
+[launch]
+# The help text: --yolo bypasses all dangerous command approval prompts.
+yolo_args = ["--yolo"]
+# --version and --help start the program without a model call.
+probe_args = ["--help"]
+
+[state]
+# API keys (.env) and OAuth logins such as Nous Portal (auth.json).
+# https://hermes-agent.nousresearch.com/docs/user-guide/configuration
+auth = [".hermes/.env", ".hermes/auth.json"]
+# The code and its virtual environment, read-only: an update inside the
+# sandbox fails. Run `hermes update` on the host. The Python that the
+# environment links to comes from uv.
+import_ro = [".hermes/hermes-agent", ".local/share/uv/python", ".hermes/SOUL.md", ".hermes/skills", ".agents/skills"]
+# A writable copy of the settings. Memories, sessions, the kanban board and
+# the gateway stay on the host; the sandbox keeps its own.
+seed = [".hermes/config.yaml"]
+env_pass = ["OPENROUTER_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "NOUS_API_KEY"]
+
+# Hermes documents no telemetry switch.
+[privacy.training]
+setting = "the data settings of the model provider you sign in to"
+url = "https://hermes-agent.nousresearch.com/docs/user-guide/configuration"
+
+# One task without a terminal: `hermes chat --oneshot --query-file PATH`
+# answers the query in the file and exits (`hermes chat --help`).
+[oneshot]
+args = ["chat", "--yolo", "--oneshot", "-Q", "--query-file", "{prompt_file}"]
+prompt = "file"
+probe_args = ["chat", "--help"]

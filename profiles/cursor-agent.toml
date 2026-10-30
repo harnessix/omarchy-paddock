@@ -1,0 +1,53 @@
+name = "cursor-agent"
+description = "Cursor CLI"
+
+# Entries that come from documentation, not from a test. paddock doctor lists them.
+unverified = [
+  "every entry: cursor-agent was not installed when this profile was written",
+  "state.auth .config/cursor/auth.json: Cursor documents only that the login is stored locally",
+  "launch.keyring: whether the login goes to the system keyring",
+]
+
+# mise tool: cursor-agent. Cursor's own installer names the command `agent`.
+[locate]
+mise = "cursor-agent"
+commands = ["cursor-agent"]
+paths = ["~/.local/bin/cursor-agent"]
+
+[launch]
+# `agent login` opens the browser.
+login_callback = true
+# A private keyring per sandbox, never the host one, in case the login goes there.
+keyring = true
+# --yolo (the same as --force) runs commands unless a rule denies them;
+# --trust trusts the workspace without a prompt.
+# https://cursor.com/docs/cli/reference/parameters
+yolo_args = ["--yolo", "--trust"]
+
+[state]
+auth = [".config/cursor/auth.json"]
+import_ro = [".cursor/skills", ".cursor/agents", ".cursor/rules", ".cursor/mcp.json", ".agents/skills"]
+# A writable copy: the CLI saves permissions and settings in it.
+# https://cursor.com/docs/cli/reference/configuration
+seed = [".cursor/cli-config.json"]
+env_pass = ["CURSOR_API_KEY"]
+
+[[mcp]]
+file = ".cursor/mcp.json"
+path = ["mcpServers"]
+
+[[mcp]]
+file = ".cursor/mcp.json"
+in_project = true
+path = ["mcpServers"]
+
+# Cursor documents no telemetry switch for the CLI.
+[privacy.training]
+setting = "Cursor Settings, General, Privacy Mode"
+url = "https://cursor.com/docs/account/privacy"
+
+# One task without a terminal: -p prints the response and exits. The prompt
+# text is fixed and names the file. https://cursor.com/docs/cli/overview
+[oneshot]
+args = ["-p", "--force", "--trust", "Read the file {prompt_file} and do the task that it describes."]
+prompt = "file"

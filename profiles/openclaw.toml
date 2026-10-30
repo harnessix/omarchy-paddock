@@ -1,0 +1,37 @@
+name = "openclaw"
+description = "OpenClaw"
+
+# Entries that come from documentation, not from a test. paddock doctor lists them.
+unverified = [
+  "every entry: openclaw was not installed when this profile was written",
+  "`paddock openclaw`: the embedded runtime with its own state in the sandbox home",
+]
+
+# Not a mise tool. omarchy-agent starts its launcher, omarchy-launch-openclaw.
+[locate]
+commands = ["openclaw", "omarchy-launch-openclaw"]
+
+[launch]
+# omarchy-agent starts `omarchy-launch-openclaw --tui`. The terminal UI
+# attaches to the OpenClaw gateway, a systemd user service on the host that
+# owns ~/.openclaw and runs the agent's tools. A sandbox around the terminal
+# UI would protect nothing, so those starts run as before, with a notice.
+# https://docs.openclaw.ai/cli/tui and https://docs.openclaw.ai/gateway/sandboxing
+wrap_on_host = "its agent runs in the OpenClaw gateway, a service on the host; paddock can sandbox only `paddock openclaw`, which runs OpenClaw's embedded runtime"
+# `paddock openclaw` runs the embedded runtime (`openclaw chat`) instead. It
+# needs its own state folder, so it uses ~/.openclaw in the sandbox home and
+# never shares the gateway's. Onboard it inside the sandbox.
+args = ["chat"]
+
+[state]
+import_ro = [".agents/skills"]
+env_pass = ["ANTHROPIC_API_KEY", "OPENAI_API_KEY", "OPENROUTER_API_KEY"]
+
+# Only ClawHub's install reports have a documented switch.
+# https://docs.openclaw.ai/help/environment
+[privacy]
+env = { CLAWHUB_DISABLE_TELEMETRY = "1" }
+
+[privacy.training]
+setting = "the data settings of the model provider you configure"
+url = "https://docs.openclaw.ai/gateway/security/secrets-and-storage"

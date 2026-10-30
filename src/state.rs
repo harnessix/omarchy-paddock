@@ -57,15 +57,11 @@ pub fn sandbox_home(
     project: &Path,
 ) -> Result<PathBuf> {
     // One home per login, so the account state of one login never shows in another.
-    let login = match auth {
-        AuthMode::Shared => "shared".to_string(),
-        AuthMode::Isolated(n) => format!("isolated-{n}"),
-    };
     let dir = env
         .paddock_data()
         .join("homes")
         .join(harness)
-        .join(login)
+        .join(crate::storage::login_dir(auth))
         .join(slug(project));
     crate::privfs::dir(&dir)?;
     Ok(dir)
@@ -78,11 +74,48 @@ pub enum AuthMode {
     Shared,
     /// A separate login kept by paddock, with a name for several accounts.
     Isolated(String),
+    /// Another account folder of the host, as Omarchy's account switch
+    /// selects it (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `GROK_HOME`). The
+    /// folder is the store, like the home in the shared mode. `key` names
+    /// the sandbox home; `dir` is empty when the mode was read back from a
+    /// record.
+    Account { key: String, dir: PathBuf },
+}
+
+impl AuthMode {
+    /// The account mode for a host folder.
+    pub fn account(dir: &Path) -> Self {
+        Self::Account {
+            key: slug(dir),
+            dir: dir.to_path_buf(),
+        }
+    }
+
+    /// The host's own logins: the home or an account folder of the host.
+    pub fn is_host_login(&self) -> bool {
+        matches!(self, Self::Shared | Self::Account { .. })
+    }
+}
+
+fn valid_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
 }
 
 impl std::str::FromStr for AuthMode {
     type Err = anyhow::Error;
     fn from_str(s: &str) -> Result<Self> {
+        if let Some(key) = s.strip_prefix("account:") {
+            if !valid_name(key) {
+                anyhow::bail!("account key '{key}' must use letters, digits, '-' or '_'");
+            }
+            return Ok(Self::Account {
+                key: key.to_string(),
+                dir: PathBuf::new(),
+            });
+        }
         let name = match s {
             "shared" => return Ok(Self::Shared),
             "isolated" => "default",
@@ -90,11 +123,7 @@ impl std::str::FromStr for AuthMode {
                 anyhow::anyhow!("unknown auth mode '{s}': use shared, isolated or isolated:NAME")
             })?,
         };
-        if name.is_empty()
-            || !name
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-        {
+        if !valid_name(name) {
             anyhow::bail!("auth name '{name}' must use letters, digits, '-' or '_'");
         }
         Ok(Self::Isolated(name.to_string()))
@@ -106,6 +135,7 @@ impl std::fmt::Display for AuthMode {
         match self {
             Self::Shared => write!(f, "shared"),
             Self::Isolated(n) => write!(f, "isolated:{n}"),
+            Self::Account { key, .. } => write!(f, "account:{key}"),
         }
     }
 }
@@ -113,9 +143,32 @@ impl std::fmt::Display for AuthMode {
 /// The directory that holds the credential files for a mode.
 pub fn auth_root(env: &HostEnv, harness: &str, mode: &AuthMode) -> PathBuf {
     match mode {
-        AuthMode::Shared => env.home.clone(),
+        AuthMode::Shared | AuthMode::Account { .. } => env.home.clone(),
         AuthMode::Isolated(name) => env.paddock_data().join("auth").join(harness).join(name),
     }
+}
+
+/// The account folder for `rel`, a path relative to HOME in the profile, in
+/// the account mode (`[state.account]`). None in the other modes, and for
+/// paths that do not move with the account.
+fn account_file(profile: &Profile, mode: &AuthMode, rel: &str) -> Option<PathBuf> {
+    match (mode, &profile.state.account) {
+        (AuthMode::Account { dir, .. }, Some(a)) if !dir.as_os_str().is_empty() => a.map(dir, rel),
+        _ => None,
+    }
+}
+
+/// The host file that a settings entry (`import_ro`, `seed`, `json_import`)
+/// reads. In the account mode, the files of the account folder come from the
+/// selected folder.
+pub fn host_file(env: &HostEnv, profile: &Profile, mode: &AuthMode, rel: &str) -> PathBuf {
+    account_file(profile, mode, rel).unwrap_or_else(|| env.home.join(rel))
+}
+
+/// The stored copy of a credential file (`auth`) for a mode.
+pub fn auth_file(env: &HostEnv, profile: &Profile, mode: &AuthMode, rel: &str) -> PathBuf {
+    account_file(profile, mode, rel)
+        .unwrap_or_else(|| auth_root(env, &profile.name, mode).join(rel))
 }
 
 /// The hash of a regular file, streamed, of at most 1 GiB. A FIFO or a device
@@ -161,7 +214,74 @@ fn write_private(bytes: &[u8], to: &Path) -> Result<()> {
     crate::privfs::write_atomic(to, bytes).with_context(|| format!("write {}", to.display()))
 }
 
+/// Where a credential is stored on the host.
+enum Store {
+    /// A path that only the host can write: the home or paddock's store.
+    Host,
+    /// A file in an account folder of the host (the account mode). Every
+    /// access goes through `safefs` from that folder, so no symlink in it is
+    /// followed.
+    Account { root: PathBuf, rel: PathBuf },
+}
+
+impl Store {
+    fn for_file(mode: &AuthMode, stored: &Path) -> Self {
+        match mode {
+            AuthMode::Account { dir, .. } if !dir.as_os_str().is_empty() => {
+                match stored.strip_prefix(dir) {
+                    Ok(rel) if !rel.as_os_str().is_empty() => Store::Account {
+                        root: dir.clone(),
+                        rel: rel.to_path_buf(),
+                    },
+                    _ => Store::Host,
+                }
+            }
+            _ => Store::Host,
+        }
+    }
+
+    fn read(&self, stored: &Path) -> Result<Option<Vec<u8>>> {
+        match self {
+            Store::Host => {
+                if !stored.is_file() {
+                    return Ok(None);
+                }
+                std::fs::read(stored)
+                    .map(Some)
+                    .with_context(|| format!("cannot read {}", stored.display()))
+            }
+            Store::Account { root, rel } => {
+                if !root.is_dir() {
+                    return Ok(None);
+                }
+                crate::safefs::Root::open(root)?.read(rel, crate::safefs::MAX_READ)
+            }
+        }
+    }
+
+    fn hash(&self, stored: &Path) -> Option<String> {
+        match self {
+            Store::Host => file_hash(stored),
+            Store::Account { .. } => self
+                .read(stored)
+                .ok()
+                .flatten()
+                .map(|b| hex(&Sha256::digest(&b))),
+        }
+    }
+
+    fn write(&self, stored: &Path, bytes: &[u8]) -> Result<()> {
+        match self {
+            Store::Host => write_private(bytes, stored),
+            Store::Account { root, rel } => crate::safefs::Root::open(root)?
+                .write(rel, bytes, 0o600)
+                .with_context(|| format!("write {}", stored.display())),
+        }
+    }
+}
+
 struct AuthItem {
+    store: Store,
     stored: PathBuf,
     /// Relative to the sandbox home, which the sandbox can write.
     rel: PathBuf,
@@ -178,6 +298,41 @@ pub struct AuthSync {
     pub mode: AuthMode,
     home: PathBuf,
     items: Vec<AuthItem>,
+    /// Folder entries (`auth = ["dir/"]`): the folder relative to the
+    /// sandbox home, and its store on the host. A login that the sandbox
+    /// adds there is copied out too.
+    folders: Vec<(PathBuf, PathBuf)>,
+}
+
+/// The names of the regular files in a host folder. Symlinks are left out.
+fn host_file_names(dir: &Path, store: &Store) -> Vec<String> {
+    let names: Vec<std::ffi::OsString> = match store {
+        Store::Account { root, rel } => crate::safefs::Root::open(root)
+            .and_then(|r| r.dir(rel, false))
+            .and_then(|d| d.file_names())
+            .unwrap_or_default(),
+        Store::Host => std::fs::read_dir(dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter(|e| e.file_type().is_ok_and(|t| t.is_file()))
+            .map(|e| e.file_name())
+            .collect(),
+    };
+    names
+        .into_iter()
+        .filter_map(|n| n.into_string().ok())
+        .collect()
+}
+
+/// The names of the regular files in a folder of the sandbox home.
+fn inside_file_names(home: &crate::safefs::Root, rel: &Path) -> Vec<String> {
+    home.dir(rel, false)
+        .and_then(|d| d.file_names())
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|n| n.into_string().ok())
+        .collect()
 }
 
 /// The hash of a credential file inside the sandbox home. A symlink or a
@@ -201,24 +356,44 @@ impl AuthSync {
         mode: &AuthMode,
         home_src: &Path,
     ) -> Result<Self> {
-        let root = auth_root(env, &profile.name, mode);
         let home = crate::safefs::Root::open(home_src)?;
         let mut items = Vec::new();
+        let mut folders = Vec::new();
+        let mut rels = Vec::new();
         for rel in &profile.state.auth {
-            let stored = root.join(rel);
+            // A folder of credential files whose names the profile cannot
+            // know, such as one file per provider.
+            if let Some(dir) = rel.strip_suffix('/') {
+                let stored = auth_file(env, profile, mode, dir);
+                let store = Store::for_file(mode, &stored);
+                let mut names = host_file_names(&stored, &store);
+                for n in inside_file_names(&home, Path::new(dir)) {
+                    if !names.contains(&n) {
+                        names.push(n);
+                    }
+                }
+                names.sort();
+                rels.extend(names.into_iter().map(|n| format!("{dir}/{n}")));
+                folders.push((PathBuf::from(dir), stored));
+            } else {
+                rels.push(rel.clone());
+            }
+        }
+        for rel in &rels {
+            let stored = auth_file(env, profile, mode, rel);
+            let store = Store::for_file(mode, &stored);
             let rel = PathBuf::from(rel);
-            if stored.is_file() {
-                let bytes = std::fs::read(&stored)
-                    .with_context(|| format!("cannot read {}", stored.display()))?;
+            if let Some(bytes) = store.read(&stored)? {
                 home.write(&rel, &bytes, 0o600)
                     .with_context(|| format!("credential {}", rel.display()))?;
-            } else if *mode == AuthMode::Shared {
+            } else if mode.is_host_login() {
                 // The host is logged out: do not keep an older login inside.
                 home.remove(&rel)?;
             }
             items.push(AuthItem {
                 inside_at_start: inside_hash(&home, &rel)?,
-                stored_at_start: file_hash(&stored),
+                stored_at_start: store.hash(&stored),
+                store,
                 stored,
                 rel,
             });
@@ -227,6 +402,7 @@ impl AuthSync {
             mode: mode.clone(),
             home: home_src.to_path_buf(),
             items,
+            folders,
         })
     }
 
@@ -239,7 +415,26 @@ impl AuthSync {
             conflicts: vec![],
         };
         let home = crate::safefs::Root::open(&self.home)?;
-        for it in &self.items {
+        // Logins that the sandbox added to a folder entry.
+        let mut added = Vec::new();
+        for (dir, stored_dir) in &self.folders {
+            for n in inside_file_names(&home, dir) {
+                let rel = dir.join(&n);
+                if self.items.iter().any(|i| i.rel == rel) {
+                    continue;
+                }
+                let stored = stored_dir.join(&n);
+                let store = Store::for_file(&self.mode, &stored);
+                added.push(AuthItem {
+                    stored_at_start: store.hash(&stored),
+                    inside_at_start: None,
+                    store,
+                    stored,
+                    rel,
+                });
+            }
+        }
+        for it in self.items.iter().chain(added.iter()) {
             // A symlink or special file in place of a credential is refused:
             // reading through it would copy a host file into the store.
             let bytes = match home.read(&it.rel, crate::safefs::MAX_READ) {
@@ -254,11 +449,11 @@ impl AuthSync {
             if now == it.inside_at_start {
                 continue;
             }
-            if file_hash(&it.stored) != it.stored_at_start {
+            if it.store.hash(&it.stored) != it.stored_at_start {
                 r.conflicts.push(it.stored.clone());
                 continue;
             }
-            write_private(&bytes, &it.stored)?;
+            it.store.write(&it.stored, &bytes)?;
             r.saved.push(it.stored.clone());
         }
         Ok(r)
@@ -267,7 +462,7 @@ impl AuthSync {
 
 /// Copy the host's credential files for a harness into an isolated store.
 pub fn auth_import(env: &HostEnv, profile: &Profile, mode: &AuthMode) -> Result<Vec<PathBuf>> {
-    if *mode == AuthMode::Shared {
+    if mode.is_host_login() {
         anyhow::bail!("the shared mode already uses the host login; import into an isolated store, for example --auth isolated:work");
     }
     let root = auth_root(env, &profile.name, mode);
@@ -286,10 +481,10 @@ pub fn auth_import(env: &HostEnv, profile: &Profile, mode: &AuthMode) -> Result<
 }
 
 /// Copy `seed` paths from the host home into the sandbox home.
-pub fn seed(env: &HostEnv, profile: &Profile, home_src: &Path) -> Result<()> {
+pub fn seed(env: &HostEnv, profile: &Profile, mode: &AuthMode, home_src: &Path) -> Result<()> {
     let home = crate::safefs::Root::open(home_src)?;
     for rel in &profile.state.seed {
-        let host = env.home.join(rel);
+        let host = host_file(env, profile, mode, rel);
         if host.exists() {
             home.copy_in(&host, Path::new(rel))
                 .with_context(|| format!("seed {rel}"))?;
@@ -334,7 +529,7 @@ pub fn json_import(
     project: &Path,
 ) -> Result<()> {
     for ji in &profile.state.json_import {
-        let host_file = env.home.join(&ji.file);
+        let host_file = host_file(env, profile, mode, &ji.file);
         let Ok(text) = std::fs::read_to_string(&host_file) else {
             continue;
         };
@@ -351,7 +546,7 @@ pub fn json_import(
             .and_then(|b| serde_json::from_slice(&b).ok())
             .unwrap_or_else(|| serde_json::json!({}));
         let mut keys: Vec<&Vec<String>> = ji.keys.iter().collect();
-        if *mode == AuthMode::Shared {
+        if mode.is_host_login() {
             keys.extend(ji.shared_keys.iter());
         }
         for k in keys {
@@ -741,6 +936,96 @@ mod auth_sync_tests {
         let p: Profile =
             toml::from_str("name = \"t\"\n[state]\nauth = [\".tool/token\"]\n").unwrap();
         (t, env, p, host_home, sandbox_home)
+    }
+
+    #[test]
+    fn the_account_mode_uses_the_account_folder_as_the_store() {
+        let (t, env, _, host_home, sb) = setup();
+        let p: Profile = toml::from_str(
+            "name = \"t\"\n[state]\nauth = [\".tool/token\", \".tool.json\", \".other\"]\n\
+             seed = [\".tool/settings\"]\n\
+             [state.account]\nenv = \"TOOL_HOME\"\ndir = \".tool\"\nalso = [\".tool.json\"]\n",
+        )
+        .unwrap();
+        let acct = t.path().join("accounts/work");
+        std::fs::create_dir_all(&acct).unwrap();
+        std::fs::write(host_home.join(".tool/token"), "main").unwrap();
+        std::fs::write(host_home.join(".other"), "other").unwrap();
+        std::fs::write(acct.join("token"), "work").unwrap();
+        std::fs::write(acct.join(".tool.json"), "{}").unwrap();
+        std::fs::write(acct.join("settings"), "work settings").unwrap();
+        let mode = AuthMode::account(&acct);
+        assert_eq!(
+            host_file(&env, &p, &mode, ".tool/settings"),
+            acct.join("settings")
+        );
+        assert_eq!(host_file(&env, &p, &mode, ".x"), host_home.join(".x"));
+        let sync = AuthSync::copy_in(&env, &p, &mode, &sb).unwrap();
+        seed(&env, &p, &mode, &sb).unwrap();
+        // Inside, the files keep their usual places.
+        assert_eq!(
+            std::fs::read_to_string(sb.join(".tool/token")).unwrap(),
+            "work"
+        );
+        assert_eq!(
+            std::fs::read_to_string(sb.join(".tool.json")).unwrap(),
+            "{}"
+        );
+        assert_eq!(std::fs::read_to_string(sb.join(".other")).unwrap(), "other");
+        assert_eq!(
+            std::fs::read_to_string(sb.join(".tool/settings")).unwrap(),
+            "work settings"
+        );
+        // A refreshed token goes back to the account folder, not to the main login.
+        std::fs::write(sb.join(".tool/token"), "work2").unwrap();
+        let r = sync.copy_out().unwrap();
+        assert_eq!(r.saved, vec![acct.join("token")]);
+        assert_eq!(
+            std::fs::read_to_string(acct.join("token")).unwrap(),
+            "work2"
+        );
+        assert_eq!(
+            std::fs::read_to_string(host_home.join(".tool/token")).unwrap(),
+            "main"
+        );
+        // A symlink in the account folder is not followed.
+        let secret = t.path().join("id_key");
+        std::fs::write(&secret, "PRIVATE KEY").unwrap();
+        std::fs::remove_file(acct.join("token")).unwrap();
+        symlink(&secret, acct.join("token")).unwrap();
+        assert!(AuthSync::copy_in(&env, &p, &mode, &sb).is_err());
+        // The mode names its own sandbox home and reads back from records.
+        let back: AuthMode = mode.to_string().parse().unwrap();
+        assert!(matches!(back, AuthMode::Account { ref key, .. } if key == &slug(&acct)));
+        assert!(auth_import(&env, &p, &mode).is_err());
+    }
+
+    #[test]
+    fn a_folder_entry_syncs_every_credential_file_in_it() {
+        let (t, env, _, host_home, sb) = setup();
+        let p: Profile =
+            toml::from_str("name = \"t\"\n[state]\nauth = [\".tool/creds/\"]\n").unwrap();
+        let creds = host_home.join(".tool/creds");
+        std::fs::create_dir_all(&creds).unwrap();
+        std::fs::write(creds.join("a.json"), "a1").unwrap();
+        let secret = t.path().join("id_key");
+        std::fs::write(&secret, "PRIVATE KEY").unwrap();
+        symlink(&secret, creds.join("link.json")).unwrap();
+        let sync = AuthSync::copy_in(&env, &p, &AuthMode::Shared, &sb).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(sb.join(".tool/creds/a.json")).unwrap(),
+            "a1"
+        );
+        // A link in the store is not followed into the sandbox.
+        assert!(!sb.join(".tool/creds/link.json").exists());
+        // A refresh and a new login inside both come back.
+        std::fs::write(sb.join(".tool/creds/a.json"), "a2").unwrap();
+        std::fs::write(sb.join(".tool/creds/b.json"), "b1").unwrap();
+        let r = sync.copy_out().unwrap();
+        assert_eq!(r.saved.len(), 2, "{:?}", r.saved);
+        assert_eq!(std::fs::read_to_string(creds.join("a.json")).unwrap(), "a2");
+        assert_eq!(std::fs::read_to_string(creds.join("b.json")).unwrap(), "b1");
+        assert_eq!(std::fs::read_to_string(&secret).unwrap(), "PRIVATE KEY");
     }
 
     #[test]

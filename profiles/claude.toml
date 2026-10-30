@@ -26,6 +26,20 @@ import_ro = [
 ]
 env_pass = ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL", "ANTHROPIC_MODEL", "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX"]
 
+# Omarchy's account switch: CLAUDE_CONFIG_DIR replaces ~/.claude, and
+# ~/.claude.json moves into that folder. `paddock wrap` uses the folder as
+# the login of the sandbox.
+[state.account]
+env = "CLAUDE_CONFIG_DIR"
+dir = ".claude"
+also = [".claude.json"]
+
+# Claude Code keeps one folder per project in ~/.claude/projects. The host
+# folder of this project is bound, so tools on the host (the Omarchy agents
+# panel, `claude --resume`) see the sessions. No other project is visible.
+[state.history]
+project_folders = ".claude/projects"
+
 # ~/.claude.json also holds the history of every project, so only these keys are copied.
 [[state.json_import]]
 file = ".claude.json"

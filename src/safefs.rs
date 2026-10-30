@@ -464,6 +464,29 @@ impl Root {
 }
 
 impl Dir {
+    /// The entries of this folder with their kind, without following any.
+    pub fn entries(&self) -> Result<Vec<(OsString, Kind)>> {
+        let mut out = Vec::new();
+        for n in list(&self.fd)? {
+            if let Some(k) = self.kind(&n)? {
+                out.push((n, k));
+            }
+        }
+        Ok(out)
+    }
+
+    /// The names of the regular files directly in this folder. Symlinks and
+    /// everything else are left out.
+    pub fn file_names(&self) -> Result<Vec<OsString>> {
+        let mut out = Vec::new();
+        for n in list(&self.fd)? {
+            if self.kind(&n)? == Some(Kind::File) {
+                out.push(n);
+            }
+        }
+        Ok(out)
+    }
+
     pub fn path(&self) -> &Path {
         &self.path
     }

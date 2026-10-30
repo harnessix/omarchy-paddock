@@ -1,0 +1,45 @@
+name = "commandcode"
+description = "Command Code"
+
+# Entries that come from documentation, not from a test. paddock doctor lists them.
+unverified = [
+  "every entry: commandcode was not installed when this profile was written",
+]
+
+# mise tool: npm:command-code. The package also installs `cmd` and `cmdc`.
+[locate]
+mise = "commandcode"
+commands = ["commandcode", "cmdc"]
+
+[launch]
+# `cmd login` opens the browser with a local callback server.
+# https://commandcode.ai/docs/quickstart
+login_callback = true
+# --yolo bypasses all permission prompts.
+# https://commandcode.ai/docs/reference/cli
+yolo_args = ["--yolo"]
+
+[state]
+auth = [".commandcode/auth.json"]
+seed = [".commandcode/config.json"]
+import_ro = [".agents/skills"]
+env_pass = ["COMMAND_CODE_API_KEY"]
+
+# https://commandcode.ai/docs/troubleshooting/telemetry
+[privacy]
+env = { DO_NOT_TRACK = "1" }
+
+[[privacy.settings]]
+file = ".commandcode/config.json"
+path = ["telemetry"]
+value = false
+
+[privacy.training]
+setting = "the data settings of your Command Code account"
+url = "https://commandcode.ai/docs/troubleshooting/telemetry"
+
+# One task without a terminal: --print answers and exits. The prompt text is
+# fixed and names the file. https://commandcode.ai/docs/reference/cli
+[oneshot]
+args = ["--yolo", "--print", "Read the file {prompt_file} and do the task that it describes."]
+prompt = "file"
