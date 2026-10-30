@@ -698,10 +698,14 @@ mod tests {
             store: host.clone(),
         };
         std::os::unix::fs::symlink(&secret, sb.join(".claude/.credentials.json")).unwrap();
-        assert!(login_copies(&run, std::slice::from_ref(&l)).unwrap().is_empty());
+        assert!(login_copies(&run, std::slice::from_ref(&l))
+            .unwrap()
+            .is_empty());
         std::fs::remove_file(sb.join(".claude/.credentials.json")).unwrap();
         std::fs::write(sb.join(".claude/.credentials.json"), "not json").unwrap();
-        assert!(login_copies(&run, std::slice::from_ref(&l)).unwrap().is_empty());
+        assert!(login_copies(&run, std::slice::from_ref(&l))
+            .unwrap()
+            .is_empty());
         std::fs::write(sb.join(".claude/.credentials.json"), "{\"t\":1}").unwrap();
         let c = login_copies(&run, std::slice::from_ref(&l)).unwrap();
         assert_eq!(c.len(), 1);
