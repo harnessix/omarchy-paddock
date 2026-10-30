@@ -792,7 +792,7 @@ paddock launchers remove    # removes everything that install wrote, and nothing
 
 The menu entries, the Omarchy menu block and the shell shims list the harnesses that were installed when you turned them on. paddock keeps them current:
 
-- On a harness start, paddock compares a cheap signal with the one of the last update: its version and the modification times of the folders on `PATH`. Installing an agent with mise or into `~/.local/bin` changes a folder on `PATH`. When the signal changed, paddock runs `paddock refresh --quiet` in the background, and the start does not wait.
+- On a harness start, paddock compares a cheap signal with the one of the last update: its version and the modification times of the folders on `PATH`. Installing an agent with mise or into `~/.local/bin` changes a folder on `PATH`. When the signal changed, paddock runs `paddock refresh --background` in the background, and the start does not wait.
 - `paddock update` runs `paddock refresh` with the new version.
 - `paddock refresh` adds the entries and shims of new harnesses and removes those of harnesses that are gone. The background run only adds: with a smaller `PATH`, it could miss a harness, and a missing shim would start that harness without the sandbox.
 - Only the parts that you turned on change. `~/.bashrc` and `~/.zshrc` do not change.

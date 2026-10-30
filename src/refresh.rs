@@ -10,7 +10,7 @@
 //! Detection takes a few hundred milliseconds, so it does not run on every
 //! start. A cheap signal, the paddock version and the modification times of
 //! the folders on PATH, is kept with the last refresh. When a harness starts
-//! and the signal has changed, paddock runs `paddock refresh --quiet` in the
+//! and the signal has changed, paddock runs `paddock refresh --background` in the
 //! background. Installing an agent with mise, or into `~/.local/bin`,
 //! changes a folder on PATH.
 
@@ -91,7 +91,7 @@ pub fn spawn_if_changed(env: &HostEnv) {
         return;
     };
     let mut cmd = Command::new(me);
-    cmd.args(["refresh", "--quiet"])
+    cmd.args(["refresh", "--background"])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
