@@ -327,8 +327,10 @@ pub struct EscapeOpts {
 
 /// Run the probe in a real sandbox. Returns the number of failed checks.
 pub fn escape(env: &HostEnv, o: &EscapeOpts) -> Result<usize> {
-    let root = env.paddock_cache().join("doctor");
-    clear_doctor_root(&root);
+    // Homes of earlier runs whose scratch project is gone go too.
+    let mut scratch = Scratch::new(&env.paddock_cache().join(SCRATCH_DIR))?;
+    crate::storage::remove_doctor_homes(env);
+    let root = scratch.root.clone();
     let project = root.join("project");
     std::fs::create_dir_all(&project)?;
 
@@ -416,12 +418,14 @@ pub fn escape(env: &HostEnv, o: &EscapeOpts) -> Result<usize> {
     }
 
     // A file in another sandbox home and one in the host home: both must stay invisible.
-    let other = env
+    let other_dir = env
         .paddock_data()
         .join("homes")
         .join("doctor-other")
-        .join("canary");
-    std::fs::create_dir_all(other.parent().unwrap())?;
+        .join(root.file_name().unwrap_or_default());
+    scratch.also_remove(other_dir.clone());
+    crate::privfs::dir(&other_dir)?;
+    let other = other_dir.join("canary");
     std::fs::write(&other, "x")?;
     let host_file = root.join("host-canary");
     std::fs::write(&host_file, "x")?;
@@ -488,6 +492,8 @@ pub fn escape(env: &HostEnv, o: &EscapeOpts) -> Result<usize> {
         ..Default::default()
     };
     let mut built = build::build_with(env, &opts, doctor_harness()?)?;
+    // The home is this run's own: its key is the scratch project.
+    scratch.also_remove(built.spec.home_src.clone());
     crate::safefs::Root::open(&built.spec.home_src)?.write(
         Path::new(".paddock-doctor-canary"),
         b"x",
@@ -582,9 +588,11 @@ pub fn escape(env: &HostEnv, o: &EscapeOpts) -> Result<usize> {
     let env2 = HostEnv::detect()?;
     // A file in the host /tmp: srt shares the host /tmp unless it is denied.
     let host_tmp = std::path::PathBuf::from(format!("/tmp/paddock-doctor-{}", std::process::id()));
+    scratch.also_remove(host_tmp.clone());
     std::fs::write(&host_tmp, "x")?;
     let host_sock =
         std::path::PathBuf::from(format!("/tmp/paddock-doctor-{}.sock", std::process::id()));
+    scratch.also_remove(host_sock.clone());
     let _ = std::fs::remove_file(&host_sock);
     let _host_sock_l = std::os::unix::net::UnixListener::bind(&host_sock)?;
     built.spec.set_env(
@@ -653,7 +661,6 @@ pub fn escape(env: &HostEnv, o: &EscapeOpts) -> Result<usize> {
     }
     drop(listener);
     drop(any);
-    let _ = std::fs::remove_dir_all(other.parent().unwrap());
 
     let text = outcome.stdout.unwrap_or_default();
     let mut failed = 0;
@@ -737,7 +744,11 @@ pub fn escape(env: &HostEnv, o: &EscapeOpts) -> Result<usize> {
         );
         failed += 1;
     }
-    clear_doctor_root(&root);
+    drop(scratch);
+    // Empty unless another run is going on.
+    if let Some(p) = other_dir.parent() {
+        let _ = std::fs::remove_dir(p);
+    }
     println!(
         "{}",
         if failed == 0 {
@@ -911,36 +922,99 @@ impl crate::broker::Approver for Recorder {
     }
 }
 
-/// Remove the doctor's own project tree. The probe leaves git repositories
-/// there, and git makes its object directories read-only, so the folders get
-/// their owner write bit back first. A leftover tree would break the next
-/// test run.
-fn clear_doctor_root(root: &Path) {
-    fn writable(dir: &Path, depth: usize) {
-        if depth > 12 {
-            return;
+/// The folder under the paddock cache with one scratch folder per escape
+/// run. Older versions used `doctor` and cleared all of it at each start, so
+/// this name keeps their runs from deleting the files of a new one.
+const SCRATCH_DIR: &str = "doctor-runs";
+
+/// The scratch folder of one escape run: `<base>/<pid>-<random>`, 0700. It
+/// holds the project, its remote and the canaries; the run's sandbox home
+/// and the fake other home are removed with it. Concurrent runs each have
+/// their own, so no run removes the files of another. Drop removes it all,
+/// also after an error or a panic, and never follows a link that the probe
+/// planted. Git makes its object folders read-only: the removal adds the
+/// owner write bit first.
+pub struct Scratch {
+    pub root: PathBuf,
+    extra: Vec<PathBuf>,
+}
+
+impl Scratch {
+    /// Make a new scratch folder under `base`, after removing what ended
+    /// runs left there.
+    pub fn new(base: &Path) -> Result<Self> {
+        use std::os::unix::fs::DirBuilderExt as _;
+        crate::privfs::dir(base)?;
+        clear_stale(base);
+        for _ in 0..100 {
+            let root = base.join(format!("{}-{}", std::process::id(), random_hex()));
+            match std::fs::DirBuilder::new().mode(0o700).create(&root) {
+                Ok(()) => {
+                    crate::privfs::tighten(&root, 0o700)?;
+                    return Ok(Self {
+                        root,
+                        extra: vec![],
+                    });
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(e) => return Err(e.into()),
+            }
         }
-        use std::os::unix::fs::PermissionsExt;
-        let Ok(m) = std::fs::symlink_metadata(dir) else {
-            return;
-        };
-        if m.is_symlink() || !m.is_dir() {
-            return;
-        }
-        let mode = m.permissions().mode();
-        if mode & 0o700 != 0o700 {
-            let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(mode | 0o700));
-        }
-        for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
-            writable(&e.path(), depth + 1);
+        bail!("no free scratch folder in {}", base.display())
+    }
+
+    /// Remove `path` together with the scratch folder.
+    pub fn also_remove(&mut self, path: PathBuf) {
+        self.extra.push(path);
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        for p in std::iter::once(&self.root).chain(self.extra.iter()) {
+            if let Err(e) = crate::safefs::remove_tree_path(p) {
+                eprintln!("paddock: cannot remove {}: {e:#}", p.display());
+            }
         }
     }
-    writable(root, 0);
-    if let Err(e) = std::fs::remove_dir_all(root) {
-        if e.kind() != std::io::ErrorKind::NotFound {
-            eprintln!("paddock: cannot clear {}: {e}", root.display());
+}
+
+fn random_hex() -> String {
+    use std::io::Read as _;
+    let mut b = [0u8; 8];
+    if std::fs::File::open("/dev/urandom")
+        .and_then(|mut f| f.read_exact(&mut b))
+        .is_err()
+    {
+        let n = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        b = (n as u64).to_le_bytes();
+    }
+    crate::manifest::hex(&b)
+}
+
+/// Remove what runs that ended without cleanup left in `base`: folders of
+/// processes that no longer run, and the shared tree of older versions.
+/// Folders of live processes stay.
+fn clear_stale(base: &Path) {
+    for e in std::fs::read_dir(base).into_iter().flatten().flatten() {
+        let name = e.file_name().to_string_lossy().into_owned();
+        let live = name
+            .split_once('-')
+            .and_then(|(pid, _)| pid.parse::<i32>().ok())
+            .is_some_and(|pid| pid > 0 && process_alive(pid));
+        if !live {
+            let _ = crate::safefs::remove_tree_path(&e.path());
         }
     }
+}
+
+fn process_alive(pid: i32) -> bool {
+    // SAFETY: signal 0 only checks that the process exists.
+    let r = unsafe { libc::kill(pid, 0) };
+    r == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
 /// Host-side git checks, run after the sandbox exits. The probe planted
@@ -1085,4 +1159,62 @@ fn s_set_approvals(built: &mut build::Built, env: &HostEnv) {
         dir.display().to_string(),
         "doctor",
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn each_escape_run_gets_its_own_scratch_and_removes_only_that() {
+        let t = tempfile::tempdir().unwrap();
+        let base = t.path().join("cache/paddock/doctor-runs");
+        let a = Scratch::new(&base).unwrap();
+        let mut b = Scratch::new(&base).unwrap();
+        assert_ne!(a.root, b.root);
+        for s in [&a, &b] {
+            assert_eq!(s.root.parent(), Some(base.as_path()));
+            let m = std::fs::metadata(&s.root).unwrap().permissions().mode();
+            assert_eq!(m & 0o777, 0o700);
+        }
+        // What a run leaves: a git object folder without write permission,
+        // a link out of the scratch folder, and its own sandbox home.
+        let outside = t.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("keep"), "x").unwrap();
+        for s in [&a, &b] {
+            let objects = s.root.join("project/.git/objects/ab");
+            std::fs::create_dir_all(&objects).unwrap();
+            std::fs::write(objects.join("cd"), "x").unwrap();
+            std::fs::set_permissions(&objects, std::fs::Permissions::from_mode(0o500)).unwrap();
+            std::os::unix::fs::symlink(&outside, s.root.join("project/link")).unwrap();
+        }
+        let home_b = t.path().join("data/homes/doctor/shared/b");
+        std::fs::create_dir_all(&home_b).unwrap();
+        b.also_remove(home_b.clone());
+
+        let (a_root, b_root) = (a.root.clone(), b.root.clone());
+        drop(b);
+        assert!(!b_root.exists());
+        assert!(!home_b.exists());
+        assert!(a_root.join("project/.git/objects/ab/cd").exists());
+        assert!(outside.join("keep").exists(), "the link was followed");
+
+        // A new run removes what dead runs and older versions left, never
+        // the folder of a live run.
+        let dead = base.join(format!("{}-0011223344556677", i32::MAX));
+        std::fs::create_dir_all(dead.join("project")).unwrap();
+        std::fs::create_dir_all(base.join("project")).unwrap();
+        std::fs::write(base.join("host-canary"), "x").unwrap();
+        let c = Scratch::new(&base).unwrap();
+        assert!(!dead.exists());
+        assert!(!base.join("project").exists());
+        assert!(!base.join("host-canary").exists());
+        assert!(a_root.exists());
+        drop(a);
+        drop(c);
+        assert_eq!(std::fs::read_dir(&base).unwrap().count(), 0);
+        assert!(outside.join("keep").exists());
+    }
 }

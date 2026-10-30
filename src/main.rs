@@ -2063,15 +2063,7 @@ fn app_cmd(env: &HostEnv, cmd: AppCmd) -> Result<i32> {
                 Err(e) => {
                     // A launcher entry has no terminal: show the error on the desktop too.
                     if !std::io::IsTerminal::is_terminal(&std::io::stderr()) {
-                        if let Some(ns) = env.which("notify-send") {
-                            let _ = std::process::Command::new(ns)
-                                .args([
-                                    "--app-name=paddock",
-                                    &format!("paddock could not start {name}"),
-                                    &format!("{e:#}"),
-                                ])
-                                .status();
-                        }
+                        app::desktop_notice(env, &app::start_error_note(&name, &e));
                     }
                     Err(e)
                 }

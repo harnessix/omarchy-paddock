@@ -174,24 +174,23 @@ Panel {
     if (!filesProc.running) { filesProc.buffer = ""; filesProc.running = true }
   }
   // A desktop notification for files that appeared since the last check.
-  // It never takes the keyboard.
+  // It never takes the keyboard. notify-send gets only a count: project
+  // names and paths come from sandboxes, and the arguments of a process are
+  // visible to every local user. "--" ends the options all the same.
   function noticeNew(list) {
     var seen = Object.assign({}, root.seenArtifacts)
-    var fresh = {}
+    var fresh = 0
     for (var i = 0; i < list.length; i++) {
       var key = list[i].id + "\n" + list[i].path + "\n" + list[i].mtime
-      if (root.artifactsLoaded && !root.seenArtifacts[key] && list[i].isNew) {
-        var k = list[i].harness + " · " + list[i].projectName
-        fresh[k] = (fresh[k] || 0) + 1
-      }
+      if (root.artifactsLoaded && !root.seenArtifacts[key] && list[i].isNew)
+        fresh++
       seen[key] = true
     }
     root.seenArtifacts = seen
     root.artifactsLoaded = true
-    for (var who in fresh) {
+    if (fresh > 0)
       Quickshell.execDetached(["notify-send", "--app-name=Paddock", "--icon=folder-download", "--",
-        strings.t("notice.title"), strings.tn("notice.body", fresh[who]).arg(who).arg(Commons.I18n.formatNumber(fresh[who]))])
-    }
+        strings.t("notice.title"), strings.tn("notice.body", fresh).arg(Commons.I18n.formatNumber(fresh))])
   }
 
   // Answers for a request, safest first. Enter alone never answers.

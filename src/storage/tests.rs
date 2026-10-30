@@ -172,6 +172,62 @@ fn inventory(homes: Vec<Home>) -> Inventory {
 }
 
 #[test]
+fn escape_test_homes_go_in_the_automatic_tier_once_their_project_is_gone() {
+    let now = 1_000 * DAY;
+    let mut gone = home("/d/homes/doctor/shared/gone-1", "doctor");
+    gone.project_exists = Some(false);
+    // A run that is still setting up: its scratch project exists.
+    let setup = home("/d/homes/doctor/shared/setup-1", "doctor");
+    let mut unknown_old = home("/d/homes/doctor/shared/unknown-1", "doctor");
+    unknown_old.project = None;
+    unknown_old.project_exists = None;
+    unknown_old.last_used = None;
+    unknown_old.modified = now - 2 * DAY;
+    let mut unknown_new = unknown_old.clone();
+    unknown_new.path = "/d/homes/doctor/shared/unknown-2".into();
+    unknown_new.modified = now - 60;
+    let mut running = gone.clone();
+    running.path = "/d/homes/doctor/shared/run-1".into();
+    running.running = true;
+    let inv = inventory(vec![gone, setup, unknown_old, unknown_new, running]);
+    let items = plan(&inv, &opts(), now);
+    let g = find(&items, "gone-1").unwrap();
+    assert_eq!(g.tier, Tier::Auto);
+    assert!(g.selected());
+    assert_eq!(find(&items, "unknown-1").unwrap().tier, Tier::Auto);
+    assert!(find(&items, "setup-1").is_none());
+    assert!(find(&items, "unknown-2").is_none());
+    assert!(find(&items, "run-1").is_none());
+}
+
+#[test]
+fn doctor_removes_escape_test_homes_whose_project_is_gone() {
+    let (_t, env) = setup();
+    let live = env.home.join(".cache/paddock/doctor-runs/1-aa/project");
+    let ended = env.home.join(".cache/paddock/doctor-runs/2-bb/project");
+    std::fs::create_dir_all(&live).unwrap();
+    let live_home = make_home(&env, DOCTOR_HARNESS, &live, false);
+    let ended_home = make_home(&env, DOCTOR_HARNESS, &ended, false);
+    // Another harness with a gone project needs consent: not touched here.
+    let other = make_home(&env, "claude", &ended, false);
+    // A sandbox rewrote its origin to name a gone project: not trusted.
+    let forged = state::sandbox_home(&env, DOCTOR_HARNESS, &AuthMode::Shared, &live)
+        .unwrap()
+        .with_file_name("forged");
+    std::fs::create_dir_all(&forged).unwrap();
+    write_origin(
+        &forged,
+        &Origin::new(&ended, DOCTOR_HARNESS, &AuthMode::Shared, false),
+    )
+    .unwrap();
+    assert_eq!(remove_doctor_homes(&env), vec![ended_home.clone()]);
+    assert!(!ended_home.exists());
+    assert!(live_home.exists());
+    assert!(other.exists());
+    assert!(forged.exists());
+}
+
+#[test]
 fn home_tiers() {
     let now = 1_000 * DAY;
     let mut gone = home("/d/homes/claude/shared/gone-1", "claude");
