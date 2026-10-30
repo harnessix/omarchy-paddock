@@ -50,7 +50,7 @@ paddock moves the boundary from "which commands can run" to "which files exist".
    omarchy plugin add https://github.com/harnessix/omarchy-paddock --enable
    ```
 
-2. Install the `paddock` command: the prebuilt binary from the [latest release](https://github.com/harnessix/omarchy-paddock/releases/latest), or `bin/install` from a clone. Both are described below.
+2. Install the `paddock` command from the latest release, v0.1.7: the prebuilt binary, or `bin/install` from a clone of that tag. Both are described below.
 
 3. Run the setup. It checks the system packages, and offers the shell commands, the launchers, the bar widget and the default backend, one step at a time. Each step says what it changes and how to undo it. A second run shows the state and changes nothing unless you ask. The last step lists where you turn off the use of your data for training (see [Privacy defaults](#privacy-defaults)).
 
@@ -62,22 +62,28 @@ paddock moves the boundary from "which commands can run" to "which files exist".
 
 ### From a clone or a release
 
-paddock is a Rust command and an Omarchy bar plugin in one repository. Clone the repository, and run the installer from its root. It installs the system packages, builds paddock, and runs `paddock doctor`.
+paddock is a Rust command and an Omarchy bar plugin in one repository. The commands below install the latest release, v0.1.7. The `main` branch can hold changes that are not released yet.
+
+Clone the release tag, and run the installer from its root. It installs the system packages, builds paddock, and runs `paddock doctor`.
 
 ```sh
-git clone https://github.com/harnessix/omarchy-paddock
+git clone --branch v0.1.7 https://github.com/harnessix/omarchy-paddock
 cd omarchy-paddock
 bin/install
 ```
 
-Without a Rust toolchain, use the prebuilt binary from the [latest release](https://github.com/harnessix/omarchy-paddock/releases/latest). It is one file. Check its checksum, copy it to `~/.local/bin`, and run `paddock doctor`, which prints the command that installs the system packages below:
+Without a Rust toolchain, use the prebuilt binary of the release. It is one file. Download it with its checksum, check the checksum, copy the binary to `~/.local/bin`, and run `paddock doctor`, which prints the command that installs the system packages below:
 
 ```sh
-sha256sum -c paddock-*-x86_64-linux.tar.gz.sha256
-tar -xzf paddock-*-x86_64-linux.tar.gz
-install -m 755 paddock-*-x86_64-linux/paddock ~/.local/bin/paddock
+curl -fLO https://github.com/harnessix/omarchy-paddock/releases/download/v0.1.7/paddock-0.1.7-x86_64-linux.tar.gz
+curl -fLO https://github.com/harnessix/omarchy-paddock/releases/download/v0.1.7/paddock-0.1.7-x86_64-linux.tar.gz.sha256
+sha256sum -c paddock-0.1.7-x86_64-linux.tar.gz.sha256
+tar -xzf paddock-0.1.7-x86_64-linux.tar.gz
+install -m 755 paddock-0.1.7-x86_64-linux/paddock ~/.local/bin/paddock
 paddock doctor
 ```
+
+All releases are on the [releases page](https://github.com/harnessix/omarchy-paddock/releases).
 
 On Arch Linux, the installer installs a package with makepkg. It also knows apt and dnf, and then copies the binary to `~/.local/bin`; that path is best effort and is not tested on every release (see [Support scope](#support-scope)). Use `bin/install --minimal` to skip the desktop packages.
 
@@ -102,6 +108,8 @@ To add the bar widget on Omarchy, point `omarchy plugin add` at this repository:
 omarchy plugin add https://github.com/harnessix/omarchy-paddock --enable
 ```
 
+`omarchy plugin add` always installs the widget from the default branch, because it takes no tag. `paddock update` updates the widget together with the command.
+
 The widget lists running sandboxes with their backend, network, display and login. Press Enter on a sandbox to go to the terminal that runs it (Hyprland). The row actions open the project folder, copy its path, show the display window of a sandbox in `window` mode, and stop the sandbox after a second press. The New button starts a sandbox in two steps: pick a recent project, then a harness that is installed on this machine, and paddock opens a terminal that runs it. The Checks button runs `paddock doctor`. Every action has a key, and the panel footer lists them.
 
 ### Update
@@ -113,7 +121,7 @@ paddock update            # asks first; --yes updates without asking
 
 `paddock update` asks the GitHub API for the latest release. It downloads the tarball and its `.sha256` into a private folder, checks the checksum, and checks that the new binary prints the expected version. Then it writes the new binary next to the old one and renames it into place, so a cut download never leaves half a binary. It talks only to `api.github.com`, `github.com` and GitHub's download hosts over HTTPS, follows no redirect to another host, and uses your `HTTPS_PROXY`. If the bar widget is installed, it also runs `omarchy plugin update harnessix.paddock --yes`.
 
-If a package owns the binary (the Arch package that `bin/install` builds), `paddock update` does not overwrite it. Run `git pull` and `bin/install` in your clone instead. `paddock update` runs only on the host, never in a sandbox.
+If a package owns the binary (the Arch package that `bin/install` builds), `paddock update` does not overwrite it. In your clone, check out the new release tag and run `bin/install` again, for example `git fetch --tags && git checkout vX.Y.Z && bin/install`, with the tag that `paddock update --check` names. `paddock update` runs only on the host, never in a sandbox.
 
 `paddock doctor` says when a newer release exists. It checks at most once a day and waits at most two seconds; `PADDOCK_NO_UPDATE_CHECK=1` turns the check off. It also says when a desktop app was updated on the host while its sandbox runs, so that you restart it.
 
