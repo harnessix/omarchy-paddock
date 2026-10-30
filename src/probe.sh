@@ -21,6 +21,20 @@ if [ -z "$leaks" ]; then ok protected-paths-absent; else fail protected-paths-ab
 
 if [ -e "$PADDOCK_PROBE_OTHER" ]; then fail other-sandbox-home-hidden "$PADDOCK_PROBE_OTHER is visible"; else ok other-sandbox-home-hidden; fi
 
+# The project .mcp.json names a package in another repository. Without an
+# approval, nothing of that repository is mounted. (An empty folder of that
+# name can exist: the path is inside the sandbox home, where a backend makes
+# mount points.)
+if [ -n "$PADDOCK_PROBE_MCP_SIBLING" ]; then
+  if grep -q paddock-sibling-canary "$PADDOCK_PROBE_MCP_SIBLING/.env" 2>/dev/null; then
+    fail mcp-project-file-cannot-mount "another repository's .env is readable"
+  elif [ -e "$PADDOCK_PROBE_MCP_SIBLING/node_modules/paddock-probe-mcp/cli.js" ]; then
+    fail mcp-project-file-cannot-mount "another repository's node_modules is visible"
+  else
+    ok mcp-project-file-cannot-mount
+  fi
+fi
+
 if [ -n "$PADDOCK_PROBE_HOSTFILE" ] && [ -e "$PADDOCK_PROBE_HOSTFILE" ]; then
   fail host-home-hidden "$PADDOCK_PROBE_HOSTFILE is visible"
 else

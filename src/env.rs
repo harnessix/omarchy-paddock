@@ -106,8 +106,12 @@ impl HostEnv {
             let p = PathBuf::from(name);
             return is_executable(&p).then_some(p);
         }
+        // A relative PATH entry (`node_modules/.bin`, `.`, or an empty one)
+        // resolves against the working directory, usually the project. The
+        // sandbox writes the project, so paddock never looks there.
         self.path
             .iter()
+            .filter(|dir| dir.is_absolute())
             .map(|dir| dir.join(name))
             .find(|p| is_executable(p))
     }

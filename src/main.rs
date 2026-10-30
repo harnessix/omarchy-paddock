@@ -838,15 +838,21 @@ fn real_main() -> Result<i32> {
                     ),
                     Status::Remote => "remote, uses the network".to_string(),
                     Status::NeedsAllow(paths) => format!(
-                        "off: needs host paths {}. To mount them read-only, add \"{}\" to [mcp] allow",
+                        "off: needs host paths that {} cannot grant. With \"{}\" in [mcp] allow, paddock mounts these read-only: {}",
+                        if s.trusted { "this configuration" } else { "a project file" },
+                        s.name,
                         paths.iter().map(|m| m.display().to_string()).collect::<Vec<_>>().join(", "),
-                        s.name
                     ),
                     Status::NeedsPort(port) => format!("off: needs host port {port}. Add it to [network] host_ports"),
                     Status::NotFound(c) => format!("off: command {c} is not installed on the host"),
                 };
-                println!("{:<20} {status}\n{:<20} from {}", s.name, "", s.source);
+                let from = if s.trusted { "" } else { " (project file)" };
+                println!(
+                    "{:<20} {status}\n{:<20} from {}{from}",
+                    s.name, "", s.source
+                );
             }
+            println!("\nOutside the shared tool installs, paddock hides .env files and keys in every mounted folder.");
             println!("\nMCP OAuth tokens and server settings come from your host login (auth mode shared).");
             println!(
                 "Put [mcp] and [network] settings in {} or in the project paddock.toml.",

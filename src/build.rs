@@ -241,6 +241,30 @@ pub fn sandbox_writable(env: &HostEnv, spec: &SandboxSpec) -> Vec<PathBuf> {
         .collect()
 }
 
+/// The harness install mounts come from the executable and the script
+/// headers it leads to (`profile::runtime_closure`). A file in a folder the
+/// sandbox can write could name any host path in its header, and paddock
+/// would mount that path. So the harness must not come from such a folder,
+/// for example through a host PATH entry inside the project.
+pub fn check_harness_install(harness: &Harness, writable: &[PathBuf]) -> Result<()> {
+    let all = std::iter::once(&harness.exe)
+        .chain(&harness.install_mounts)
+        .chain(&harness.path_dirs);
+    for p in all {
+        if let Some(w) = writable.iter().find(|w| p.starts_with(w)) {
+            bail!(
+                "the {} harness resolves to {}, inside {}, which the sandbox can write. \
+                 paddock does not mount host paths that such a file names. \
+                 Install the harness outside the project and the sandbox homes.",
+                harness.profile.name,
+                p.display(),
+                w.display()
+            );
+        }
+    }
+    Ok(())
+}
+
 pub fn resolve_project(path: Option<&Path>) -> Result<PathBuf> {
     let raw = match path {
         Some(p) => p.to_path_buf(),
@@ -426,6 +450,7 @@ pub fn build_with(env: &HostEnv, opts: &Options, harness: Harness) -> Result<Bui
             spec.add_mount(Mount::same(real, rw, origin));
         }
     }
+    check_harness_install(&harness, &sandbox_writable(env, &spec))?;
     for k in &m.env.pass {
         if let Some(v) = env.var(k) {
             spec.set_secret_env(k, v, "manifest env.pass");
@@ -566,6 +591,26 @@ pub fn build_with(env: &HostEnv, opts: &Options, harness: Harness) -> Result<Bui
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_harness_from_a_sandbox_writable_folder_is_refused() {
+        let profile: Profile = toml::from_str("name = \"t\"\n").unwrap();
+        let mut h = Harness {
+            profile,
+            exe: PathBuf::from("/usr/bin/tool"),
+            install_mounts: vec![PathBuf::from("/home/demo/.local/share/mise/installs/t/1")],
+            path_dirs: vec![],
+            source: "test".into(),
+        };
+        let writable = vec![PathBuf::from("/home/demo/proj")];
+        assert!(check_harness_install(&h, &writable).is_ok());
+        // An interpreter that a project script names: its folder is on PATH.
+        h.path_dirs.push(PathBuf::from("/home/demo/proj/bin"));
+        assert!(check_harness_install(&h, &writable).is_err());
+        h.path_dirs.clear();
+        h.exe = PathBuf::from("/home/demo/proj/node_modules/.bin/tool");
+        assert!(check_harness_install(&h, &writable).is_err());
+    }
 
     #[test]
     fn dates_for_branch_names() {
