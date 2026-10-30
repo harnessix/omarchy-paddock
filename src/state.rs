@@ -430,6 +430,22 @@ impl AuthSync {
         })
     }
 
+    /// The host logins that the sandbox got a copy of. None for an isolated
+    /// login, which the host never reads.
+    pub fn host_logins(&self) -> Vec<HeldLogin> {
+        if !self.mode.is_host_login() {
+            return Vec::new();
+        }
+        self.items
+            .iter()
+            .map(|i| HeldLogin {
+                home: self.home.clone(),
+                rel: i.rel.clone(),
+                store: i.stored.clone(),
+            })
+            .collect()
+    }
+
     /// Copy back every credential that changed inside the sandbox, for example
     /// after a login or a token refresh. If the store changed too (the harness
     /// also runs on the host), the store keeps its version.
@@ -649,6 +665,23 @@ pub struct Running {
     /// The id that the parent uses for it with `paddock-host status`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub spawn_id: Option<String>,
+    /// The host logins that this sandbox holds a copy of (the main login or
+    /// an Omarchy account). While it runs, paddock checks their limits for
+    /// the Omarchy agents panel from its side (omarchy_usage.rs).
+    #[serde(default)]
+    pub logins: Vec<HeldLogin>,
+}
+
+/// A host login file and the sandbox's copy of it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HeldLogin {
+    /// The sandbox home. The sandbox can write it, so it is read through
+    /// `safefs` only.
+    pub home: PathBuf,
+    /// The copy, relative to `home`.
+    pub rel: PathBuf,
+    /// The login file on the host.
+    pub store: PathBuf,
 }
 
 /// A project where a sandbox started, for the panel's "start again" list.
