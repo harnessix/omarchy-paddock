@@ -31,6 +31,11 @@ import_ro = [".grok/AGENTS.md", ".grok/rules", ".grok/skills", ".grok/agents", "
 seed = [".grok/config.toml", ".grok/pager.toml"]
 env_pass = ["XAI_API_KEY", "GROK_API_KEY"]
 
+# Omarchy's account switch: GROK_HOME replaces ~/.grok.
+[state.account]
+env = "GROK_HOME"
+dir = ".grok"
+
 [[mcp]]
 file = ".grok/config.toml"
 format = "toml"

@@ -74,6 +74,8 @@ paddock setup --yes --shims --launchers
 
 `--shims`: `claude`, `codex` and others start in a sandbox in bash and zsh. `--launchers`: menu entries in a "Paddock" folder (Super+Space on Omarchy). `paddock shims install` and `paddock launchers install` do the same one at a time.
 
+On Omarchy, `paddock shims install --scope omarchy-agent` puts only the agents that `omarchy-agent` starts (the agent key, the console, the agents panel, the alias `a`) in a sandbox. Typed commands and scripts do not change. Ask the user before you run it, and tell them what it changes: one marked block in `~/.config/mise/config.toml`, and from then on every agent start from Omarchy runs through `paddock wrap`. `paddock shims remove` undoes it. If paddock reports that the file already has its own `[wrappers.omarchy-agent]`, do not edit or remove the user's entry; tell the user.
+
 `paddock shims install` adds one marked line to `~/.bashrc` and `~/.zshrc`. It takes effect in new shells. `PADDOCK_BYPASS=1 claude` runs a harness once without the sandbox. A harness command in the home directory stops with an error, because the home directory is never a project.
 
 ## Run
@@ -127,6 +129,7 @@ Ask the user before you run `paddock gc` with `--yes`. Show them the dry-run lis
 - `--homes` deletes transcripts and settings of old projects.
 - `--include-app-logins` deletes the login of a desktop app. The user must log in again.
 - `--worktrees --force` deletes uncommitted changes in a worktree. Its branch and commits stay.
+- `--scratch` deletes the scratch projects of agents that started in the home folder, with their files.
 
 Do not delete sandbox homes, images or worktrees with `rm`, `docker rmi` or `git worktree remove`. `paddock gc` checks that no sandbox runs in them.
 

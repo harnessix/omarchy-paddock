@@ -114,12 +114,16 @@ pub fn login_dir(auth: &AuthMode) -> String {
     match auth {
         AuthMode::Shared => "shared".into(),
         AuthMode::Isolated(n) => format!("isolated-{n}"),
+        AuthMode::Account { key, .. } => format!("account-{key}"),
     }
 }
 
 fn auth_from_dir(login: &str) -> Option<AuthMode> {
     if login == "shared" {
         return Some(AuthMode::Shared);
+    }
+    if let Some(key) = login.strip_prefix("account-") {
+        return format!("account:{key}").parse().ok();
     }
     let name = login.strip_prefix("isolated-")?;
     format!("isolated:{name}").parse().ok()
@@ -249,6 +253,27 @@ pub struct Inventory {
     pub any_running: bool,
     /// Records of paddock's base image builds in the docker build cache.
     pub build_cache: Vec<BuildRecord>,
+    /// Scratch projects of `paddock wrap` starts in the home folder.
+    pub scratch: Vec<Scratch>,
+}
+
+/// A scratch project (`$XDG_DATA_HOME/paddock/scratch/<harness>`): where an
+/// agent from `omarchy-agent` works when it starts in the home folder. Its
+/// files are the user's work.
+#[derive(Debug, Clone, Serialize)]
+pub struct Scratch {
+    pub harness: String,
+    pub path: PathBuf,
+    pub bytes: u64,
+    /// Entries at the top of the project.
+    pub entries: usize,
+    /// The newest change of the project or a start in it.
+    pub last_active: u64,
+    pub running: bool,
+}
+
+pub fn scratch_root(env: &HostEnv) -> PathBuf {
+    env.paddock_data().join("scratch")
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -500,6 +525,7 @@ pub fn removable_roots(env: &HostEnv) -> Vec<PathBuf> {
         worktrees_root(env),
         keyring_root(env),
         sessions_root(env),
+        scratch_root(env),
     ]
 }
 
@@ -1060,6 +1086,29 @@ pub fn scan(env: &HostEnv, host: &Host, with_sizes: bool) -> Inventory {
         })
         .collect();
 
+    let scratch = subdirs(&scratch_root(env))
+        .into_iter()
+        .map(|path| {
+            let entries = std::fs::read_dir(&path).map(|d| d.count()).unwrap_or(0);
+            let started = homes
+                .iter()
+                .filter(|h| h.project.as_deref() == Some(path.as_path()))
+                .map(|h| h.last_active())
+                .max()
+                .unwrap_or(0);
+            let changed = std::fs::metadata(&path)
+                .map(|m| m.mtime().max(0) as u64)
+                .unwrap_or(0);
+            Scratch {
+                harness: name(&path),
+                last_active: changed.max(started),
+                running: running_projects.contains(path.as_path()),
+                entries,
+                bytes: 0,
+                path,
+            }
+        })
+        .collect();
     let mut inv = Inventory {
         size_kind: SizeKind::Allocated,
         homes,
@@ -1071,6 +1120,7 @@ pub fn scan(env: &HostEnv, host: &Host, with_sizes: bool) -> Inventory {
         old_caches,
         any_running: !running.is_empty(),
         build_cache,
+        scratch,
     };
     if with_sizes {
         measure(&mut inv, |_| true);
@@ -1086,6 +1136,7 @@ fn measure(inv: &mut Inventory, want: impl Fn(&Path) -> bool) {
         .map(|h| &h.path)
         .chain(inv.worktrees.iter().map(|w| &w.path))
         .chain(inv.old_caches.iter().map(|c| &c.path))
+        .chain(inv.scratch.iter().map(|c| &c.path))
         .filter(|p| want(p))
         .cloned()
         .collect();
@@ -1100,6 +1151,11 @@ fn measure(inv: &mut Inventory, want: impl Fn(&Path) -> bool) {
     for w in &mut inv.worktrees {
         if let Some(b) = by.get(&w.path) {
             w.bytes = *b;
+        }
+    }
+    for c in &mut inv.scratch {
+        if let Some(b) = by.get(&c.path) {
+            c.bytes = *b;
         }
     }
     for c in &mut inv.old_caches {
@@ -1117,6 +1173,8 @@ pub struct GcOptions {
     pub include_app_logins: bool,
     pub worktrees: bool,
     pub force: bool,
+    /// Also scratch projects that were not used for `older_than_days`.
+    pub scratch: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -1350,6 +1408,28 @@ pub fn plan(inv: &Inventory, o: &GcOptions, now: u64) -> Vec<Item> {
             },
         });
     }
+    for c in &inv.scratch {
+        if c.running || c.last_active > old {
+            continue;
+        }
+        let mut needs = Vec::new();
+        need(&mut needs, o.scratch, "--scratch");
+        items.push(Item {
+            what: format!("scratch project {} {}", c.harness, c.path.display()),
+            tier: Tier::Consent,
+            bytes: c.bytes,
+            reason: format!(
+                "not used for {} days",
+                now.saturating_sub(c.last_active) / DAY
+            ),
+            warning: (c.entries > 0)
+                .then(|| format!("its {} files and folders are lost", c.entries)),
+            needs,
+            action: Action::Path {
+                path: c.path.clone(),
+            },
+        });
+    }
     for w in &inv.worktrees {
         if w.running {
             continue;
@@ -1423,6 +1503,7 @@ pub fn measure_plan(inv: &mut Inventory, items: &mut [Item]) {
         .iter()
         .map(|w| &w.path)
         .chain(inv.old_caches.iter().map(|c| &c.path))
+        .chain(inv.scratch.iter().map(|c| &c.path))
         .collect();
     let want: BTreeSet<PathBuf> = listed
         .into_iter()
@@ -1438,6 +1519,7 @@ pub fn measure_plan(inv: &mut Inventory, items: &mut [Item]) {
         .map(|h| (&h.path, h.bytes))
         .chain(inv.worktrees.iter().map(|w| (&w.path, w.bytes)))
         .chain(inv.old_caches.iter().map(|c| (&c.path, c.bytes)))
+        .chain(inv.scratch.iter().map(|c| (&c.path, c.bytes)))
         .collect();
     for i in items.iter_mut() {
         if let Action::Path { path } | Action::Worktree { path, .. } = &i.action {
@@ -1733,6 +1815,22 @@ pub fn render_du(env: &HostEnv, inv: &Inventory, now: u64) -> String {
             h.auth,
             h.loses
         ));
+    }
+    if !inv.scratch.is_empty() {
+        t.push_str(&format!(
+            "\nScratch projects (agents that started in the home folder): {}\n",
+            human(inv.scratch.iter().map(|c| c.bytes).sum())
+        ));
+        for c in &inv.scratch {
+            t.push_str(&format!(
+                "  {:>9}  {:<12}  {}  {}{}\n",
+                human(c.bytes),
+                ago(now, c.last_active),
+                c.harness,
+                tilde(&c.path),
+                if c.running { " [running]" } else { "" }
+            ));
+        }
     }
     let total_images: u64 = inv.images.iter().map(|i| i.unique.unwrap_or(i.bytes)).sum();
     t.push_str(&format!(

@@ -234,7 +234,7 @@ pub fn run(
     write_files(&launch)?;
 
     let spec = &built.spec;
-    state::seed(env, &built.profile, &spec.home_src)?;
+    state::seed(env, &built.profile, &built.auth, &spec.home_src)?;
     state::toml_set(&built.profile, &spec.home_src, &spec.project)?;
     state::json_import(
         env,

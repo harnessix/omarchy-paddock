@@ -274,6 +274,14 @@ pub fn report(env: &HostEnv) -> Result<bool> {
         println!("  off      harness commands run without a sandbox; paddock shims install makes the sandbox the default");
     }
 
+    let s = crate::omarchy::status(env);
+    if s.block || s.shims || env.which(crate::omarchy::SCOPE).is_some() {
+        println!("\nOmarchy agents (paddock shims --scope omarchy-agent):");
+        for l in crate::omarchy::doctor_lines(env) {
+            println!("{l}");
+        }
+    }
+
     println!("\nUpdates:");
     for l in crate::update::doctor_lines(env) {
         println!("{l}");

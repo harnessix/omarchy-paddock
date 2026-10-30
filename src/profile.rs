@@ -183,6 +183,41 @@ pub struct State {
     /// external sandbox, so a second trust prompt only gets in the way.
     #[serde(default)]
     pub toml_set: Vec<TomlSet>,
+    /// The variable that points the harness at another account folder, as
+    /// Omarchy's account switch sets it. `paddock wrap` reads it from the
+    /// command and uses that folder as the login of the sandbox.
+    pub account: Option<Account>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Account {
+    /// The variable, for example CLAUDE_CONFIG_DIR.
+    pub env: String,
+    /// The folder that the variable replaces, relative to HOME.
+    pub dir: String,
+    /// Files outside `dir`, relative to HOME, that move into the account
+    /// folder with it, for example `.claude.json`.
+    #[serde(default)]
+    pub also: Vec<String>,
+}
+
+impl Account {
+    /// The host path of `rel` (relative to HOME) for the account folder
+    /// `folder`. None: the path does not move with the account.
+    pub fn map(&self, folder: &Path, rel: &str) -> Option<PathBuf> {
+        let dir = self.dir.trim_end_matches('/');
+        if rel == dir {
+            return Some(folder.to_path_buf());
+        }
+        if let Some(rest) = rel.strip_prefix(dir).and_then(|r| r.strip_prefix('/')) {
+            return Some(folder.join(rest));
+        }
+        if self.also.iter().any(|a| a == rel) {
+            return Path::new(rel).file_name().map(|n| folder.join(n));
+        }
+        None
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -389,10 +424,16 @@ impl<'a> HarnessFactory<'a> {
         }
         for cmd in &p.locate.commands {
             tried.push(format!("PATH lookup of {cmd}"));
-            if let Some(path) = self.env.which(cmd) {
-                if is_shim(&path) {
-                    continue;
-                }
+            // The first match that is not a version-manager shim: Omarchy
+            // puts mise's wrapper folder first on PATH.
+            let found = self
+                .env
+                .path
+                .iter()
+                .filter(|d| d.is_absolute())
+                .map(|d| d.join(cmd))
+                .find(|p| is_executable(p) && !is_shim(p));
+            if let Some(path) = found {
                 return canonical(&path);
             }
         }
