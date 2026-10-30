@@ -280,6 +280,19 @@ pub fn report(env: &HostEnv) -> Result<bool> {
         for l in crate::omarchy::doctor_lines(env) {
             println!("{l}");
         }
+        // Isolated logins stay out of the host: the agents panel never sees
+        // their limits. An Omarchy account, which `paddock wrap` uses, is shown.
+        let isolated = crate::state::isolated_logins(env);
+        if !isolated.is_empty() {
+            let list: Vec<String> = isolated
+                .iter()
+                .map(|(h, n)| format!("{h} isolated:{n}"))
+                .collect();
+            println!(
+                "  note     the agents panel does not show isolated logins ({}); to show one, add that login as an Omarchy account (omarchy agent account add), select it (omarchy agent account use) and start the agent from Omarchy",
+                list.join(", ")
+            );
+        }
     }
 
     println!("\nUpdates:");
