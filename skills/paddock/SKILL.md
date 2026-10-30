@@ -24,14 +24,34 @@ Do not edit files under `~/.local/share/paddock`, `~/.local/state/paddock` or `~
 
 paddock supports Omarchy (Arch Linux with Hyprland). Other distributions are best effort.
 
+`omarchy plugin add` installs only the bar widget. The `paddock` command is a separate install: the prebuilt binary from the latest GitHub release (see the README), or `bin/install` from a clone.
+
 ```sh
 git clone https://github.com/harnessix/omarchy-paddock
 cd omarchy-paddock
 bin/install                     # system packages, build, then paddock doctor
-omarchy plugin add https://github.com/harnessix/omarchy-paddock --enable   # Omarchy bar widget
 ```
 
 `bin/install` uses `sudo` for system packages. Tell the user before you run it. Use `bin/install --minimal` to skip the desktop packages.
+
+Then run the setup without questions. Name every step that the user asked for, and only those:
+
+```sh
+paddock setup --yes --shims --launchers --plugin   # shell commands, launchers, bar widget
+paddock setup --yes --backend podman               # the default backend
+paddock setup --yes --app vscode=~/src/api         # a workspace folder for an app
+paddock setup --yes                                # only show the state of each step
+```
+
+With `--yes`, `paddock setup` prints the package install command and never runs `sudo`. Give that command to the user. Each step prints what it changed and how to undo it, and a second run changes nothing. `--no-shims`, `--no-launchers` and `--no-plugin` undo a step.
+
+## Update
+
+```sh
+paddock update --check          # is there a newer release, and what would an update do
+```
+
+Ask the user before you run `paddock update --yes`: it replaces the paddock binary and updates the bar widget. If a pacman package owns the binary, `paddock update` refuses and prints what to run instead (pull the clone and run `bin/install` again). `paddock doctor` also says when a newer release exists.
 
 ## Check
 
@@ -48,9 +68,10 @@ If a check fails, `paddock doctor` prints the install command for the missing pa
 Most users never type `paddock`. Turn on both of these, and tell the user what they do:
 
 ```sh
-paddock shims install           # `claude`, `codex` and others start in a sandbox in bash and zsh
-paddock launchers install       # menu entries in a "Paddock" folder (Super+Space on Omarchy)
+paddock setup --yes --shims --launchers
 ```
+
+`--shims`: `claude`, `codex` and others start in a sandbox in bash and zsh. `--launchers`: menu entries in a "Paddock" folder (Super+Space on Omarchy). `paddock shims install` and `paddock launchers install` do the same one at a time.
 
 `paddock shims install` adds one marked line to `~/.bashrc` and `~/.zshrc`. It takes effect in new shells. `PADDOCK_BYPASS=1 claude` runs a harness once without the sandbox. A harness command in the home directory stops with an error, because the home directory is never a project.
 
@@ -109,9 +130,7 @@ Do not delete sandbox homes, images or worktrees with `rm`, `docker rmi` or `git
 ## Remove
 
 ```sh
-paddock shims remove
-paddock launchers remove
-omarchy plugin remove harnessix.paddock
+paddock setup --yes --no-shims --no-launchers --no-plugin
 ```
 
 Then delete `~/.local/bin/paddock`, or run `sudo pacman -R omarchy-paddock` if `bin/install` installed the Arch package. The data directories are `~/.local/share/paddock`, `~/.cache/paddock`, `~/.local/state/paddock` and `~/.config/paddock`. They hold sandbox homes and isolated logins, so ask the user before you delete them. To free space and keep paddock, use `paddock gc` instead.

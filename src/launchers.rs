@@ -376,6 +376,17 @@ pub fn remove(env: &HostEnv) -> Result<Vec<PathBuf>> {
     Ok(removed)
 }
 
+/// Whether `install` ran and `remove` did not run since.
+pub fn installed(env: &HostEnv) -> bool {
+    record_file(env).is_file()
+        || std::fs::read_dir(applications_dir(env)).is_ok_and(|d| {
+            d.flatten().any(|e| {
+                let n = e.file_name().to_string_lossy().into_owned();
+                n.starts_with(CLI_PREFIX) && n.ends_with(".desktop")
+            })
+        })
+}
+
 fn refresh_desktop_database(env: &HostEnv) {
     let _ = Command::new("update-desktop-database")
         .arg(applications_dir(env))

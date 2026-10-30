@@ -516,6 +516,21 @@ fn open_tunnel(cfg: &HostProxy, host: &str, port: u16) -> Result<Box<dyn Duplex>
     }
 }
 
+/// A connection to host:port for paddock's own requests on the host (`paddock
+/// update`), made the way a host program makes it: through `HTTPS_PROXY` or
+/// `ALL_PROXY` unless `NO_PROXY` names the host, with the same refusal of
+/// loopback and private targets. Reads time out after `timeout`.
+pub fn host_connect(
+    cfg: &HostProxy,
+    host: &str,
+    port: u16,
+    timeout: Duration,
+) -> Result<impl Read + Write + Send> {
+    let s = open_tunnel(cfg, host, port)?;
+    s.set_tick(timeout)?;
+    Ok(s)
+}
+
 trait Duplex: Read + Write + Send + 'static {
     fn dup(&self) -> std::io::Result<Box<dyn Duplex>>;
     fn close_write(&self);
@@ -821,7 +836,7 @@ pub fn relay(listen: &str, socket: &Path, forward: &[u16], ready: Option<&Path>)
     Ok(())
 }
 
-mod tls;
+pub(crate) mod tls;
 
 #[cfg(test)]
 mod tests;
