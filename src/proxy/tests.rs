@@ -341,3 +341,316 @@ fn proxy_refuses_mapped_loopback_and_lan() {
     let ok = check_target(&cfg, "::ffff:8.8.8.8", 443).unwrap();
     assert_eq!(ok.len(), 1);
 }
+
+// An `https://` upstream proxy. The fake proxy records every byte that
+// arrives on its TCP socket, so a test can check that nothing readable, and
+// above all no credential, crossed the network outside TLS.
+
+struct Recording {
+    inner: std::net::TcpStream,
+    raw: Arc<Mutex<Vec<u8>>>,
+}
+
+impl Read for Recording {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        self.raw.lock().unwrap().extend_from_slice(&buf[..n]);
+        Ok(n)
+    }
+}
+
+impl Write for Recording {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.inner.write(buf)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+struct TlsProxy {
+    port: u16,
+    /// Every byte the proxy received on the wire.
+    raw: Arc<Mutex<Vec<u8>>>,
+    /// The request heads it decrypted.
+    heads: Arc<Mutex<Vec<String>>>,
+}
+
+fn self_signed() -> rcgen::CertifiedKey<rcgen::KeyPair> {
+    rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap()
+}
+
+/// A TLS proxy with the certificate `ck`. It answers CONNECT with 200 and then
+/// echoes; it answers a forwarded GET with "ok".
+fn tls_proxy(ck: &rcgen::CertifiedKey<rcgen::KeyPair>) -> TlsProxy {
+    use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(ck.signing_key.serialize_der()));
+    let scfg = Arc::new(
+        rustls::ServerConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(vec![ck.cert.der().clone()], key)
+            .unwrap(),
+    );
+    let l = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = l.local_addr().unwrap().port();
+    let raw = Arc::new(Mutex::new(Vec::new()));
+    let heads = Arc::new(Mutex::new(Vec::new()));
+    let (raw2, heads2) = (raw.clone(), heads.clone());
+    std::thread::spawn(move || {
+        for c in l.incoming().flatten() {
+            let (scfg, raw, heads) = (scfg.clone(), raw2.clone(), heads2.clone());
+            std::thread::spawn(move || {
+                let conn = rustls::ServerConnection::new(scfg).unwrap();
+                let mut s = rustls::StreamOwned::new(conn, Recording { inner: c, raw });
+                let Ok((head, _)) = read_head(&mut s) else {
+                    return;
+                };
+                let head = String::from_utf8_lossy(&head).into_owned();
+                let connect = head.starts_with("CONNECT ");
+                heads.lock().unwrap().push(head);
+                if connect {
+                    s.write_all(b"HTTP/1.1 200 Connection established\r\n\r\n")
+                        .unwrap();
+                    let mut buf = [0u8; 4096];
+                    loop {
+                        match s.read(&mut buf) {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => {
+                                if s.write_all(&buf[..n]).is_err() {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    let _ = s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+                }
+                s.conn.send_close_notify();
+                let _ = s.flush();
+            });
+        }
+    });
+    TlsProxy { port, raw, heads }
+}
+
+fn trusting(ck: &rcgen::CertifiedKey<rcgen::KeyPair>) -> Arc<rustls::ClientConfig> {
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add(ck.cert.der().clone()).unwrap();
+    tls::config_with_roots(roots).unwrap()
+}
+
+fn https_cfg(var: &str, port: u16, tls: Arc<rustls::ClientConfig>) -> HostProxy {
+    let url = format!("https://user:s3cret@localhost:{port}");
+    HostProxy {
+        tls: Some(tls),
+        ..HostProxy::from_vars(|k| (k == var).then(|| url.clone()))
+    }
+}
+
+fn contains(hay: &[u8], needle: &[u8]) -> bool {
+    hay.windows(needle.len()).any(|w| w == needle)
+}
+
+fn creds_b64() -> String {
+    base64::engine::general_purpose::STANDARD.encode("user:s3cret")
+}
+
+#[test]
+fn https_proxy_url_keeps_its_tls_scheme() {
+    for var in ["HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY"] {
+        let cfg =
+            HostProxy::from_vars(|k| (k == var).then(|| "https://u:p@proxy.example:8443".into()));
+        let up = cfg.https.as_ref().or(cfg.http.as_ref()).unwrap();
+        assert!(
+            matches!(
+                up,
+                Upstream::Http {
+                    tls: true,
+                    port: 8443,
+                    ..
+                }
+            ),
+            "{var}: {up:?}"
+        );
+    }
+    let cfg =
+        HostProxy::from_vars(|k| (k == "HTTPS_PROXY").then(|| "http://proxy.example:3128".into()));
+    assert!(matches!(cfg.https, Some(Upstream::Http { tls: false, .. })));
+    // An https URL without a port uses 443.
+    let cfg =
+        HostProxy::from_vars(|k| (k == "HTTPS_PROXY").then(|| "https://proxy.example".into()));
+    assert!(matches!(
+        cfg.https,
+        Some(Upstream::Http {
+            tls: true,
+            port: 443,
+            ..
+        })
+    ));
+}
+
+#[test]
+fn connect_through_an_https_proxy_sends_credentials_only_inside_tls() {
+    let ck = self_signed();
+    let p = tls_proxy(&ck);
+    let (_d, sock) = start(https_cfg("HTTPS_PROXY", p.port, trusting(&ck)));
+    let (code, mut s) = connect(&sock, "api.example.invalid:443");
+    assert_eq!(code, 200);
+    roundtrip(&mut s, b"through the TLS tunnel");
+    // A larger transfer in both directions at once.
+    let big: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
+    let mut w = s.try_clone().unwrap();
+    let send = big.clone();
+    let t = std::thread::spawn(move || w.write_all(&send).unwrap());
+    let mut back = vec![0u8; big.len()];
+    s.read_exact(&mut back).unwrap();
+    t.join().unwrap();
+    assert!(back == big);
+    let head = p.heads.lock().unwrap()[0].clone();
+    assert!(
+        head.starts_with("CONNECT api.example.invalid:443 HTTP/1.1"),
+        "{head}"
+    );
+    assert!(
+        head.contains(&format!("Proxy-Authorization: Basic {}", creds_b64())),
+        "{head}"
+    );
+    let raw = p.raw.lock().unwrap();
+    assert!(!contains(&raw, creds_b64().as_bytes()));
+    assert!(!contains(&raw, b"CONNECT"));
+    assert!(!contains(&raw, b"through the TLS tunnel"));
+}
+
+#[test]
+fn plain_http_through_an_https_proxy_stays_inside_tls() {
+    let ck = self_signed();
+    let p = tls_proxy(&ck);
+    let (_d, sock) = start(https_cfg("HTTP_PROXY", p.port, trusting(&ck)));
+    let mut s = UnixStream::connect(&sock).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    s.write_all(
+        b"GET http://site.example.invalid/x HTTP/1.1\r\nHost: site.example.invalid\r\n\r\n",
+    )
+    .unwrap();
+    let mut all = Vec::new();
+    let _ = s.read_to_end(&mut all);
+    let text = String::from_utf8_lossy(&all);
+    assert!(
+        text.starts_with("HTTP/1.1 200 OK") && text.ends_with("ok"),
+        "{text}"
+    );
+    let head = p.heads.lock().unwrap()[0].clone();
+    assert!(
+        head.starts_with("GET http://site.example.invalid/x HTTP/1.1"),
+        "{head}"
+    );
+    assert!(
+        head.contains(&format!("Proxy-Authorization: Basic {}", creds_b64())),
+        "{head}"
+    );
+    let raw = p.raw.lock().unwrap();
+    assert!(!contains(&raw, creds_b64().as_bytes()));
+    assert!(!contains(&raw, b"site.example.invalid/x"));
+}
+
+#[test]
+fn an_untrusted_proxy_certificate_fails_closed() {
+    let ck = self_signed();
+    let p = tls_proxy(&ck);
+    // The client trusts a different CA.
+    let (_d, sock) = start(https_cfg("ALL_PROXY", p.port, trusting(&self_signed())));
+    assert_eq!(connect(&sock, "api.example.invalid:443").0, 502);
+    let mut s = UnixStream::connect(&sock).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    s.write_all(b"GET http://site.example.invalid/ HTTP/1.1\r\nHost: site.example.invalid\r\n\r\n")
+        .unwrap();
+    let (head, _) = read_head(&mut s).unwrap();
+    assert!(head.starts_with(b"HTTP/1.1 502"));
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(p.heads.lock().unwrap().is_empty());
+    let raw = p.raw.lock().unwrap();
+    assert!(!raw.is_empty(), "the client hello arrived");
+    assert!(!contains(&raw, creds_b64().as_bytes()));
+    assert!(!contains(&raw, b"CONNECT"));
+}
+
+#[test]
+fn an_https_proxy_that_speaks_plain_http_gets_no_credentials() {
+    // A listener that records what arrives and answers like a plain proxy.
+    let l = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = l.local_addr().unwrap().port();
+    let raw = Arc::new(Mutex::new(Vec::new()));
+    let raw2 = raw.clone();
+    std::thread::spawn(move || {
+        for mut c in l.incoming().flatten() {
+            c.set_read_timeout(Some(Duration::from_millis(500)))
+                .unwrap();
+            let mut buf = [0u8; 4096];
+            if let Ok(n) = c.read(&mut buf) {
+                raw2.lock().unwrap().extend_from_slice(&buf[..n]);
+            }
+            let _ = c.write_all(b"HTTP/1.1 200 OK\r\n\r\n");
+        }
+    });
+    let ck = self_signed();
+    let (_d, sock) = start(https_cfg("HTTPS_PROXY", port, trusting(&ck)));
+    assert_eq!(connect(&sock, "api.example.invalid:443").0, 502);
+    let raw = raw.lock().unwrap();
+    assert!(!contains(&raw, creds_b64().as_bytes()));
+    assert!(!contains(&raw, b"CONNECT"));
+}
+
+#[test]
+fn https_tunnel_passes_a_half_close() {
+    let ck = self_signed();
+    let p = tls_proxy(&ck);
+    let (_d, sock) = start(https_cfg("HTTPS_PROXY", p.port, trusting(&ck)));
+    let (code, mut s) = connect(&sock, "api.example.invalid:443");
+    assert_eq!(code, 200);
+    // The client stops sending; the answer still comes back, then the end.
+    s.write_all(b"last words").unwrap();
+    s.shutdown(Shutdown::Write).unwrap();
+    let mut all = Vec::new();
+    s.read_to_end(&mut all).unwrap();
+    assert_eq!(all, b"last words");
+}
+
+#[test]
+fn https_tunnel_closes_when_idle() {
+    let ck = self_signed();
+    let p = tls_proxy(&ck);
+    let mut cfg = https_cfg("HTTPS_PROXY", p.port, trusting(&ck));
+    cfg.idle = Duration::from_millis(600);
+    let (_d, sock) = start(cfg);
+    let (code, mut s) = connect(&sock, "api.example.invalid:443");
+    assert_eq!(code, 200);
+    for i in 0..6 {
+        roundtrip(&mut s, format!("frame {i}").as_bytes());
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    std::thread::sleep(Duration::from_millis(1500));
+    let mut buf = [0u8; 8];
+    assert_eq!(s.read(&mut buf).unwrap_or(0), 0);
+}
+
+#[test]
+fn warns_about_cleartext_credentials_to_remote_proxies() {
+    let warn = |var: &str, url: &str| {
+        HostProxy::from_vars(|k| (k == var).then(|| url.to_string())).cleartext_warnings()
+    };
+    assert_eq!(
+        warn("HTTPS_PROXY", "http://u:p@proxy.example:3128").len(),
+        1
+    );
+    assert_eq!(
+        warn("ALL_PROXY", "socks5://u:p@proxy.example:1080").len(),
+        1
+    );
+    assert!(warn("HTTPS_PROXY", "https://u:p@proxy.example:8443").is_empty());
+    assert!(warn("HTTPS_PROXY", "http://proxy.example:3128").is_empty());
+    assert!(warn("ALL_PROXY", "socks5://u:p@127.0.0.1:1080").is_empty());
+    assert!(!warn("HTTPS_PROXY", "http://u:p@proxy.example:3128")[0].contains("u:p"));
+}

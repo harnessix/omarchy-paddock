@@ -11,7 +11,8 @@
 //!
 //! Protocol work is done by small, widely used crates: `httparse` parses
 //! requests and upstream responses, `url` parses proxy and request URLs,
-//! `socks` speaks SOCKS5 to an upstream, and `no-proxy` evaluates NO_PROXY.
+//! `socks` speaks SOCKS5 to an upstream, `rustls` speaks TLS to an `https://`
+//! upstream (see `tls.rs`), and `no-proxy` evaluates NO_PROXY.
 //! This module holds only the policy: which targets are refused, which host
 //! loopback ports are allowed, limits, and the socket plumbing.
 
@@ -108,9 +109,13 @@ pub fn canonical(ip: IpAddr) -> IpAddr {
 /// The proxy that the host uses.
 #[derive(Debug, Clone)]
 pub enum Upstream {
+    /// An HTTP proxy. With `tls`, the URL scheme was `https` and paddock
+    /// talks to the proxy over TLS: the request and its credentials never
+    /// leave in cleartext.
     Http {
         host: String,
         port: u16,
+        tls: bool,
         auth: Option<String>,
     },
     Socks5 {
@@ -133,9 +138,10 @@ fn upstream(raw: &str) -> Option<Upstream> {
     let user = decode(url.username());
     let pass = url.password().map(decode).unwrap_or_default();
     match url.scheme() {
-        "http" | "https" => Some(Upstream::Http {
+        scheme @ ("http" | "https") => Some(Upstream::Http {
             host,
             port,
+            tls: scheme == "https",
             auth: (!user.is_empty()).then(|| {
                 base64::engine::general_purpose::STANDARD.encode(format!("{user}:{pass}"))
             }),
@@ -162,6 +168,10 @@ pub struct HostProxy {
     pub idle: Duration,
     /// Connections handled at the same time.
     pub max_conns: usize,
+    /// Trust only this TLS config for `https://` proxies, instead of the
+    /// system trust store. Tests use it for a local CA.
+    #[cfg(test)]
+    pub tls: Option<Arc<rustls::ClientConfig>>,
 }
 
 impl Default for HostProxy {
@@ -174,6 +184,8 @@ impl Default for HostProxy {
             allow_lan: false,
             idle: Duration::from_secs(15 * 60),
             max_conns: 512,
+            #[cfg(test)]
+            tls: None,
         }
     }
 }
@@ -190,6 +202,49 @@ impl HostProxy {
             no_proxy: first(&["NO_PROXY", "no_proxy"]),
             ..Self::default()
         }
+    }
+
+    fn tls_config(&self) -> Result<Arc<rustls::ClientConfig>> {
+        #[cfg(test)]
+        if let Some(c) = &self.tls {
+            return Ok(c.clone());
+        }
+        tls::system_config()
+    }
+
+    /// Warnings about upstream proxies that get credentials in cleartext.
+    /// An `https://` proxy never does. A `http://` or `socks5://` proxy with
+    /// a user name in its URL gets them in cleartext, because that is what
+    /// the protocol does and what every host program does with that URL.
+    pub fn cleartext_warnings(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        for u in [&self.https, &self.http].into_iter().flatten() {
+            let (host, port, kind) = match u {
+                Upstream::Http {
+                    host,
+                    port,
+                    tls: false,
+                    auth: Some(_),
+                } => (host, port, "http://"),
+                Upstream::Socks5 {
+                    host,
+                    port,
+                    auth: Some(_),
+                } => (host, port, "socks5://"),
+                _ => continue,
+            };
+            if is_loopback(host) {
+                continue;
+            }
+            let w = format!(
+                "the upstream proxy {kind}{} gets its user name and password in cleartext on the network; use an https:// proxy URL to protect them",
+                authority(host, *port)
+            );
+            if !out.contains(&w) {
+                out.push(w);
+            }
+        }
+        out
     }
 
     fn bypass(&self, host: &str) -> bool {
@@ -366,8 +421,27 @@ fn authority(host: &str, port: u16) -> String {
     }
 }
 
+/// Connect to an HTTP upstream proxy. With `tls`, do the TLS handshake and
+/// check the certificate first; any failure is an error, never a fallback to
+/// plain TCP, so credentials go out only inside TLS.
+fn connect_proxy(cfg: &HostProxy, host: &str, port: u16, tls: bool) -> Result<Box<dyn Duplex>> {
+    let tcp = connect_tcp(host, port)?;
+    if !tls {
+        return Ok(Box::new(tcp));
+    }
+    let tc = cfg
+        .tls_config()
+        .context("cannot set up TLS to the upstream proxy")?;
+    Ok(Box::new(tls::TlsStream::connect(
+        tc,
+        host,
+        tcp,
+        HEAD_TIMEOUT,
+    )?))
+}
+
 /// Open a tunnel to host:port the way a host program would.
-fn open_tunnel(cfg: &HostProxy, host: &str, port: u16) -> Result<TcpStream> {
+fn open_tunnel(cfg: &HostProxy, host: &str, port: u16) -> Result<Box<dyn Duplex>> {
     let vetted = check_target(cfg, host, port)?;
     let up = if cfg.bypass(host) || is_loopback(host) {
         None
@@ -376,21 +450,22 @@ fn open_tunnel(cfg: &HostProxy, host: &str, port: u16) -> Result<TcpStream> {
     };
     match up {
         // Direct: only the addresses that passed the check.
-        None => connect_addrs(host, &vetted),
+        None => Ok(Box::new(connect_addrs(host, &vetted)?)),
         Some(Upstream::Http {
             host: ph,
             port: pp,
+            tls,
             auth,
         }) => {
-            let mut s = connect_tcp(ph, *pp)?;
+            let mut s = connect_proxy(cfg, ph, *pp, *tls)?;
             let target = authority(host, port);
             let mut req = format!("CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n");
             if let Some(a) = auth {
                 req.push_str(&format!("Proxy-Authorization: Basic {a}\r\n"));
             }
             req.push_str("\r\n");
+            s.set_tick(HEAD_TIMEOUT)?;
             s.write_all(req.as_bytes())?;
-            s.set_read_timeout(Some(HEAD_TIMEOUT))?;
             let (head, rest) = read_head(&mut s)?;
             let mut headers = [httparse::EMPTY_HEADER; 64];
             let mut resp = httparse::Response::new(&mut headers);
@@ -402,7 +477,6 @@ fn open_tunnel(cfg: &HostProxy, host: &str, port: u16) -> Result<TcpStream> {
             if !rest.is_empty() {
                 bail!("upstream proxy sent data before the tunnel opened");
             }
-            s.set_read_timeout(None)?;
             Ok(s)
         }
         Some(Upstream::Socks5 {
@@ -418,7 +492,7 @@ fn open_tunnel(cfg: &HostProxy, host: &str, port: u16) -> Result<TcpStream> {
                 None => socks::Socks5Stream::connect(proxy, (host, port)),
             }
             .with_context(|| format!("upstream SOCKS proxy could not reach {host}:{port}"))?;
-            Ok(s.into_inner())
+            Ok(Box::new(s.into_inner()))
         }
     }
 }
@@ -438,6 +512,18 @@ impl Duplex for TcpStream {
     }
     fn set_tick(&self, d: Duration) -> std::io::Result<()> {
         self.set_read_timeout(Some(d))
+    }
+}
+
+impl Duplex for Box<dyn Duplex> {
+    fn dup(&self) -> std::io::Result<Box<dyn Duplex>> {
+        (**self).dup()
+    }
+    fn close_write(&self) {
+        (**self).close_write()
+    }
+    fn set_tick(&self, d: Duration) -> std::io::Result<()> {
+        (**self).set_tick(d)
     }
 }
 
@@ -583,9 +669,12 @@ fn handle(cfg: &HostProxy, mut client: UnixStream) -> Result<()> {
     let version = req.version.unwrap_or(1);
     let opened = match &via {
         Some(Upstream::Http {
-            host: ph, port: pp, ..
+            host: ph,
+            port: pp,
+            tls,
+            ..
         }) => check_target(cfg, &host, port)
-            .and_then(|_| connect_tcp(ph, *pp))
+            .and_then(|_| connect_proxy(cfg, ph, *pp, *tls))
             .map(|s| (s, format!("{method} {url} HTTP/1.{version}\r\n"))),
         _ => {
             let tunnel_cfg = HostProxy {
@@ -712,6 +801,8 @@ pub fn relay(listen: &str, socket: &Path, forward: &[u16], ready: Option<&Path>)
     }
     Ok(())
 }
+
+mod tls;
 
 #[cfg(test)]
 mod tests;
