@@ -568,7 +568,7 @@ fn start(env: &HostEnv, a: &RunArgs, shell: bool) -> Result<i32> {
     let wt = built.worktree.clone();
     let code = run::run(env, built, backend.as_ref(), false, false)?.code;
     if let Some(w) = wt {
-        eprintln!("\n{}", build::worktree_report(&w));
+        eprintln!("\n{}", build::worktree_report(env, &w));
     }
     Ok(code)
 }
@@ -1472,7 +1472,7 @@ fn files_cmd(env: &HostEnv, id: Option<&str>, json: bool) -> Result<i32> {
         if id.is_none() && items.is_empty() && !running {
             continue;
         }
-        let changes = recover::project_changes(&s);
+        let changes = recover::project_changes(env, &s);
         out.push((s, running, items, changes));
     }
     if json {
@@ -1517,10 +1517,14 @@ fn files_cmd(env: &HostEnv, id: Option<&str>, json: bool) -> Result<i32> {
             );
         }
         if changes.git {
+            let paths = if changes.changed_unknown {
+                "an unknown number of".to_string()
+            } else {
+                changes.changed.len().to_string()
+            };
             println!(
-                "  project: {} new commit(s), {} changed path(s) since start",
+                "  project: {} new commit(s), {paths} changed path(s) since start",
                 changes.commits.len(),
-                changes.changed.len()
             );
             for c in changes.commits.iter().take(10) {
                 println!("    commit {c}");
@@ -1745,12 +1749,13 @@ fn approver_cmd(env: &HostEnv, cmd: ApproverCmd) -> Result<i32> {
 /// zenity is not installed.
 fn pick_folder_gui(env: &HostEnv, name: &str) -> Option<(PathBuf, bool)> {
     let dir = pick_dir_gui(env, name)?;
-    let is_repo = std::process::Command::new("git")
-        .arg("-C")
-        .arg(&dir)
-        .args(["rev-parse", "--verify", "-q", "HEAD"])
-        .output()
-        .is_ok_and(|o| o.status.success());
+    let is_repo = paddock::hostgit::Layout::discover(&dir)
+        .ok()
+        .flatten()
+        .is_some_and(|l| {
+            l.try_query(&["rev-parse", "--verify", "-q", "HEAD"])
+                .is_some()
+        });
     if !is_repo {
         return Some((dir, false));
     }

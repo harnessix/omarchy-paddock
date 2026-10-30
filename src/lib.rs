@@ -11,6 +11,7 @@ pub mod doctor;
 pub mod env;
 pub mod gui;
 pub mod hostcli;
+pub mod hostgit;
 pub mod keyring;
 pub mod launchers;
 pub mod logging;

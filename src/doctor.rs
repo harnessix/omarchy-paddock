@@ -307,7 +307,7 @@ pub struct EscapeOpts {
 /// Run the probe in a real sandbox. Returns the number of failed checks.
 pub fn escape(env: &HostEnv, o: &EscapeOpts) -> Result<usize> {
     let root = env.paddock_cache().join("doctor");
-    let _ = std::fs::remove_dir_all(&root);
+    clear_doctor_root(&root);
     let project = root.join("project");
     std::fs::create_dir_all(&project)?;
 
@@ -520,6 +520,20 @@ pub fn escape(env: &HostEnv, o: &EscapeOpts) -> Result<usize> {
         "doctor",
     );
     built.spec.set_env("PADDOCK_PROBE_PUSH", "1", "doctor");
+    // The git escape checks: a path that a planted setting would create on
+    // the host, and a directory that a planted pointer file would name.
+    let git_canary = root.join("git-canary");
+    let _ = std::fs::remove_file(&git_canary);
+    built.spec.set_env(
+        "PADDOCK_PROBE_GIT_CANARY",
+        git_canary.display().to_string(),
+        "doctor",
+    );
+    built.spec.set_env(
+        "PADDOCK_PROBE_GIT_EVIL",
+        root.join("evil.git").display().to_string(),
+        "doctor",
+    );
     // Host passthrough requests from the probe are denied, except pushes to
     // the known remote, which get "allow for this session".
     let recorder = std::sync::Arc::new(Recorder::default());
@@ -614,6 +628,16 @@ pub fn escape(env: &HostEnv, o: &EscapeOpts) -> Result<usize> {
             println!("  {line}");
         }
     }
+    for (name, problem) in git_host_checks(&env2, &project, &git_canary) {
+        seen += 1;
+        match problem {
+            None => println!("  ok {name}"),
+            Some(p) => {
+                failed += 1;
+                println!("  FAIL {name}: {p}");
+            }
+        }
+    }
     for (name, problem) in push_checks(&recorder, &remote) {
         seen += 1;
         match problem {
@@ -673,7 +697,7 @@ pub fn escape(env: &HostEnv, o: &EscapeOpts) -> Result<usize> {
         );
         failed += 1;
     }
-    let _ = std::fs::remove_dir_all(&root);
+    clear_doctor_root(&root);
     println!(
         "{}",
         if failed == 0 {
@@ -845,6 +869,99 @@ impl crate::broker::Approver for Recorder {
             crate::broker::Answer::Deny
         })
     }
+}
+
+/// Remove the doctor's own project tree. The probe leaves git repositories
+/// there, and git makes its object directories read-only, so the folders get
+/// their owner write bit back first. A leftover tree would break the next
+/// test run.
+fn clear_doctor_root(root: &Path) {
+    fn writable(dir: &Path, depth: usize) {
+        if depth > 12 {
+            return;
+        }
+        use std::os::unix::fs::PermissionsExt;
+        let Ok(m) = std::fs::symlink_metadata(dir) else {
+            return;
+        };
+        if m.is_symlink() || !m.is_dir() {
+            return;
+        }
+        let mode = m.permissions().mode();
+        if mode & 0o700 != 0o700 {
+            let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(mode | 0o700));
+        }
+        for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+            writable(&e.path(), depth + 1);
+        }
+    }
+    writable(root, 0);
+    if let Err(e) = std::fs::remove_dir_all(root) {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            eprintln!("paddock: cannot clear {}: {e}", root.display());
+        }
+    }
+}
+
+/// Host-side git checks, run after the sandbox exits. The probe planted
+/// settings and hooks that would run a command on the host. These calls are
+/// the ones paddock makes after every run, so nothing may start.
+fn git_host_checks(
+    env: &HostEnv,
+    project: &Path,
+    canary: &Path,
+) -> Vec<(&'static str, Option<String>)> {
+    let check = |ok: bool, why: String| (!ok).then_some(why);
+    let layout = crate::hostgit::Layout::discover(project);
+    let mut out = vec![(
+        "git-layout-still-trusted",
+        match &layout {
+            Ok(Some(l)) if l.work_tree == project => None,
+            Ok(Some(l)) => Some(format!(
+                "the project root moved to {}",
+                l.work_tree.display()
+            )),
+            Ok(None) => Some("the project is no longer a repository".into()),
+            Err(e) => Some(format!("{e:#}")),
+        },
+    )];
+    // Everything paddock runs on the host after a sandbox exits.
+    let mut status = None;
+    if let Ok(Some(l)) = &layout {
+        let _ = l.try_query(&["rev-parse", "HEAD"]);
+        let _ = l.try_query(&["log", "--oneline", "-n", "5"]);
+        let _ = l.try_query(&["status", "--porcelain"]);
+        status = l.status(env, "all").ok().flatten();
+    }
+    for s in crate::recover::Session::all(env)
+        .into_iter()
+        .filter(|s| s.project == project)
+        .take(2)
+    {
+        let _ = crate::recover::project_changes(env, &s);
+    }
+    out.push((
+        "git-planted-config-never-runs",
+        check(
+            !canary.exists(),
+            format!(
+                "a host git call ran a setting the sandbox planted and created {}",
+                canary.display()
+            ),
+        ),
+    ));
+    out.push((
+        "git-worktree-state-still-readable",
+        match status {
+            Some(lines) if lines.iter().any(|l| l.contains("planted.txt")) => None,
+            Some(_) if env.which("bwrap").is_none() => None,
+            Some(lines) => Some(format!("the sandboxed status missed the change: {lines:?}")),
+            None if env.which("bwrap").is_none() => None,
+            None => Some("the sandboxed status gave no answer".into()),
+        },
+    ));
+    let _ = std::fs::remove_file(canary);
+    out
 }
 
 /// Host-side checks of what the probe's pushes asked for.

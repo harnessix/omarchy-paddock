@@ -30,6 +30,50 @@ fi
 if touch "$P/.git/hooks/pre-commit" 2>/dev/null; then fail git-hooks-read-only "created .git/hooks/pre-commit"; else ok git-hooks-read-only; fi
 if (echo "[core]" >> "$P/.git/config") 2>/dev/null; then fail git-config-read-only "appended to .git/config"; else ok git-config-read-only; fi
 
+# The git directory is a mount point, so it cannot be renamed. Without that,
+# `mv .git .git2 && mkdir .git` would put a fresh, writable .git on the host.
+if mv "$P/.git" "$P/.git-moved" 2>/dev/null; then
+  mv "$P/.git-moved" "$P/.git" 2>/dev/null
+  fail git-dir-cannot-be-renamed "renamed .git inside the sandbox"
+else
+  ok git-dir-cannot-be-renamed
+fi
+# The pointer files that send git to another directory, and the object store
+# redirect. Each must be read-only here.
+for f in commondir config.worktree objects/info/alternates; do
+  name=$(echo "git-$f-read-only" | tr / -)
+  if (echo "$PADDOCK_PROBE_GIT_EVIL" > "$P/.git/$f") 2>/dev/null; then
+    fail "$name" "wrote .git/$f"
+  else
+    ok "$name"
+  fi
+done
+# A canary that a planted setting would create on the host. The host checks
+# after the run that nothing created it: paddock's own git calls must not run
+# repository settings, and status-like work happens in a sandbox.
+if [ -n "$PADDOCK_PROBE_GIT_CANARY" ]; then
+  evil="[core]
+	fsmonitor = touch $PADDOCK_PROBE_GIT_CANARY
+	hooksPath = $P/evilhooks
+[filter \"paddockprobe\"]
+	clean = touch $PADDOCK_PROBE_GIT_CANARY
+	smudge = cat
+"
+  # The project work tree is writable: a nested repository there carries the
+  # settings instead, and .gitattributes names the filter.
+  mkdir -p "$P/nested" "$P/evilhooks"
+  (cd "$P/nested" && git init -q 2>/dev/null && printf '%s' "$evil" > .git/config && echo nested > file.txt \
+    && git -c user.name=probe -c user.email=probe@localhost add -A 2>/dev/null \
+    && git -c user.name=probe -c user.email=probe@localhost commit -qm nested 2>/dev/null)
+  # Git makes its object directories read-only. The host must be able to
+  # delete this project again after the test.
+  chmod -R u+rwX "$P/nested" 2>/dev/null
+  printf '* filter=paddockprobe\n' > "$P/.gitattributes"
+  printf '#!/bin/sh\ntouch %s\n' "$PADDOCK_PROBE_GIT_CANARY" > "$P/evilhooks/post-commit"
+  chmod +x "$P/evilhooks/post-commit" 2>/dev/null
+  echo "planted" > "$P/planted.txt"
+fi
+
 if grep -q paddock-secret-canary "$P/.env" 2>/dev/null; then fail secrets-masked ".env content is readable"; else ok secrets-masked; fi
 if (echo x > "$P/.env") 2>/dev/null; then fail secrets-read-only ".env is writable"; else ok secrets-read-only; fi
 

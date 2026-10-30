@@ -2,12 +2,11 @@
 //! the spec: mounts, caches, environment, setup lines. They do not depend on
 //! each other, so each can be tested alone.
 
-use crate::env::{capture, HostEnv};
+use crate::env::HostEnv;
 use crate::manifest::Manifest;
 use crate::spec::{Mount, SandboxSpec};
-use anyhow::{Context as _, Result};
+use anyhow::{bail, Context as _, Result};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 pub struct Context<'a> {
     pub env: &'a HostEnv,
@@ -40,67 +39,37 @@ pub fn cache_mount(env: &HostEnv, name: &str, dst: PathBuf, origin: &str) -> Res
     Ok(Mount::bind(src, dst, true, origin))
 }
 
-/// The git root of a path, if the path is inside a work tree.
+/// The git root of a path, if the path is inside a work tree. It comes from
+/// the file system, never from configuration that a sandbox can write.
 pub fn git_toplevel(dir: &Path) -> Option<PathBuf> {
-    capture(
-        Command::new("git")
-            .arg("-C")
-            .arg(dir)
-            .args(["rev-parse", "--show-toplevel"]),
-    )
-    .ok()
-    .map(PathBuf::from)
+    crate::hostgit::Layout::toplevel(dir)
 }
 
 pub struct Git;
 
 impl Git {
-    fn dirs(project: &Path) -> Option<(PathBuf, PathBuf)> {
-        let out = capture(Command::new("git").arg("-C").arg(project).args([
-            "rev-parse",
-            "--path-format=absolute",
-            "--git-dir",
-            "--git-common-dir",
-        ]))
-        .ok()?;
-        let mut lines = out.lines();
-        Some((PathBuf::from(lines.next()?), PathBuf::from(lines.next()?)))
-    }
-
-    /// Every git directory whose hooks and config the host runs: the main one,
-    /// each worktree, and each submodule.
-    pub fn protected_dirs(git_dir: &Path, common: &Path) -> Vec<PathBuf> {
-        let mut out = vec![common.to_path_buf()];
-        if git_dir != common {
-            out.push(git_dir.to_path_buf());
-        }
-        for sub in ["worktrees", "modules"] {
-            collect_git_dirs(&common.join(sub), 0, &mut out);
-        }
-        out.sort();
-        out.dedup();
-        out
-    }
-}
-
-fn collect_git_dirs(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
-    if depth > 4 {
-        return;
-    }
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for e in entries.flatten() {
-        let p = e.path();
-        if !p.is_dir() {
-            continue;
-        }
-        if p.join("HEAD").is_file() {
-            out.push(p.clone());
-        }
-        collect_git_dirs(&p.join("modules"), depth + 1, out);
-        if !p.join("HEAD").is_file() {
-            collect_git_dirs(&p, depth + 1, out);
+    /// Make a file of a git directory exist, so a read-only bind can cover
+    /// it. Without the file the sandbox can create it later and point git at
+    /// its own content. The git directory is sandbox-writable, so the path is
+    /// walked without following a symlink, and an existing file is never
+    /// replaced. A symlink or a special file in its place is an error: a bind
+    /// of it would follow it on the host.
+    fn placeholder(git_dir: &Path, rel: &str, content: &str) -> Result<()> {
+        use crate::safefs::Kind;
+        let root = crate::safefs::Root::open(git_dir)?;
+        let (parent, name) = match rel.rsplit_once('/') {
+            Some((p, n)) => (Path::new(p), n),
+            None => (Path::new(""), rel),
+        };
+        let dir = root.dir(parent, true)?;
+        match dir.kind(name.as_ref())? {
+            Some(Kind::File) => Ok(()),
+            Some(other) => bail!(
+                "{} is a {:?}, not a file. paddock does not bind it, because git on the host reads it.",
+                git_dir.join(rel).display(),
+                other
+            ),
+            None => dir.write(name.as_ref(), content.as_bytes(), 0o644),
         }
     }
 }
@@ -110,36 +79,80 @@ impl Detector for Git {
         "git"
     }
     fn apply(&self, cx: &Context, spec: &mut SandboxSpec) -> Result<()> {
-        let Some((git_dir, common)) = Self::dirs(cx.project) else {
+        let Some(layout) = crate::hostgit::Layout::discover(cx.project)? else {
             return Ok(());
         };
-        if !common.starts_with(cx.project) {
+        if !layout.common_dir.starts_with(cx.project) {
             // A linked worktree: commits write to the main repository's git directory.
             spec.add_mount(Mount::same(
-                &common,
+                &layout.common_dir,
                 true,
                 "detector git: common dir of a linked worktree",
             ));
         }
-        for dir in Self::protected_dirs(&git_dir, &common) {
-            let hooks = dir.join("hooks");
-            if !hooks.exists() {
-                std::fs::create_dir_all(&hooks)?;
+        // `.git` gets a mount point of its own. A mount point cannot be
+        // renamed or replaced in the sandbox, so the read-only files below it
+        // cannot be moved aside with `mv .git .git2 && mkdir .git`.
+        if layout.linked {
+            spec.add_mount(Mount::same(
+                &layout.dot_git,
+                false,
+                "detector git: the .git file names the git directory",
+            ));
+        } else {
+            spec.add_mount(Mount::same(
+                &layout.dot_git,
+                true,
+                "detector git: the git directory is its own mount point",
+            ));
+        }
+        for dir in layout.protected_dirs() {
+            if dir != layout.dot_git && dir.starts_with(cx.project) {
+                // A worktree or submodule git directory inside the project
+                // gets its own mount point as well.
+                spec.add_mount(Mount::same(
+                    &dir,
+                    true,
+                    "detector git: a git directory is its own mount point",
+                ));
             }
+            // The hooks folder: created without following a symlink, so a
+            // read-only bind of it cannot land anywhere else.
+            let hooks = dir.join("hooks");
+            crate::safefs::Root::open(&dir)?.dir(Path::new("hooks"), true)?;
             spec.add_mount(Mount::same(
                 &hooks,
                 false,
                 "detector git: hooks run on the host",
             ));
-            for f in ["config", "config.worktree"] {
+            let linked = dir.join("commondir").is_file();
+            for f in crate::hostgit::PROTECTED_FILES {
                 let p = dir.join(f);
-                if p.is_file() {
-                    spec.add_mount(Mount::same(
-                        &p,
-                        false,
-                        "detector git: config can run commands on the host",
-                    ));
+                // `gitdir` exists only in a registered worktree. Never write
+                // one: its content is a path paddock must not invent.
+                if *f == "gitdir" {
+                    if p.is_file() {
+                        spec.add_mount(Mount::same(
+                            &p,
+                            false,
+                            "detector git: gitdir names the work tree",
+                        ));
+                    }
+                    continue;
                 }
+                // "." means "this directory", which is what a git directory
+                // without a common directory of its own needs.
+                let content = if *f == "commondir" && !linked {
+                    ".\n"
+                } else {
+                    ""
+                };
+                Self::placeholder(&dir, f, content)?;
+                spec.add_mount(Mount::same(
+                    &p,
+                    false,
+                    "detector git: config and pointer files steer host git",
+                ));
             }
         }
         Ok(())
@@ -412,6 +425,104 @@ impl Detector for AutoRun {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::spec::MountKind;
+
+    fn run_git(dir: &Path, args: &[&str]) {
+        let ok = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(["-c", "user.name=t", "-c", "user.email=t@localhost"])
+            .args(args)
+            .status()
+            .unwrap()
+            .success();
+        assert!(ok, "git {args:?}");
+    }
+
+    fn git_mounts(project: &Path) -> SandboxSpec {
+        let env = HostEnv::from_parts(
+            project.join("fake-home"),
+            "t".into(),
+            1000,
+            1000,
+            Default::default(),
+        );
+        let mut spec = SandboxSpec::new(
+            "t".into(),
+            "x",
+            project,
+            env.home.join("sandbox"),
+            &env.home,
+            1000,
+            1000,
+            "t",
+        );
+        let manifest = crate::manifest::Manifest::default();
+        let cx = Context {
+            env: &env,
+            project,
+            manifest: &manifest,
+        };
+        Git.apply(&cx, &mut spec).unwrap();
+        spec
+    }
+
+    #[test]
+    fn the_git_dir_and_its_pointer_files_are_mounted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("repo");
+        std::fs::create_dir_all(&project).unwrap();
+        run_git(&project, &["init", "-q", "-b", "main"]);
+        run_git(&project, &["commit", "-q", "--allow-empty", "-m", "one"]);
+        let spec = git_mounts(&project);
+        let kind = |p: &Path| spec.mounts.iter().find(|m| m.dst == p).map(|m| m.kind);
+        let dot = project.join(".git");
+        // Its own mount point, so it cannot be renamed in the sandbox.
+        assert_eq!(kind(&dot), Some(MountKind::Rw));
+        for f in ["hooks", "config", "config.worktree", "commondir"] {
+            assert_eq!(kind(&dot.join(f)), Some(MountKind::Ro), "{f}");
+        }
+        assert_eq!(
+            kind(&dot.join("objects/info/alternates")),
+            Some(MountKind::Ro)
+        );
+        // The pointer files that paddock created are harmless to git.
+        assert_eq!(
+            std::fs::read_to_string(dot.join("commondir"))
+                .unwrap()
+                .trim(),
+            "."
+        );
+        assert_eq!(
+            std::fs::read_to_string(dot.join("config.worktree")).unwrap(),
+            ""
+        );
+    }
+
+    #[test]
+    fn a_linked_worktree_keeps_its_dot_git_file_read_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("repo");
+        std::fs::create_dir_all(&project).unwrap();
+        run_git(&project, &["init", "-q", "-b", "main"]);
+        run_git(&project, &["commit", "-q", "--allow-empty", "-m", "one"]);
+        let wt = tmp.path().join("wt");
+        run_git(&project, &["worktree", "add", "-q", wt.to_str().unwrap()]);
+        let spec = git_mounts(&wt);
+        let kind = |p: &Path| spec.mounts.iter().find(|m| m.dst == p).map(|m| m.kind);
+        // The `.git` file names the git directory: read-only.
+        assert_eq!(kind(&wt.join(".git")), Some(MountKind::Ro));
+        // The repository's git directory is writable, so commits work.
+        let common = project.join(".git");
+        assert_eq!(kind(&common), Some(MountKind::Rw));
+        assert_eq!(kind(&common.join("config")), Some(MountKind::Ro));
+        // And the worktree's own pointer files in the repository.
+        let wt_dir = common.join("worktrees");
+        let entry = std::fs::read_dir(&wt_dir).unwrap().next().unwrap().unwrap();
+        for f in ["commondir", "gitdir"] {
+            assert_eq!(kind(&entry.path().join(f)), Some(MountKind::Ro), "{f}");
+        }
+    }
 
     #[test]
     fn secret_names() {

@@ -1,12 +1,10 @@
 //! The policy engine runs last. It never adds access. It refuses a spec that
 //! breaks an invariant and names the source of the offending entry.
 
-use crate::detect::Git;
 use crate::env::HostEnv;
 use crate::spec::{MountKind, SandboxSpec};
 use anyhow::{bail, Result};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 /// Paths under HOME that hold credentials or private data. They are never
 /// mounted, and no mount may contain them.
@@ -310,23 +308,37 @@ pub fn enforce(env: &HostEnv, spec: &SandboxSpec) -> Result<()> {
     }
 
     // Every writable mount that contains a git directory must also carry the
-    // read-only overrides for its hooks and config.
+    // read-only overrides for its hooks, config and pointer files, and the
+    // git directory must be a mount point of its own: a mount point cannot be
+    // renamed, so the read-only entries below it cannot be moved aside.
     for m in spec.mounts.iter().filter(|m| m.kind == MountKind::Rw) {
         let src = m.src.as_ref().unwrap();
         for git_dir in git_dirs_under(src) {
-            let common = common_dir(&git_dir).unwrap_or_else(|| git_dir.clone());
-            for dir in Git::protected_dirs(&git_dir, &common) {
-                for p in [dir.join("hooks"), dir.join("config")] {
+            let is_mount = |p: &Path, kind: MountKind| {
+                spec.mounts.iter().any(|o| o.dst == p && o.kind == kind)
+            };
+            if git_dir.starts_with(src) && git_dir != *src && !is_mount(&git_dir, MountKind::Rw) {
+                bail!(
+                    "policy: {} is not a mount point of its own inside {} (from {}). The sandbox could rename it and plant a new one.",
+                    git_dir.display(),
+                    src.display(),
+                    m.origin
+                );
+            }
+            let layout = match crate::hostgit::Layout::discover(src) {
+                Ok(Some(l)) => l,
+                _ => continue,
+            };
+            for dir in layout.protected_dirs() {
+                let mut needed = vec![dir.join("hooks")];
+                needed.extend(crate::hostgit::PROTECTED_FILES.iter().map(|f| dir.join(f)));
+                for p in needed {
                     if !p.exists() || !p.starts_with(src) {
                         continue;
                     }
-                    let covered = spec
-                        .mounts
-                        .iter()
-                        .any(|o| o.dst == p && o.kind == MountKind::Ro);
-                    if !covered {
+                    if !is_mount(&p, MountKind::Ro) {
                         bail!(
-                            "policy: {} is writable inside {} (from {}). Git runs it on the host.",
+                            "policy: {} is writable inside {} (from {}). Git reads and runs it on the host.",
                             p.display(),
                             src.display(),
                             m.origin
@@ -360,23 +372,12 @@ fn git_dirs_under(root: &Path) -> Vec<PathBuf> {
     v
 }
 
-fn common_dir(git_dir: &Path) -> Option<PathBuf> {
-    let out = Command::new("git")
-        .arg("--git-dir")
-        .arg(git_dir)
-        .args(["rev-parse", "--path-format=absolute", "--git-common-dir"])
-        .output()
-        .ok()?;
-    out.status
-        .success()
-        .then(|| PathBuf::from(String::from_utf8_lossy(&out.stdout).trim()))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::spec::Mount;
     use std::collections::BTreeMap;
+    use std::process::Command;
 
     fn fake_env(home: &Path) -> HostEnv {
         HostEnv::from_parts(
@@ -454,7 +455,23 @@ mod tests {
         assert!(ok);
         let mut s = spec(&env, &project);
         s.add_mount(Mount::same(&project, true, "test project"));
-        assert!(enforce(&env, &s).unwrap_err().to_string().contains("hooks"));
+        // The git directory must be a mount point of its own first.
+        let e = enforce(&env, &s).unwrap_err().to_string();
+        assert!(e.contains("mount point"), "{e}");
+        s.add_mount(Mount::same(project.join(".git"), true, "test git dir"));
+        let e = enforce(&env, &s).unwrap_err().to_string();
+        assert!(e.contains("hooks"), "{e}");
+        // What the git detector adds makes the spec pass.
+        let detector_env = fake_env(tmp.path());
+        let cx = crate::detect::Context {
+            env: &detector_env,
+            project: &project,
+            manifest: &crate::manifest::Manifest::default(),
+        };
+        let mut s = spec(&env, &project);
+        s.add_mount(Mount::same(&project, true, "test project"));
+        crate::detect::Detector::apply(&crate::detect::Git, &cx, &mut s).unwrap();
+        enforce(&env, &s).unwrap();
     }
 
     #[test]

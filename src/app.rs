@@ -371,14 +371,18 @@ pub fn run(env: &HostEnv, o: &AppOptions) -> Result<i32> {
 /// After the app exits: print what it left in its worktree, and send a
 /// notification when no terminal shows the text (a launcher start).
 fn report_worktree(env: &HostEnv, name: &str, w: &build::Worktree) {
-    eprintln!("\n{}", build::worktree_report(w));
+    eprintln!("\n{}", build::worktree_report(env, w));
     if std::io::IsTerminal::is_terminal(&std::io::stderr()) {
         return;
     }
     let Some(ns) = env.which("notify-send") else {
         return;
     };
-    let (commits, changed) = build::worktree_counts(w);
+    let (commits, changed) = build::worktree_counts(env, w);
+    let changed = match changed {
+        Some(n) => format!("{n}"),
+        None => "an unknown number of".to_string(),
+    };
     let _ = std::process::Command::new(ns)
         .args([
             "--app-name=paddock",

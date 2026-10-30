@@ -52,15 +52,15 @@ pub struct Repo {
     pub alternates: Option<String>,
 }
 
-fn git(dir: &Path, args: &[&str]) -> Result<String> {
-    crate::env::capture(Command::new("git").arg("-C").arg(dir).args(args))
-}
-
-/// Read the remotes of a repository. Reading configuration runs no programs.
+/// Read the remotes of a repository. The call names the git directory and
+/// drops the host's own configuration, so only the repository's own remotes
+/// are listed. Reading configuration runs no programs.
 pub fn read_remotes(dir: &Path) -> Vec<Remote> {
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(dir)
+    let Ok(Some(layout)) = crate::hostgit::Layout::discover(dir) else {
+        return vec![];
+    };
+    let out = layout
+        .command()
         .args([
             "config",
             "--null",
@@ -108,14 +108,12 @@ impl Repo {
     /// Take the snapshot when the sandbox starts. None if the project is not
     /// a git repository.
     pub fn snapshot(project: &Path) -> Option<Repo> {
-        let common = git(
-            project,
-            &["rev-parse", "--path-format=absolute", "--git-common-dir"],
-        )
-        .ok()?;
-        let common_dir = std::fs::canonicalize(&common).ok()?;
+        // The layout comes from the file system, not from `commondir` or
+        // `core.worktree`, which a sandbox can write.
+        let layout = crate::hostgit::Layout::discover(project).ok().flatten()?;
+        let common_dir = std::fs::canonicalize(&layout.common_dir).ok()?;
         let remotes = read_remotes(project);
-        let alternates = std::fs::read_to_string(common_dir.join("objects/info/alternates")).ok();
+        let alternates = read_alternates(&common_dir).ok().flatten();
         Some(Repo {
             common_dir,
             remotes,
@@ -126,6 +124,54 @@ impl Repo {
     pub fn find(&self, name: &str) -> Option<&Remote> {
         self.remotes.iter().find(|r| r.name == name)
     }
+}
+
+/// `objects/info/alternates` of a repository, read without following a
+/// symlink, without blocking on a FIFO, and with a size limit.
+fn read_alternates(common: &Path) -> Result<Option<String>> {
+    let bytes = crate::safefs::Root::open(common)?.read(
+        Path::new("objects/info/alternates"),
+        crate::safefs::MAX_READ,
+    )?;
+    Ok(bytes.map(|b| String::from_utf8_lossy(&b).into_owned()))
+}
+
+/// What the object store of a repository looks like. The scratch repository
+/// borrows these objects, so a change between the card and the push would
+/// push objects of another repository. Each directory is checked with
+/// `lstat`: a symlink here could point into any host repository.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ObjectStore {
+    alternates: Option<String>,
+    dirs: Vec<(u64, u64)>,
+}
+
+fn object_store(common: &Path) -> Result<ObjectStore> {
+    let mut dirs = Vec::new();
+    for rel in ["objects", "objects/info", "objects/pack"] {
+        let p = common.join(rel);
+        let m = match std::fs::symlink_metadata(&p) {
+            Ok(m) => m,
+            // `info` and `pack` are created on demand; absent is fine.
+            Err(_) if rel != "objects" => {
+                dirs.push((0, 0));
+                continue;
+            }
+            Err(e) => return Err(e).context(format!("cannot read {}", p.display())),
+        };
+        if m.is_symlink() || !m.is_dir() {
+            bail!(
+                "{} is a symlink or not a directory; paddock does not push from this repository",
+                p.display()
+            );
+        }
+        use std::os::unix::fs::MetadataExt;
+        dirs.push((m.dev(), m.ino()));
+    }
+    Ok(ObjectStore {
+        alternates: read_alternates(common)?,
+        dirs,
+    })
 }
 
 /// Quote a value for a git configuration subsection name.
@@ -202,6 +248,10 @@ pub struct PushPlan {
     pub notes: Vec<String>,
     pub refs: Vec<PlannedRef>,
     scratch: Scratch,
+    /// The repository whose objects the scratch repository borrows.
+    common_dir: PathBuf,
+    /// Its object store when the card was made.
+    store: ObjectStore,
 }
 
 impl PushPlan {
@@ -441,8 +491,8 @@ pub fn plan(
             (sandbox_url.to_string(), false)
         }
     };
-    let alternates = std::fs::read_to_string(repo.common_dir.join("objects/info/alternates")).ok();
-    if alternates != repo.alternates {
+    let store = object_store(&repo.common_dir)?;
+    if store.alternates != repo.alternates {
         bail!(
             "objects/info/alternates of the repository changed while the sandbox ran; paddock does not push from it"
         );
@@ -546,11 +596,21 @@ pub fn plan(
         notes,
         refs: planned,
         scratch,
+        common_dir: repo.common_dir.clone(),
+        store,
     })
 }
 
 /// Push after approval. Never runs hooks and never reads the project config.
 pub fn push(plan: &PushPlan) -> Result<serde_json::Value> {
+    // The sandbox keeps running while the card waits. Check the object store
+    // again now: the scratch repository reads objects through it.
+    if object_store(&plan.common_dir)? != plan.store {
+        bail!(
+            "the object store of {} changed while the request waited; paddock does not push from it",
+            plan.common_dir.display()
+        );
+    }
     let mut c = scratch_git(&plan.scratch.0);
     c.args(["push", "--no-verify", "--porcelain", "--", &plan.url]);
     for r in &plan.refs {
@@ -714,6 +774,34 @@ mod tests {
         let scratch = p.scratch.0.clone();
         drop(p);
         assert!(!scratch.exists());
+    }
+
+    #[test]
+    fn the_object_store_is_checked_again_before_the_push() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (work, remote) = project(tmp.path());
+        let repo = Repo::snapshot(&work).unwrap();
+        let sha = sh(&work, &["rev-parse", "HEAD"]);
+        let a = args(
+            "origin",
+            remote.to_str().unwrap(),
+            serde_json::json!([{ "sha": sha, "dst": "refs/heads/feature" }]),
+        );
+        let p = plan(Some(&repo), &tmp.path().join("run"), &a).unwrap();
+        // The sandbox keeps running while the card waits: a new alternates
+        // line would borrow the objects of another repository.
+        let info = work.join(".git/objects/info");
+        std::fs::create_dir_all(&info).unwrap();
+        std::fs::write(info.join("alternates"), "/srv/other/objects\n").unwrap();
+        let e = push(&p).unwrap_err().to_string();
+        assert!(e.contains("object store"), "{e}");
+        std::fs::remove_file(info.join("alternates")).unwrap();
+        // A symlink in place of a pack directory is refused as well.
+        let pack = work.join(".git/objects/pack");
+        std::fs::remove_dir_all(&pack).unwrap();
+        std::os::unix::fs::symlink("/srv/other/objects/pack", &pack).unwrap();
+        let e = push(&p).unwrap_err().to_string();
+        assert!(e.contains("symlink"), "{e}");
     }
 
     #[test]

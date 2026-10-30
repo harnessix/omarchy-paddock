@@ -493,7 +493,10 @@ pub fn describe(req: &Request, project: &Path) -> (String, String) {
                     "run on the host: {}",
                     line.chars().take(80).collect::<String>()
                 ),
-                format!("Run on the host in {}:\n{line}", project.display()),
+                format!(
+                    "Run on the host in {}.\nThe sandbox writes that folder, so a command that reads files there, a git command for example, can take instructions from them.\n{line}",
+                    project.display()
+                ),
             )
         }
         "fetch" => {
@@ -662,7 +665,7 @@ fn inbox(project: &Path) -> Result<crate::safefs::Dir> {
     dot.subdir(std::ffi::OsStr::new("inbox"), true)
 }
 
-fn run_capture(cmd: &mut Command, timeout: Duration) -> Result<(i32, String, String)> {
+pub fn run_capture(cmd: &mut Command, timeout: Duration) -> Result<(i32, String, String)> {
     let mut child = cmd
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
