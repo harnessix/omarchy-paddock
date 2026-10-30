@@ -1,6 +1,8 @@
 # Changelog
 
-## Unreleased
+## 0.1.7
+
+A security release. Update from every earlier version. The docker and podman relay sent the user name and password of an `https://` host proxy in cleartext, and connected directly when it could not use the proxy URL. `recover --to` could be redirected into a protected folder, and a project file could reveal secrets to a flatpak app without approval.
 
 - Security: if the host proxy URL uses a scheme that the docker and podman relay cannot use (for example `socks4://`), the relay refuses connections. Before, it connected directly, which changed the exit address that the user chose.
 - Security: `paddock recover --to` walks to the target folder one folder at a time without following symlinks, checks where the opened folder really is, and creates the file in it. Before, it checked the path and then opened it again, so a sandbox that can write a folder on that path could swap it for a symlink in between and make paddock create a new file in a protected place such as `~/.ssh`.
