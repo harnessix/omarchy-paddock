@@ -168,6 +168,7 @@ fn inventory(homes: Vec<Home>) -> Inventory {
         old_caches: vec![],
         any_running: false,
         build_cache: vec![],
+        scratch: vec![],
     }
 }
 

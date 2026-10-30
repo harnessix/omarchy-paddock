@@ -39,6 +39,9 @@ pub struct Options {
     /// A sandbox that another sandbox asked for (`paddock-host spawn`). It
     /// uses the parent's settings snapshot and runs the one-shot command.
     pub child: Option<crate::spawn::ChildPlan>,
+    /// `paddock wrap`: the command runs as given, with its `env` prefix and
+    /// shell form, and the login comes from its account folder.
+    pub transparent: Option<crate::wrap::Transparent>,
 }
 
 /// A worktree that paddock created for one run.
@@ -342,12 +345,21 @@ pub fn build_with(env: &HostEnv, opts: &Options, harness: Harness) -> Result<Bui
     };
     let project = worktree.as_ref().map(|w| w.path.clone()).unwrap_or(project);
 
-    let auth: state::AuthMode = opts
-        .auth
-        .clone()
-        .or(m.auth.mode.clone())
-        .unwrap_or_else(|| "shared".into())
-        .parse()?;
+    let account = opts.transparent.as_ref().and_then(|t| t.account.as_ref());
+    let auth: state::AuthMode = match account {
+        Some(dir) => state::AuthMode::account(dir),
+        None => opts
+            .auth
+            .clone()
+            .or(m.auth.mode.clone())
+            .unwrap_or_else(|| "shared".into())
+            .parse()?,
+    };
+    if let state::AuthMode::Account { dir, .. } = &auth {
+        if dir.as_os_str().is_empty() {
+            bail!("the account mode is only for `paddock wrap`; use shared or isolated:NAME");
+        }
+    }
     let id = match &opts.child {
         Some(c) => c.id.clone(),
         None => state::new_id(&profile.name, &project),
@@ -460,7 +472,7 @@ pub fn build_with(env: &HostEnv, opts: &Options, harness: Harness) -> Result<Bui
         }
     }
     for rel in &profile.state.import_ro {
-        let host = env.home.join(rel);
+        let host = state::host_file(env, &profile, &auth, rel);
         if host.exists() {
             spec.add_mount(Mount::same(&host, false, &format!("{porigin} import_ro")));
         }
@@ -485,6 +497,21 @@ pub fn build_with(env: &HostEnv, opts: &Options, harness: Harness) -> Result<Bui
         }
     }
     check_harness_install(&harness, &sandbox_writable(env, &spec))?;
+    if let state::AuthMode::Account { dir, .. } = &auth {
+        // The host writes refreshed tokens back into the account folder. A
+        // folder that a sandbox can write could lead those writes anywhere.
+        let real = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.clone());
+        if let Some(w) = sandbox_writable(env, &spec)
+            .iter()
+            .find(|w| real.starts_with(w))
+        {
+            bail!(
+                "the account folder {} is inside {}, which a sandbox can write; paddock does not use it as a login",
+                dir.display(),
+                w.display()
+            );
+        }
+    }
     for k in &m.env.pass {
         if let Some(v) = env.var(k) {
             spec.set_secret_env(k, v, "manifest env.pass");
@@ -492,6 +519,16 @@ pub fn build_with(env: &HostEnv, opts: &Options, harness: Harness) -> Result<Bui
     }
     for (k, v) in &m.env.set {
         spec.set_env(k, v.clone(), "manifest env.set");
+    }
+    // The `env` prefix of a `paddock wrap` command, as the agent gets it on
+    // the host.
+    if let Some(t) = &opts.transparent {
+        for k in &t.env_unset {
+            spec.env.remove(k);
+        }
+        for (k, v) in &t.env_set {
+            spec.set_env(k, v.clone(), "command: env prefix");
+        }
     }
 
     // The detectors.
@@ -544,6 +581,13 @@ pub fn build_with(env: &HostEnv, opts: &Options, harness: Harness) -> Result<Bui
         // The privacy flags are global options: before a subcommand.
         c.extend(crate::privacy::args(&profile, privacy));
         c.extend(o.render(&spec.home.join(crate::spawn::PROMPT_IN_HOME)));
+        c
+    } else if let Some(t) = opts.transparent.as_ref().filter(|t| !t.shell.is_empty()) {
+        // The shell form: the script starts its `$0`, which is the harness.
+        // The script's arguments stay as they are.
+        let mut c = t.shell.clone();
+        c.push(harness.exe.display().to_string());
+        c.extend(opts.args.iter().cloned());
         c
     } else {
         let mut c = vec![harness.exe.display().to_string()];

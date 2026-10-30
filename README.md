@@ -294,6 +294,7 @@ The other items need a flag that names them:
 - `--homes` adds homes whose project is gone, or that were not used for `--older-than` days (default 90). A home holds the transcripts and settings of a harness in one project. A terminal harness keeps its login in your home or in `~/.local/share/paddock/auth`, so the login stays.
 - A desktop app keeps its login in its home. If you delete the home, you must log in again. These homes also need `--include-app-logins`.
 - `--worktrees` adds paddock worktrees. A worktree with unmerged commits or uncommitted changes also needs `--force`. paddock then keeps its branch, so the commits stay in the repository.
+- `--scratch` adds scratch projects that were not used for `--older-than` days. An agent from `omarchy-agent` works in one when it starts in the home folder (see [Only the agents that Omarchy starts](#only-the-agents-that-omarchy-starts)). Its files are lost.
 
 paddock never removes the home or worktree of a running sandbox. It deletes only inside its own directories. It never follows a symlink, so a link in a sandbox home cannot point it at your files. A sandbox can edit the `.paddock-origin` file in its home, which records the project. paddock uses that file only when it matches the folder name of the home, which contains a hash of the project path.
 
@@ -702,9 +703,39 @@ After `install`, typing `claude` in a new shell runs `paddock run claude` in the
 
 - To run a command without the sandbox once, prefix it: `PADDOCK_BYPASS=1 claude`.
 - In your home directory, the command stops with an error, because paddock does not use the home directory as a project. Go to a project first.
-- Shell functions win over PATH, so version managers such as mise do not bypass them. Scripts and programs that start `claude` themselves are not covered: only interactive bash and zsh shells.
+- Shell functions win over PATH, so version managers such as mise do not bypass them. Scripts and programs that start `claude` themselves are not covered: only interactive bash and zsh shells. For the agents that Omarchy starts, see the next section.
 - If paddock or the script is gone, each function runs the real program, and the line in the rc file does nothing.
 - `paddock doctor` lists the commands that start in a sandbox, the rc file that loads them, and how to turn them off. Each run also prints a `paddock:` line with the sandbox it started, so you always see when a shim takes over.
+
+### Only the agents that Omarchy starts
+
+Omarchy starts the default agent with `omarchy-agent`: from the key Super+Shift+Ctrl+A, the drop-down console, the agents panel, `omarchy agent prompt`, crash reports and the alias `a`. These starts run unattended: `omarchy-agent` adds each agent's flag for no approvals, such as `codex --approve-for-me`. This scope puts only these starts in a sandbox:
+
+```sh
+paddock shims install --scope omarchy-agent   # agents from omarchy-agent start in a sandbox
+paddock shims list                            # shows the scope and whether it is on
+paddock shims remove                          # removes both scopes
+```
+
+- Commands that you type and scripts do not change. Omarchy's files do not change either.
+- paddock writes one marked block into `~/.config/mise/config.toml`: a mise wrapper for `omarchy-agent`. It keeps the rest of the file, with its comments and order, and runs `mise reshim`. `paddock shims remove` takes the block out again, byte for byte. If the file already has its own `[wrappers.omarchy-agent]`, paddock does not replace it and stops with a message.
+- The wrapper runs the real `omarchy-agent` with a private folder first on `PATH`, for that start only. Its shim for `omarchy-launch-tui` puts `paddock wrap --` in front of the agent command. The agent window keeps its app id, `org.omarchy.agent`. With `--inline`, the agent starts the same way in the current terminal.
+- If paddock is gone, the wrapper runs `omarchy-agent` without a sandbox, so the key still works.
+- `PADDOCK_BYPASS=1 omarchy-agent` starts once without a sandbox.
+
+`paddock wrap -- COMMAND` runs the command as it is, in a sandbox:
+
+- The arguments stay the same. paddock adds no auto-approval flags and removes none. It adds only the telemetry switches of the profile (see [Privacy defaults](#privacy-defaults)).
+- The project is the current folder. The home folder is no project. If `omarchy-agent` starts in the home folder (when `~/Work` does not exist), the agent works in a scratch project of its own, `~/.local/share/paddock/scratch/<agent>`. The `paddock:` line names it, `paddock files` lists it, and `paddock gc --scratch` removes old ones.
+- An `env` prefix keeps its variables. For Claude Code, Codex and Grok Build, Omarchy's account switch sets `CLAUDE_CONFIG_DIR`, `CODEX_HOME` or `GROK_HOME`. paddock uses that folder as the login of the sandbox: it copies the login in at the start, and copies a refreshed token back at the end, the same as for your main login. The pin `OMARCHY_AGENT_<AGENT>_HOME` stays.
+- The shell form `bash -c '…' amp PROMPT` runs whole in the sandbox, with `$0` set to the agent program. An absolute path, such as a user install in `~/.local/bin`, runs that program.
+- The exit code passes through.
+- A command without a paddock profile runs without a sandbox. paddock shows a notification that names it, so a start never fails only because paddock does not know an agent yet.
+- If paddock knows the agent but cannot start the sandbox, it says why and does not start the agent on the host.
+
+`paddock doctor` shows whether the wrapper and the shim folder are in place, whether `mise reshim` made the dispatch link, whether `omarchy-agent` still starts agents the way paddock expects, and whether your default agent has a paddock profile.
+
+Codex starts its own sandbox for each command. That sandbox cannot start inside paddock. With `--approve-for-me`, Codex runs the command again without it, inside paddock's sandbox.
 
 ## Launchers
 

@@ -65,6 +65,15 @@ enum Cmd {
         #[command(subcommand)]
         cmd: ShimsCmd,
     },
+    /// Run an agent command as it is, in a sandbox: same arguments, folder,
+    /// account and exit code (transparent mode). paddock adds no
+    /// auto-approval flags. Commands without a profile run without a sandbox.
+    #[command(after_help = WRAP_HELP)]
+    Wrap {
+        /// The command, after `--`.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
+        command: Vec<String>,
+    },
     Launchers {
         #[command(subcommand)]
         cmd: LaunchersCmd,
@@ -119,6 +128,10 @@ enum Cmd {
         /// Also paddock worktrees.
         #[arg(long)]
         worktrees: bool,
+        /// Also scratch projects (starts in the home folder through `paddock
+        /// wrap`) that were not used for --older-than days. Their files are lost.
+        #[arg(long)]
+        scratch: bool,
         /// With --worktrees: also worktrees with unmerged commits or uncommitted changes.
         #[arg(long)]
         force: bool,
@@ -321,11 +334,32 @@ enum Cmd {
 #[derive(Subcommand)]
 enum ShimsCmd {
     /// Write the shell functions, and source them from ~/.bashrc and ~/.zshrc.
-    Install,
-    /// Remove the functions and the lines that `install` added.
+    /// With --scope omarchy-agent: only the agents that Omarchy's
+    /// omarchy-agent starts (its key, menu, agents panel and `a` alias).
+    Install {
+        /// shell (the default): typed commands in bash and zsh.
+        /// omarchy-agent: only the starts from omarchy-agent.
+        #[arg(long, default_value = "shell", value_parser = ["shell", "omarchy-agent"])]
+        scope: String,
+    },
+    /// Remove the functions, the lines that `install` added, and the
+    /// omarchy-agent scope.
     Remove,
     /// Show the commands that `install` would cover, and whether they are on.
     List,
+    /// Run a program that a scope takes over (from paddock's mise wrapper).
+    #[command(hide = true)]
+    Exec {
+        program: String,
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+    /// The omarchy-launch-tui shim of the omarchy-agent scope.
+    #[command(hide = true)]
+    LaunchTui {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -677,6 +711,7 @@ impl RunArgs {
             assume_yes: self.yes,
             args: self.args.clone(),
             child: None,
+            transparent: None,
         })
     }
 }
@@ -1107,10 +1142,61 @@ fn real_main() -> Result<i32> {
             Ok(0)
         }
         Cmd::Pick { harness } => pick(&env, &harness),
+        Cmd::Wrap { command } => paddock::wrap::main(env, &command),
+        Cmd::Shims {
+            cmd: ShimsCmd::Exec { program, args },
+        } => {
+            if program != paddock::omarchy::SCOPE {
+                bail!("paddock shims exec only runs omarchy-agent");
+            }
+            paddock::omarchy::exec_agent(&env, &args)
+        }
+        Cmd::Shims {
+            cmd: ShimsCmd::LaunchTui { args },
+        } => paddock::omarchy::launch_tui(&env, &args),
+        Cmd::Shims {
+            cmd: ShimsCmd::Install { scope },
+        } if scope == "omarchy-agent" => {
+            use paddock::omarchy;
+            let r = omarchy::install(&env)?;
+            println!(
+                "Added the omarchy-agent wrapper to {} (one marked block).",
+                r.config.display()
+            );
+            println!("Wrote the shim folder {}.", r.shims.display());
+            if let Err(e) = &r.reshim {
+                println!("mise reshim did not run: {e}. Run it yourself, or the key keeps starting agents without a sandbox.");
+            }
+            println!("\nAgents that omarchy-agent starts (its key, the menu, the agents panel, `a`) now run in a sandbox.");
+            println!(
+                "Commands that you type and scripts do not change. Undo with: paddock shims remove"
+            );
+            if let Some(agent) = omarchy::default_agent(&env) {
+                if paddock::wrap::profile_for(&env, &agent).is_none() {
+                    println!("Your default agent {agent} has no paddock profile yet: it still starts without a sandbox.");
+                }
+            }
+            Ok(0)
+        }
         Cmd::Shims { cmd } => {
             use paddock::shims;
             match cmd {
+                ShimsCmd::Exec { .. } | ShimsCmd::LaunchTui { .. } => unreachable!(),
                 ShimsCmd::List => {
+                    let s = paddock::omarchy::status(&env);
+                    println!(
+                        "scope omarchy-agent: {}",
+                        if s.on() {
+                            "on, agents that omarchy-agent starts run in a sandbox"
+                        } else if s.user_wrapper {
+                            "off, your mise config has its own [wrappers.omarchy-agent]"
+                        } else if s.block || s.shims {
+                            "incomplete, run paddock shims install --scope omarchy-agent again"
+                        } else {
+                            "off"
+                        }
+                    );
+                    println!("scope shell:");
                     let on = shims::installed(&env);
                     let active = shims::active(&env);
                     for (harness, cmd) in shims::detect(&env)? {
@@ -1127,7 +1213,7 @@ fn real_main() -> Result<i32> {
                         println!("\nShims are off. Turn them on with: paddock shims install");
                     }
                 }
-                ShimsCmd::Install => {
+                ShimsCmd::Install { .. } => {
                     let r = shims::install(&env)?;
                     for (harness, cmd) in &r.shims {
                         println!("{cmd:<10} paddock run {harness}");
@@ -1144,6 +1230,13 @@ fn real_main() -> Result<i32> {
                 ShimsCmd::Remove => {
                     for p in shims::remove(&env)? {
                         println!("removed {}", p.display());
+                    }
+                    let (removed, reshim) = paddock::omarchy::remove(&env)?;
+                    for p in removed {
+                        println!("removed {}", p.display());
+                    }
+                    if let Some(Err(e)) = reshim {
+                        println!("mise reshim did not run: {e}. Run it yourself to remove the omarchy-agent dispatch link.");
                     }
                     println!("Open a new shell, or run `unset -f` on the commands, to stop using them in this shell.");
                 }
@@ -1375,6 +1468,7 @@ fn real_main() -> Result<i32> {
             include_app_logins,
             worktrees,
             force,
+            scratch,
             json,
         } => gc_cmd(
             &env,
@@ -1385,6 +1479,7 @@ fn real_main() -> Result<i32> {
                 include_app_logins,
                 worktrees,
                 force,
+                scratch,
             },
             json,
         ),
@@ -1572,6 +1667,14 @@ struct RunArgsCli {
     run: RunArgs,
 }
 
+const WRAP_HELP: &str = "Examples:
+  paddock wrap -- codex --approve-for-me
+  paddock wrap -- env -u CLAUDE_CONFIG_DIR OMARCHY_AGENT_CLAUDE_HOME= claude --permission-mode auto
+
+An `env` prefix keeps its variables. CLAUDE_CONFIG_DIR, CODEX_HOME and GROK_HOME choose the
+account folder that the sandbox logs in with. In the home folder, the agent works in a scratch
+project under ~/.local/share/paddock/scratch. PADDOCK_BYPASS=1 runs the command without a sandbox.";
+
 const FILES_HELP: &str = "The project is shared with the host, so its changes are already yours. \
 Files that a sandbox saves elsewhere, for example to ~/Desktop or ~/Downloads, stay in its private home. \
 Recovery folders and ignore rules are set in [recovery] of ~/.config/paddock/config.toml:
@@ -1671,6 +1774,8 @@ harnesses whose profile no longer exists, and old shared caches (mise-installs).
 A desktop app keeps its login in its home: those homes also need --include-app-logins.
 --worktrees adds paddock worktrees. A worktree with unmerged commits or uncommitted changes
 also needs --force, and paddock keeps its branch.
+--scratch adds scratch projects (agents that `paddock wrap` started in the home folder) that
+were not used for --older-than days. Their files are lost.
 
 paddock never removes the home or worktree of a running sandbox, and never deletes outside
 its own directories or through a symlink.
@@ -1782,6 +1887,22 @@ fn files_cmd(env: &HostEnv, id: Option<&str>, json: bool) -> Result<i32> {
         let changes = recover::project_changes(env, &s);
         out.push((s, running, items, changes));
     }
+    // Scratch projects: where agents from omarchy-agent work when they start
+    // in the home folder (`paddock wrap`).
+    let scratch: Vec<(String, PathBuf, usize)> = if id.is_none() {
+        std::fs::read_dir(paddock::storage::scratch_root(env))
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+            .map(|e| {
+                let n = std::fs::read_dir(e.path()).map(|d| d.count()).unwrap_or(0);
+                (e.file_name().to_string_lossy().into_owned(), e.path(), n)
+            })
+            .collect()
+    } else {
+        vec![]
+    };
     if json {
         let list: Vec<_> = out
             .iter()
@@ -1793,11 +1914,22 @@ fn files_cmd(env: &HostEnv, id: Option<&str>, json: bool) -> Result<i32> {
                 })
             })
             .collect();
+        let sc: Vec<_> = scratch
+            .iter()
+            .map(|(h, p, n)| serde_json::json!({ "harness": h, "project": p, "entries": n }))
+            .collect();
         println!(
             "{}",
-            serde_json::json!({ "api_version": "paddock.files/v1", "sandboxes": list })
+            serde_json::json!({ "api_version": "paddock.files/v1", "sandboxes": list, "scratch": sc })
         );
         return Ok(0);
+    }
+    if !scratch.is_empty() {
+        println!("Scratch projects (agents from omarchy-agent that started in the home folder work here):");
+        for (h, p, n) in &scratch {
+            println!("  {h:<12} {}  ({n} files and folders)", p.display());
+        }
+        println!();
     }
     if out.is_empty() {
         println!("No sandbox has files outside its project.");
