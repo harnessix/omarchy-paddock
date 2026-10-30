@@ -1752,7 +1752,7 @@ fn update_cmd(env: &HostEnv, check: bool, yes: bool) -> Result<i32> {
     }
     if newer {
         match &owner {
-            Some(o) => println!("{}", update::package_hint(o)),
+            Some(o) => println!("{}", update::package_hint(o, &rel.version)),
             None => println!(
                 "An update downloads {} and its .sha256 from GitHub into a private folder, checks the checksum and the version of the new binary, and then replaces {}.",
                 rel.tarball(),
