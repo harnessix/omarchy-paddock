@@ -7,8 +7,8 @@ fn config_is_off_by_default_and_names_known_devices() {
     let c = DevicesCfg::parse("").unwrap();
     assert!(c.mount);
     assert!(c.enabled.is_empty());
-    assert!(enabled(&c, false).is_empty());
-    assert_eq!(enabled(&c, true).len(), 1);
+    assert!(enabled(&c, false, None).is_empty());
+    assert_eq!(enabled(&c, true, None).len(), 1);
     let c = DevicesCfg::parse("[devices]\necho = true\n").unwrap();
     assert_eq!(c.enabled, ["echo"]);
     let c = DevicesCfg::parse("[devices]\nmount = false\necho = false\n").unwrap();

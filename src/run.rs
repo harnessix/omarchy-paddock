@@ -163,15 +163,23 @@ pub fn run(
         .as_ref()
         .map(|w| w.repo.clone())
         .unwrap_or_else(|| built.spec.project.clone());
-    let kv = crate::kv::start(
+    let lineage = crate::kv::Lineage {
+        parent: built.parent.clone(),
+        chain: built
+            .spawn
+            .as_ref()
+            .map(|c| c.chain.clone())
+            .unwrap_or_default(),
+        can_spawn: spawner.as_ref().is_some_and(|s| s.available()),
+    };
+    let kv = crate::kv::start(env, &mut built.spec, kv_project, kv_approver, lineage);
+    let mut devices = crate::devices::start(
         env,
         &mut built.spec,
-        kv_project,
-        kv_approver,
-        built.parent.clone(),
+        backend.name(),
+        built.test_devices,
+        built.device_ceiling.as_deref(),
     );
-    let mut devices =
-        crate::devices::start(env, &mut built.spec, backend.name(), built.test_devices);
     // Terminal harnesses that log in through a browser and a localhost callback.
     let _login = if built.profile.launch.login_callback && built.spec.gui.mode != GuiMode::App {
         crate::login::prepare(env, &mut built.spec, backend.name() == "srt")?
@@ -556,7 +564,9 @@ fn start_broker(
     // turns spawn off for this run; the rest of the broker still works.
     let spawner = match crate::spawn::SpawnCfg::load(env) {
         Ok(cfg) => {
-            let ceiling = crate::spawn::Ceiling::of(built, backend, &policy.modes);
+            let mut ceiling = crate::spawn::Ceiling::of(built, backend, &policy.modes);
+            ceiling.devices =
+                crate::devices::names_for(env, built.test_devices, built.device_ceiling.as_deref());
             match crate::spawn::Spawner::new(env, cfg, ceiling, &built.spec.project) {
                 Ok(s) => Some(std::sync::Arc::new(s)),
                 Err(e) => {

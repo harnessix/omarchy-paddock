@@ -1,6 +1,7 @@
 //! The paddock kv part of `paddock doctor --escape`. Before the run, the
-//! host writes a canary into the `self` scope of another, made-up sandbox
-//! and opens a kv socket in that sandbox's run folder. The probe tries to
+//! host writes a canary into the `self` scope and the `tree` scope of
+//! another, made-up sandbox and opens a kv socket in that sandbox's run
+//! folder. The probe tries to
 //! read the canary and to claim another identity. After the run, the host
 //! checks the store: the canary is unchanged, and every entry that the
 //! probe wrote carries the probe's own sandbox id.
@@ -48,6 +49,17 @@ impl EscapeProbe {
                 now,
             )
             .map_err(|e| anyhow::anyhow!("cannot write the kv canary: {e:?}"))?;
+        st.put(
+            &store::ns_tree(&other),
+            "canary",
+            CANARY,
+            None,
+            None,
+            &w,
+            q,
+            now,
+        )
+        .map_err(|e| anyhow::anyhow!("cannot write the kv tree canary: {e:?}"))?;
         st.register(&other, "doctor", Path::new("/"), None, now)?;
         let other_dir = env.paddock_run().join(&other);
         crate::privfs::dir(&other_dir)?;
@@ -92,6 +104,14 @@ impl EscapeProbe {
         let own_ns = store::ns_self(sandbox);
         let project_ns = store::ns_project(project);
         let canary = st.get(&other_ns, "canary", now).ok().flatten();
+        let tree_canary = st
+            .get(&store::ns_tree(&self.other), "canary", now)
+            .ok()
+            .flatten();
+        let tree_keys = st
+            .list(&store::ns_tree(&self.other), "", 100, now)
+            .map(|(v, _)| v.len())
+            .unwrap_or(0);
         let other_keys = st
             .list(&other_ns, "", 100, now)
             .map(|(v, _)| v.len())
@@ -113,6 +133,13 @@ impl EscapeProbe {
                         other_keys,
                         canary.map(|c| c.version)
                     ),
+                ),
+            ),
+            (
+                "kv-other-tree-unchanged",
+                check(
+                    tree_canary.as_ref().is_some_and(|c| c.value == CANARY) && tree_keys == 1,
+                    format!("the tree scope of another spawn tree changed: {tree_keys} keys"),
                 ),
             ),
             (
@@ -162,7 +189,9 @@ impl EscapeProbe {
         if let Ok(mut st) = Store::open(&self.store) {
             for ns in [
                 store::ns_self(&self.other),
+                store::ns_tree(&self.other),
                 store::ns_self(sandbox),
+                store::ns_tree(sandbox),
                 store::ns_project(project),
             ] {
                 let _ = st.remove_ns(&ns);

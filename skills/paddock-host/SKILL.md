@@ -75,6 +75,7 @@ Limits that you can rely on:
 | `self` (default) | Your own state in this run |
 | `project` | Tasks, results and notes for every agent of this project |
 | `parent` | Read the state of the agent that started you (read-only) |
+| `tree` | Tasks and results shared by the agent that the user started and every agent it started with spawn, and theirs |
 | `user` | State for all projects. The user must allow it first. If the user does not ask for it, do not use it. |
 
 Use these key names, so that agents of different harnesses understand each other:
@@ -91,6 +92,12 @@ Use these key names, so that agents of different harnesses understand each other
 2. If the work takes longer, claim again before the time ends.
 3. Write the result to `result:NAME`, set the task status, then `release NAME`.
 4. To wait for another agent, run `paddock-host kv watch --prefix result: --scope project --timeout 300`.
+
+With spawn, use `--scope tree` instead of `project`:
+
+- As the parent: write one `task:NAME` for each part of the work in `tree` before you start the children, and put context for them in your own scope (they read it with `--scope parent`). Then wait with `paddock-host kv watch --prefix result: --scope tree --timeout 600`. Pass the printed `cursor N` as `--version N` to the next watch. When a child ends, paddock writes `result:SPAWN-ID` there, with `status`, `summary` and `ref` (its branch).
+- As a child: read your task with `--scope parent` or from `tree`, claim it in `tree`, and write `result:NAME` in `tree`. You cannot write `project`: what is worth keeping for the project, put in your result, and the parent decides. You cannot release the lease of a sibling. `--force` works only for a sandbox above the owner.
+- A child never gets more than its parent. Do not ask the user for a scope or a device that your parent does not have.
 
 Rules that you can rely on:
 

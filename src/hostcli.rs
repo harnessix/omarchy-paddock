@@ -74,8 +74,9 @@ OTHER AGENTS
 
 STATE AND DEVICES
   `paddock-host kv` keeps state on the host: for this sandbox, for every
-  sandbox of this project, or for the sandbox that started this one. It needs
-  no approval, except the scope that all projects share. Host devices, when
+  sandbox of this project, for the sandbox that started this one, or for a
+  whole spawn tree (--scope tree: tasks for children and their results). It
+  needs no approval, except the scope that all projects share. Host devices, when
   the user turns them on, are files in /dev/paddock. Read
   /dev/paddock/.catalog for each device and its request format.
 
@@ -255,6 +256,12 @@ When the child ends, its results are in .paddock/inbox/spawn-ID/:
 
 Read the branch with git, for example `git log --stat paddock/spawn-codex-ID`,
 and merge what you want to keep.
+
+paddock also writes result:ID into the tree scope of paddock kv (status,
+summary, ref). With several children, wait for all of them at once:
+  paddock-host kv watch --prefix result: --scope tree --timeout 600
+Children read your own kv scope with --scope parent, and share tasks with you
+in --scope tree. Run `paddock-host kv --help` for the key names.
 
 wait exits with 0 when the child ended with exit code 0, 1 when it failed or
 was stopped, and 5 when it still runs after --timeout. A child stops when this

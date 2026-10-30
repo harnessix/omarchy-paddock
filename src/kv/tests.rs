@@ -270,17 +270,38 @@ fn service(
     cfg: KvCfg,
     answer: Option<Answer>,
 ) -> (Service, Arc<Fixed>) {
+    let chain: Vec<&str> = parent.into_iter().collect();
+    node(w, id, &chain, false, cfg, answer)
+}
+
+/// A sandbox in a spawn tree. `chain` holds the sandboxes above it, the root
+/// first and the parent last, as the host records them.
+fn node(
+    w: &World,
+    id: &str,
+    chain: &[&str],
+    can_spawn: bool,
+    cfg: KvCfg,
+    answer: Option<Answer>,
+) -> (Service, Arc<Fixed>) {
     let fixed = Arc::new(Fixed {
         answer,
         asked: Mutex::new(Vec::new()),
     });
+    let lineage = Lineage {
+        parent: chain.last().map(|p| p.to_string()),
+        chain: chain.iter().map(|c| c.to_string()).collect(),
+        can_spawn,
+    };
     let svc = Service::new(
         w.env.clone(),
         Identity {
+            tree: lineage.tree_root(id),
             sandbox: id.into(),
             harness: "t".into(),
             project: "/src/app".into(),
-            parent: parent.map(String::from),
+            parent: lineage.parent.clone(),
+            chain: lineage.chain.clone(),
         },
         cfg,
         fixed.clone(),
@@ -289,7 +310,13 @@ fn service(
     .with_store(w.store.clone());
     Store::open(&w.store)
         .unwrap()
-        .register(id, "t", Path::new("/src/app"), parent, crate::state::now())
+        .register(
+            id,
+            "t",
+            Path::new("/src/app"),
+            chain.last().copied(),
+            crate::state::now(),
+        )
         .unwrap();
     (svc, fixed)
 }
@@ -489,7 +516,6 @@ fn leases_belong_to_the_sandbox() {
     let w = world();
     let (a, _) = service(&w, "a", None, KvCfg::default(), None);
     let (b, _) = service(&w, "b", None, KvCfg::default(), None);
-    let (child, _) = service(&w, "child", Some("a"), KvCfg::default(), None);
 
     // The owner that the client sends is ignored.
     let r = a.handle(
@@ -522,7 +548,18 @@ fn leases_belong_to_the_sandbox() {
     assert_eq!(rel(&a, false).status, Status::Done);
     assert_eq!(rel(&a, false).status, Status::NotFound);
 
-    // The parent can force the release of a child's lease.
+    // The parent can force the release of a child's lease. A child writes
+    // the project scope only when the user configuration allows it.
+    let (child, _) = service(
+        &w,
+        "child",
+        Some("a"),
+        KvCfg {
+            child_project_write: true,
+            ..KvCfg::default()
+        },
+        None,
+    );
     child.handle(&claim(Scope::Project, "job", 60), None);
     assert_eq!(rel_named(&b, "job", true).status, Status::Denied);
     assert_eq!(rel_named(&a, "job", false).status, Status::Denied);
@@ -774,4 +811,235 @@ fn gc_plan_skips_running_sandboxes() {
         .unwrap()
         .stale
         .is_empty());
+}
+
+/// A spawn tree: root r started c1 and c2; c1 started g. Another root r2
+/// has its own tree.
+struct Tree {
+    r: Service,
+    c1: Service,
+    c2: Service,
+    g: Service,
+    r2: Service,
+}
+
+fn tree(w: &World, cfg: KvCfg) -> Tree {
+    Tree {
+        r: node(w, "r", &[], true, cfg.clone(), None).0,
+        c1: node(w, "c1", &["r"], false, cfg.clone(), None).0,
+        c2: node(w, "c2", &["r"], false, cfg.clone(), None).0,
+        g: node(w, "g", &["r", "c1"], false, cfg.clone(), None).0,
+        r2: node(w, "r2", &[], true, cfg, None).0,
+    }
+}
+
+fn get(s: &Service, scope: Scope, key: &str) -> Response {
+    s.handle(&req("get", scope, key), None)
+}
+
+#[test]
+fn scopes_resolve_by_place_in_the_spawn_tree() {
+    let w = world();
+    let t = tree(&w, KvCfg::default());
+    for s in [&t.r, &t.c1, &t.c2, &t.g] {
+        assert_eq!(s.identity().tree.as_deref(), Some("r"));
+    }
+    assert_eq!(t.r2.identity().tree.as_deref(), Some("r2"));
+
+    // Each sandbox has its own self scope; siblings cannot read it.
+    t.c1.handle(&put(Scope::Own, "plan", "c1 plan"), None);
+    t.r.handle(&put(Scope::Own, "plan", "root plan"), None);
+    assert_eq!(get(&t.c2, Scope::Own, "plan").status, Status::NotFound);
+    // parent is the self scope of the sandbox one level up, not of a
+    // sibling and not of the root for a grandchild.
+    assert_eq!(
+        get(&t.c1, Scope::Parent, "plan").result["value"],
+        "root plan"
+    );
+    assert_eq!(
+        get(&t.c2, Scope::Parent, "plan").result["value"],
+        "root plan"
+    );
+    assert_eq!(get(&t.g, Scope::Parent, "plan").result["value"], "c1 plan");
+    assert_eq!(get(&t.r, Scope::Parent, "plan").status, Status::Disabled);
+    // parent is read-only, for every write op.
+    for r in [
+        put(Scope::Parent, "plan", "x"),
+        req("delete", Scope::Parent, "plan"),
+        claim(Scope::Parent, "plan", 60),
+    ] {
+        assert_eq!(t.g.handle(&r, None).status, Status::Denied);
+    }
+    assert_eq!(get(&t.c1, Scope::Own, "plan").result["value"], "c1 plan");
+
+    // tree is shared by the whole tree, and each entry names its writer.
+    let r =
+        t.r.handle(&put(Scope::Tree, "task:a", "{\"status\":\"todo\"}"), None);
+    assert_eq!(r.status, Status::Done);
+    for s in [&t.c1, &t.c2, &t.g] {
+        let r = get(s, Scope::Tree, "task:a");
+        assert_eq!(r.result["writer"], "r");
+        assert_eq!(r.result["untrusted"], true);
+    }
+    t.g.handle(&put(Scope::Tree, "note:g", "from g"), None);
+    assert_eq!(get(&t.r, Scope::Tree, "note:g").result["writer"], "g");
+    // Another tree does not see it.
+    assert_eq!(get(&t.r2, Scope::Tree, "task:a").status, Status::NotFound);
+
+    // A sandbox that cannot spawn and was not spawned has no tree.
+    let (lone, _) = node(&w, "lone", &[], false, KvCfg::default(), None);
+    assert_eq!(get(&lone, Scope::Tree, "task:a").status, Status::Disabled);
+    let info = lone.handle(&req("info", Scope::Own, ""), None);
+    assert!(info.result["scopes"]["tree"]
+        .as_str()
+        .unwrap()
+        .starts_with("none"));
+    let info = t.g.handle(&req("info", Scope::Own, ""), None);
+    assert_eq!(info.result["tree_root"], "r");
+    assert_eq!(info.result["started_by"][1], "c1");
+}
+
+#[test]
+fn tree_leases_work_across_siblings_and_only_ancestors_force_them() {
+    let w = world();
+    let t = tree(&w, KvCfg::default());
+    let rel = |s: &Service, name: &str, force: bool| {
+        s.handle(
+            &Request {
+                force: Some(force),
+                ..req("release", Scope::Tree, name)
+            },
+            None,
+        )
+        .status
+    };
+    // Two siblings race for one task: one wins.
+    let won = t.c1.handle(&claim(Scope::Tree, "a", 60), None);
+    assert_eq!(won.status, Status::Done);
+    let lost = t.c2.handle(&claim(Scope::Tree, "a", 60), None);
+    assert_eq!(lost.status, Status::Conflict);
+    assert_eq!(lost.result["owner"], "c1");
+    // A sibling, and a child of the owner, cannot free it.
+    assert_eq!(rel(&t.c2, "a", true), Status::Denied);
+    assert_eq!(rel(&t.g, "a", true), Status::Denied);
+    // The root can, with force only.
+    assert_eq!(rel(&t.r, "a", false), Status::Denied);
+    assert_eq!(rel(&t.r, "a", true), Status::Done);
+    // A grandchild's lease: its parent and the root can force it; its
+    // parent's sibling cannot.
+    t.g.handle(&claim(Scope::Tree, "b", 60), None);
+    assert_eq!(rel(&t.c2, "b", true), Status::Denied);
+    assert_eq!(rel(&t.c1, "b", true), Status::Done);
+    t.g.handle(&claim(Scope::Tree, "b", 60), None);
+    assert_eq!(rel(&t.r, "b", true), Status::Done);
+    // Results with compare-and-swap: the second create-only write loses.
+    let create = |s: &Service| {
+        s.handle(
+            &Request {
+                version: Some(0),
+                ..put(Scope::Tree, "result:a", "done")
+            },
+            None,
+        )
+        .status
+    };
+    assert_eq!(create(&t.c1), Status::Done);
+    assert_eq!(create(&t.c2), Status::Conflict);
+}
+
+#[test]
+fn a_child_cannot_write_the_project_scope_by_default() {
+    let w = world();
+    let t = tree(&w, KvCfg::default());
+    t.r.handle(&put(Scope::Project, "note:x", "tip"), None);
+    // It can read what the project keeps.
+    assert_eq!(get(&t.c1, Scope::Project, "note:x").result["value"], "tip");
+    for r in [
+        put(Scope::Project, "note:x", "mine"),
+        req("delete", Scope::Project, "note:x"),
+        claim(Scope::Project, "job", 60),
+        Request {
+            entries: Some(BTreeMap::from([("k".into(), "v".into())])),
+            ..req("mset", Scope::Project, "")
+        },
+    ] {
+        assert_eq!(t.c1.handle(&r, None).status, Status::Denied);
+        assert_eq!(t.g.handle(&r, None).status, Status::Denied);
+    }
+    assert_eq!(get(&t.r, Scope::Project, "note:x").result["value"], "tip");
+    // The user can allow it in the user configuration.
+    let cfg = KvCfg::parse("[kv]\nchild_project_write = true\n").unwrap();
+    assert!(cfg.child_project_write);
+    let (c, _) = node(&w, "c3", &["r"], false, cfg, None);
+    let r = c.handle(&put(Scope::Project, "note:y", "ok"), None);
+    assert_eq!(r.status, Status::Done);
+}
+
+#[test]
+fn the_tree_is_read_only_after_its_root_ends_and_gc_removes_it() {
+    let w = world();
+    let t = tree(&w, KvCfg::default());
+    t.c1.handle(&put(Scope::Tree, "result:a", "done"), None);
+    Store::open(&w.store).unwrap().finish("r", 1000).unwrap();
+    let late = t.c1.handle(&put(Scope::Tree, "result:b", "late"), None);
+    assert_eq!(late.status, Status::Denied);
+    // The copy stays for review.
+    assert_eq!(get(&t.c1, Scope::Tree, "result:a").result["value"], "done");
+    let mut st = Store::open(&w.store).unwrap();
+    // A running descendant keeps the root's data; without one it is stale.
+    let far = crate::state::now() + 10;
+    let ids = |v: Vec<store::Stale>| v.into_iter().map(|s| s.sandbox).collect::<Vec<_>>();
+    assert!(!ids(st.stale(far, &["g".into()]).unwrap()).contains(&"r".to_string()));
+    assert!(ids(st.stale(far, &[]).unwrap()).contains(&"r".to_string()));
+    st.remove_sandboxes(&["r".into()]).unwrap();
+    assert!(st
+        .get(&store::ns_tree("r"), "result:a", crate::state::now())
+        .unwrap()
+        .is_none());
+}
+
+#[test]
+fn a_child_inherits_the_user_scope_grant_and_never_asks_itself() {
+    let w = world();
+    let cfg = KvCfg::default();
+    let (r, asked_r) = node(&w, "r", &[], true, cfg.clone(), Some(Answer::Session));
+    let (c1, asked_c1) = node(&w, "c1", &["r"], false, cfg.clone(), Some(Answer::Session));
+    let (g, asked_g) = node(
+        &w,
+        "g",
+        &["r", "c1"],
+        false,
+        cfg.clone(),
+        Some(Answer::Session),
+    );
+    // Before the root has a grant, a child is refused without a question.
+    let resp = get(&g, Scope::User, "k");
+    assert_eq!(resp.status, Status::Denied);
+    assert!(asked_g.asked.lock().unwrap().is_empty());
+    // The root allows it for its session; the whole tree inherits it.
+    assert_eq!(get(&r, Scope::User, "k").status, Status::NotFound);
+    assert_eq!(asked_r.asked.lock().unwrap().len(), 1);
+    assert_eq!(get(&c1, Scope::User, "k").status, Status::NotFound);
+    assert!(asked_c1.asked.lock().unwrap().is_empty());
+    let (g2, asked_g2) = node(
+        &w,
+        "g2",
+        &["r", "c1"],
+        false,
+        cfg.clone(),
+        Some(Answer::Deny),
+    );
+    assert_eq!(get(&g2, Scope::User, "k").status, Status::NotFound);
+    assert!(asked_g2.asked.lock().unwrap().is_empty());
+    // Children of a root without a grant never ask, whatever they would answer.
+    let (r2, _) = node(&w, "r2", &[], true, cfg.clone(), Some(Answer::Deny));
+    let (s1, asked_s1) = node(&w, "s1", &["r2"], false, cfg.clone(), Some(Answer::Session));
+    assert_eq!(get(&s1, Scope::User, "k").status, Status::Denied);
+    assert!(asked_s1.asked.lock().unwrap().is_empty());
+    assert_eq!(get(&r2, Scope::User, "k").status, Status::Denied);
+    // The grant ends with the root's session.
+    Store::open(&w.store).unwrap().finish("r", 1).unwrap();
+    let (c3, asked_c3) = node(&w, "c3", &["r"], false, cfg, Some(Answer::Session));
+    assert_eq!(get(&c3, Scope::User, "k").status, Status::Denied);
+    assert!(asked_c3.asked.lock().unwrap().is_empty());
 }

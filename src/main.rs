@@ -353,14 +353,17 @@ enum EnvCmd {
 #[derive(Args)]
 struct KvScope {
     /// The project scope of this folder.
-    #[arg(long, conflicts_with_all = ["user", "sandbox"])]
+    #[arg(long, conflicts_with_all = ["user", "sandbox", "tree"])]
     project: Option<PathBuf>,
     /// The scope that all projects share.
-    #[arg(long, conflicts_with = "sandbox")]
+    #[arg(long, conflicts_with_all = ["sandbox", "tree"])]
     user: bool,
     /// The self scope of one sandbox, by id.
-    #[arg(long)]
+    #[arg(long, conflicts_with = "tree")]
     sandbox: Option<String>,
+    /// The tree scope of a spawn tree, by the id of its root sandbox.
+    #[arg(long)]
+    tree: Option<String>,
 }
 
 impl KvScope {
@@ -370,6 +373,8 @@ impl KvScope {
             Target::User
         } else if let Some(id) = &self.sandbox {
             Target::Sandbox(id.clone())
+        } else if let Some(root) = &self.tree {
+            Target::Tree(root.clone())
         } else {
             Target::Project(project_of(self.project.as_deref())?)
         })

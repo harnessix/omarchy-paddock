@@ -224,9 +224,12 @@ pub struct Built {
     /// Who answers host passthrough requests. None means the user, through
     /// the panel, a notification or `paddock approvals`.
     pub approver: Option<std::sync::Arc<dyn crate::broker::Approver>>,
-    /// The sandbox that started this one, for the `parent` scope of paddock kv.
-    /// None for a sandbox that the user started.
+    /// The sandbox that started this one, for the `parent` scope of paddock
+    /// kv. None for a sandbox that the user started. The spawn child build
+    /// sets it from the job that the parent's paddock wrote.
     pub parent: Option<String>,
+    /// For a spawned sandbox: the devices of its parent. It gets no other.
+    pub device_ceiling: Option<Vec<String>>,
     /// Serve the built-in `echo` device whatever the user configuration says.
     /// `paddock doctor --escape` tests the device mount with it.
     pub test_devices: bool,
@@ -641,6 +644,7 @@ pub fn build_with(env: &HostEnv, opts: &Options, harness: Harness) -> Result<Bui
         inherit_env: inherit,
         approver: None,
         parent: None,
+        device_ceiling: None,
         test_devices: false,
         worktree,
         auth,

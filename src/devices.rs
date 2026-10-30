@@ -15,6 +15,11 @@
 //! request. `/dev/paddock/.catalog` is read-only and describes each device:
 //! its request format, its limits and whether it is on.
 //!
+//! A sandbox that another one started (`spawn`) gets at most the devices
+//! of its parent: the parent's paddock records them in the child's job, and
+//! the child's own `/dev/paddock` serves only those that the user
+//! configuration still turns on.
+//!
 //! Devices are off unless `[devices]` in the user configuration turns them
 //! on. The project `paddock.toml` cannot do this, because the agent can edit
 //! that file. Requests and responses never go into logs or process
@@ -954,14 +959,37 @@ pub fn mount(dir: &Path, fs: DeviceFs) -> Result<Mounted> {
     })
 }
 
-/// The devices to serve: the user's choice, plus `echo` when `test` is set
-/// (`paddock doctor --escape` tests the round trip).
-pub fn enabled(cfg: &DevicesCfg, test: bool) -> Vec<Arc<dyn Device>> {
+/// The names of the devices to serve: the user's choice, plus `echo` when
+/// `test` is set (`paddock doctor --escape` tests the round trip). With a
+/// `ceiling` (the devices of the parent of a spawned sandbox), only names
+/// that are in it.
+pub fn enabled_names(cfg: &DevicesCfg, test: bool, ceiling: Option<&[String]>) -> Vec<String> {
+    if !cfg.mount {
+        return Vec::new();
+    }
     let mut names = cfg.enabled.clone();
     if test && !names.iter().any(|n| n == "echo") {
         names.push("echo".into());
     }
-    names.iter().filter_map(|n| builtin(n)).collect()
+    names.retain(|n| builtin(n).is_some() && ceiling.is_none_or(|c| c.contains(n)));
+    names
+}
+
+/// The devices to serve. See `enabled_names`.
+pub fn enabled(cfg: &DevicesCfg, test: bool, ceiling: Option<&[String]>) -> Vec<Arc<dyn Device>> {
+    enabled_names(cfg, test, ceiling)
+        .iter()
+        .filter_map(|n| builtin(n))
+        .collect()
+}
+
+/// The devices that a sandbox gets at its start, by name, for the ceiling
+/// of its children. A configuration error gives none, the same as `start`.
+pub fn names_for(env: &HostEnv, test: bool, ceiling: Option<&[String]>) -> Vec<String> {
+    match DevicesCfg::load(env) {
+        Ok(c) => enabled_names(&c, test, ceiling),
+        Err(_) => Vec::new(),
+    }
 }
 
 /// The devices of one sandbox. Dropping it unmounts them.
@@ -1025,7 +1053,14 @@ impl Drop for Devices {
 /// record the folder in the spec, for the backend. Container backends get
 /// the empty folder now and the mount after the start (`after_start`). A
 /// problem is a notice, not an error: the sandbox starts without devices.
-pub fn start(env: &HostEnv, spec: &mut SandboxSpec, backend: &str, test: bool) -> Option<Devices> {
+/// `ceiling` holds the devices of the parent, for a spawned sandbox.
+pub fn start(
+    env: &HostEnv,
+    spec: &mut SandboxSpec,
+    backend: &str,
+    test: bool,
+    ceiling: Option<&[String]>,
+) -> Option<Devices> {
     let cfg = match DevicesCfg::load(env) {
         Ok(c) => c,
         Err(e) => {
@@ -1036,7 +1071,7 @@ pub fn start(env: &HostEnv, spec: &mut SandboxSpec, backend: &str, test: bool) -
     if !cfg.mount {
         return None;
     }
-    let devices = enabled(&cfg, test);
+    let devices = enabled(&cfg, test, ceiling);
     // Without an enabled device the mount is only a catalog, so a missing
     // FUSE is not worth a notice at each start.
     let quiet = devices.is_empty();

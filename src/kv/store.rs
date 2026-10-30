@@ -5,8 +5,8 @@
 //! paddock binary, so the same binary still runs inside containers without
 //! a system library.
 //!
-//! A key lives in a namespace: `self:<sandbox id>`, `project:<path>` or
-//! `user`. Versions come from one counter for the whole store, so a key that
+//! A key lives in a namespace: `self:<sandbox id>`, `tree:<root sandbox
+//! id>`, `project:<path>` or `user`. Versions come from one counter for the whole store, so a key that
 //! is deleted and written again never gets an old version back, and a
 //! watcher never misses that change. Each write and delete also goes to a
 //! short history per key; prefix watches read their changes from it.
@@ -18,6 +18,11 @@ use std::path::Path;
 
 pub fn ns_self(sandbox: &str) -> String {
     format!("self:{sandbox}")
+}
+
+/// The namespace of a spawn tree: it belongs to the root sandbox.
+pub fn ns_tree(root: &str) -> String {
+    format!("tree:{root}")
 }
 
 pub fn ns_project(project: &Path) -> String {
@@ -100,7 +105,7 @@ impl From<rusqlite::Error> for WriteError {
     }
 }
 
-/// A finished sandbox with `self` data, for `paddock gc`.
+/// A finished sandbox with `self` data or a `tree` scope, for `paddock gc`.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct Stale {
     pub sandbox: String,
@@ -159,7 +164,15 @@ CREATE TABLE IF NOT EXISTS sandboxes (
   started INTEGER NOT NULL,
   ended INTEGER
 );
+CREATE TABLE IF NOT EXISTS grants (
+  sandbox TEXT NOT NULL,
+  name TEXT NOT NULL,
+  PRIMARY KEY (sandbox, name)
+) WITHOUT ROWID;
 ";
+
+/// How many sandboxes above one another `ancestors` follows at most.
+const MAX_CHAIN: usize = 32;
 
 fn live(expires: Option<u64>, now: u64) -> bool {
     expires.is_none_or(|e| e > now)
@@ -588,12 +601,66 @@ impl Store {
         Ok(())
     }
 
+    /// Record the end of a sandbox. Its session grants end with it.
     pub fn finish(&self, id: &str, now: u64) -> Result<()> {
         self.conn.execute(
             "UPDATE sandboxes SET ended = ?2 WHERE id = ?1",
             params![id, now],
         )?;
+        self.conn
+            .execute("DELETE FROM grants WHERE sandbox = ?1", params![id])?;
         Ok(())
+    }
+
+    /// Whether a sandbox ended. None when paddock has no record of it.
+    pub fn ended(&self, id: &str) -> Result<Option<bool>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT ended IS NOT NULL FROM sandboxes WHERE id = ?1",
+                params![id],
+                |r| r.get::<_, bool>(0),
+            )
+            .optional()?)
+    }
+
+    /// Record that the user allowed `name` for the session of a sandbox.
+    /// Only the host process of that sandbox writes it; children read it.
+    pub fn grant(&self, sandbox: &str, name: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR IGNORE INTO grants (sandbox, name) VALUES (?1, ?2)",
+            params![sandbox, name],
+        )?;
+        Ok(())
+    }
+
+    pub fn granted(&self, sandbox: &str, name: &str) -> Result<bool> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT 1 FROM grants g JOIN sandboxes s ON s.id = g.sandbox
+                 WHERE g.sandbox = ?1 AND g.name = ?2 AND s.ended IS NULL",
+                params![sandbox, name],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some())
+    }
+
+    /// The sandboxes above `id`, as paddock recorded them: the parent first.
+    pub fn ancestors(&self, id: &str) -> Result<Vec<String>> {
+        let mut out: Vec<String> = Vec::new();
+        let mut cur = id.to_string();
+        while out.len() < MAX_CHAIN {
+            match self.parent_of(&cur)? {
+                Some(p) if p != id && !out.contains(&p) => {
+                    out.push(p.clone());
+                    cur = p;
+                }
+                _ => break,
+            }
+        }
+        Ok(out)
     }
 
     /// The sandbox that started `id`, as paddock recorded it.
@@ -609,21 +676,21 @@ impl Store {
             .flatten())
     }
 
-    /// Sandboxes whose `self` data is older than `cutoff` and that do not
-    /// run. `running` holds the running sandboxes; their parents are kept
-    /// too, because a running child reads them.
+    /// Sandboxes whose `self` data or `tree` scope is older than `cutoff`
+    /// and that do not run. `running` holds the running sandboxes; the
+    /// sandboxes above them are kept too, because a running child reads its
+    /// parent and writes the tree of its root. `self:` and `tree:` have the
+    /// same length, so one `substr` gives the sandbox of both.
     pub fn stale(&self, cutoff: u64, running: &[String]) -> Result<Vec<Stale>> {
         let mut keep: Vec<String> = running.to_vec();
         for id in running {
-            if let Some(p) = self.parent_of(id)? {
-                keep.push(p);
-            }
+            keep.extend(self.ancestors(id)?);
         }
         let mut st = self.conn.prepare(
             "SELECT substr(e.ns, 6), COUNT(*), SUM(e.size), MAX(e.updated),
                     MAX(COALESCE(s.ended, 0)), MAX(COALESCE(s.started, 0))
              FROM entries e LEFT JOIN sandboxes s ON s.id = substr(e.ns, 6)
-             WHERE e.ns LIKE 'self:%' GROUP BY e.ns",
+             WHERE e.ns LIKE 'self:%' OR e.ns LIKE 'tree:%' GROUP BY substr(e.ns, 6)",
         )?;
         let rows = st.query_map([], |r| {
             let (u, e, s): (u64, u64, u64) = (r.get(3)?, r.get(4)?, r.get(5)?);
@@ -644,15 +711,18 @@ impl Store {
         Ok(out)
     }
 
-    /// Remove the `self` data, its history and the records of these sandboxes.
+    /// Remove the `self` data, the `tree` scope of a root, their history
+    /// and the records of these sandboxes.
     pub fn remove_sandboxes(&mut self, ids: &[String]) -> Result<u64> {
         let tx = self.conn.transaction()?;
         let mut n = 0;
         for id in ids {
-            let ns = ns_self(id);
-            n += tx.execute("DELETE FROM entries WHERE ns = ?1", params![ns])? as u64;
-            tx.execute("DELETE FROM history WHERE ns = ?1", params![ns])?;
+            for ns in [ns_self(id), ns_tree(id)] {
+                n += tx.execute("DELETE FROM entries WHERE ns = ?1", params![ns])? as u64;
+                tx.execute("DELETE FROM history WHERE ns = ?1", params![ns])?;
+            }
             tx.execute("DELETE FROM sandboxes WHERE id = ?1", params![id])?;
+            tx.execute("DELETE FROM grants WHERE sandbox = ?1", params![id])?;
         }
         tx.commit()?;
         Ok(n)
@@ -679,7 +749,8 @@ impl Store {
     pub fn forget_ended(&mut self, cutoff: u64) -> Result<u64> {
         Ok(self.conn.execute(
             "DELETE FROM sandboxes WHERE ended IS NOT NULL AND ended < ?1
-             AND NOT EXISTS (SELECT 1 FROM entries WHERE ns = 'self:' || sandboxes.id)",
+             AND NOT EXISTS (SELECT 1 FROM entries
+                             WHERE ns IN ('self:' || sandboxes.id, 'tree:' || sandboxes.id))",
             params![cutoff],
         )? as u64)
     }
@@ -697,6 +768,8 @@ impl Store {
     pub fn forget_sandbox(&mut self, id: &str) -> Result<()> {
         self.conn
             .execute("DELETE FROM sandboxes WHERE id = ?1", params![id])?;
+        self.conn
+            .execute("DELETE FROM grants WHERE sandbox = ?1", params![id])?;
         Ok(())
     }
 }

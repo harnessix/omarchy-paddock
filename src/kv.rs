@@ -17,20 +17,28 @@
 //!   an agent with a prompt injection can write there.
 //! - `parent`: the `self` scope of the sandbox that started this one, read
 //!   only. Only a sandbox started by another sandbox has one.
+//! - `tree`: shared by one spawn tree. The root sandbox (the one the user
+//!   started) owns it; the root and every sandbox below it read and write
+//!   it, and each entry records its writer. It is on in a sandbox that can
+//!   use `spawn` and in every sandbox that `spawn` started. When the root
+//!   ends, the scope is read-only; the data stays for review until
+//!   `paddock gc` removes it with the root's `self` data.
 //! - `user`: shared across all projects. Off until the user allows it: the
 //!   first use asks through the approval card.
+//!
+//! A sandbox that another one started never gets more than its parent. It
+//! writes only its own scope and `tree`: `project` is read-only for it
+//! unless `[kv] child_project_write` says otherwise. For `user` it inherits
+//! the session grant of the sandboxes above it. Without one, its first use
+//! asks the user on a card that names the sandbox that started it.
 //!
 //! Key names can appear in the audit log; values never do.
 //!
 //! Leases (`claim`, `release`) are keys under `lease:` whose owner paddock
 //! writes from the connection. Plain writes cannot change those keys.
 //!
-//! Two extensions are planned and fit this model without a new store:
+//! One extension is planned and fits this model without a new store:
 //!
-//! - A `tree` scope: the root sandbox of a spawn tree and all its
-//!   descendants read and write it; it ends with the root. Its namespace
-//!   would be `tree:<root id>`, and `Identity` would carry the root next to
-//!   the parent. The `sandboxes` table already records each parent.
 //! - A host API for automation: a socket in the run folder outside every
 //!   sandbox, where each client is a named principal from `[kv.clients.*]`
 //!   of the user configuration with the namespaces it may read and write.
@@ -97,8 +105,13 @@ pub struct KvCfg {
     pub project_bytes: u64,
     pub user_bytes: u64,
     pub max_keys: u64,
-    /// `paddock gc` removes the `self` data of a run this many days after it ended.
+    /// `paddock gc` removes the `self` data of a run, and the `tree` scope
+    /// of a root, this many days after it ended.
     pub keep_days: u64,
+    /// Whether a sandbox that another one started can write the `project`
+    /// scope. Off by default: what a child learns goes to `tree`, and the
+    /// parent decides what the project keeps.
+    pub child_project_write: bool,
 }
 
 impl Default for KvCfg {
@@ -112,6 +125,7 @@ impl Default for KvCfg {
             user_bytes: 4 << 20,
             max_keys: 4096,
             keep_days: 30,
+            child_project_write: false,
         }
     }
 }
@@ -127,6 +141,7 @@ struct RawCfg {
     user_bytes: Option<u64>,
     max_keys: Option<u64>,
     keep_days: Option<u64>,
+    child_project_write: Option<bool>,
 }
 
 impl KvCfg {
@@ -167,13 +182,14 @@ impl KvCfg {
             user_bytes: range("user_bytes", raw.user_bytes, d.user_bytes, 1024, 1 << 30)?,
             max_keys: range("max_keys", raw.max_keys, d.max_keys, 1, 1_000_000)?,
             keep_days: range("keep_days", raw.keep_days, d.keep_days, 1, 3650)?,
+            child_project_write: raw.child_project_write.unwrap_or(d.child_project_write),
         })
     }
 
     fn quota(&self, scope: Scope) -> Quota {
         Quota {
             bytes: match scope {
-                Scope::Project => self.project_bytes,
+                Scope::Project | Scope::Tree => self.project_bytes,
                 Scope::User => self.user_bytes,
                 _ => self.self_bytes,
             },
@@ -190,6 +206,7 @@ pub enum Scope {
     Own,
     Project,
     Parent,
+    Tree,
     User,
 }
 
@@ -199,12 +216,13 @@ impl Scope {
             Scope::Own => "self",
             Scope::Project => "project",
             Scope::Parent => "parent",
+            Scope::Tree => "tree",
             Scope::User => "user",
         }
     }
     /// Entries that another sandbox can write.
-    fn shared(self) -> bool {
-        matches!(self, Scope::Project | Scope::User)
+    pub fn shared(self) -> bool {
+        matches!(self, Scope::Project | Scope::Tree | Scope::User)
     }
 }
 
@@ -215,9 +233,10 @@ impl std::str::FromStr for Scope {
             "self" => Ok(Scope::Own),
             "project" => Ok(Scope::Project),
             "parent" => Ok(Scope::Parent),
+            "tree" => Ok(Scope::Tree),
             "user" => Ok(Scope::User),
             _ => Err(format!(
-                "unknown scope '{s}': use self, project, parent or user"
+                "unknown scope '{s}': use self, project, parent, tree or user"
             )),
         }
     }
@@ -229,9 +248,44 @@ pub struct Identity {
     pub sandbox: String,
     pub harness: String,
     pub project: PathBuf,
-    /// The sandbox that started this one. `spawn` sets it; until then it is
-    /// always `None` and the `parent` scope is empty.
+    /// The sandbox that started this one (`spawn`). None: the user did.
     pub parent: Option<String>,
+    /// The sandboxes above this one, the root first and the parent last.
+    /// Empty for a sandbox that the user started.
+    pub chain: Vec<String>,
+    /// The root of the spawn tree, when this sandbox has a `tree` scope.
+    pub tree: Option<String>,
+}
+
+impl Identity {
+    /// Whether another sandbox started this one.
+    pub fn is_child(&self) -> bool {
+        self.parent.is_some()
+    }
+}
+
+/// Where a sandbox sits in a spawn tree. It comes from the host: the
+/// parent's paddock writes it into the job of the child.
+#[derive(Debug, Clone, Default)]
+pub struct Lineage {
+    pub parent: Option<String>,
+    /// The sandboxes above this one, the root first and the parent last.
+    pub chain: Vec<String>,
+    /// Whether this sandbox can start children. A root gets a `tree` scope
+    /// only then.
+    pub can_spawn: bool,
+}
+
+impl Lineage {
+    /// The root of the tree, when this sandbox has a `tree` scope.
+    pub fn tree_root(&self, me: &str) -> Option<String> {
+        match self.chain.first() {
+            Some(root) => Some(root.clone()),
+            None if self.parent.is_some() => self.parent.clone(),
+            None if self.can_spawn => Some(me.to_string()),
+            None => None,
+        }
+    }
 }
 
 /// One request. Unknown fields are an error: a request has no field that
@@ -267,8 +321,8 @@ pub struct Request {
     /// mset: the keys and values to write, all or none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub entries: Option<std::collections::BTreeMap<String, String>>,
-    /// release: free a lease that another sandbox holds. Only the parent of
-    /// that sandbox can.
+    /// release: free a lease that another sandbox holds. Only a sandbox
+    /// above that one in its spawn tree can.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub force: Option<bool>,
     /// claim: accepted for clients that send it, and ignored. The owner of a
@@ -399,6 +453,7 @@ impl Service {
             Scope::Own => store::ns_self(&self.id.sandbox),
             Scope::Project => store::ns_project(&self.id.project),
             Scope::Parent => store::ns_self(self.id.parent.as_deref()?),
+            Scope::Tree => store::ns_tree(self.id.tree.as_deref()?),
             Scope::User => store::NS_USER.to_string(),
         })
     }
@@ -442,6 +497,23 @@ impl Service {
         if self.user_granted.load(Ordering::SeqCst) {
             return None;
         }
+        // A child inherits the session grant of the sandboxes above it. The
+        // chain comes from the host, never from the request.
+        if self.inherited_user_grant() {
+            self.user_granted.store(true, Ordering::SeqCst);
+            return None;
+        }
+        // A sandbox that another one started never asks on its own: one
+        // prompt injection must not turn into many questions. The root
+        // sandbox asks (its children then inherit the grant), or the user
+        // allows the scope in the configuration.
+        if self.id.is_child() {
+            return Some(Response::new(
+                Status::Denied,
+                "a sandbox started by spawn cannot ask for the user scope; use it in the root sandbox first, or set [kv] user = \"allow\" in the user configuration",
+            ));
+        }
+        let started = crate::spawn::chain_text(&self.id.chain);
         let p = Pending {
             id: request_id(),
             sandbox: self.id.sandbox.clone(),
@@ -450,19 +522,26 @@ impl Service {
             capability: USER_CAPABILITY.into(),
             summary: "use the user-wide paddock kv scope".into(),
             detail: format!(
-                "The sandbox wants to {} the user scope of paddock kv. Sandboxes of all your projects share this scope, so what one agent writes there, agents in other projects read.",
+                "{}The sandbox wants to {} the user scope of paddock kv. Sandboxes of all your projects share this scope, so what one agent writes there, agents in other projects read.",
+                started.map(|t| format!("{t} ")).unwrap_or_default(),
                 if WRITE_OPS.contains(&req.op.as_str()) { "write to" } else { "read" }
             ),
             reason: String::new(),
             created: crate::state::now(),
             expires: crate::state::now() + self.wait.as_secs(),
             session_allowed: true,
-            started_by: vec![],
+            started_by: self.id.chain.clone(),
         };
         let (decision, resp) = match self.approver.ask(&self.env, &p, self.wait) {
             Some(Answer::Once) => ("allowed once", None),
             Some(Answer::Session) => {
                 self.user_granted.store(true, Ordering::SeqCst);
+                // The children of this sandbox inherit it.
+                if let Err(e) =
+                    Store::open(&self.path).and_then(|s| s.grant(&self.id.sandbox, USER_CAPABILITY))
+                {
+                    log::warn!("cannot record the user scope grant: {e:#}");
+                }
                 ("allowed for this session", None)
             }
             Some(Answer::Deny) => (
@@ -487,6 +566,25 @@ impl Service {
         resp
     }
 
+    /// Whether a sandbox above this one has the user scope for its session.
+    fn inherited_user_grant(&self) -> bool {
+        if self.id.chain.is_empty() {
+            return false;
+        }
+        let Ok(st) = Store::open(&self.path) else {
+            return false;
+        };
+        self.id
+            .chain
+            .iter()
+            .any(|a| st.granted(a, USER_CAPABILITY).unwrap_or(false))
+    }
+
+    /// Whether this sandbox may write the project scope.
+    fn project_writable(&self) -> bool {
+        !self.id.is_child() || self.cfg.child_project_write
+    }
+
     fn info(&self) -> serde_json::Value {
         serde_json::json!({
             "protocol": PROTOCOL,
@@ -494,10 +592,17 @@ impl Service {
             "harness": self.id.harness,
             "project": self.id.project,
             "parent": self.id.parent,
+            "started_by": self.id.chain,
+            "tree_root": self.id.tree,
             "scopes": {
                 "self": "read-write; this sandbox only",
-                "project": "read-write; shared with every sandbox of this project; untrusted",
+                "project": if self.project_writable() { "read-write; shared with every sandbox of this project; untrusted" } else { "read-only for a sandbox that another one started ([kv] child_project_write); shared with every sandbox of this project; untrusted" },
                 "parent": if self.id.parent.is_some() { "read-only; the self scope of the sandbox that started this one" } else { "none: no sandbox started this one" },
+                "tree": match &self.id.tree {
+                    Some(r) if r == &self.id.sandbox => "read-write; shared with every sandbox that this one starts, and their children; untrusted".to_string(),
+                    Some(r) => format!("read-write; shared with sandbox {r}, which started this spawn tree, and every sandbox in it; untrusted"),
+                    None => "none: only a sandbox that can start other agents (spawn), and the sandboxes it starts, have one".to_string(),
+                },
                 "user": match self.cfg.user {
                     Mode::Deny => "off".to_string(),
                     Mode::Allow => "read-write; shared with every project; untrusted".to_string(),
@@ -510,6 +615,7 @@ impl Service {
                 "max_value_bytes": self.cfg.max_value,
                 "self_bytes": self.cfg.self_bytes,
                 "project_bytes": self.cfg.project_bytes,
+                "tree_bytes": self.cfg.project_bytes,
                 "user_bytes": self.cfg.user_bytes,
                 "max_keys_per_scope": self.cfg.max_keys,
                 "max_ttl_seconds": MAX_TTL,
@@ -579,11 +685,21 @@ impl Service {
         let Some(ns) = self.ns(scope) else {
             return Response::new(
                 Status::Disabled,
-                "this sandbox has no parent scope: only a sandbox that another sandbox started has one",
+                if scope == Scope::Tree {
+                    "this sandbox has no tree scope: only a sandbox that can start other agents (paddock-host spawn), and the sandboxes it starts, have one"
+                } else {
+                    "this sandbox has no parent scope: only a sandbox that another sandbox started has one"
+                },
             );
         };
         if write && scope == Scope::Parent {
             return Response::new(Status::Denied, "the parent scope is read-only");
+        }
+        if write && scope == Scope::Project && !self.project_writable() {
+            return Response::new(
+                Status::Denied,
+                "a sandbox that another sandbox started cannot write the project scope: write to the tree scope, and the sandbox that started you decides what the project keeps ([kv] child_project_write in the user configuration)",
+            );
         }
         // Check the whole request before the user is asked anything.
         if let Err(e) = self.check(req) {
@@ -598,6 +714,22 @@ impl Service {
             Ok(s) => s,
             Err(e) => return Response::new(Status::Failed, format!("{e:#}")),
         };
+        // The tree ends with its root. Its data stays for review, read-only.
+        if write && scope == Scope::Tree {
+            let root = self.id.tree.as_deref().unwrap_or_default();
+            match st.ended(root) {
+                Ok(Some(false)) => {}
+                Ok(_) => {
+                    return Response::new(
+                        Status::Denied,
+                        format!(
+                            "the spawn tree of sandbox {root} ended; its tree scope is read-only"
+                        ),
+                    )
+                }
+                Err(e) => return Response::new(Status::Failed, format!("{e:#}")),
+            }
+        }
         let r = self.run(&mut st, req, scope, &ns, conn);
         r.unwrap_or_else(|e| Response::new(Status::Failed, format!("{e:#}")))
     }
@@ -854,8 +986,8 @@ impl Service {
         }
     }
 
-    /// Free the lease `lease:<name>`. Only its owner can, or with `force`
-    /// the parent of the owner. A sibling cannot.
+    /// Free the lease `lease:<name>`. Only its owner can, or with `force` a
+    /// sandbox above the owner in its spawn tree. A sibling cannot.
     fn release(
         &self,
         st: &mut Store,
@@ -870,12 +1002,12 @@ impl Service {
             return Ok(Response::new(Status::NotFound, format!("no lease {key:?}")));
         };
         if e.writer != self.id.sandbox {
-            let parent = st.parent_of(&e.writer)?;
-            if !force || parent.as_deref() != Some(self.id.sandbox.as_str()) {
+            let above = st.ancestors(&e.writer)?;
+            if !force || !above.contains(&self.id.sandbox) {
                 return Ok(Response {
                     status: Status::Denied,
                     message: format!(
-                        "sandbox {} holds the lease; only it, its parent with --force, or the user on the host can release it",
+                        "sandbox {} holds the lease; only it, a sandbox above it with --force, or the user on the host can release it",
                         e.writer
                     ),
                     result: serde_json::json!({ "lease": key, "owner": e.writer, "expires": e.expires }),
@@ -1085,7 +1217,7 @@ pub fn start(
     spec: &mut crate::spec::SandboxSpec,
     project: PathBuf,
     approver: Arc<dyn Approver>,
-    parent: Option<String>,
+    lineage: Lineage,
 ) -> Option<Served> {
     let cfg = match KvCfg::load(env) {
         Ok(c) => c,
@@ -1101,10 +1233,12 @@ pub fn start(
         .map(|p| p.wait)
         .unwrap_or(120);
     let id = Identity {
+        tree: lineage.tree_root(&spec.id),
         sandbox: spec.id.clone(),
         harness: spec.harness.clone(),
         project,
-        parent,
+        parent: lineage.parent,
+        chain: lineage.chain,
     };
     let svc = Service::new(env.clone(), id, cfg, approver, Duration::from_secs(wait));
     let sock = env.paddock_run().join(&spec.id).join("kv.sock");
@@ -1123,7 +1257,8 @@ pub fn start(
 /// What `paddock gc` can remove from the store.
 #[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
 pub struct GcPlan {
-    /// Finished runs whose `self` data is older than `keep_days`.
+    /// Finished runs whose `self` data, or whose `tree` scope as a root, is
+    /// older than `keep_days`.
     pub stale: Vec<store::Stale>,
     pub expired_entries: u64,
     pub expired_bytes: u64,
@@ -1166,7 +1301,7 @@ pub fn gc_items(env: &HostEnv, now: u64) -> Result<Vec<crate::storage::Item>> {
         tier: crate::storage::Tier::Auto,
         bytes: plan.stale.iter().map(|s| s.bytes).sum::<u64>() + plan.expired_bytes,
         reason: format!(
-            "the self scope of runs that ended more than {days} days ago ([kv] keep_days), and keys whose time to live passed"
+            "the self scope of runs, and the tree scope of spawn trees, that ended more than {days} days ago ([kv] keep_days), and keys whose time to live passed"
         ),
         warning: None,
         needs: vec![],

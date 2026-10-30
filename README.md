@@ -495,7 +495,7 @@ paddock-host wait <id> --timeout 600
 paddock-host kill <id>
 ```
 
-The child runs the harness once, without a terminal (`claude -p`, `codex exec`, `opencode run`, `copilot -p`, `agy --print` or `grok --prompt-file`), and stops when the task is done. It works in a new worktree on the branch `paddock/spawn-<harness>-<id>`, from the commit that the parent has checked out. The worktree uses the same repository, so the child's commits are in the parent's repository at once. `wait` and `status` give the branch name and the exit status. The parent reads the branch with git, for example `git diff main...paddock/spawn-codex-<id>`, and merges what it wants. paddock also writes a short summary to `.paddock/inbox/spawn-<id>/`: `result.json` with the state, the exit code, the branch, the commit count and a diff summary, and `output.txt` with the end of the child's final output.
+The child runs the harness once, without a terminal (`claude -p`, `codex exec`, `opencode run`, `copilot -p`, `agy --print` or `grok --prompt-file`), and stops when the task is done. It works in a new worktree on the branch `paddock/spawn-<harness>-<id>`, from the commit that the parent has checked out. The worktree uses the same repository, so the child's commits are in the parent's repository at once. `wait` and `status` give the branch name and the exit status. The parent reads the branch with git, for example `git diff main...paddock/spawn-codex-<id>`, and merges what it wants. paddock also writes a short summary to `.paddock/inbox/spawn-<id>/`: `result.json` with the state, the exit code, the branch, the commit count and a diff summary, and `output.txt` with the end of the child's final output. When the child ends, paddock also writes `result:<id>` into the `tree` scope of [paddock kv](#shared-state-paddock-kv), with `status`, `summary` and `ref` (the branch). So the parent can run `paddock-host kv watch --prefix result: --scope tree` instead of polling several children.
 
 With `--from-head`, the child starts from the parent's files as they are now. paddock first makes a commit of them, with uncommitted and new files but without ignored ones. It uses a private index file, so the parent's files, index and branches do not change. The host git call is the hardened one that paddock uses for worktrees: it refuses a repository configuration that can start a program.
 
@@ -527,7 +527,7 @@ timeout = 1800           # seconds that one child may run in total
 
 These rules always hold:
 
-- A child never gets more than its parent. It gets the same backend, network mode, LAN setting and approved mounts, and the same project. Its environment is clean. It gets no display. Its host capability modes are at most those of the parent. paddock uses the settings that the parent had when it started, so a change to `paddock.toml` during the run does not reach the child.
+- A child never gets more than its parent. It gets the same backend, network mode, LAN setting and approved mounts, and the same project. Its environment is clean. It gets no display. Its host capability modes are at most those of the parent. Its `/dev/paddock` has at most the devices of the parent. In paddock kv it writes only its own scope and the `tree` scope. paddock uses the settings that the parent had when it started, so a change to `paddock.toml` during the run does not reach the child.
 - No credentials move between sandboxes. The child uses its own login of its harness, in its own sandbox home. The parent never sees it. The parent gets only the results.
 - The first spawn of each harness in a session asks you. The card shows the harness, the role, the login it uses, the limits and the task. "Allow for this session" covers only that harness in that role.
 - Requests from a child, for example `git-push` or `exec`, show "Started by sandbox X" on the card. An "Allow for this session" answer for the parent does not apply to the child, and an answer for the child does not apply to the parent. Otherwise a sandbox could avoid a question by giving the work to a child.
@@ -550,20 +550,39 @@ paddock-host kv claim review --ttl 600 --scope project
 paddock-host kv watch --prefix result: --scope project --timeout 300
 ```
 
+In a spawn tree, the parent writes the tasks into the `tree` scope, each child claims one with a lease and writes its result, and the parent waits for `result:`:
+
+```sh
+# parent
+paddock-host kv put task:parser '{"title":"fix the parser","status":"todo"}' --scope tree
+paddock-host spawn codex --prompt-file task.md
+paddock-host kv watch --prefix result: --scope tree --timeout 600
+# each child
+paddock-host kv claim parser --ttl 600 --scope tree    # exit code 9: a sibling has it
+paddock-host kv put result:parser '{"status":"done","ref":"paddock/spawn-codex-ID"}' --scope tree
+```
+
 Each key belongs to a scope:
 
 | Scope | Who reads and writes it | Default |
 | :--- | :--- | :--- |
 | `self` | This sandbox only | on |
 | `project` | Every sandbox of the same project. Each entry records the sandbox that wrote it. | on |
-| `parent` | Read-only: the `self` scope of the sandbox that started this one | empty until sandboxes can start sandboxes |
+| `parent` | Read-only: the `self` scope of the sandbox that started this one with `spawn` | only in a spawned sandbox |
+| `tree` | The sandbox that you started and every sandbox that it started with `spawn`, and theirs. Each entry records its writer. | on as soon as a sandbox can use `spawn` |
 | `user` | Every sandbox of every project | asks you at the first use |
 
 An agent with a prompt injection can write a false tip into the `project` scope, and the next agent reads it. So paddock records the writer of every entry, and the client marks what another sandbox wrote as untrusted.
 
-A write can depend on the current version of a key (`--if-version`). A key can expire (`--ttl`). `mget` and `mset` read and write several keys at once. `history` shows the last versions of a key. `watch` waits for a change of one key or of a prefix. A lease (`claim NAME --ttl SECONDS`) makes sure that only one agent does a task. paddock sets the owner of a lease from the socket. Only the owner releases it, or the parent of the owner with `--force`, or you on the host. A lease expires at the end of its time. Keep values small: put diffs, files and logs in a git branch or a file, and store the reference. `paddock-host kv --help` in the sandbox lists the key names that agents share: `task:`, `lease:`, `result:`, `heartbeat:` and `note:`.
+A spawned sandbox never gets more than its parent here either:
 
-On the host, `paddock kv list`, `paddock kv get KEY`, `paddock kv delete KEY` and `paddock kv release NAME` read the project scope of the current folder. `--user` and `--sandbox ID` choose another scope.
+- It writes its own `self` scope and `tree`. It reads `project`, but does not write it, so that what a child picks up stays in the tree until its parent decides what the project keeps. `child_project_write = true` in `[kv]` changes that.
+- For `user`, it inherits "Allow for this session" from the sandboxes above it. Without that, it is refused, and it never asks you itself: one prompt injection must not turn into many questions. Use the scope in the root sandbox first, or set `[kv] user = "allow"`.
+- The `tree` scope belongs to the root of the tree: the sandbox that you started. When the root ends, its children stop and the tree is read-only. The data stays for you to review (`paddock kv list --tree ROOT-ID`) until `paddock gc` removes it with the root's `self` data.
+
+A write can depend on the current version of a key (`--if-version`). A key can expire (`--ttl`). `mget` and `mset` read and write several keys at once. `history` shows the last versions of a key. `watch` waits for a change of one key or of a prefix. A lease (`claim NAME --ttl SECONDS`) makes sure that only one agent does a task. paddock sets the owner of a lease from the socket. Only the owner releases it, or with `--force` a sandbox above the owner in its spawn tree (its parent, or the parent of that one), or you on the host. A sibling cannot. A lease expires at the end of its time. Keep values small: put diffs, files and logs in a git branch or a file, and store the reference. `paddock-host kv --help` in the sandbox lists the key names that agents share: `task:`, `lease:`, `result:`, `heartbeat:` and `note:`.
+
+On the host, `paddock kv list`, `paddock kv get KEY`, `paddock kv delete KEY` and `paddock kv release NAME` read the project scope of the current folder. `--user`, `--sandbox ID` and `--tree ROOT-ID` choose another scope.
 
 The limits and the `user` scope are in `~/.config/paddock/config.toml`. A project `paddock.toml` cannot change them.
 
@@ -573,11 +592,12 @@ user = "ask"           # ask | allow | deny
 max_value = 65536      # bytes per value
 self_bytes = 4194304   # bytes per scope; also project_bytes and user_bytes
 max_keys = 4096        # keys per scope
-keep_days = 30         # paddock gc removes the self scope of a run this many days after it ended
+keep_days = 30         # paddock gc removes the self scope of a run, and the tree of a root, this many days after it ended
+child_project_write = false   # true: spawned sandboxes can write the project scope too
 enabled = true
 ```
 
-`paddock gc` removes the `self` data of runs that ended more than `keep_days` ago, and keys whose time to live passed. The audit log `~/.local/state/paddock/kv-audit.jsonl` records each write with its key name and size. It never records a value.
+`paddock gc` removes the `self` data of runs, and the `tree` scope of spawn trees whose root ended, more than `keep_days` ago, and keys whose time to live passed. The audit log `~/.local/state/paddock/kv-audit.jsonl` records each write with its key name and size. It never records a value.
 
 ## Devices: /dev/paddock
 

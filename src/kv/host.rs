@@ -13,6 +13,8 @@ pub enum Target {
     Project(PathBuf),
     User,
     Sandbox(String),
+    /// The tree scope of a spawn tree, by the id of its root sandbox.
+    Tree(String),
 }
 
 impl Target {
@@ -21,6 +23,7 @@ impl Target {
             Target::Project(p) => store::ns_project(p),
             Target::User => store::NS_USER.into(),
             Target::Sandbox(id) => store::ns_self(id),
+            Target::Tree(root) => store::ns_tree(root),
         }
     }
     fn label(&self) -> String {
@@ -28,6 +31,7 @@ impl Target {
             Target::Project(p) => format!("project {}", p.display()),
             Target::User => "user scope".into(),
             Target::Sandbox(id) => format!("sandbox {id}"),
+            Target::Tree(root) => format!("spawn tree of sandbox {root}"),
         }
     }
 }
@@ -119,7 +123,7 @@ pub fn delete(env: &HostEnv, t: &Target, key: &str) -> Result<i32> {
 }
 
 /// Free a lease whatever sandbox holds it. Only the user can do this for
-/// any lease; inside, only the owner and its parent can.
+/// any lease; inside, only the owner and the sandboxes above it can.
 pub fn release(env: &HostEnv, t: &Target, name: &str) -> Result<i32> {
     let key = format!("{LEASE_PREFIX}{name}");
     let mut st = open(env)?;

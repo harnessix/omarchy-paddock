@@ -227,6 +227,8 @@ if command -v paddock-host >/dev/null 2>&1 && [ -n "$PADDOCK_KV_SOCKET" ]; then
   KV="paddock-host kv"
   if $KV put probe/identity x >/dev/null 2>&1 && [ "$($KV get probe/identity 2>/dev/null)" = x ]; then ok kv-self-round-trip; else fail kv-self-round-trip "put and get in the self scope failed"; fi
   if $KV get canary 2>/dev/null | grep -q paddock-kv-canary; then fail kv-other-self-hidden "read the self scope of another sandbox"; else ok kv-other-self-hidden; fi
+  # The tree scope is that of this sandbox's own spawn tree, or none.
+  if $KV get canary --scope tree 2>/dev/null | grep -q paddock-kv-canary; then fail kv-other-tree-hidden "read the tree scope of another spawn tree"; else ok kv-other-tree-hidden; fi
   out=$($KV raw "{\"v\":1,\"op\":\"get\",\"key\":\"canary\",\"sandbox\":\"$PADDOCK_PROBE_KV_OTHER\"}" 2>/dev/null)
   out2=$($KV raw "{\"v\":1,\"op\":\"get\",\"scope\":\"self:$PADDOCK_PROBE_KV_OTHER\",\"key\":\"canary\"}" 2>/dev/null)
   case "$out$out2" in
