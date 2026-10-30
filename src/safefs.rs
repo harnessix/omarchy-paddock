@@ -468,6 +468,15 @@ impl Dir {
         &self.path
     }
 
+    /// Where this open folder really is now, from the kernel, not from the
+    /// path that was walked.
+    pub fn real_path(&self) -> Result<PathBuf> {
+        Ok(std::fs::read_link(format!(
+            "/proc/self/fd/{}",
+            self.fd.as_raw_fd()
+        ))?)
+    }
+
     /// Read a regular file. None when it does not exist. A symlink, a folder
     /// or a special file is an error; a FIFO or a device is never opened.
     pub fn read(&self, name: &OsStr, max: u64) -> Result<Option<Vec<u8>>> {
