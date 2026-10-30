@@ -5,7 +5,7 @@
 use crate::env::HostEnv;
 use crate::manifest::Manifest;
 use crate::spec::{Mount, SandboxSpec};
-use anyhow::{Context as _, Result};
+use anyhow::{bail, Context as _, Result};
 use std::path::{Path, PathBuf};
 
 pub struct Context<'a> {
@@ -48,17 +48,29 @@ pub fn git_toplevel(dir: &Path) -> Option<PathBuf> {
 pub struct Git;
 
 impl Git {
-    /// Make a file exist, so a read-only bind can cover it. Without the file
-    /// the sandbox can create it later and point git at its own content.
-    /// False means the host cannot create it; then nothing is bound there.
-    fn placeholder(path: &Path, content: &str) -> bool {
-        if path.is_file() {
-            return true;
+    /// Make a file of a git directory exist, so a read-only bind can cover
+    /// it. Without the file the sandbox can create it later and point git at
+    /// its own content. The git directory is sandbox-writable, so the path is
+    /// walked without following a symlink, and an existing file is never
+    /// replaced. A symlink or a special file in its place is an error: a bind
+    /// of it would follow it on the host.
+    fn placeholder(git_dir: &Path, rel: &str, content: &str) -> Result<()> {
+        use crate::safefs::Kind;
+        let root = crate::safefs::Root::open(git_dir)?;
+        let (parent, name) = match rel.rsplit_once('/') {
+            Some((p, n)) => (Path::new(p), n),
+            None => (Path::new(""), rel),
+        };
+        let dir = root.dir(parent, true)?;
+        match dir.kind(name.as_ref())? {
+            Some(Kind::File) => Ok(()),
+            Some(other) => bail!(
+                "{} is a {:?}, not a file. paddock does not bind it, because git on the host reads it.",
+                git_dir.join(rel).display(),
+                other
+            ),
+            None => dir.write(name.as_ref(), content.as_bytes(), 0o644),
         }
-        if path.exists() || !path.parent().is_some_and(|p| p.is_dir()) {
-            return false;
-        }
-        std::fs::write(path, content).is_ok()
     }
 }
 
@@ -104,10 +116,10 @@ impl Detector for Git {
                     "detector git: a git directory is its own mount point",
                 ));
             }
+            // The hooks folder: created without following a symlink, so a
+            // read-only bind of it cannot land anywhere else.
             let hooks = dir.join("hooks");
-            if !hooks.exists() {
-                std::fs::create_dir_all(&hooks)?;
-            }
+            crate::safefs::Root::open(&dir)?.dir(Path::new("hooks"), true)?;
             spec.add_mount(Mount::same(
                 &hooks,
                 false,
@@ -135,16 +147,12 @@ impl Detector for Git {
                 } else {
                     ""
                 };
-                if *f == "objects/info/alternates" && !p.exists() {
-                    let _ = std::fs::create_dir_all(dir.join("objects/info"));
-                }
-                if Self::placeholder(&p, content) {
-                    spec.add_mount(Mount::same(
-                        &p,
-                        false,
-                        "detector git: config and pointer files steer host git",
-                    ));
-                }
+                Self::placeholder(&dir, f, content)?;
+                spec.add_mount(Mount::same(
+                    &p,
+                    false,
+                    "detector git: config and pointer files steer host git",
+                ));
             }
         }
         Ok(())
