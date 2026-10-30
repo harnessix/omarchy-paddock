@@ -31,7 +31,7 @@ paddock supports Omarchy (Arch Linux with Hyprland). Other distributions are bes
 `omarchy plugin add` installs only the bar widget. The `paddock` command is a separate install: the prebuilt binary from the latest GitHub release (see the README), or `bin/install` from a clone.
 
 ```sh
-git clone https://github.com/harnessix/omarchy-paddock
+git clone --branch v0.1.7 https://github.com/harnessix/omarchy-paddock   # the latest release
 cd omarchy-paddock
 bin/install                     # system packages, build, then paddock doctor
 ```
@@ -55,7 +55,7 @@ With `--yes`, `paddock setup` prints the package install command and never runs 
 paddock update --check          # is there a newer release, and what would an update do
 ```
 
-Ask the user before you run `paddock update --yes`: it replaces the paddock binary and updates the bar widget. If a pacman package owns the binary, `paddock update` refuses and prints what to run instead (pull the clone and run `bin/install` again). `paddock doctor` also says when a newer release exists.
+Ask the user before you run `paddock update --yes`: it replaces the paddock binary and updates the bar widget. If a pacman package owns the binary, `paddock update` refuses and prints what to run instead (check out the new release tag in the clone and run `bin/install` again). `paddock doctor` also says when a newer release exists.
 
 ## Check
 
