@@ -25,6 +25,10 @@ pub struct Profile {
     pub network: ProfileNetwork,
     #[serde(default)]
     pub mcp: Vec<McpSource>,
+    /// Vendor telemetry switches that paddock turns off inside the sandbox,
+    /// and where the user turns off the use of their data for training.
+    #[serde(default)]
+    pub privacy: Privacy,
     /// Profile entries that come from documentation, not from a test on a
     /// real install. `paddock doctor` lists them.
     #[serde(default)]
@@ -189,6 +193,49 @@ pub struct ProfileNetwork {
     pub endpoints: Vec<String>,
 }
 
+/// The privacy defaults of a harness (see privacy.rs). Each entry must come
+/// from the vendor's documentation, with the link in a comment next to it.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Privacy {
+    /// Environment variables that turn telemetry, usage statistics or crash
+    /// reports off.
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
+    /// Arguments that turn telemetry off, passed after `yolo_args`.
+    #[serde(default)]
+    pub args: Vec<String>,
+    /// Values written into settings files in the sandbox home at each start,
+    /// after `seed`. The host files are never changed.
+    #[serde(default)]
+    pub settings: Vec<Setting>,
+    /// Data use for training is an account setting that no program can
+    /// change: where the user turns it off.
+    pub training: Option<Training>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Setting {
+    /// File relative to HOME.
+    pub file: String,
+    /// json or toml.
+    #[serde(default = "default_json")]
+    pub format: String,
+    /// Key path. `{project}` is the project path.
+    pub path: Vec<String>,
+    pub value: toml::Value,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Training {
+    /// Where the setting is, in plain words.
+    pub setting: String,
+    /// The official page with the setting, or the documentation about it.
+    pub url: String,
+}
+
 const BUILTIN: &[(&str, &str)] = &[
     ("agy", include_str!("../profiles/agy.toml")),
     (
@@ -204,8 +251,17 @@ const BUILTIN: &[(&str, &str)] = &[
     ("codex", include_str!("../profiles/codex.toml")),
     ("copilot", include_str!("../profiles/copilot.toml")),
     ("gemini", include_str!("../profiles/gemini.toml")),
+    ("grok", include_str!("../profiles/grok.toml")),
     ("opencode", include_str!("../profiles/opencode.toml")),
 ];
+
+/// A built-in profile by name.
+pub fn builtin(name: &str) -> Option<Profile> {
+    BUILTIN
+        .iter()
+        .find(|(n, _)| *n == name)
+        .and_then(|(_, text)| toml::from_str(text).ok())
+}
 
 /// A harness that the factory located on this host.
 #[derive(Debug, Clone)]
@@ -454,6 +510,31 @@ mod tests {
             // Desktop apps keep their approval setting in their own settings.
             if p.app.is_none() {
                 assert!(!p.launch.yolo_args.is_empty(), "{name} has no yolo_args");
+            }
+        }
+    }
+
+    #[test]
+    fn builtin_privacy_entries_are_well_formed() {
+        for (name, text) in BUILTIN {
+            let p: Profile = toml::from_str(text).unwrap();
+            let t = p.privacy.training.as_ref();
+            assert!(t.is_some(), "{name} has no privacy.training note");
+            assert!(t.unwrap().url.starts_with("https://"), "{name}");
+            for s in &p.privacy.settings {
+                assert!(
+                    s.format == "json" || s.format == "toml",
+                    "{name}: {}",
+                    s.file
+                );
+                assert!(!s.path.is_empty(), "{name}: {}", s.file);
+                let rel = Path::new(&s.file);
+                assert!(
+                    rel.is_relative()
+                        && rel.components().all(|c| matches!(c, Component::Normal(_))),
+                    "{name}: {} must stay inside the sandbox home",
+                    s.file
+                );
             }
         }
     }

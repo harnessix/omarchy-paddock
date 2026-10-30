@@ -197,6 +197,9 @@ pub fn run(
         &spec.home_src,
         &spec.project,
     )?;
+    for w in crate::privacy::write_settings(&spec.home_src, &spec.home_settings)? {
+        log::warn!("{w}");
+    }
     let auth = AuthSync::copy_in(env, &built.profile, &built.auth, &spec.home_src)?;
     state::write_gitconfig(env, &spec.home_src, repo.as_ref())?;
     let watched = state::snapshot(&spec.watch);

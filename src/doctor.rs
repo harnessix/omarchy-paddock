@@ -232,6 +232,19 @@ pub fn report(env: &HostEnv) -> Result<bool> {
         }
     }
 
+    println!("\nPrivacy:");
+    println!(
+        "  {}",
+        crate::privacy::telemetry_line(crate::privacy::user_mode(env))
+    );
+    let notes = crate::privacy::training_notes(env)?;
+    if !notes.is_empty() {
+        println!("  Use of your data for training is an account setting. Turn it off here:");
+    }
+    for n in &notes {
+        println!("  {:<16} {}: {}", n.harness, n.setting, n.url);
+    }
+
     println!("\nShell commands:");
     if crate::shims::installed(env) {
         let cmds = crate::shims::active(env);

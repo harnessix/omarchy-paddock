@@ -13,3 +13,35 @@ display_name = "Visual Studio Code"
 icon = "visual-studio-code"
 schemes = ["vscode"]
 open_roots = true
+
+# Usage data, error telemetry and crash reports off. Experiments stop with
+# them, and the second setting turns them off on its own. Extensions keep
+# their own telemetry settings. Code - OSS builds use the second folder.
+# https://code.visualstudio.com/docs/configure/telemetry
+# https://code.visualstudio.com/docs/supporting/FAQ
+[[privacy.settings]]
+file = ".config/Code/User/settings.json"
+path = ["telemetry.telemetryLevel"]
+value = "off"
+
+[[privacy.settings]]
+file = ".config/Code/User/settings.json"
+path = ["workbench.enableExperiments"]
+value = false
+
+[[privacy.settings]]
+file = ".config/Code - OSS/User/settings.json"
+path = ["telemetry.telemetryLevel"]
+value = "off"
+
+[[privacy.settings]]
+file = ".config/Code - OSS/User/settings.json"
+path = ["workbench.enableExperiments"]
+value = false
+
+# VS Code itself trains no model. GitHub Copilot in VS Code follows the
+# GitHub account setting.
+# https://docs.github.com/en/copilot/how-tos/manage-your-account/manage-policies
+[privacy.training]
+setting = "for GitHub Copilot: GitHub Settings, Copilot, Allow GitHub to use my data for AI model training"
+url = "https://github.com/settings/copilot"

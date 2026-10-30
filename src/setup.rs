@@ -435,6 +435,25 @@ fn apps_step(
     Ok(())
 }
 
+/// Privacy: shows the telemetry mode and where to turn off training. It
+/// changes nothing: training is an account setting on the vendor's site.
+fn privacy_step(env: &HostEnv) -> Result<()> {
+    println!("\n7. Privacy");
+    println!(
+        "   {}",
+        crate::privacy::telemetry_line(crate::privacy::user_mode(env))
+    );
+    let notes = crate::privacy::training_notes(env)?;
+    if notes.is_empty() {
+        return Ok(());
+    }
+    println!("   Use of your data for training is an account setting. Turn it off here:");
+    for n in &notes {
+        println!("   {:<16} {}: {}", n.harness, n.setting, n.url);
+    }
+    Ok(())
+}
+
 /// Run the wizard. `ask` is None for `--yes` and without a terminal.
 pub fn run(env: &HostEnv, o: &Opts, mut ask: Option<&mut dyn Ask>) -> Result<Outcome> {
     update::refuse_in_sandbox(env, "paddock setup")?;
@@ -450,6 +469,7 @@ pub fn run(env: &HostEnv, o: &Opts, mut ask: Option<&mut dyn Ask>) -> Result<Out
     plugin_step(env, o, &mut ask, &mut out)?;
     backend_step(env, o, &mut ask, &mut out)?;
     apps_step(env, o, &mut ask, &mut out)?;
+    privacy_step(env)?;
     println!();
     if out.changes.is_empty() {
         println!("Nothing changed.");

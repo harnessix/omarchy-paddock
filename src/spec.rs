@@ -103,6 +103,19 @@ pub struct EnvVar {
     pub secret: bool,
 }
 
+/// A value that paddock writes into a settings file in the sandbox home at
+/// each start (privacy.rs). The host file is never changed.
+#[derive(Debug, Clone, Serialize)]
+pub struct HomeSetting {
+    /// Relative to the sandbox home.
+    pub file: PathBuf,
+    /// json or toml.
+    pub format: String,
+    pub path: Vec<String>,
+    pub value: serde_json::Value,
+    pub origin: String,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct HostTool {
     pub name: String,
@@ -253,6 +266,8 @@ pub struct SandboxSpec {
     pub inherit_path: Vec<PathBuf>,
     /// Files generated for this run (passwd, group). Backends bind them read-only.
     pub generated: Vec<(PathBuf, PathBuf)>,
+    /// Values written into settings files in the sandbox home before the start.
+    pub home_settings: Vec<HomeSetting>,
 }
 
 impl SandboxSpec {
@@ -301,6 +316,7 @@ impl SandboxSpec {
             notices: Vec::new(),
             inherit_path: Vec::new(),
             generated: Vec::new(),
+            home_settings: Vec::new(),
         }
     }
 

@@ -49,6 +49,18 @@ pub struct Manifest {
     /// configuration only; a project file cannot set them.
     #[serde(default, skip_serializing)]
     pub recovery: Option<toml::Value>,
+    /// Vendor telemetry inside the sandbox. Read from the user configuration
+    /// only; a project file cannot change it.
+    #[serde(default)]
+    pub privacy: PrivacyCfg,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PrivacyCfg {
+    /// off (default): paddock turns vendor telemetry off in every sandbox.
+    /// vendor: the harness's own default applies.
+    pub telemetry: Option<crate::privacy::Telemetry>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -232,9 +244,16 @@ impl Manifest {
     }
 
     fn merge(&mut self, o: Manifest) {
-        // [host] and [apps] are trusted only from the user configuration.
-        if o.host.is_some() || !o.apps.is_empty() || o.recovery.is_some() {
-            log::warn!("[host], [apps] and [recovery] in a project paddock.toml are ignored");
+        // [host], [apps], [recovery] and [privacy] are trusted only from the
+        // user configuration.
+        if o.host.is_some()
+            || !o.apps.is_empty()
+            || o.recovery.is_some()
+            || o.privacy.telemetry.is_some()
+        {
+            log::warn!(
+                "[host], [apps], [recovery] and [privacy] in a project paddock.toml are ignored"
+            );
         }
         if o.default_harness.is_some() {
             self.default_harness = o.default_harness;

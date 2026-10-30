@@ -76,7 +76,14 @@ fn short_label(description: &str, name: &str) -> String {
     if d.is_empty() {
         return name.to_string();
     }
-    for vendor in ["Anthropic ", "OpenAI ", "Google ", "GitHub ", "Microsoft "] {
+    for vendor in [
+        "Anthropic ",
+        "OpenAI ",
+        "Google ",
+        "GitHub ",
+        "Microsoft ",
+        "xAI ",
+    ] {
         if let Some(rest) = d.strip_prefix(vendor) {
             if !rest.is_empty() {
                 return rest.to_string();
@@ -407,6 +414,7 @@ mod tests {
             short_label("Google Antigravity CLI", "agy"),
             "Antigravity CLI"
         );
+        assert_eq!(short_label("xAI Grok Build", "grok"), "Grok Build");
         assert_eq!(short_label("opencode", "opencode"), "opencode");
         assert_eq!(short_label("", "x"), "x");
     }

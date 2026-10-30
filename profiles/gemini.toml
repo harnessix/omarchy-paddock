@@ -32,3 +32,20 @@ path = ["mcpServers"]
 
 [network]
 endpoints = ["generativelanguage.googleapis.com", "oauth2.googleapis.com", "cloudcode-pa.googleapis.com"]
+
+# Usage statistics off in the sandbox copy of settings.json. Telemetry is off
+# by default, and the variable keeps it off.
+# https://github.com/google-gemini/gemini-cli/blob/main/docs/reference/configuration.md
+[privacy]
+env = { GEMINI_TELEMETRY_ENABLED = "false" }
+
+[[privacy.settings]]
+file = ".gemini/settings.json"
+path = ["privacy", "usageStatisticsEnabled"]
+value = false
+
+# The terms depend on how you sign in.
+# https://github.com/google-gemini/gemini-cli/blob/main/docs/resources/tos-privacy.md
+[privacy.training]
+setting = "the privacy notice of your sign-in method"
+url = "https://developers.google.com/gemini-code-assist/resources/privacy-notices"
