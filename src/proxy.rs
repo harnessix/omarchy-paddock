@@ -634,7 +634,7 @@ fn handle(cfg: &HostProxy, mut client: UnixStream) -> Result<()> {
 pub fn serve(socket: &Path, cfg: HostProxy) -> Result<()> {
     let _ = std::fs::remove_file(socket);
     if let Some(d) = socket.parent() {
-        std::fs::create_dir_all(d)?;
+        crate::privfs::dir(d)?;
     }
     let listener = UnixListener::bind(socket)
         .with_context(|| format!("cannot listen on {}", socket.display()))?;

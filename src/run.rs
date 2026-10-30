@@ -67,8 +67,7 @@ pub fn probe_flags(env: &HostEnv, built: &Built) -> Result<()> {
             env.paddock_config().join("harness.d").display()
         );
     }
-    std::fs::create_dir_all(cache.parent().unwrap())?;
-    std::fs::write(cache, "ok")?;
+    crate::privfs::write(&cache, "ok")?;
     Ok(())
 }
 
@@ -165,7 +164,7 @@ pub fn run(
         built.spec.mise_shared_spec(scratch.clone())
     };
     if let Some(p) = shared {
-        std::fs::create_dir_all(&scratch)?;
+        crate::privfs::dir(&scratch)?;
         let what = built.spec.mise_shared.join(" ");
         let result = provision(env, backend, &p, quiet, &format!("shared tools: {what}"));
         let _ = std::fs::remove_dir_all(&scratch);
@@ -417,7 +416,7 @@ fn start_broker(
     interactive: bool,
 ) -> Result<Option<crate::broker::git::Repo>> {
     let run_dir = env.paddock_run().join(&built.spec.id);
-    std::fs::create_dir_all(&run_dir)?;
+    crate::privfs::dir(&run_dir)?;
     let sock = run_dir.join("host.sock");
     let policy = crate::broker::HostPolicy::load(env)?;
     let human: std::sync::Arc<dyn crate::broker::Approver> =

@@ -241,9 +241,8 @@ impl Session {
 
     fn save(&self, env: &HostEnv) -> Result<()> {
         let dir = sessions_dir(env);
-        std::fs::create_dir_all(&dir)?;
-        std::fs::write(
-            dir.join(format!("{}.json", self.id)),
+        crate::privfs::write(
+            &dir.join(format!("{}.json", self.id)),
             serde_json::to_string(self)?,
         )?;
         Ok(())

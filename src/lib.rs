@@ -21,6 +21,7 @@ pub mod mcp;
 pub mod mise;
 pub mod policy;
 pub mod portal;
+pub mod privfs;
 pub mod profile;
 pub mod proxy;
 pub mod recover;

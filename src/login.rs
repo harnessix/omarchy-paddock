@@ -128,7 +128,7 @@ pub fn prepare(
         return Ok(None);
     }
     let inbound = run.join("inbound");
-    std::fs::create_dir_all(&inbound)?;
+    crate::privfs::dir(&inbound)?;
     if !spec
         .mounts
         .iter()

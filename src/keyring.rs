@@ -22,6 +22,7 @@ use crate::spec::{GuiMode, SandboxSpec};
 use anyhow::Result;
 use sha2::{Digest, Sha256};
 use std::io::Read;
+#[cfg(test)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 
@@ -123,13 +124,8 @@ pub fn password(env: &HostEnv, home_src: &std::path::Path) -> Result<String> {
     let mut bytes = [0u8; 32];
     std::fs::File::open("/dev/urandom")?.read_exact(&mut bytes)?;
     let pw = hex(&bytes);
-    std::fs::create_dir_all(file.parent().unwrap())?;
-    std::fs::set_permissions(
-        file.parent().unwrap(),
-        std::fs::Permissions::from_mode(0o700),
-    )?;
-    std::fs::write(&file, &pw)?;
-    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600))?;
+    // 0600 from the start: no moment where another user can read it.
+    crate::privfs::write(&file, &pw)?;
     Ok(pw)
 }
 
@@ -222,7 +218,9 @@ mod tests {
     fn password_is_stable_per_home_and_private() {
         let tmp = tempfile::tempdir().unwrap();
         let env = HostEnv::from_parts(tmp.path().to_path_buf(), "u".into(), 1, 1, BTreeMap::new());
-        let a = password(&env, std::path::Path::new("/h/a")).unwrap();
+        let a = crate::privfs::tests::with_umask_022(|| {
+            password(&env, std::path::Path::new("/h/a")).unwrap()
+        });
         assert_eq!(a, password(&env, std::path::Path::new("/h/a")).unwrap());
         assert_ne!(a, password(&env, std::path::Path::new("/h/b")).unwrap());
         assert_eq!(a.len(), 64);
@@ -237,5 +235,7 @@ mod tests {
             std::fs::metadata(f).unwrap().permissions().mode() & 0o777,
             0o600
         );
+        assert_eq!(crate::privfs::tests::mode(&dir), 0o700);
+        assert_eq!(crate::privfs::tests::mode(&env.paddock_state()), 0o700);
     }
 }

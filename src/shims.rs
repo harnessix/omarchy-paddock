@@ -111,8 +111,7 @@ pub fn install(env: &HostEnv) -> Result<Report> {
     let paddock = launchers::launcher_exe(env)?;
     let shims = detect(env)?;
     let file = script_file(env);
-    std::fs::create_dir_all(file.parent().unwrap())?;
-    std::fs::write(&file, script(&shims, &paddock))?;
+    crate::privfs::write(&file, script(&shims, &paddock))?;
     let line = rc_line(env);
     let rcs = rc_files(env);
     for rc in &rcs {

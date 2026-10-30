@@ -103,7 +103,7 @@ pub fn create_worktree(env: &HostEnv, repo: &Path, app: Option<&str>) -> Result<
         .join("worktrees")
         .join(state::slug(repo))
         .join(&id);
-    std::fs::create_dir_all(path.parent().unwrap())?;
+    crate::privfs::dir(path.parent().unwrap())?;
     git(
         repo,
         &[

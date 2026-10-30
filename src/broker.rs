@@ -33,6 +33,7 @@ const MAX_OUTPUT: usize = 1024 * 1024;
 
 pub mod forge;
 pub mod git;
+pub mod notify;
 
 /// The capabilities, in the order `paddock-host capabilities` lists them.
 pub const CAPABILITIES: &[(&str, &str)] = &[
@@ -281,7 +282,10 @@ pub fn answer(env: &HostEnv, id: &str, a: Answer) -> Result<()> {
     if a == Answer::Session && !p.session_allowed {
         bail!("this request can only be allowed once");
     }
-    std::fs::write(dir.join(format!("{id}.answer")), serde_json::to_string(&a)?)?;
+    crate::privfs::write(
+        &dir.join(format!("{id}.answer")),
+        serde_json::to_string(&a)?,
+    )?;
     Ok(())
 }
 
@@ -289,11 +293,82 @@ pub fn audit_file(env: &HostEnv) -> PathBuf {
     env.paddock_state().join("host-audit.jsonl")
 }
 
+/// What the audit log keeps about a request. The log lives on disk for a
+/// long time, so it never holds request text that can be private:
+///
+/// - clipboard-write: the length of the text, never the text.
+/// - exec: the program and the number of arguments. Arguments can hold
+///   tokens or passwords (`curl -H "Authorization: ..."`), so they stay out.
+/// - forge: the command line without the body text, and the body length.
+/// - notify: the lengths of the title and the body.
+/// - open-url: the scheme and host. Paths and queries can hold login codes.
+/// - fetch, git-push, screenshot: the paths, remote and refs, as the user saw
+///   them. These name host locations, not private content.
+///
+/// `prepared` is the detail that `prepare` worked out, for the capabilities
+/// where it is safe to keep (fetch and git-push).
+pub fn audit_detail(req: &Request, project: &Path, prepared: Option<&str>) -> String {
+    let chars = |key: &str| arg_str(req, key).map_or(0, |t| t.chars().count());
+    match req.cap.as_str() {
+        "clipboard-write" => format!("set the host clipboard: {} characters", chars("text")),
+        "exec" => {
+            let a = argv(req);
+            let total: usize =
+                a.iter().map(|x| x.chars().count()).sum::<usize>() + a.len().saturating_sub(1);
+            format!(
+                "run on the host: {} with {} arguments ({total} characters; arguments are not logged)",
+                a.first().map(|p| shell_quote(p)).unwrap_or_default(),
+                a.len().saturating_sub(1),
+            )
+        }
+        "forge" => {
+            let tool = arg_str(req, "tool").unwrap_or("gh");
+            let t = forge::tool(tool).unwrap_or(&forge::GH);
+            let (rest, body) = forge::split_body(t, &argv(req));
+            let mut line = std::iter::once(tool.to_string())
+                .chain(rest)
+                .map(|a| shell_quote(&a))
+                .collect::<Vec<_>>()
+                .join(" ");
+            if let Some(b) = body {
+                line.push_str(&format!(" (body: {} characters)", b.chars().count()));
+            }
+            line
+        }
+        "notify" => format!(
+            "show a notification: title {} characters, body {} characters",
+            chars("title"),
+            chars("body")
+        ),
+        "open-url" => {
+            let u = arg_str(req, "url").unwrap_or("");
+            match url::Url::parse(u) {
+                Ok(p) => format!(
+                    "open {}://{} ({} characters)",
+                    p.scheme(),
+                    p.host_str().unwrap_or(""),
+                    u.chars().count()
+                ),
+                Err(_) => format!("open a URL ({} characters)", u.chars().count()),
+            }
+        }
+        "fetch" | "git-push" if prepared.is_some() => prepared.unwrap_or_default().to_string(),
+        "fetch" => format!(
+            "copy {} into the sandbox",
+            arg_str(req, "path").unwrap_or("")
+        ),
+        "git-push" => format!("git push {}", arg_str(req, "remote").unwrap_or("")),
+        "screenshot" | "clipboard-read" => describe(req, project).1,
+        other => other.to_string(),
+    }
+}
+
 fn audit(
     env: &HostEnv,
     ctx: &Context,
     req: &Request,
     detail: &str,
+    request: Option<&str>,
     decision: &str,
     resp: &Response,
 ) {
@@ -303,21 +378,15 @@ fn audit(
         "harness": ctx.harness,
         "project": ctx.project,
         "capability": req.cap,
+        "request": request,
         "detail": detail,
-        "reason": req.reason,
+        "reason": req.reason.chars().take(500).collect::<String>(),
         "decision": decision,
         "status": resp.status,
         "message": resp.message,
     });
     let f = audit_file(env);
-    if let Some(d) = f.parent() {
-        let _ = std::fs::create_dir_all(d);
-    }
-    match std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&f)
-    {
+    match crate::privfs::append(&f) {
         Ok(mut file) => {
             if let Err(e) = writeln!(file, "{line}") {
                 log::warn!("cannot write the audit log {}: {e}", f.display());
@@ -364,16 +433,20 @@ impl Approver for DenyAll {
 
 pub struct HostApprover;
 
+/// Write a pending request for the panel and the CLI: 0600 in a 0700 folder.
+pub fn write_pending(env: &HostEnv, p: &Pending) -> std::io::Result<PathBuf> {
+    let pending = approvals_dir(env).join(format!("{}.json", p.id));
+    crate::privfs::write(&pending, serde_json::to_string(p).unwrap_or_default())?;
+    Ok(pending)
+}
+
 impl Approver for HostApprover {
     fn ask(&self, env: &HostEnv, p: &Pending, wait: Duration) -> Option<Answer> {
-        let dir = approvals_dir(env);
-        let _ = std::fs::create_dir_all(&dir);
-        let pending = dir.join(format!("{}.json", p.id));
-        let answer_file = dir.join(format!("{}.answer", p.id));
-        if std::fs::write(&pending, serde_json::to_string(p).unwrap_or_default()).is_err() {
+        let answer_file = approvals_dir(env).join(format!("{}.answer", p.id));
+        let Ok(pending) = write_pending(env, p) else {
             return None;
-        }
-        notify_with_actions(env, p);
+        };
+        let shown = notify_with_actions(env, p);
         let start = Instant::now();
         let mut got = None;
         while start.elapsed() < wait {
@@ -382,6 +455,10 @@ impl Approver for HostApprover {
                 break;
             }
             std::thread::sleep(Duration::from_millis(200));
+        }
+        // Answered elsewhere or timed out: the buttons mean nothing now.
+        if let Some(h) = shown {
+            h.close();
         }
         let _ = std::fs::remove_file(&pending);
         let _ = std::fs::remove_file(&answer_file);
@@ -405,43 +482,44 @@ pub fn approval_ui_active(env: &HostEnv) -> bool {
         .is_some_and(|t| state::now().saturating_sub(t) < 15)
 }
 
-fn notify_with_actions(env: &HostEnv, p: &Pending) {
-    if approval_ui_active(env) {
-        return;
-    }
-    let Some(ns) = env.which("notify-send") else {
-        return;
-    };
-    let mut args = vec![
-        "--app-name=paddock".to_string(),
-        "--urgency=critical".to_string(),
-        "--wait".to_string(),
-        "--action=once=Allow once".to_string(),
-    ];
+/// The fallback prompt when the bar does not run. The request detail can
+/// hold clipboard text, so it goes over the user's session bus, never into
+/// the arguments of a process, which every local user can read.
+pub fn approval_note(p: &Pending) -> notify::Note {
+    let mut actions = vec![("once".to_string(), "Allow once".to_string())];
     if p.session_allowed {
-        args.push("--action=session=Allow for this session".into());
+        actions.push(("session".into(), "Allow for this session".into()));
     }
-    args.push("--action=deny=Deny".into());
-    args.push(format!("paddock: {} asks for {}", p.harness, p.capability));
-    let body = if p.reason.is_empty() {
-        p.detail.clone()
-    } else {
-        format!("{}\n\nReason: {}", p.detail, p.reason)
-    };
-    args.push(body);
+    actions.push(("deny".into(), "Deny".into()));
+    notify::Note {
+        summary: format!("paddock: {} asks for {}", p.harness, p.capability),
+        body: if p.reason.is_empty() {
+            p.detail.clone()
+        } else {
+            format!("{}\n\nReason: {}", p.detail, p.reason)
+        },
+        actions,
+        critical: true,
+    }
+}
+
+fn notify_with_actions(env: &HostEnv, p: &Pending) -> Option<notify::Handle> {
+    if approval_ui_active(env) {
+        return None;
+    }
     let (env2, id) = (env.clone(), p.id.clone());
-    std::thread::spawn(move || {
-        let out = Command::new(ns)
-            .args(&args)
-            .stdin(Stdio::null())
-            .stderr(Stdio::null())
-            .output();
-        if let Ok(o) = out {
-            if let Ok(a) = String::from_utf8_lossy(&o.stdout).trim().parse::<Answer>() {
-                let _ = answer(&env2, &id, a);
-            }
+    let on_action = move |key: &str| {
+        if let Ok(a) = key.parse::<Answer>() {
+            let _ = answer(&env2, &id, a);
         }
-    });
+    };
+    match notify::ask(env, &approval_note(p), on_action) {
+        Ok(h) => Some(h),
+        Err(e) => {
+            log::debug!("cannot show the approval notification: {e:#}");
+            None
+        }
+    }
 }
 
 fn arg_str<'a>(req: &'a Request, key: &str) -> Option<&'a str> {
@@ -666,11 +744,31 @@ fn inbox(project: &Path) -> Result<crate::safefs::Dir> {
 }
 
 pub fn run_capture(cmd: &mut Command, timeout: Duration) -> Result<(i32, String, String)> {
+    run_capture_input(cmd, timeout, None)
+}
+
+/// Like `run_capture`, with `input` written to the command's stdin.
+pub fn run_capture_input(
+    cmd: &mut Command,
+    timeout: Duration,
+    input: Option<&[u8]>,
+) -> Result<(i32, String, String)> {
     let mut child = cmd
-        .stdin(Stdio::null())
+        .stdin(if input.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()?;
+    if let (Some(data), Some(mut stdin)) = (input, child.stdin.take()) {
+        let data = data.to_vec();
+        // A thread, so a command that does not read cannot block paddock.
+        std::thread::spawn(move || {
+            let _ = stdin.write_all(&data);
+        });
+    }
     let (mut so, mut se) = (child.stdout.take().unwrap(), child.stderr.take().unwrap());
     let t1 = std::thread::spawn(move || {
         let mut b = Vec::new();
@@ -798,16 +896,13 @@ fn perform(env: &HostEnv, ctx: &Context, req: &Request, work: &Work) -> Result<s
             Ok(serde_json::json!({}))
         }
         "notify" => {
-            let ns = env
-                .which("notify-send")
-                .context("notifications need notify-send on the host")?;
-            let title = format!("{}: {}", ctx.harness, arg_str(req, "title").unwrap_or(""));
-            let mut cmd = Command::new(ns);
-            cmd.arg("--app-name=paddock").arg(title);
-            if let Some(b) = arg_str(req, "body") {
-                cmd.arg(b);
-            }
-            run_capture(&mut cmd, Duration::from_secs(5))?;
+            // Over the session bus: the text never shows in a process list.
+            let n = notify::Note {
+                summary: format!("{}: {}", ctx.harness, arg_str(req, "title").unwrap_or("")),
+                body: arg_str(req, "body").unwrap_or("").to_string(),
+                ..Default::default()
+            };
+            notify::show(env, &n).context("cannot show the notification")?;
             Ok(serde_json::json!({}))
         }
         _ => unreachable!(),
@@ -955,13 +1050,17 @@ fn prepare(env: &HostEnv, ctx: &Context, req: &Request) -> Result<Prepared> {
                 .collect::<Vec<_>>()
                 .join(" ");
             let write = call.access == forge::Access::Write;
+            let mut detail = format!(
+                "{} on the host with your {} login:\n{line}",
+                if write { "Change" } else { "Read" },
+                call.tool
+            );
+            if let Some(b) = &call.stdin {
+                detail.push_str(&format!("\n\nBody (read from stdin):\n{b}"));
+            }
             Ok(Prepared {
                 summary: format!("{} {} on {}", call.tool, call.command, call.repo),
-                detail: format!(
-                    "{} on the host with your {} login:\n{line}",
-                    if write { "Change" } else { "Read" },
-                    call.tool
-                ),
+                detail,
                 keys: vec![call.grant_key()],
                 session_allowed: true,
                 always_ask: false,
@@ -1020,7 +1119,7 @@ fn run_forge(
         .paddock_run()
         .join(&ctx.id)
         .join(format!("forge-{}", new_request_id()));
-    std::fs::create_dir_all(&dir)?;
+    crate::privfs::dir(&dir)?;
     let long = call.argv.iter().any(|a| a == "watch" || a == "--watch");
     let timeout = req
         .args
@@ -1038,7 +1137,13 @@ fn run_forge(
         .env_remove("GH_REPO")
         .env_remove("GIT_DIR")
         .env_remove("GIT_WORK_TREE");
-    let r = run_capture(&mut cmd, Duration::from_secs(timeout));
+    // Body text goes on stdin (`--body-file -`): the arguments of a host
+    // process are visible to every local user.
+    let r = run_capture_input(
+        &mut cmd,
+        Duration::from_secs(timeout),
+        call.stdin.as_deref().map(str::as_bytes),
+    );
     let _ = std::fs::remove_dir_all(&dir);
     let (code, out, err) = r?;
     Ok(serde_json::json!({ "exit_code": code, "stdout": out, "stderr": err }))
@@ -1100,7 +1205,8 @@ impl Broker {
                 &self.env,
                 &self.ctx,
                 req,
-                &describe(req, &self.ctx.project).1,
+                &audit_detail(req, &self.ctx.project, None),
+                None,
                 "invalid",
                 &r,
             );
@@ -1122,7 +1228,8 @@ impl Broker {
                 &self.env,
                 &self.ctx,
                 req,
-                &describe(req, &self.ctx.project).1,
+                &audit_detail(req, &self.ctx.project, None),
+                None,
                 "disabled",
                 &r,
             );
@@ -1136,6 +1243,7 @@ impl Broker {
             let g = self.grants.lock().unwrap();
             prep.session_allowed && prep.keys.iter().all(|k| g.contains(k))
         };
+        let mut request_id: Option<String> = None;
         let (decision, allowed) = if mode == Mode::Allow && !prep.always_ask {
             ("allowed by configuration", Some(true))
         } else if prep.read_only {
@@ -1143,8 +1251,9 @@ impl Broker {
         } else if granted() {
             ("allowed for this session", Some(true))
         } else {
+            request_id = Some(new_request_id());
             let p = Pending {
-                id: new_request_id(),
+                id: request_id.clone().unwrap_or_default(),
                 sandbox: self.ctx.id.clone(),
                 harness: self.ctx.harness.clone(),
                 project: self.ctx.project.clone(),
@@ -1195,7 +1304,16 @@ impl Broker {
                 Err(e) => Response::new(Status::Failed, format!("{e:#}")),
             },
         };
-        audit(&self.env, &self.ctx, req, &prep.detail, decision, &resp);
+        let safe = matches!(req.cap.as_str(), "fetch" | "git-push").then_some(prep.detail.as_str());
+        audit(
+            &self.env,
+            &self.ctx,
+            req,
+            &audit_detail(req, &self.ctx.project, safe),
+            request_id.as_deref(),
+            decision,
+            &resp,
+        );
         log::info!(
             "sandbox {}: {} request {}: {:?}",
             self.ctx.id,
@@ -1239,7 +1357,7 @@ fn new_request_id() -> String {
 pub fn serve(socket: &Path, broker: Broker) -> Result<()> {
     let _ = std::fs::remove_file(socket);
     if let Some(d) = socket.parent() {
-        std::fs::create_dir_all(d)?;
+        crate::privfs::dir(d)?;
     }
     let listener = UnixListener::bind(socket)
         .with_context(|| format!("cannot listen on {}", socket.display()))?;

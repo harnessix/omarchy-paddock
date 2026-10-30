@@ -67,8 +67,7 @@ pub fn sandbox_home(
         .join(harness)
         .join(login)
         .join(slug(project));
-    std::fs::create_dir_all(&dir)?;
-    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
+    crate::privfs::dir(&dir)?;
     Ok(dir)
 }
 
@@ -150,29 +149,16 @@ fn watch_hash(p: &Path) -> Option<String> {
 }
 
 fn copy_private(from: &Path, to: &Path) -> Result<()> {
-    if let Some(dir) = to.parent() {
-        std::fs::create_dir_all(dir)?;
-    }
     // Write next to the target, then rename: the same atomic pattern the
-    // harnesses use, so a crash never leaves half a token.
-    let tmp = to.with_extension("paddock-tmp");
-    std::fs::copy(from, &tmp)
-        .with_context(|| format!("copy {} -> {}", from.display(), tmp.display()))?;
-    std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
-    std::fs::rename(&tmp, to)?;
-    Ok(())
+    // harnesses use, so a crash never leaves half a token. The copy is 0600
+    // from its first byte.
+    crate::privfs::copy_atomic(from, to)
+        .with_context(|| format!("copy {} -> {}", from.display(), to.display()))
 }
 
 /// Write bytes to a host path that only the host can write, atomically.
 fn write_private(bytes: &[u8], to: &Path) -> Result<()> {
-    if let Some(dir) = to.parent() {
-        std::fs::create_dir_all(dir)?;
-    }
-    let tmp = to.with_extension("paddock-tmp");
-    std::fs::write(&tmp, bytes).with_context(|| format!("write {}", tmp.display()))?;
-    std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
-    std::fs::rename(&tmp, to)?;
-    Ok(())
+    crate::privfs::write_atomic(to, bytes).with_context(|| format!("write {}", to.display()))
 }
 
 struct AuthItem {
@@ -474,8 +460,7 @@ pub fn record_recent(env: &HostEnv, project: &Path, harness: &str) -> Result<()>
     );
     v.truncate(20);
     let f = recent_file(env);
-    std::fs::create_dir_all(f.parent().unwrap())?;
-    std::fs::write(f, serde_json::to_string_pretty(&v)?)?;
+    crate::privfs::write(&f, serde_json::to_string_pretty(&v)?)?;
     Ok(())
 }
 
@@ -494,8 +479,7 @@ impl Running {
 
     pub fn register(&self, env: &HostEnv) -> Result<()> {
         let f = Self::file(env, &self.id);
-        std::fs::create_dir_all(f.parent().unwrap())?;
-        std::fs::write(f, serde_json::to_string(self)?)?;
+        crate::privfs::write(&f, serde_json::to_string(self)?)?;
         Ok(())
     }
 
@@ -547,10 +531,7 @@ pub fn env_notice_changed(env: &HostEnv, project: &Path, names: &[String]) -> bo
     {
         return false;
     }
-    if let Some(d) = file.parent() {
-        let _ = std::fs::create_dir_all(d);
-    }
-    let _ = std::fs::write(&file, &hash);
+    let _ = crate::privfs::write(&file, &hash);
     true
 }
 

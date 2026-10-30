@@ -35,7 +35,7 @@ pub fn all() -> Vec<Box<dyn Detector>> {
 /// Bind a shared cache directory, kept under the paddock cache, over `dst`.
 pub fn cache_mount(env: &HostEnv, name: &str, dst: PathBuf, origin: &str) -> Result<Mount> {
     let src = env.paddock_cache().join("shared").join(name);
-    std::fs::create_dir_all(&src)?;
+    crate::privfs::dir(&src)?;
     Ok(Mount::bind(src, dst, true, origin))
 }
 

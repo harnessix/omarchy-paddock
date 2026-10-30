@@ -307,8 +307,7 @@ pub fn install(env: &HostEnv) -> Result<Report> {
             created.push(e.desktop_file.clone());
         }
     }
-    std::fs::create_dir_all(env.paddock_state())?;
-    std::fs::write(record_file(env), serde_json::to_string_pretty(&created)?)?;
+    crate::privfs::write(&record_file(env), serde_json::to_string_pretty(&created)?)?;
 
     // A folder for menu-based desktops.
     let dir = xdg_directory_file(env);
