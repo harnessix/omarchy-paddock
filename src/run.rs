@@ -131,6 +131,13 @@ pub fn run(
     capture: bool,
     quiet: bool,
 ) -> Result<Outcome> {
+    // From here on, a SIGTERM (`kill`, a spawn parent that ends) or a SIGHUP
+    // (a closed terminal) must not end paddock before its exit steps: the
+    // device mount, the login and history copies, the session record.
+    // Before the sandbox starts, paddock notes it and does not start it;
+    // after, it passes SIGTERM to the sandbox, as `paddock stop` does, and
+    // waits. The old handlers come back when `run` returns.
+    let forwarding = Forward::install();
     let interactive = !capture && std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
     // App mode: a restricted Wayland socket and a portal-only session bus,
     // both alive until the sandbox exits.
@@ -291,9 +298,13 @@ pub fn run(
             });
         }
     }
+    if forwarding.stop_requested() {
+        bail!("paddock was asked to stop before the sandbox started");
+    }
     let mut child = cmd
         .spawn()
         .with_context(|| format!("cannot start {}", launch.program.display()))?;
+    forwarding.set_child(child.id());
     if let (Some(data), Some(mut w)) = (stdin, child.stdin.take()) {
         // A thread, so a harness that does not read cannot block paddock.
         std::thread::spawn(move || {
@@ -405,6 +416,11 @@ pub fn run(
     unsafe {
         libc::signal(libc::SIGINT, old_int);
         libc::signal(libc::SIGQUIT, old_quit);
+    }
+    if forwarding.hung_up() {
+        // The terminal is gone: a write to it would fail and end the exit
+        // steps half way.
+        quiet_stdio();
     }
 
     // The children of this sandbox end with it.
@@ -724,6 +740,98 @@ impl HistorySync {
         self.thread
             .join()
             .expect("the history thread does not panic")
+    }
+}
+
+/// The sandbox process that SIGTERM and SIGHUP are passed to (0 before it
+/// starts), whether a stop came before it started, and whether a SIGHUP came.
+static FORWARD_PID: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+static STOP_BEFORE_START: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static HUNG_UP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+extern "C" fn forward_signal(sig: libc::c_int) {
+    use std::sync::atomic::Ordering;
+    if sig == libc::SIGHUP {
+        HUNG_UP.store(true, Ordering::SeqCst);
+    }
+    let pid = FORWARD_PID.load(Ordering::SeqCst);
+    if pid > 0 {
+        // SAFETY: kill(2) is async-signal-safe.
+        unsafe { libc::kill(pid, libc::SIGTERM) };
+    } else {
+        STOP_BEFORE_START.store(true, Ordering::SeqCst);
+    }
+}
+
+/// The handlers for SIGTERM and SIGHUP during one run. Dropping it puts the
+/// previous handlers back.
+struct Forward {
+    old: Vec<(libc::c_int, libc::sigaction)>,
+}
+
+impl Forward {
+    fn install() -> Self {
+        use std::sync::atomic::Ordering;
+        HUNG_UP.store(false, Ordering::SeqCst);
+        STOP_BEFORE_START.store(false, Ordering::SeqCst);
+        FORWARD_PID.store(0, Ordering::SeqCst);
+        let mut old = Vec::new();
+        for sig in [libc::SIGTERM, libc::SIGHUP] {
+            // SAFETY: a plain sigaction(2) with a handler that only calls
+            // async-signal-safe functions.
+            unsafe {
+                let mut sa: libc::sigaction = std::mem::zeroed();
+                sa.sa_sigaction = forward_signal as extern "C" fn(libc::c_int) as usize;
+                sa.sa_flags = libc::SA_RESTART;
+                libc::sigemptyset(&mut sa.sa_mask);
+                let mut prev: libc::sigaction = std::mem::zeroed();
+                libc::sigaction(sig, &sa, &mut prev);
+                old.push((sig, prev));
+            }
+        }
+        Self { old }
+    }
+
+    /// Pass later signals to the sandbox. A stop that came before is passed
+    /// on at once.
+    fn set_child(&self, pid: u32) {
+        use std::sync::atomic::Ordering;
+        FORWARD_PID.store(pid as i32, Ordering::SeqCst);
+        if STOP_BEFORE_START.swap(false, Ordering::SeqCst) {
+            // SAFETY: a plain kill(2) on the sandbox process.
+            unsafe { libc::kill(pid as i32, libc::SIGTERM) };
+        }
+    }
+
+    fn stop_requested(&self) -> bool {
+        STOP_BEFORE_START.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn hung_up(&self) -> bool {
+        HUNG_UP.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+impl Drop for Forward {
+    fn drop(&mut self) {
+        for (sig, prev) in &self.old {
+            // SAFETY: restores the handler that `install` saved.
+            unsafe { libc::sigaction(*sig, prev, std::ptr::null_mut()) };
+        }
+        FORWARD_PID.store(0, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// Point standard output and error at /dev/null.
+fn quiet_stdio() {
+    // SAFETY: open(2) and dup2(2) on our own descriptors.
+    unsafe {
+        let fd = libc::open(c"/dev/null".as_ptr(), libc::O_WRONLY);
+        if fd >= 0 {
+            libc::dup2(fd, 1);
+            libc::dup2(fd, 2);
+            libc::close(fd);
+        }
     }
 }
 
