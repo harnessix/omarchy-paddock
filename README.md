@@ -327,7 +327,7 @@ Who talks to the host proxy depends on the backend. On docker and podman, the pa
 
 ## Logins and MCP
 
-By default, a sandbox uses your existing login (auth mode `shared`). paddock copies the credential files of the harness from your home directory into the sandbox at start. If the harness refreshes a token in the sandbox, paddock writes it back when the sandbox exits. If the file also changed on the host in the meantime, the host version stays, and paddock tells you.
+By default, a sandbox uses your existing login (auth mode `shared`). paddock copies the credential files of the harness from your home directory into the sandbox at start. If the harness refreshes a token in the sandbox, paddock writes it back within a minute, while the sandbox runs, so tools that read the login on the host (for example the limits in the Omarchy agents panel) stay current. If the host refreshes the token instead, paddock copies the new one into the sandbox. If the file changed on both sides, the host version stays, and paddock tells you at exit. A login goes back only to the place that it came from: your main login, an Omarchy account folder, or an isolated store. An isolated login never reaches your home directory, so the agents panel does not show it.
 
 Some harnesses keep their login in the system keyring. Copilot CLI is one of them. Its sandbox gets a private keyring of its own (gnome-keyring, on a private session bus), encrypted with a password that paddock keeps on the host. The sandbox cannot reach your host keyring, and your host keyring does not see the sandbox's login. So you log in once inside the sandbox, and the login stays for later runs.
 
@@ -727,7 +727,7 @@ paddock shims remove                          # removes both scopes
 
 - The arguments stay the same. paddock adds no auto-approval flags and removes none. It adds only the telemetry switches of the profile (see [Privacy defaults](#privacy-defaults)).
 - The project is the current folder. The home folder is no project. If `omarchy-agent` starts in the home folder (when `~/Work` does not exist), the agent works in a scratch project of its own, `~/.local/share/paddock/scratch/<agent>`. The `paddock:` line names it, `paddock files` lists it, and `paddock gc --scratch` removes old ones.
-- An `env` prefix keeps its variables. For Claude Code, Codex and Grok Build, Omarchy's account switch sets `CLAUDE_CONFIG_DIR`, `CODEX_HOME` or `GROK_HOME`. paddock uses that folder as the login of the sandbox: it copies the login in at the start, and copies a refreshed token back at the end, the same as for your main login. The pin `OMARCHY_AGENT_<AGENT>_HOME` stays.
+- An `env` prefix keeps its variables. For Claude Code, Codex and Grok Build, Omarchy's account switch sets `CLAUDE_CONFIG_DIR`, `CODEX_HOME` or `GROK_HOME`. paddock uses that folder as the login of the sandbox: it copies the login in at the start, and copies a refreshed token back while the sandbox runs, the same as for your main login. The pin `OMARCHY_AGENT_<AGENT>_HOME` stays.
 - The shell form `bash -c '…' amp PROMPT` runs whole in the sandbox, with `$0` set to the agent program. An absolute path, such as a user install in `~/.local/bin`, runs that program.
 - The exit code passes through.
 - A command without a paddock profile runs without a sandbox. paddock shows a notification that names it, so a start never fails only because paddock does not know an agent yet.
@@ -753,7 +753,7 @@ paddock has a profile for every agent that `omarchy-agent` can start. `paddock d
 The agents panel reads the session history of each agent from fixed places in your home folder. A sandbox keeps its history in its own home. For starts through `omarchy-agent` (`paddock wrap`), paddock brings it back. Other runs keep their history in the sandbox home: a transcript that a sandbox wrote and that your host harness loads later, for example with `claude --resume`, could carry instructions out of the sandbox.
 
 - Claude Code keeps one folder per project in `~/.claude/projects`. paddock binds the host folder of the current project into the sandbox, read-write. The sandbox sees only this one folder, no other project's. `claude --resume` on the host also finds these sessions.
-- Codex (`~/.codex/sessions`) and Grok Build (`~/.grok/sessions`) keep their history by date or by session. At the end of a session, paddock copies new history files back. It copies a file only when the host has none, or when the sandbox only added to it. It never follows a symlink in the sandbox home.
+- Codex (`~/.codex/sessions`) and Grok Build (`~/.grok/sessions`) keep their history by date or by session. paddock copies new history files back every five minutes while the sandbox runs, and at the end of the session. It copies a file only when the host has none, or when the sandbox only added to it. It never follows a symlink in the sandbox home.
 - With an account folder (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `GROK_HOME`), the history goes to that folder, the same as on the host.
 - An isolated login (`--auth isolated:NAME`) keeps its history in the sandbox home.
 - paddock never writes the panel's own usage records. The panel's collectors count the sessions the same way as sessions on the host.
