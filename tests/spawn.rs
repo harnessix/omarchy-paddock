@@ -1,7 +1,8 @@
 //! `paddock-host spawn` end to end, in bubblewrap, with fake harnesses: a
 //! parent sandbox starts a child sandbox, the child commits on its own branch,
 //! and the results reach the parent's inbox. Stopping the parent stops the
-//! child. Skipped where the host cannot run bubblewrap.
+//! child. A parent hands tasks to two children through the tree scope of
+//! paddock kv. Skipped where the host cannot run bubblewrap.
 
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -52,7 +53,7 @@ fn world(parent_script: &str) -> World {
     std::fs::create_dir_all(root.join("run")).unwrap();
     std::fs::write(
         cfg.join("config.toml"),
-        "[host]\nspawn = \"allow\"\n[spawn]\nharnesses = [\"childfake\", \"childsleep\", \"childreview\"]\ntimeout = 120\n",
+        "[host]\nspawn = \"allow\"\n[spawn]\nharnesses = [\"childfake\", \"childsleep\", \"childreview\", \"childkv\"]\ntimeout = 120\n",
     )
     .unwrap();
     std::fs::write(
@@ -96,6 +97,28 @@ fn world(parent_script: &str) -> World {
             &format!(
                 "[oneshot]\nargs = [\"-c\", {}]\nprompt = \"stdin\"\n",
                 toml_str(review)
+            ),
+        ),
+    )
+    .unwrap();
+    // Reads the parent's brief, tries the project scope, then takes the
+    // first task in the tree scope that no other child holds.
+    let kv = "cat >/dev/null; K='paddock-host kv'; \
+              echo \"PARENT $($K get brief --scope parent)\"; \
+              $K put note:x y --scope project >/dev/null 2>&1; echo \"PROJECT_EXIT $?\"; \
+              for t in a b; do \
+                $K claim $t --ttl 300 --scope tree >/dev/null 2>&1 || continue; \
+                if $K get result:task-$t --scope tree >/dev/null 2>&1; then $K release $t --scope tree; continue; fi; \
+                $K put result:task-$t \"done by $PADDOCK_ID\" --scope tree >/dev/null || exit 42; \
+                echo \"CLAIMED $t\"; exit 0; \
+              done; echo NOTHING";
+    std::fs::write(
+        cfg.join("harness.d/childkv.toml"),
+        profile(
+            "childkv",
+            &format!(
+                "[oneshot]\nargs = [\"-c\", {}]\nprompt = \"stdin\"\n",
+                toml_str(kv)
             ),
         ),
     )
@@ -427,4 +450,80 @@ fn a_systemd_scope_holds_the_child_and_its_limits() {
     wait_for("the child to end", 30, || {
         list(&w).into_iter().all(|s| !ours(&s)).then_some(())
     });
+}
+
+#[test]
+fn children_claim_tasks_in_the_tree_scope_and_the_parent_watch_wakes() {
+    if !bwrap_works() {
+        eprintln!("skipped: bwrap cannot create a user namespace here");
+        return;
+    }
+    let w = world(
+        "K='paddock-host kv'; \
+         $K put brief from-the-parent >/dev/null || exit 20; \
+         $K put task:a '{\"status\":\"todo\"}' --scope tree >/dev/null || exit 21; \
+         v=$($K put task:b '{\"status\":\"todo\"}' --scope tree | sed 's/^version //') || exit 22; \
+         id1=$(paddock-host spawn childkv --prompt-file task.md) || exit 23; \
+         id2=$(paddock-host spawn childkv --prompt-file task.md) || exit 24; \
+         seen=0; \
+         while [ $seen -lt 2 ]; do \
+           out=$($K watch --prefix result:task- --version \"$v\" --scope tree --timeout 100) || exit 25; \
+           echo \"$out\"; \
+           v=$(echo \"$out\" | sed -n 's/^cursor //p'); \
+           seen=$((seen + $(echo \"$out\" | grep -c '^put'))); \
+         done; \
+         echo WOKE; \
+         paddock-host wait \"$id1\" --timeout 100 >/dev/null || exit 26; \
+         paddock-host wait \"$id2\" --timeout 100 >/dev/null || exit 27; \
+         echo \"R1 $($K get result:$id1 --scope tree)\"; \
+         echo \"R2 $($K get result:$id2 --scope tree)\"",
+    );
+    let out = start_parent(&w).wait_with_output().unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "parent failed: {stdout}\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // The watch woke on the children's results, not on a poll.
+    assert!(stdout.contains("WOKE"), "{stdout}");
+    assert!(stdout.contains("put\tresult:task-a"), "{stdout}");
+    assert!(stdout.contains("put\tresult:task-b"), "{stdout}");
+    // paddock wrote result:<spawn id> with the branch for each child.
+    for tag in ["R1 ", "R2 "] {
+        let line = stdout.lines().find(|l| l.starts_with(tag)).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&line[3..]).unwrap();
+        assert_eq!(v["status"], "done", "{line}");
+        assert!(v["ref"]
+            .as_str()
+            .unwrap()
+            .starts_with("paddock/spawn-childkv-"));
+    }
+    // Each child took a different task, read its parent's self scope and
+    // could not write the project scope.
+    let mut claimed = Vec::new();
+    for e in std::fs::read_dir(w.repo.join(".paddock/inbox"))
+        .unwrap()
+        .flatten()
+    {
+        let output = std::fs::read_to_string(e.path().join("output.txt")).unwrap();
+        assert!(output.contains("PARENT from-the-parent"), "{output}");
+        assert!(output.contains("PROJECT_EXIT 3"), "{output}");
+        let t = output
+            .lines()
+            .find_map(|l| l.strip_prefix("CLAIMED "))
+            .unwrap_or_else(|| panic!("no task claimed: {output}"));
+        claimed.push(t.to_string());
+    }
+    claimed.sort();
+    assert_eq!(claimed, ["a", "b"]);
+    // The watch names the child that wrote each result.
+    let writer = stdout
+        .lines()
+        .find_map(|l| l.split("by ").nth(1))
+        .unwrap()
+        .trim()
+        .to_string();
+    assert!(writer.contains("childkv-spawn-"), "{writer}");
+    assert!(ps(&w).is_empty());
 }

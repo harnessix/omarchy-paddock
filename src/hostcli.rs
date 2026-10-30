@@ -8,6 +8,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 
 mod git;
+pub mod kv;
 
 pub const EXIT_USAGE: i32 = 2;
 pub const EXIT_NO_HOST: i32 = 6;
@@ -34,6 +35,7 @@ USAGE
   paddock-host status [ID]
   paddock-host wait ID [--timeout SECONDS]
   paddock-host kill ID
+  paddock-host kv COMMAND [ARG...]              (key-value store, see `paddock-host kv --help`)
   paddock-host help [CAPABILITY]
 
 Common options
@@ -69,6 +71,14 @@ OTHER AGENTS
   `paddock-host spawn` starts another harness, for example codex, in its own
   sandbox with one task. It works on its own branch and returns its results
   to .paddock/inbox/. Run `paddock-host help spawn` for the rules and limits.
+
+STATE AND DEVICES
+  `paddock-host kv` keeps state on the host: for this sandbox, for every
+  sandbox of this project, for the sandbox that started this one, or for a
+  whole spawn tree (--scope tree: tasks for children and their results). It
+  needs no approval, except the scope that all projects share. Host devices, when
+  the user turns them on, are files in /dev/paddock. Read
+  /dev/paddock/.catalog for each device and its request format.
 
 EXIT CODES
   0   done (for exec and gh: the command's own exit code is returned instead)
@@ -247,6 +257,12 @@ When the child ends, its results are in .paddock/inbox/spawn-ID/:
 Read the branch with git, for example `git log --stat paddock/spawn-codex-ID`,
 and merge what you want to keep.
 
+paddock also writes result:ID into the tree scope of paddock kv (status,
+summary, ref). With several children, wait for all of them at once:
+  paddock-host kv watch --prefix result: --scope tree --timeout 600
+Children read your own kv scope with --scope parent, and share tasks with you
+in --scope tree. Run `paddock-host kv --help` for the key names.
+
 wait exits with 0 when the child ended with exit code 0, 1 when it failed or
 was stopped, and 5 when it still runs after --timeout. A child stops when this
 sandbox ends. Use `paddock-host capabilities --json` to see the limits."#
@@ -327,6 +343,7 @@ pub fn main(args: &[String]) -> i32 {
         "git" => return git::git_main(rest),
         "git-remote-helper" => return git::remote_helper(rest),
         "gh" => return git::gh_main(rest),
+        "kv" => return kv::main(rest),
         "forge" if rest.first().is_some_and(|t| t == "gh") => return git::gh_main(&rest[1..]),
         _ => {}
     }

@@ -140,6 +140,11 @@ pub fn settings(env: &HostEnv, spec: &SandboxSpec) -> Result<serde_json::Value> 
         allow_read.push(s(&root));
     }
     let mut allow_write: Vec<String> = vec![s(&spec.home_src), s(&private_tmp(env, spec))];
+    // srt cannot bind the device mount to /dev/paddock. It stays at its host
+    // path in the run folder, writable, and PADDOCK_DEVICES names it.
+    if let Some(dir) = &spec.devices {
+        allow_write.push(s(dir));
+    }
     let mut deny_write: Vec<String> = Vec::new();
     for m in &spec.mounts {
         let same = m.src.as_ref().is_some_and(|src| *src == m.dst);
@@ -199,7 +204,7 @@ pub fn settings(env: &HostEnv, spec: &SandboxSpec) -> Result<serde_json::Value> 
             // a session bus need them. Nested user namespaces stay blocked either
             // way, and srt's own network namespace isolates abstract sockets.
             // The host passthrough socket (broker.rs) needs it too.
-            "allowAllUnixSockets": spec.gui.enabled() || spec.host_socket.is_some() || spec.keyring,
+            "allowAllUnixSockets": spec.gui.enabled() || spec.host_socket.is_some() || spec.kv_socket.is_some() || spec.keyring,
         },
         "filesystem": {
             "denyRead": deny_read,
@@ -316,6 +321,12 @@ impl Backend for Srt {
         // folder, which allowRead already covers.
         if let Some(sock) = &spec.host_socket {
             vars.insert("PADDOCK_HOST_SOCKET".into(), s(sock));
+        }
+        if let Some(sock) = &spec.kv_socket {
+            vars.insert("PADDOCK_KV_SOCKET".into(), s(sock));
+        }
+        if let Some(dir) = &spec.devices {
+            vars.insert("PADDOCK_DEVICES".into(), s(dir));
         }
         vars.insert("CLAUDE_CODE_TMPDIR".into(), s(&tmp));
         // Host tools appear in their own directories, not under /run/paddock/bin.
@@ -451,5 +462,17 @@ mod tests {
         let (env, mut s) = spec();
         s.network = Network::Egress;
         assert!(settings(&env, &s).is_err());
+    }
+
+    #[test]
+    fn devices_are_writable_and_the_kv_socket_reachable() {
+        let (env, mut s) = spec();
+        let dev = crate::devices::mount_dir(&env, "srt", &s.id);
+        assert!(!dev.starts_with(env.paddock_run().join(&s.id)));
+        s.devices = Some(dev.clone());
+        s.kv_socket = Some(env.paddock_run().join(&s.id).join("kv.sock"));
+        let v = settings(&env, &s).unwrap();
+        assert!(list(&v, "allowWrite").contains(&dev.to_str().unwrap()));
+        assert_eq!(v["network"]["allowAllUnixSockets"], true);
     }
 }

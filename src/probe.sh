@@ -220,6 +220,56 @@ else
   fail host-client-connects "paddock-host is not on PATH"
 fi
 
+# paddock kv: the socket of this sandbox reaches only this sandbox's scopes.
+# doctor wrote a canary into the self scope of another sandbox, and opened
+# that sandbox's socket on the host. Neither may be reachable from here.
+if command -v paddock-host >/dev/null 2>&1 && [ -n "$PADDOCK_KV_SOCKET" ]; then
+  KV="paddock-host kv"
+  if $KV put probe/identity x >/dev/null 2>&1 && [ "$($KV get probe/identity 2>/dev/null)" = x ]; then ok kv-self-round-trip; else fail kv-self-round-trip "put and get in the self scope failed"; fi
+  if $KV get canary 2>/dev/null | grep -q paddock-kv-canary; then fail kv-other-self-hidden "read the self scope of another sandbox"; else ok kv-other-self-hidden; fi
+  # The tree scope is that of this sandbox's own spawn tree, or none.
+  if $KV get canary --scope tree 2>/dev/null | grep -q paddock-kv-canary; then fail kv-other-tree-hidden "read the tree scope of another spawn tree"; else ok kv-other-tree-hidden; fi
+  out=$($KV raw "{\"v\":1,\"op\":\"get\",\"key\":\"canary\",\"sandbox\":\"$PADDOCK_PROBE_KV_OTHER\"}" 2>/dev/null)
+  out2=$($KV raw "{\"v\":1,\"op\":\"get\",\"scope\":\"self:$PADDOCK_PROBE_KV_OTHER\",\"key\":\"canary\"}" 2>/dev/null)
+  case "$out$out2" in
+    *paddock-kv-canary*) fail kv-identity-not-spoofable "a request that names another sandbox read its data" ;;
+    *'"invalid"'*'"invalid"'*) ok kv-identity-not-spoofable ;;
+    *) fail kv-identity-not-spoofable "unexpected answers: $(echo "$out$out2" | tr '\n' ' ' | cut -c1-200)" ;;
+  esac
+  if [ -e "$PADDOCK_PROBE_KV_OTHER_SOCK" ]; then fail kv-other-socket-hidden "the kv socket of another sandbox is visible"; else ok kv-other-socket-hidden; fi
+  $KV put probe/note y --scope project >/dev/null 2>&1
+  if $KV get probe/note --scope project --json 2>/dev/null | grep -q "\"writer\": \"$PADDOCK_ID\""; then ok kv-project-writer-recorded; else fail kv-project-writer-recorded "the project entry does not name this sandbox"; fi
+  $KV put probe/x y --scope parent >/dev/null 2>&1; rc=$?
+  if [ "$rc" = 3 ] || [ "$rc" = 4 ]; then ok kv-parent-not-writable; else fail kv-parent-not-writable "exit code $rc, expected 3 or 4"; fi
+  $KV put lease:probe "{\"owner\":\"$PADDOCK_PROBE_KV_OTHER\"}" --scope project >/dev/null 2>&1; rc=$?
+  if [ "$rc" = 8 ]; then ok kv-lease-not-forgeable; else fail kv-lease-not-forgeable "a plain put to a lease key gave exit code $rc, expected 8"; fi
+  $KV raw "{\"v\":1,\"op\":\"claim\",\"scope\":\"project\",\"key\":\"probe\",\"ttl\":60,\"owner\":\"$PADDOCK_PROBE_KV_OTHER\"}" >/dev/null 2>&1
+  $KV get canary --scope user >/dev/null 2>&1; rc=$?
+  if [ "$rc" = 3 ]; then ok kv-user-scope-needs-approval; else fail kv-user-scope-needs-approval "exit code $rc, expected 3 (denied)"; fi
+  # A watch returns when the key changes.
+  ( sleep 0.5; $KV put probe/watched 2 >/dev/null 2>&1 ) &
+  if [ "$($KV watch probe/watched --version 0 --timeout 10 2>/dev/null)" = 2 ]; then ok kv-watch-wakes; else fail kv-watch-wakes "the watch did not return the new value"; fi
+  wait
+else
+  fail kv-socket-present "PADDOCK_KV_SOCKET is not set or paddock-host is missing"
+fi
+
+# Devices: a FUSE file system that the host serves. doctor turns on echo.
+D="${PADDOCK_DEVICES:-/dev/paddock}"
+if [ -n "$PADDOCK_PROBE_DEVICES" ]; then
+  if [ -n "$PADDOCK_DEVICES" ] && [ -d "$D" ]; then ok devices-mounted; else fail devices-mounted "PADDOCK_DEVICES='$PADDOCK_DEVICES', $D is not a folder"; fi
+  if grep -q '"name": "echo"' "$D/.catalog" 2>/dev/null; then ok devices-catalog-lists-echo; else fail devices-catalog-lists-echo "$D/.catalog does not list echo"; fi
+  if (echo x > "$D/.catalog") 2>/dev/null; then fail devices-catalog-read-only "wrote to $D/.catalog"; else ok devices-catalog-read-only; fi
+  if (echo x > "$D/paddock-probe-new") 2>/dev/null || mkdir "$D/paddock-probe-dir" 2>/dev/null; then fail devices-no-new-files "created a file in $D"; else ok devices-no-new-files; fi
+  want="paddock-echo-$$"
+  got=$( { exec 3<>"$D/echo" && printf '%s' "$want" >&3 && cat <&3; } 2>/dev/null )
+  if [ "$got" = "$want" ]; then ok devices-echo-round-trip; else fail devices-echo-round-trip "got '$(echo "$got" | cut -c1-80)'"; fi
+  # One open is one request: a second write after the read fails.
+  if ( exec 3<>"$D/echo" && printf a >&3 && cat <&3 >/dev/null && printf b >&3 ) 2>/dev/null; then fail devices-one-request-per-open "a second write was accepted"; else ok devices-one-request-per-open; fi
+else
+  skip devices-mounted "${PADDOCK_PROBE_DEVICES_OFF:-devices are off}"
+fi
+
 # Push and pull requests: no credentials inside, and every push goes to the
 # host. doctor answers pushes to origin with "allow for this session" and
 # checks on the host what each push asked for.

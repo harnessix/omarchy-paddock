@@ -353,6 +353,7 @@ fn ceiling(parent: &str, depth: u32, project: &Path) -> Ceiling {
         manifest: Manifest::default(),
         modes: HostPolicy::default().modes,
         auth: "shared".into(),
+        devices: vec![],
     }
 }
 
@@ -678,6 +679,53 @@ fn the_prompt_never_reaches_argv_or_the_audit_log_and_results_reach_the_inbox() 
     assert_eq!(end["child_harness"], "codex");
     assert_eq!(end["exit_code"], 0);
     assert!(end["duration_s"].is_u64());
+
+    // The parent can watch result: in the tree scope instead of polling.
+    let st = crate::kv::store::Store::open(&crate::kv::store_path(&s.env)).unwrap();
+    let e = st
+        .get(
+            &crate::kv::store::ns_tree("p-1"),
+            &format!("result:{id}"),
+            crate::state::now(),
+        )
+        .unwrap()
+        .expect("no result in the tree scope");
+    assert_eq!(e.writer, crate::spawn::RESULT_WRITER);
+    let v: serde_json::Value = serde_json::from_str(&e.value).unwrap();
+    assert_eq!(v["status"], "done");
+    assert_eq!(v["ref"], format!("paddock/spawn-codex-{id}"));
+    assert_eq!(v["commits"], 2);
+    assert!(!e.value.contains("TASK-TEXT"), "{}", e.value);
+}
+
+#[test]
+fn a_child_gets_at_most_the_devices_of_its_parent() {
+    use crate::devices::{enabled_names, DevicesCfg};
+    let on = DevicesCfg::parse("[devices]\necho = true\n").unwrap();
+    let off = DevicesCfg::parse("").unwrap();
+    let echo = vec!["echo".to_string()];
+    // A root gets what the user configuration turns on.
+    assert_eq!(enabled_names(&on, false, None), echo);
+    // A child of a parent without devices gets none, even when the
+    // configuration turns one on now, and even in test mode.
+    assert!(enabled_names(&on, false, Some(&[])).is_empty());
+    assert!(enabled_names(&on, true, Some(&[])).is_empty());
+    // A child of a parent with echo keeps it only while the user still
+    // turns it on.
+    assert_eq!(enabled_names(&on, false, Some(&echo)), echo);
+    assert!(enabled_names(&off, false, Some(&echo)).is_empty());
+    let no_mount = DevicesCfg::parse("[devices]\nmount = false\necho = true\n").unwrap();
+    assert!(enabled_names(&no_mount, false, None).is_empty());
+    // The ceiling travels in the job, and an old job without it means none.
+    let mut c = ceiling("p", 0, Path::new("/src/app"));
+    c.devices = echo.clone();
+    let back: Ceiling = serde_json::from_str(&serde_json::to_string(&c).unwrap()).unwrap();
+    assert_eq!(back.devices, echo);
+    let mut v = serde_json::to_value(&c).unwrap();
+    v.as_object_mut().unwrap().remove("devices");
+    let old: Ceiling = serde_json::from_value(v).unwrap();
+    assert!(old.devices.is_empty());
+    assert_eq!(old.root(), "p");
 }
 
 #[test]

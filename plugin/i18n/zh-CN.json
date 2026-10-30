@@ -88,6 +88,7 @@
   "popup.ask.open-url": "允许 %2 中的 %1 打开这个链接吗？",
   "popup.ask.notify": "允许 %2 中的 %1 显示一条通知吗？",
   "popup.ask.spawn": "允许 %2 中的 %1 用这个任务启动另一个 agent 吗？",
+  "popup.ask.kv-user": "允许 %2 中的 %1 使用所有项目共享的 paddock kv 范围吗？",
   "popup.ask.other": "允许 %2 中的 %1 在你的电脑上执行这个操作吗？",
   "approve.gone": "这个请求已不在等待：它已超时，或已在别处答复。",
   "approve.denied": "已拒绝。",

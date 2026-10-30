@@ -6,9 +6,13 @@
 //! The rules:
 //!
 //! - A child never gets more than its parent. The `Ceiling` records what the
-//!   parent had (network, lan, environment, mounts, backend, host modes and
-//!   the project), and `Ceiling::check` refuses a child spec that is wider.
-//!   The child gets no display.
+//!   parent had (network, lan, environment, mounts, backend, host modes,
+//!   devices and the project), and `Ceiling::check` refuses a child spec
+//!   that is wider. The child gets no display.
+//! - paddock kv: the child reads its parent's `self` scope as `parent`, and
+//!   shares the `tree` scope of the root sandbox with every sandbox of the
+//!   tree. When a child ends, the parent's paddock writes `result:<id>` in
+//!   `tree`, so a parent can watch `result:` instead of polling.
 //! - The limits come only from the user configuration (`[host] spawn` and
 //!   `[spawn]`). A project `paddock.toml` cannot set them.
 //! - No credentials move between sandboxes. The child logs in with its own
@@ -406,6 +410,10 @@ pub struct Ceiling {
     pub modes: BTreeMap<String, Mode>,
     /// The login mode for the child: the manifest's, or shared.
     pub auth: String,
+    /// The devices in the parent's `/dev/paddock`. The child gets at most
+    /// these.
+    #[serde(default)]
+    pub devices: Vec<String>,
 }
 
 fn from_env_or_manifest(origin: &str) -> bool {
@@ -455,7 +463,15 @@ impl Ceiling {
             manifest: m,
             modes: modes.clone(),
             auth: built.auth.to_string(),
+            devices: Vec::new(),
         }
+    }
+
+    /// The root of the spawn tree: the sandbox that the user started.
+    pub fn root(&self) -> &str {
+        self.chain
+            .first()
+            .map_or(self.parent.as_str(), |r| r.as_str())
     }
 
     /// Refuse a child that would get more than the parent. `endpoints` are
@@ -774,6 +790,21 @@ impl Spawner {
         }
     }
 
+    /// Whether this sandbox can start children: `[spawn]` names a harness,
+    /// it is not as deep as `max_depth` allows, and the user did not set
+    /// spawn to deny. Its `tree` scope of paddock kv is on then.
+    pub fn available(&self) -> bool {
+        self.cfg.depth_allows(self.ceiling.depth)
+            && !self.cfg.harnesses.is_empty()
+            && self
+                .ceiling
+                .modes
+                .get("spawn")
+                .copied()
+                .unwrap_or(Mode::Deny)
+                != Mode::Deny
+    }
+
     pub fn running(&self) -> usize {
         self.children
             .lock()
@@ -1068,10 +1099,44 @@ impl Spawner {
             }
         }
         self.audit_end(&done, &r);
+        self.publish_result(&done, &r);
         if let Some(e) = self.children.lock().unwrap().get_mut(id) {
             e.status = done;
         }
         self.changed.notify_all();
+    }
+
+    /// Write `result:<spawn id>` into the `tree` scope of paddock kv. A
+    /// parent can watch `result:` there instead of polling. The branch stays
+    /// the result itself; this is a pointer to it. paddock writes it, so the
+    /// writer is `paddock`, not a sandbox.
+    fn publish_result(&self, s: &Status, r: &ChildResult) {
+        let cfg = match crate::kv::KvCfg::load(&self.env) {
+            Ok(c) if c.enabled => c,
+            _ => return,
+        };
+        let value = result_value(s, r);
+        let w = crate::kv::store::Writer {
+            sandbox: RESULT_WRITER,
+            harness: "spawn",
+        };
+        let q = crate::kv::store::Quota {
+            bytes: cfg.project_bytes,
+            keys: cfg.max_keys,
+        };
+        let ns = crate::kv::store::ns_tree(self.ceiling.root());
+        let key = format!("result:{}", s.id);
+        let r =
+            crate::kv::store::Store::open(&crate::kv::store_path(&self.env)).and_then(|mut st| {
+                st.put(&ns, &key, &value, None, None, &w, q, state::now())
+                    .map_err(|e| anyhow::anyhow!("{e:?}"))
+            });
+        if let Err(e) = r {
+            log::warn!(
+                "spawn {}: cannot write {key} to the tree scope: {e:#}",
+                s.id
+            );
+        }
     }
 
     fn write_inbox(&self, s: &Status, r: &ChildResult) -> Result<String> {
@@ -1224,6 +1289,50 @@ impl Spawner {
     }
 }
 
+/// The writer of the `result:` keys that paddock puts in the `tree` scope.
+pub const RESULT_WRITER: &str = "paddock";
+
+/// The value of `result:<spawn id>`: the state, one line of summary and the
+/// branch as `ref`. JSON, in the key convention of paddock kv.
+pub fn result_value(s: &Status, r: &ChildResult) -> String {
+    let status = match s.state {
+        State::Exited if s.exit_code == Some(0) => "done",
+        State::Exited => "failed",
+        State::Failed => "failed",
+        State::Stopped => "stopped",
+        State::TimedOut => "timed_out",
+        State::Starting | State::Running => "in_progress",
+    };
+    let summary = if !s.message.is_empty() {
+        s.message.clone()
+    } else {
+        format!(
+            "{} exited with code {}; {} commits on {}{}",
+            s.harness,
+            s.exit_code.map_or("?".into(), |c| c.to_string()),
+            r.commits,
+            s.branch,
+            match r.uncommitted {
+                Some(n) if n > 0 => format!(", {n} files not committed"),
+                _ => String::new(),
+            }
+        )
+    };
+    serde_json::json!({
+        "status": status,
+        "summary": summary,
+        "ref": s.branch,
+        "spawn_id": s.id,
+        "sandbox": s.sandbox,
+        "harness": s.harness,
+        "role": s.role,
+        "exit_code": s.exit_code,
+        "commits": r.commits,
+        "inbox": s.inbox,
+    })
+    .to_string()
+}
+
 /// The base commit of a child: HEAD of the parent's project folder.
 fn base_commit(dir: &Path) -> Result<String> {
     let l = crate::hostgit::Layout::discover(dir)?
@@ -1329,6 +1438,10 @@ fn run_child(env: &HostEnv, job: &Job, prompt: Vec<u8>, result: &mut ChildResult
             modes,
             role: job.role,
         });
+        // paddock kv and the devices: the identity comes from the job, which
+        // the parent's paddock wrote in a folder that no sandbox sees.
+        built.parent = Some(c.parent.clone());
+        built.device_ceiling = Some(c.devices.clone());
         match oneshot.prompt {
             crate::profile::PromptVia::Stdin => built.stdin = Some(prompt.clone()),
             crate::profile::PromptVia::File => {
