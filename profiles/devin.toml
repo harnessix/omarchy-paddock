@@ -1,0 +1,46 @@
+name = "devin"
+description = "Devin CLI"
+
+# Entries that come from documentation, not from a test. paddock doctor lists them.
+unverified = [
+  "every entry: devin was not installed when this profile was written",
+]
+
+# mise tool: http:devin
+[locate]
+mise = "devin"
+commands = ["devin"]
+
+[launch]
+login_callback = true
+# --permission-mode dangerous runs tools without asking; the sandbox is the
+# trusted workspace. https://docs.devin.ai/cli/reference/commands
+yolo_args = ["--permission-mode", "dangerous", "--respect-workspace-trust", "false"]
+
+[state]
+# https://docs.devin.ai/cli/enterprise/devin-auth
+auth = [".local/share/devin/credentials.toml"]
+import_ro = [".config/devin/AGENTS.md", ".config/devin/skills", ".agents/skills"]
+seed = [".config/devin/config.json", ".config/devin/mcp_config.json"]
+
+# The install is read-only in the sandbox; mise updates it on the host.
+# https://docs.devin.ai/cli/reference/configuration/config-file
+[[state.settings]]
+file = ".config/devin/config.json"
+path = ["auto_update"]
+value = false
+
+[[mcp]]
+file = ".config/devin/mcp_config.json"
+path = ["mcpServers"]
+
+# Cognition documents no telemetry switch for the CLI.
+[privacy.training]
+setting = "the data settings of your Devin organization"
+url = "https://docs.devin.ai/cli/reference/configuration/config-file"
+
+# One task without a terminal: -p prints the response, --prompt-file reads
+# the prompt from a file. https://docs.devin.ai/cli/reference/commands
+[oneshot]
+args = ["-p", "--permission-mode", "dangerous", "--respect-workspace-trust", "false", "--prompt-file", "{prompt_file}"]
+prompt = "file"

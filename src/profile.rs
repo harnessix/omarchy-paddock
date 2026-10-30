@@ -140,6 +140,10 @@ pub struct Launch {
     /// private keyring of its own (keyring.rs), never the host one.
     #[serde(default)]
     pub keyring: bool,
+    /// `paddock wrap` runs this harness on the host, with this reason in a
+    /// notice, because it cannot work in a sandbox (for example, it needs
+    /// its own sandbox, or its agent runs in a host service).
+    pub wrap_on_host: Option<String>,
 }
 
 impl Default for Launch {
@@ -151,6 +155,7 @@ impl Default for Launch {
             probe_args: default_probe(),
             login_callback: false,
             keyring: false,
+            wrap_on_host: None,
         }
     }
 }
@@ -183,6 +188,11 @@ pub struct State {
     /// external sandbox, so a second trust prompt only gets in the way.
     #[serde(default)]
     pub toml_set: Vec<TomlSet>,
+    /// Values written into settings files in the sandbox home at each start,
+    /// after `seed`, for example to turn off a self-update that cannot work
+    /// on the read-only install. The host files are never changed.
+    #[serde(default)]
+    pub settings: Vec<Setting>,
     /// The variable that points the harness at another account folder, as
     /// Omarchy's account switch sets it. `paddock wrap` reads it from the
     /// command and uses that folder as the login of the sandbox.
@@ -268,6 +278,10 @@ pub struct ProfileNetwork {
     /// Hosts the harness needs. Reserved for the allowlist network mode.
     #[serde(default)]
     pub endpoints: Vec<String>,
+    /// Ports on the sandbox loopback that the host reaches on its own
+    /// 127.0.0.1, for a harness that serves its UI to the host browser.
+    #[serde(default)]
+    pub publish: Vec<u16>,
 }
 
 /// The privacy defaults of a harness (see privacy.rs). Each entry must come
@@ -330,6 +344,28 @@ const BUILTIN: &[(&str, &str)] = &[
     ("gemini", include_str!("../profiles/gemini.toml")),
     ("grok", include_str!("../profiles/grok.toml")),
     ("opencode", include_str!("../profiles/opencode.toml")),
+    // The other agents that omarchy-agent starts.
+    ("amp", include_str!("../profiles/amp.toml")),
+    ("commandcode", include_str!("../profiles/commandcode.toml")),
+    ("crush", include_str!("../profiles/crush.toml")),
+    (
+        "cursor-agent",
+        include_str!("../profiles/cursor-agent.toml"),
+    ),
+    ("devin", include_str!("../profiles/devin.toml")),
+    ("dsh", include_str!("../profiles/dsh.toml")),
+    ("freebuff", include_str!("../profiles/freebuff.toml")),
+    ("hermes", include_str!("../profiles/hermes.toml")),
+    ("kilo", include_str!("../profiles/kilo.toml")),
+    ("kimi", include_str!("../profiles/kimi.toml")),
+    ("kiro-cli", include_str!("../profiles/kiro-cli.toml")),
+    ("mcode", include_str!("../profiles/mcode.toml")),
+    ("muse", include_str!("../profiles/muse.toml")),
+    ("omp", include_str!("../profiles/omp.toml")),
+    ("openclaw", include_str!("../profiles/openclaw.toml")),
+    ("ori", include_str!("../profiles/ori.toml")),
+    ("pi", include_str!("../profiles/pi.toml")),
+    ("qwen", include_str!("../profiles/qwen.toml")),
 ];
 
 /// A built-in profile by name.
@@ -585,13 +621,20 @@ fn shebang_interpreter(file: &Path) -> Option<String> {
 mod tests {
     use super::*;
 
+    /// Harnesses without a flag for no approvals: they ask none (pi, ori,
+    /// freebuff, mcode's terminal UI), take the mode from a variable (dsh),
+    /// or run on the host (openclaw).
+    const NO_APPROVAL_FLAG: &[&str] = &["pi", "ori", "freebuff", "mcode", "dsh", "openclaw"];
+
     #[test]
     fn builtin_profiles_parse_and_have_yolo_args() {
         for (name, text) in BUILTIN {
             let p: Profile = toml::from_str(text).unwrap();
             assert_eq!(&p.name, name);
             // Desktop apps keep their approval setting in their own settings.
-            if p.app.is_none() {
+            // Some harnesses ask for no approvals, or take the mode from a
+            // variable that omarchy-agent sets.
+            if p.app.is_none() && !NO_APPROVAL_FLAG.contains(name) {
                 assert!(!p.launch.yolo_args.is_empty(), "{name} has no yolo_args");
             }
         }

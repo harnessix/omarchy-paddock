@@ -1,0 +1,43 @@
+name = "crush"
+description = "Charm Crush"
+
+# Entries that come from documentation, not from a test. paddock doctor lists them.
+unverified = [
+  "every entry: crush was not installed when this profile was written",
+  "state.auth .local/share/crush/crush.json: the file that keeps keys pasted in the model picker",
+  "oneshot: `crush run` and its prompt on stdin",
+]
+
+# mise tool: crush
+[locate]
+mise = "crush"
+commands = ["crush"]
+
+[launch]
+# The README: --yolo skips all permission prompts.
+# https://github.com/charmbracelet/crush
+yolo_args = ["--yolo"]
+
+[state]
+auth = [".local/share/crush/crush.json"]
+# crushrc runs in a shell when crush loads it, so it is mounted read-only.
+import_ro = [".config/crush", ".config/AGENTS.md", ".agents/skills"]
+env_pass = ["ANTHROPIC_API_KEY", "OPENAI_API_KEY", "GEMINI_API_KEY", "OPENROUTER_API_KEY", "HYPER_API_KEY", "XAI_API_KEY", "GROQ_API_KEY"]
+
+# Metrics off, with the switches in the README, section "Metrics".
+# https://github.com/charmbracelet/crush#metrics
+[privacy]
+env = { CRUSH_DISABLE_METRICS = "1", DO_NOT_TRACK = "1" }
+
+# crush is a client: the account settings of the model provider apply.
+[privacy.training]
+setting = "the data settings of the model provider you sign in to"
+url = "https://github.com/charmbracelet/crush#configuration"
+
+# One task without a terminal. `crush run` answers one prompt and exits and
+# never asks (omarchy-agent: "--yolo belongs to the interactive command only");
+# the prompt text is fixed and names the file.
+[oneshot]
+args = ["run", "Read the file {prompt_file} and do the task that it describes."]
+prompt = "file"
+probe_args = ["run", "--help"]

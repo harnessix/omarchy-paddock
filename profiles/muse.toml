@@ -1,0 +1,35 @@
+name = "muse"
+description = "Meta Muse Code"
+
+# Entries that come from documentation, not from a test. paddock doctor lists them.
+unverified = [
+  "every entry: muse was not installed when this profile was written",
+  "launch.wrap_on_host: muse's own sandbox inside paddock was not tested",
+]
+
+# mise tool: muse
+[locate]
+mise = "muse"
+commands = ["muse"]
+
+[launch]
+# Muse runs every shell command in its own bubblewrap sandbox and refuses
+# the command when that sandbox cannot start. paddock blocks nested user
+# namespaces, so muse's sandbox cannot start inside paddock. paddock does
+# not turn muse's sandbox off: omarchy-agent starts run on the host, as
+# before, with a notice.
+# https://dev.meta.ai/docs/muse-code/permissions
+wrap_on_host = "muse keeps its own sandbox, which cannot start inside paddock's sandbox, so it runs with its own sandbox only"
+login_callback = true
+# --approval-mode never skips the tool prompts and keeps muse's sandbox.
+yolo_args = ["--approval-mode", "never"]
+
+[state]
+seed = [".config/muse/settings.json"]
+import_ro = [".agents/skills"]
+env_pass = ["META_API_KEY"]
+
+# Muse names telemetry options in its settings but documents no key.
+[privacy.training]
+setting = "the data settings of your Meta account"
+url = "https://dev.meta.ai/docs/muse-code/configuration"

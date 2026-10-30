@@ -45,6 +45,10 @@ pub fn detect(env: &HostEnv) -> Result<Vec<(String, String)>> {
         let Some(p) = f.profile(&e.name) else {
             continue;
         };
+        // A harness that cannot work in a sandbox keeps its own command.
+        if p.launch.wrap_on_host.is_some() {
+            continue;
+        }
         let commands = if p.locate.commands.is_empty() {
             vec![e.name.clone()]
         } else {

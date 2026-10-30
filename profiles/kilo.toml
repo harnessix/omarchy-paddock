@@ -1,0 +1,47 @@
+name = "kilo"
+description = "Kilo Code CLI"
+
+# Entries that come from documentation, not from a test. paddock doctor lists them.
+unverified = [
+  "every entry: kilo was not installed when this profile was written",
+  "state.auth .local/share/kilo/auth.json: the layout of opencode, which kilo is built on",
+]
+
+# mise tool: npm:@kilocode/cli
+[locate]
+mise = "kilo"
+commands = ["kilo"]
+
+[launch]
+login_callback = true
+# --auto approves every permission that a rule does not deny.
+# https://kilo.ai/docs/code-with-ai/platforms/cli
+yolo_args = ["--auto"]
+
+[state]
+auth = [".local/share/kilo/auth.json", ".local/share/kilo/mcp-auth.json"]
+import_ro = [".config/kilo", ".agents/skills"]
+env_pass = ["KILO_API_KEY", "ANTHROPIC_API_KEY", "OPENAI_API_KEY", "OPENROUTER_API_KEY"]
+
+[[mcp]]
+file = ".config/kilo/kilo.json"
+path = ["mcp"]
+
+[[mcp]]
+file = "kilo.json"
+in_project = true
+path = ["mcp"]
+
+# Kilo's OpenTelemetry export runs only when OTEL_EXPORTER_OTLP_ENDPOINT is
+# set; no other switch is documented.
+# https://kilo.ai/docs/code-with-ai/platforms/cli
+[privacy.training]
+setting = "the data settings of the model provider you sign in to"
+url = "https://kilo.ai/docs/code-with-ai/platforms/cli"
+
+# One task without a terminal: `kilo run --file` attaches the file; the
+# message is fixed text. https://kilo.ai/docs/code-with-ai/platforms/cli-reference
+[oneshot]
+args = ["run", "--auto", "--file", "{prompt_file}", "Do the task that the attached file describes."]
+prompt = "file"
+probe_args = ["run", "--help"]

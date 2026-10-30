@@ -134,6 +134,8 @@ impl World {
             .env("MISE_CACHE_DIR", r.join("mise-cache"))
             .env("MISE_STATE_DIR", r.join("mise-state"))
             .env("MISE_OFFLINE", "1")
+            .env("LC_ALL", "C")
+            .env("LANG", "C")
             .env("FAKE_LOG", r)
             .env_remove("DBUS_SESSION_BUS_ADDRESS")
             .env_remove("CLAUDE_CONFIG_DIR")
@@ -393,6 +395,52 @@ fn the_real_omarchy_agent_builds_one_command_for_both_paths() {
             assert!(built.contains(&ui.display().to_string()), "{built}");
         }
     }
+}
+
+#[test]
+fn the_shell_form_a_host_only_agent_and_a_read_only_install() {
+    if !bwrap_works() {
+        eprintln!("skipped: bwrap cannot create a user namespace here");
+        return;
+    }
+    let w = world();
+    // amp's form with a prompt: the script runs whole in the sandbox, and
+    // its $0 is the agent program there.
+    write_exec(
+        &w.tools.join("amp"),
+        "#!/bin/sh\nread -r first\nprintf 'inside=%s zero=%s args=%s stdin=%s\\n' \"${PADDOCK:-no}\" \"$0\" \"$*\" \"$first\" >> \"$PWD/agent.log\"\n",
+    );
+    let script = "printf \"%s\\n\" \"$1\" | exec \"$0\" --dangerously-allow-all";
+    let out = w.paddock(&["wrap", "--", "bash", "-c", script, "amp", "the prompt"]);
+    ok(&out);
+    let line = w.agent_log().pop().unwrap();
+    let amp = std::fs::canonicalize(w.tools.join("amp")).unwrap();
+    assert_eq!(
+        line,
+        format!(
+            "inside=1 zero={} args=--dangerously-allow-all stdin=the prompt",
+            amp.display()
+        )
+    );
+
+    // muse keeps its own sandbox, which cannot start in paddock's: it runs
+    // as before, and paddock says so.
+    write_exec(&w.tools.join("muse"), AGENT);
+    let out = w.paddock(&["wrap", "--", "muse", "--approval-mode", "never"]);
+    let text = ok(&out);
+    assert!(text.contains("muse runs without a sandbox"), "{text}");
+    assert!(w.agent_log().pop().unwrap().starts_with("inside=no "));
+
+    // A self-update inside the sandbox fails: the install is read-only.
+    write_exec(
+        &w.tools.join("claude"),
+        "#!/bin/sh\nif touch \"$(dirname \"$0\")/update\" 2>\"$PWD/update.err\"; then echo updated >> \"$PWD/agent.log\"; else echo refused >> \"$PWD/agent.log\"; fi\n",
+    );
+    ok(&w.paddock(&["wrap", "--", "claude"]));
+    assert_eq!(w.agent_log().pop().unwrap(), "refused");
+    let err = std::fs::read_to_string(w.proj.join("update.err")).unwrap();
+    assert!(err.contains("Read-only file system"), "{err}");
+    assert!(!w.tools.join("update").exists());
 }
 
 #[test]
