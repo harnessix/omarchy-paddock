@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Security: the docker and podman egress proxy treats IPv4-mapped (`::ffff:a.b.c.d`), IPv4-compatible and NAT64 (`64:ff9b::a.b.c.d`) IPv6 addresses as their IPv4 address in its loopback, host and LAN checks. Before, `::ffff:127.0.0.1` passed as "not loopback". The proxy also connects only to the addresses that it checked, so a second DNS lookup cannot point a name somewhere else. Reported in the Omarchy plugin marketplace review.
+
 ## 0.1.5
 
 A security release. Update from every earlier version: a sandbox was able to run a command on the host through git, and to make paddock on the host read or write outside the sandbox in more places than 0.1.4 fixed.

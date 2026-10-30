@@ -169,6 +169,12 @@ if [ -n "$PADDOCK_PROBE_RELAY" ]; then
     else
       ok proxy-refuses-host
     fi
+    # IPv4-mapped IPv6 forms of loopback must be refused as well.
+    if curl -s -o /dev/null --max-time 5 -p -x "$HTTPS_PROXY" "http://[::ffff:127.0.0.1]:$PADDOCK_PROBE_PORT/" 2>/dev/null; then
+      fail proxy-refuses-mapped-loopback "the proxy reached ::ffff:127.0.0.1"
+    else
+      ok proxy-refuses-mapped-loopback
+    fi
     reached=""
     for a in $PADDOCK_PROBE_LOCAL_ADDRS; do
       if curl -s -o /dev/null --max-time 5 -p -x "$HTTPS_PROXY" "http://$a:$PADDOCK_PROBE_ANYPORT/" 2>/dev/null; then reached="$reached $a"; fi
