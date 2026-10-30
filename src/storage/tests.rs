@@ -429,6 +429,22 @@ fn scan_reads_homes_sessions_and_keyrings() {
     let project = env.home.join("src/app");
     std::fs::create_dir_all(&project).unwrap();
     let live = make_home(&env, "claude", &project, false);
+    // Big enough for its own data blocks: btrfs keeps small files inline in
+    // its metadata, and `btrfs filesystem du` reports 0 exclusive bytes then.
+    // Incompressible (btrfs may compress) and synced (unflushed data counts 0).
+    let mut x: u32 = 1;
+    let data: Vec<u8> = (0..256 * 1024)
+        .map(|_| {
+            x = x.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (x >> 24) as u8
+        })
+        .collect();
+    {
+        use std::io::Write;
+        let mut f = std::fs::File::create(live.join("data.bin")).unwrap();
+        f.write_all(&data).unwrap();
+        f.sync_all().unwrap();
+    }
     let gone_project = env.home.join("src/removed");
     let gone = make_home(&env, "claude", &gone_project, false);
     let legacy = env
