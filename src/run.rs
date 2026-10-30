@@ -247,6 +247,7 @@ pub fn run(
         log::warn!("{w}");
     }
     let auth = AuthSync::copy_in(env, &built.profile, &built.auth, &spec.home_src)?;
+    let history = crate::history::CopyBack::new(env, &built.profile, &built.auth, &spec.home_src);
     state::write_gitconfig(env, &spec.home_src, repo.as_ref())?;
     let watched = state::snapshot(&spec.watch);
 
@@ -415,6 +416,14 @@ pub fn run(
         );
     }
     let synced = auth.copy_out()?;
+    match history.copy_out() {
+        Ok(files) if !files.is_empty() => log::info!(
+            "copied {} session file(s) back to the host history",
+            files.len()
+        ),
+        Ok(_) => {}
+        Err(e) => log::warn!("cannot copy the session history back: {e:#}"),
+    }
     if !quiet {
         for f in &synced.saved {
             eprintln!("paddock: saved updated credentials to {}", f.display());

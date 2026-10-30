@@ -31,6 +31,12 @@ env_pass = ["OPENAI_API_KEY", "OPENAI_BASE_URL", "CODEX_API_KEY"]
 env = "CODEX_HOME"
 dir = ".codex"
 
+# Codex keeps its sessions by date. New ones are copied back at exit, so the
+# Omarchy agents panel counts them.
+[state.history]
+copy_back = [".codex/sessions", ".codex/archived_sessions"]
+files = ["*.jsonl"]
+
 # The project is already sandboxed: mark it trusted, so codex does not ask.
 [[state.toml_set]]
 file = ".codex/config.toml"

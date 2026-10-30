@@ -497,6 +497,7 @@ pub fn build_with(env: &HostEnv, opts: &Options, harness: Harness) -> Result<Bui
         }
     }
     check_harness_install(&harness, &sandbox_writable(env, &spec))?;
+    crate::history::apply(env, &profile, &auth, &mut spec)?;
     if let state::AuthMode::Account { dir, .. } = &auth {
         // The host writes refreshed tokens back into the account folder. A
         // folder that a sandbox can write could lead those writes anywhere.

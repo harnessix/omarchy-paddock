@@ -444,6 +444,69 @@ fn the_shell_form_a_host_only_agent_and_a_read_only_install() {
 }
 
 #[test]
+fn history_reaches_the_host_and_other_projects_stay_hidden() {
+    if !bwrap_works() {
+        eprintln!("skipped: bwrap cannot create a user namespace here");
+        return;
+    }
+    let w = world();
+    let projects = w.home.join(".claude/projects");
+    let other = projects.join("-home-demo-other-project");
+    std::fs::create_dir_all(&other).unwrap();
+    std::fs::write(other.join("secret-session.jsonl"), "{\"other\":1}\n").unwrap();
+    // Claude Code: it lists what it sees, and writes a transcript.
+    write_exec(
+        &w.tools.join("claude"),
+        "#!/bin/sh\nls -A \"$HOME/.claude/projects\" > \"$PWD/seen.txt\"\nfor d in \"$HOME\"/.claude/projects/*/; do ls -A \"$d\" >> \"$PWD/seen.txt\"; done\nkey=$(printf '%s' \"$PWD\" | sed 's/[^A-Za-z0-9]/-/g')\nprintf '{\"t\":1}\\n' > \"$HOME/.claude/projects/$key/s1.jsonl\"\n",
+    );
+    ok(&w.paddock(&["wrap", "--", "claude"]));
+    let proj = std::fs::canonicalize(&w.proj).unwrap();
+    let key: String = proj
+        .to_string_lossy()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect();
+    let seen = std::fs::read_to_string(w.proj.join("seen.txt")).unwrap();
+    assert_eq!(seen.trim(), key, "the sandbox saw other projects: {seen}");
+    assert_eq!(
+        std::fs::read_to_string(projects.join(&key).join("s1.jsonl")).unwrap(),
+        "{\"t\":1}\n"
+    );
+
+    // Codex: a session by date is copied back at exit.
+    write_exec(
+        &w.tools.join("codex"),
+        "#!/bin/sh\nmkdir -p \"$HOME/.codex/sessions/2026/10/30\"\nprintf '{\"r\":1}\\n' > \"$HOME/.codex/sessions/2026/10/30/rollout-1.jsonl\"\nls -A \"$HOME/.codex/sessions\" > \"$PWD/codex-seen.txt\"\n",
+    );
+    std::fs::create_dir_all(w.home.join(".codex/sessions/2026/10/29")).unwrap();
+    std::fs::write(
+        w.home.join(".codex/sessions/2026/10/29/rollout-0.jsonl"),
+        "old\n",
+    )
+    .unwrap();
+    ok(&w.paddock(&["wrap", "--", "codex", "--approve-for-me"]));
+    assert_eq!(
+        std::fs::read_to_string(w.home.join(".codex/sessions/2026/10/30/rollout-1.jsonl")).unwrap(),
+        "{\"r\":1}\n"
+    );
+    // The host's own sessions are not in the sandbox.
+    let seen = std::fs::read_to_string(w.proj.join("codex-seen.txt")).unwrap();
+    assert_eq!(seen.trim(), "2026");
+    assert!(!w
+        .root
+        .join("data/paddock/homes/codex")
+        .read_dir()
+        .unwrap()
+        .flatten()
+        .any(|l| l
+            .path()
+            .read_dir()
+            .unwrap()
+            .flatten()
+            .any(|h| h.path().join(".codex/sessions/2026/10/29").exists())));
+}
+
+#[test]
 fn a_start_in_the_home_folder_works_in_a_scratch_project() {
     if !bwrap_works() {
         eprintln!("skipped: bwrap cannot create a user namespace here");

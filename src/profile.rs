@@ -197,6 +197,23 @@ pub struct State {
     /// Omarchy's account switch sets it. `paddock wrap` reads it from the
     /// command and uses that folder as the login of the sandbox.
     pub account: Option<Account>,
+    /// Session history that tools on the host read (history.rs).
+    pub history: Option<History>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct History {
+    /// A folder, relative to HOME, with one folder per project in Claude
+    /// Code's naming. paddock binds this project's host folder read-write.
+    pub project_folders: Option<String>,
+    /// Folders, relative to HOME, whose new files paddock copies back to the
+    /// host at exit, for history that is kept by date.
+    #[serde(default)]
+    pub copy_back: Vec<String>,
+    /// File name patterns for `copy_back`. Empty: every file.
+    #[serde(default)]
+    pub files: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

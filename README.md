@@ -748,6 +748,16 @@ paddock has a profile for every agent that `omarchy-agent` can start. `paddock d
 | muse | no | Muse runs each shell command in its own bubblewrap sandbox, and refuses the command when that sandbox cannot start. paddock blocks nested sandboxes, so muse starts on the host with its own sandbox, and paddock shows a notice. paddock never turns muse's sandbox off. |
 | openclaw | no | Its agent runs in the OpenClaw gateway, a service on your machine. The terminal UI only talks to it, so a sandbox around the UI protects nothing. Starts from `omarchy-agent` run as before, with a notice. `paddock openclaw` runs OpenClaw's embedded runtime in a sandbox, with its own state folder in the sandbox home. |
 
+#### Usage statistics in the Omarchy agents panel
+
+The agents panel reads the session history of each agent from fixed places in your home folder. A sandbox keeps its history in its own home, so paddock brings it back:
+
+- Claude Code keeps one folder per project in `~/.claude/projects`. paddock binds the host folder of the current project into the sandbox, read-write. The sandbox sees only this one folder, no other project's. `claude --resume` on the host also finds these sessions.
+- Codex (`~/.codex/sessions`) and Grok Build (`~/.grok/sessions`) keep their history by date or by session. At the end of a session, paddock copies new history files back. It copies a file only when the host has none, or when the sandbox only added to it. It never follows a symlink in the sandbox home.
+- With an account folder (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `GROK_HOME`), the history goes to that folder, the same as on the host.
+- An isolated login (`--auth isolated:NAME`) keeps its history in the sandbox home.
+- paddock never writes the panel's own usage records. The panel's collectors count the sessions the same way as sessions on the host.
+
 Inside the sandbox, the installs of the agents are read-only. mise updates them on the host before each start (`auto_update`). Where a vendor documents a switch, paddock turns the agent's own self-update off in the sandbox. Other self-updates fail with "Read-only file system".
 
 ## Launchers

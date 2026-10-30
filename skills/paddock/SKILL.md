@@ -76,6 +76,8 @@ paddock setup --yes --shims --launchers
 
 On Omarchy, `paddock shims install --scope omarchy-agent` puts only the agents that `omarchy-agent` starts (the agent key, the console, the agents panel, the alias `a`) in a sandbox. Typed commands and scripts do not change. Ask the user before you run it, and tell them what it changes: one marked block in `~/.config/mise/config.toml`, and from then on every agent start from Omarchy runs through `paddock wrap`. `paddock shims remove` undoes it. If paddock reports that the file already has its own `[wrappers.omarchy-agent]`, do not edit or remove the user's entry; tell the user.
 
+Sessions of claude, codex and grok in a sandbox reach the host history, so the Omarchy agents panel counts them: claude gets only the host folder of its own project in `~/.claude/projects`, and codex and grok copy new history back at exit. Do not bind more history folders by hand.
+
 Every agent that `omarchy-agent` can start has a profile. muse and openclaw still start on the host, with a notice: muse needs its own sandbox, and the agent of openclaw runs in a host service. Do not try to turn off muse's sandbox to make it fit. Many profiles come from documentation; `paddock doctor` lists what is not verified.
 
 `paddock shims install` adds one marked line to `~/.bashrc` and `~/.zshrc`. It takes effect in new shells. `PADDOCK_BYPASS=1 claude` runs a harness once without the sandbox. A harness command in the home directory stops with an error, because the home directory is never a project.
