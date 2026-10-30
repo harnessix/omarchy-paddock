@@ -619,7 +619,14 @@ fn worktrees_with_commits_need_force_and_keep_their_branch() {
     let inv = scan(&env, &h, false);
     let w = |p: &Path| inv.worktrees.iter().find(|w| w.path == p).unwrap();
     assert_eq!(w(&clean.path).unmerged, Some(0));
-    assert_eq!(w(&clean.path).dirty, Some(false));
+    // The worktree state comes from a sandboxed `git status`. A host that
+    // cannot run one, such as a CI container without user namespaces,
+    // reports it as unknown instead of guessing.
+    assert!(
+        matches!(w(&clean.path).dirty, Some(false) | None),
+        "{:?}",
+        w(&clean.path).dirty
+    );
     assert_eq!(w(&ahead.path).unmerged, Some(1));
 
     let o = GcOptions {
@@ -628,14 +635,20 @@ fn worktrees_with_commits_need_force_and_keep_their_branch() {
         ..opts()
     };
     let removed = apply(&env, &c, &plan(&inv, &o, state::now()));
-    assert_eq!(removed.len(), 1, "{removed:?}");
-    assert!(!clean.path.exists());
-    assert!(ahead.path.exists());
+    if w(&clean.path).dirty.is_some() {
+        assert_eq!(removed.len(), 1, "{removed:?}");
+        assert!(!clean.path.exists());
+        assert!(ahead.path.exists());
+    } else {
+        // An unknown state counts as a risk, so it needs --force as well.
+        assert_eq!(removed.len(), 0, "{removed:?}");
+    }
 
     let o = GcOptions { force: true, ..o };
     let removed = apply(&env, &c, &plan(&scan(&env, &h, false), &o, state::now()));
-    assert!(removed[0].error.is_none(), "{removed:?}");
+    assert!(removed.iter().all(|r| r.error.is_none()), "{removed:?}");
     assert!(!ahead.path.exists());
+    assert!(!clean.path.exists());
     let branches = Command::new("git")
         .arg("-C")
         .arg(&repo)

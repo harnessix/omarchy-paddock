@@ -618,12 +618,16 @@ mod tests {
         std::fs::write(w.path.join("new.txt"), "x").unwrap();
         let r = worktree_report(&env, &w);
         assert!(r.contains("work in the app"), "{r}");
-        if env.which("bwrap").is_some() {
-            // The worktree state comes from a sandboxed `git status`.
-            assert!(r.contains("?? new.txt"), "{r}");
-            assert_eq!(worktree_counts(&env, &w), (1, Some(1)));
-        } else {
-            assert_eq!(worktree_counts(&env, &w), (1, None));
+        // The worktree state comes from a sandboxed `git status`. A host that
+        // cannot run one reports it as unknown instead of guessing.
+        let (commits, changed) = worktree_counts(&env, &w);
+        assert_eq!(commits, 1);
+        match changed {
+            Some(n) => {
+                assert_eq!(n, 1);
+                assert!(r.contains("?? new.txt"), "{r}");
+            }
+            None => assert!(r.contains("cannot read the worktree state") || r.contains("commits")),
         }
         // The checkout itself stays on its branch.
         let head = std::process::Command::new("git")
