@@ -228,3 +228,66 @@ fn a_question_waits_for_the_answer_of_the_user_across_reads() {
         "{log}"
     );
 }
+
+/// `paddock approvals answer ID --text -` reads the answer from standard
+/// input, so it never shows in the process list, and an answer may start
+/// with `-`.
+#[test]
+fn an_answer_comes_from_standard_input() {
+    use std::io::Write;
+    let t = tempfile::tempdir().unwrap();
+    let mut vars = std::collections::BTreeMap::new();
+    vars.insert(
+        "XDG_STATE_HOME".to_string(),
+        t.path().join("state").display().to_string(),
+    );
+    vars.insert(
+        "XDG_RUNTIME_DIR".to_string(),
+        t.path().join("run").display().to_string(),
+    );
+    let env = paddock::env::HostEnv::from_parts(
+        t.path().join("home"),
+        "demo".into(),
+        1000,
+        1000,
+        vars.clone(),
+    );
+    let p = paddock::broker::Pending {
+        id: "r-1-abc".into(),
+        sandbox: "s".into(),
+        harness: "fake".into(),
+        project: t.path().into(),
+        capability: paddock::broker::ASK_CAPABILITY.into(),
+        summary: String::new(),
+        detail: "Which flag?".into(),
+        reason: String::new(),
+        created: paddock::state::now(),
+        expires: 0,
+        session_allowed: false,
+        started_by: vec![],
+        choices: vec![],
+    };
+    paddock::broker::write_pending(&env, &p).unwrap();
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_paddock"))
+        .args(["approvals", "answer", "r-1-abc", "--text", "-"])
+        .env("HOME", t.path().join("home"))
+        .envs(&vars)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"-n, not -f\n")
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert!(out.status.success(), "{out:?}");
+    let answer =
+        std::fs::read_to_string(paddock::broker::approvals_dir(&env).join("r-1-abc.answer"))
+            .unwrap();
+    let v: serde_json::Value = serde_json::from_str(&answer).unwrap();
+    assert_eq!(v["reply"], "-n, not -f");
+}

@@ -46,7 +46,29 @@ fn proxy(conn: &Connection) -> Result<Proxy<'static>> {
     Ok(Proxy::new(conn, DEST, PATH, DEST)?)
 }
 
+/// The body as plain text for a server that reads markup in bodies (the
+/// `body-markup` capability, on by default in mako and dunst): `&`, `<` and
+/// `>` are escaped, so text from a sandbox cannot add links, images or
+/// formatting.
+pub fn escape_markup(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
+fn reads_markup(p: &Proxy<'_>) -> bool {
+    p.call::<_, _, Vec<String>>("GetCapabilities", &())
+        .map(|caps| caps.iter().any(|c| c == "body-markup"))
+        // When the server does not say, escaping is the safe choice.
+        .unwrap_or(true)
+}
+
 fn send(p: &Proxy<'_>, n: &Note) -> Result<u32> {
+    let body = if reads_markup(p) {
+        escape_markup(&n.body)
+    } else {
+        n.body.clone()
+    };
     let actions: Vec<&str> = n
         .actions
         .iter()
@@ -61,7 +83,7 @@ fn send(p: &Proxy<'_>, n: &Note) -> Result<u32> {
             0u32,
             "",
             n.summary.as_str(),
-            n.body.as_str(),
+            body.as_str(),
             actions,
             hints,
             -1i32,
@@ -131,5 +153,16 @@ impl Handle {
         if let Ok(p) = proxy(&self.conn) {
             let _: Result<(), _> = p.call("CloseNotification", &(self.id,));
         }
+    }
+}
+
+#[cfg(test)]
+mod markup_tests {
+    #[test]
+    fn markup_from_a_sandbox_is_shown_as_text() {
+        assert_eq!(
+            super::escape_markup("<b>x</b> & <a href=\"u\">y</a>"),
+            "&lt;b&gt;x&lt;/b&gt; &amp; &lt;a href=\"u\"&gt;y&lt;/a&gt;"
+        );
     }
 }

@@ -33,6 +33,16 @@ pub const MAX_CHOICES: usize = 8;
 pub const MAX_CHOICE: usize = 64;
 /// Questions that one sandbox can have open at the same time.
 const MAX_OPEN_QUESTIONS: usize = 4;
+/// Questions of all sandboxes on the card at the same time, so that no
+/// sandbox can push host requests of others off the card.
+pub const MAX_ALL_QUESTIONS: usize = 8;
+/// After the user dismisses a question, the sandbox cannot ask a new one
+/// for this long.
+pub const REASK_AFTER_DISMISS: Duration = Duration::from_secs(30);
+/// An answer stays this long, so that every read of the question gets it.
+const KEEP_REPLY: Duration = Duration::from_secs(5);
+/// How often abandoned questions are withdrawn.
+const SWEEP_EVERY: Duration = Duration::from_secs(10);
 /// A question that no read waited for during this time is withdrawn: the
 /// agent stopped asking.
 const ABANDONED: Duration = Duration::from_secs(120);
@@ -161,15 +171,20 @@ struct Open {
     /// When the last read stopped waiting.
     left: Instant,
     note: Option<broker::notify::Handle>,
+    /// The answer and when it came. Reads that still wait get it too.
+    done: Option<(Reply, Instant)>,
 }
 
 /// `/dev/paddock/ask`: the read returns the user's answer.
 pub struct Ask {
     ctx: DeviceCtx,
     open: Mutex<HashMap<String, Open>>,
+    /// When the user last dismissed a question of this sandbox.
+    dismissed: Mutex<Option<Instant>>,
 }
 
 /// What the user answered.
+#[derive(Clone)]
 enum Reply {
     Text(String),
     Dismissed,
@@ -180,7 +195,22 @@ impl Ask {
         Self {
             ctx,
             open: Mutex::new(HashMap::new()),
+            dismissed: Mutex::new(None),
         }
+    }
+
+    /// The device with a thread that withdraws abandoned questions, also
+    /// when the agent never asks again.
+    pub fn start(ctx: DeviceCtx) -> std::sync::Arc<Self> {
+        let a = std::sync::Arc::new(Self::new(ctx));
+        let weak = std::sync::Arc::downgrade(&a);
+        std::thread::spawn(move || loop {
+            std::thread::sleep(SWEEP_EVERY);
+            let Some(a) = weak.upgrade() else { return };
+            let mut open = a.open.lock().unwrap();
+            a.sweep(&mut open);
+        });
+        a
     }
 
     fn pending_file(&self, id: &str) -> std::path::PathBuf {
@@ -226,17 +256,23 @@ impl Ask {
         broker::audit_line(&self.ctx.env, &line);
     }
 
-    /// Withdraw questions that no read waited for in a while.
+    /// Withdraw questions that no read waited for in a while, and drop
+    /// answers that every read collected or that are old.
     fn sweep(&self, open: &mut HashMap<String, Open>) {
         let stale: Vec<String> = open
             .iter()
-            .filter(|(_, q)| q.readers == 0 && q.left.elapsed() > ABANDONED)
+            .filter(|(_, q)| match &q.done {
+                Some((_, at)) => q.readers == 0 || at.elapsed() > KEEP_REPLY,
+                None => q.readers == 0 && q.left.elapsed() > ABANDONED,
+            })
             .map(|(k, _)| k.clone())
             .collect();
         for k in stale {
             if let Some(q) = open.remove(&k) {
-                self.withdraw(&q);
-                self.audit(&q, "withdrawn: the agent stopped waiting", None);
+                if q.done.is_none() {
+                    self.withdraw(&q);
+                    self.audit(&q, "withdrawn: the agent stopped waiting", None);
+                }
             }
         }
     }
@@ -257,7 +293,7 @@ impl Ask {
         let note = broker::notify::Note {
             summary: format!("paddock: {} asks you a question", p.harness),
             body: format!(
-                "{}{}\n\nType an answer: paddock approvals answer {} --text 'ANSWER'",
+                "{}{}\n\nType an answer in a terminal: paddock approvals answer {} --text -\n(type the answer, then Ctrl-D)",
                 crate::spawn::chain_text(&p.started_by)
                     .map(|c| format!("{c}\n\n"))
                     .unwrap_or_default(),
@@ -299,48 +335,80 @@ impl Ask {
             h.update(c.as_bytes());
         }
         let key = crate::manifest::hex(&h.finalize());
-        let mut open = self.open.lock().unwrap();
-        self.sweep(&mut open);
-        if let Some(q) = open.get_mut(&key) {
-            q.readers += 1;
-            return Ok(key);
-        }
-        if open.len() >= MAX_OPEN_QUESTIONS {
-            return Err(DevError::Failed);
-        }
-        let now = crate::state::now();
-        let p = broker::Pending {
-            id: broker::new_request_id(),
-            sandbox: self.ctx.sandbox.clone(),
-            harness: self.ctx.harness.clone(),
-            project: self.ctx.project.clone(),
-            capability: broker::ASK_CAPABILITY.into(),
-            summary: "asks you a question".into(),
-            detail: question.to_string(),
-            reason: String::new(),
-            created: now,
-            // A question has no time limit; it waits until the agent stops.
-            expires: 0,
-            session_allowed: false,
-            started_by: self.ctx.started_by.clone(),
-            choices: choices.to_vec(),
+        let p = {
+            let mut open = self.open.lock().unwrap();
+            self.sweep(&mut open);
+            if let Some(q) = open.get_mut(&key) {
+                q.readers += 1;
+                return Ok(key);
+            }
+            if open.len() >= MAX_OPEN_QUESTIONS {
+                return Err(DevError::Failed);
+            }
+            if self
+                .dismissed
+                .lock()
+                .unwrap()
+                .is_some_and(|t| t.elapsed() < REASK_AFTER_DISMISS)
+            {
+                return Err(DevError::Denied);
+            }
+            let all = broker::pending(&self.ctx.env)
+                .iter()
+                .filter(|p| p.capability == broker::ASK_CAPABILITY)
+                .count();
+            if all >= MAX_ALL_QUESTIONS {
+                return Err(DevError::Failed);
+            }
+            let now = crate::state::now();
+            let p = broker::Pending {
+                id: broker::new_request_id(),
+                sandbox: self.ctx.sandbox.clone(),
+                harness: self.ctx.harness.clone(),
+                project: self.ctx.project.clone(),
+                capability: broker::ASK_CAPABILITY.into(),
+                summary: "asks you a question".into(),
+                detail: question.to_string(),
+                reason: String::new(),
+                created: now,
+                // A question has no time limit; it waits until the agent stops.
+                expires: 0,
+                session_allowed: false,
+                started_by: self.ctx.started_by.clone(),
+                choices: choices.to_vec(),
+            };
+            // In the list before the card exists: a read of the same question
+            // that comes now attaches instead of making a second card.
+            open.insert(
+                key.clone(),
+                Open {
+                    id: p.id.clone(),
+                    chars: question.chars().count(),
+                    choices: choices.len(),
+                    readers: 1,
+                    left: Instant::now(),
+                    note: None,
+                    done: None,
+                },
+            );
+            p
         };
+        // The card and the notification, without holding the lock: a slow
+        // session bus must not block the other reads of this sandbox.
         if let Err(e) = broker::write_pending(&self.ctx.env, &p) {
             log::warn!("cannot put the question on the card: {e}");
+            self.open.lock().unwrap().remove(&key);
             return Err(DevError::Failed);
         }
         let note = self.notify(&p);
-        open.insert(
-            key.clone(),
-            Open {
-                id: p.id.clone(),
-                chars: question.chars().count(),
-                choices: choices.len(),
-                readers: 1,
-                left: Instant::now(),
-                note,
-            },
-        );
+        match self.open.lock().unwrap().get_mut(&key) {
+            Some(q) => q.note = note,
+            None => {
+                if let Some(n) = note {
+                    n.close();
+                }
+            }
+        }
         Ok(key)
     }
 
@@ -360,7 +428,7 @@ impl Drop for Ask {
     /// The sandbox ended: its open questions leave the card.
     fn drop(&mut self) {
         let open = std::mem::take(&mut *self.open.lock().unwrap());
-        for q in open.values() {
+        for q in open.values().filter(|q| q.done.is_none()) {
             self.withdraw(q);
             self.audit(q, "withdrawn: the sandbox ended", None);
         }
@@ -368,7 +436,9 @@ impl Drop for Ask {
 }
 
 fn check_question(p: &Parsed) -> Result<(String, Vec<String>), DevError> {
-    let q = p.text.trim().to_string();
+    // Control and invisible format characters never reach the card, a
+    // notification or a terminal.
+    let q = broker::clean_text(p.text.trim()).trim().to_string();
     if q.is_empty() || q.chars().count() > MAX_QUESTION {
         return Err(DevError::Invalid);
     }
@@ -380,7 +450,11 @@ fn check_question(p: &Parsed) -> Result<(String, Vec<String>), DevError> {
         }
         for v in list {
             let s = v.as_str().ok_or(DevError::Invalid)?.trim();
-            if s.is_empty() || s.chars().count() > MAX_CHOICE || s.chars().any(char::is_control) {
+            if s.is_empty()
+                || s.chars().count() > MAX_CHOICE
+                || broker::clean_text(s) != s
+                || s.contains(['\n', '\t'])
+            {
                 return Err(DevError::Invalid);
             }
             choices.push(s.to_string());
@@ -406,28 +480,39 @@ impl Device for Ask {
             if let Some(q) = open.get_mut(&key) {
                 q.readers = q.readers.saturating_sub(1);
                 q.left = Instant::now();
+                if q.readers == 0 && q.done.is_some() {
+                    open.remove(&key);
+                }
             }
             outcome
         };
         loop {
-            let id = match self.open.lock().unwrap().get(&key) {
-                Some(q) => q.id.clone(),
-                // Another read of the same question got the answer.
+            let (id, done) = match self.open.lock().unwrap().get(&key) {
+                Some(q) => (q.id.clone(), q.done.as_ref().map(|(r, _)| r.clone())),
                 None => return Err(DevError::Cancelled),
             };
-            if let Some(reply) = self.answered(&id) {
-                let q = self.open.lock().unwrap().remove(&key);
-                if let Some(q) = q {
-                    self.withdraw(&q);
-                    match &reply {
-                        Reply::Text(t) => self.audit(&q, "answered", Some(t.chars().count())),
-                        Reply::Dismissed => self.audit(&q, "dismissed", None),
-                    }
-                }
-                return match reply {
+            if let Some(reply) = done {
+                return leave(match reply {
                     Reply::Text(t) => Ok(t.into_bytes()),
                     Reply::Dismissed => Err(DevError::Denied),
-                };
+                });
+            }
+            if let Some(reply) = self.answered(&id) {
+                let mut open = self.open.lock().unwrap();
+                if let Some(q) = open.get_mut(&key) {
+                    if q.done.is_none() {
+                        self.withdraw(q);
+                        match &reply {
+                            Reply::Text(t) => self.audit(q, "answered", Some(t.chars().count())),
+                            Reply::Dismissed => {
+                                self.audit(q, "dismissed", None);
+                                *self.dismissed.lock().unwrap() = Some(Instant::now());
+                            }
+                        }
+                        q.done = Some((reply, Instant::now()));
+                    }
+                }
+                continue;
             }
             if call.cancelled() {
                 return leave(Err(DevError::Cancelled));
@@ -594,5 +679,124 @@ mod tests {
         assert_eq!(broker::pending(&env).len(), 1);
         drop(ask);
         assert!(broker::pending(&env).is_empty());
+    }
+
+    fn wait_for_card(env: &crate::env::HostEnv) -> String {
+        let start = Instant::now();
+        while broker::pending(env).is_empty() && start.elapsed() < Duration::from_secs(5) {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        broker::pending(env)[0].id.clone()
+    }
+
+    #[test]
+    fn every_read_of_one_question_gets_the_answer() {
+        let dir = tempfile::tempdir().unwrap();
+        let c = ctx(dir.path());
+        let env = c.env.clone();
+        let ask = std::sync::Arc::new(Ask::new(c));
+        let reads: Vec<_> = (0..2)
+            .map(|_| {
+                let a = ask.clone();
+                std::thread::spawn(move || {
+                    let call = Call::for_test("asker", Duration::from_secs(60));
+                    a.call(&call, br#"{"question": "Which port?", "timeout": 10}"#)
+                })
+            })
+            .collect();
+        let id = wait_for_card(&env);
+        std::thread::sleep(Duration::from_millis(200));
+        assert_eq!(broker::pending(&env).len(), 1);
+        broker::answer_reply(&env, &id, "-p 8080").unwrap();
+        for r in reads {
+            assert_eq!(r.join().unwrap().unwrap(), b"-p 8080");
+        }
+        assert!(broker::pending(&env).is_empty());
+    }
+
+    #[test]
+    fn after_a_dismissal_a_new_question_waits() {
+        let dir = tempfile::tempdir().unwrap();
+        let c = ctx(dir.path());
+        let env = c.env.clone();
+        let ask = std::sync::Arc::new(Ask::new(c));
+        let a = ask.clone();
+        let t = std::thread::spawn(move || {
+            let call = Call::for_test("asker", Duration::from_secs(60));
+            a.call(&call, b"May I?")
+        });
+        let id = wait_for_card(&env);
+        broker::answer(&env, &id, broker::Answer::Deny).unwrap();
+        assert_eq!(errno(t.join().unwrap()), libc::EACCES);
+        // A new question at once is declined without a new card.
+        let call = Call::for_test("asker", Duration::from_secs(60));
+        assert_eq!(
+            errno(ask.call(&call, br#"{"question": "And now?", "timeout": 1}"#)),
+            libc::EACCES
+        );
+        assert!(broker::pending(&env).is_empty());
+    }
+
+    #[test]
+    fn control_and_bidi_characters_never_reach_the_card() {
+        let dir = tempfile::tempdir().unwrap();
+        let c = ctx(dir.path());
+        let env = c.env.clone();
+        let ask = Ask::new(c);
+        let call = Call::for_test("asker", Duration::from_secs(60));
+        let q = serde_json::json!({
+            "question": "Allow\u{1b}[2J\r this\u{202e}gnp.exe\u{200b}?\nLine two",
+            "timeout": 1
+        });
+        assert_eq!(
+            errno(ask.call(&call, q.to_string().as_bytes())),
+            libc::ETIME
+        );
+        assert_eq!(
+            broker::pending(&env)[0].detail,
+            "Allow[2J thisgnp.exe?\nLine two"
+        );
+        for bad in ["\u{1b}[31mred", "a\u{202e}b"] {
+            let r = serde_json::json!({ "question": "q", "choices": [bad] });
+            assert_eq!(
+                errno(ask.call(&call, r.to_string().as_bytes())),
+                libc::EINVAL
+            );
+        }
+    }
+
+    #[test]
+    fn questions_of_all_sandboxes_are_limited() {
+        let dir = tempfile::tempdir().unwrap();
+        let c = ctx(dir.path());
+        let env = c.env.clone();
+        for i in 0..MAX_ALL_QUESTIONS {
+            broker::write_pending(
+                &env,
+                &broker::Pending {
+                    id: format!("r-other-{i}"),
+                    sandbox: format!("other-{i}"),
+                    harness: "fake".into(),
+                    project: dir.path().into(),
+                    capability: broker::ASK_CAPABILITY.into(),
+                    summary: String::new(),
+                    detail: "q".into(),
+                    reason: String::new(),
+                    created: crate::state::now(),
+                    expires: 0,
+                    session_allowed: false,
+                    started_by: vec![],
+                    choices: vec![],
+                },
+            )
+            .unwrap();
+        }
+        let ask = Ask::new(c);
+        let call = Call::for_test("asker", Duration::from_secs(60));
+        assert_eq!(
+            errno(ask.call(&call, br#"{"question": "One more?", "timeout": 1}"#)),
+            libc::EIO
+        );
+        assert_eq!(broker::pending(&env).len(), MAX_ALL_QUESTIONS);
     }
 }

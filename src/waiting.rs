@@ -79,6 +79,10 @@ pub fn format_rfc3339(secs: u64) -> String {
 pub fn parse_rfc3339(s: &str) -> Result<u64> {
     let s = s.trim();
     let bad = || anyhow::anyhow!("{s:?} is not an RFC 3339 time such as 2026-10-30T15:00:00Z");
+    // Every slice below is by byte: a multibyte character would split one.
+    if !s.is_ascii() {
+        return Err(bad());
+    }
     let b = s.as_bytes();
     if b.len() < 20 || b[4] != b'-' || b[7] != b'-' || !matches!(b[10], b'T' | b't' | b' ') {
         return Err(bad());
@@ -225,5 +229,16 @@ mod tests {
         assert_eq!(EXIT_STILL_WAITING, 75);
         assert_ne!(ERRNO_STILL_WAITING, libc::ETIMEDOUT);
         assert_ne!(ERRNO_STILL_WAITING, libc::EAGAIN);
+    }
+
+    #[test]
+    fn a_time_with_a_multibyte_character_is_refused_not_a_panic() {
+        for t in [
+            "2026-10-30T15:00:00\u{e9}0000",
+            "2026-10-30T15:00:00+0\u{e9}00",
+            "2026-10-30T15:00:0\u{e9}Z",
+        ] {
+            assert!(parse_rfc3339(t).is_err(), "{t}");
+        }
     }
 }

@@ -286,7 +286,32 @@ pub fn pending(env: &HostEnv) -> Vec<Pending> {
             }
         }
     }
-    out.sort_by_key(|p| p.created);
+    // A question of a sandbox that no longer runs: its paddock process was
+    // killed before it could withdraw the question. Older than a minute, so
+    // a question that is being put on the card is never removed.
+    let now = state::now();
+    if out
+        .iter()
+        .any(|p| p.capability == ASK_CAPABILITY && now.saturating_sub(p.created) > 60)
+    {
+        let running: Vec<String> = state::Running::list(env)
+            .into_iter()
+            .map(|r| r.id)
+            .collect();
+        out.retain(|p| {
+            let gone = p.capability == ASK_CAPABILITY
+                && now.saturating_sub(p.created) > 60
+                && !running.contains(&p.sandbox);
+            if gone {
+                let dir = approvals_dir(env);
+                let _ = std::fs::remove_file(dir.join(format!("{}.json", p.id)));
+                let _ = std::fs::remove_file(dir.join(format!("{}.answer", p.id)));
+            }
+            !gone
+        });
+    }
+    // Host requests first: questions of agents never push them off the card.
+    out.sort_by_key(|p| (p.capability == ASK_CAPABILITY, p.created));
     out
 }
 
@@ -514,7 +539,40 @@ impl Approver for DenyAll {
 pub struct HostApprover;
 
 /// Write a pending request for the panel and the CLI: 0600 in a 0700 folder.
+/// Text from a sandbox, made safe to show: no control characters except
+/// newline and tab, and no invisible format characters. A terminal would run
+/// escape sequences (clear the screen, rewrite a line), and bidi overrides
+/// can reverse text on a card or in a notification.
+pub fn clean_text(s: &str) -> String {
+    s.chars()
+        .filter(|&c| {
+            if c == '\n' || c == '\t' {
+                return true;
+            }
+            !c.is_control()
+                && !matches!(c,
+                    '\u{061C}' | '\u{180E}' | '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}'
+                    | '\u{2060}'..='\u{206F}' | '\u{FEFF}' | '\u{FFF9}'..='\u{FFFB}')
+        })
+        .collect()
+}
+
+impl Pending {
+    /// The same request with every text that a sandbox can choose cleaned.
+    pub fn cleaned(&self) -> Self {
+        let mut p = self.clone();
+        p.summary = clean_text(&p.summary);
+        p.detail = clean_text(&p.detail);
+        p.reason = clean_text(&p.reason);
+        p.harness = clean_text(&p.harness);
+        p.choices = p.choices.iter().map(|c| clean_text(c)).collect();
+        p.started_by = p.started_by.iter().map(|c| clean_text(c)).collect();
+        p
+    }
+}
+
 pub fn write_pending(env: &HostEnv, p: &Pending) -> std::io::Result<PathBuf> {
+    let p = &p.cleaned();
     let pending = approvals_dir(env).join(format!("{}.json", p.id));
     crate::privfs::write(&pending, serde_json::to_string(p).unwrap_or_default())?;
     Ok(pending)
@@ -522,6 +580,7 @@ pub fn write_pending(env: &HostEnv, p: &Pending) -> std::io::Result<PathBuf> {
 
 impl Approver for HostApprover {
     fn ask(&self, env: &HostEnv, p: &Pending, wait: Duration) -> Option<Answer> {
+        let p = &p.cleaned();
         let answer_file = approvals_dir(env).join(format!("{}.answer", p.id));
         let Ok(pending) = write_pending(env, p) else {
             return None;

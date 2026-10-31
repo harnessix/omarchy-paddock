@@ -185,7 +185,7 @@ pub fn builtin(name: &str, ctx: &DeviceCtx) -> Option<Arc<dyn Device>> {
     match name {
         "echo" => Some(Arc::new(Echo)),
         "wait" => Some(Arc::new(blocking::Wait)),
-        "ask" => Some(Arc::new(blocking::Ask::new(ctx.clone()))),
+        "ask" => Some(blocking::Ask::start(ctx.clone())),
         _ => None,
     }
 }

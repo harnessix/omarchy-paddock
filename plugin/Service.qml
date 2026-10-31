@@ -117,7 +117,8 @@ Item {
     answerProc.command = ["sh", "-c", root.launcher, "paddock", "approvals", "answer", r.id, decision]
     answerProc.running = true
   }
-  // The answer to a question goes to paddock as one argument after --text.
+  // The answer to a question goes to paddock on standard input (--text -),
+  // never as an argument: every local user can read process arguments.
   function answerText(r, text) {
     var t = String(text || "").trim()
     if (t === "" || root.settled[r.id]) return
@@ -125,9 +126,11 @@ Item {
     s[r.id] = { state: "sending", decision: "reply" }
     root.settled = s
     root.typingId = ""
-    answerProc.pending = { id: r.id, decision: "reply" }
-    answerProc.command = ["sh", "-c", root.launcher, "paddock", "approvals", "answer", r.id, "--text", t.slice(0, 4000)]
-    answerProc.running = true
+    textProc.pending = { id: r.id, decision: "reply" }
+    textProc.text = t.slice(0, 4000)
+    textProc.stdinEnabled = true
+    textProc.command = ["sh", "-c", root.launcher, "paddock", "approvals", "answer", r.id, "--text", "-"]
+    textProc.running = true
   }
   function finish(id, ok, decision) {
     var s = Object.assign({}, root.settled)
@@ -249,6 +252,24 @@ Item {
     id: answerProc
     property var pending: null
     onExited: function(exitCode) {
+      if (pending) root.finish(pending.id, exitCode === 0, pending.decision)
+      pending = null
+      root.refresh()
+    }
+  }
+
+  Process {
+    id: textProc
+    property var pending: null
+    property string text: ""
+    stdinEnabled: true
+    onStarted: {
+      write(text)
+      // Closing standard input ends the answer.
+      stdinEnabled = false
+    }
+    onExited: function(exitCode) {
+      text = ""
       if (pending) root.finish(pending.id, exitCode === 0, pending.decision)
       pending = null
       root.refresh()

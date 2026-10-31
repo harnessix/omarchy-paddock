@@ -1103,3 +1103,53 @@ fn a_prefix_watch_wakes_at_once_and_when_a_lease_runs_out() {
     let (c, _) = service(&w, "c", None, KvCfg::default(), None);
     assert_eq!(c.handle(&claim, None).status, Status::Done);
 }
+
+#[test]
+fn an_expiry_between_two_watches_is_not_lost() {
+    let w = world();
+    let (a, _) = service(&w, "a", None, KvCfg::default(), None);
+    let (b, _) = service(&w, "b", None, KvCfg::default(), None);
+    // The first watch ends with a cursor.
+    assert_eq!(
+        b.handle(&put(Scope::Project, "lease-x", "1"), None).status,
+        Status::Done
+    );
+    let r = a.handle(
+        &Request {
+            prefix: Some("lease:".into()),
+            version: Some(0),
+            timeout: Some(1),
+            ..req("watch", Scope::Project, "")
+        },
+        None,
+    );
+    let cursor = r.result["cursor"].as_u64().unwrap_or(0);
+    // While no watch runs, a lease is taken and runs out, and nobody writes.
+    let claim = Request {
+        ttl: Some(1),
+        ..req("claim", Scope::Project, "job")
+    };
+    assert_eq!(b.handle(&claim, None).status, Status::Done);
+    std::thread::sleep(Duration::from_millis(2200));
+    // The next watch with the cursor sees the claim and its expiry at once.
+    let start = Instant::now();
+    let r = a.handle(
+        &Request {
+            prefix: Some("lease:".into()),
+            version: Some(cursor),
+            timeout: Some(10),
+            ..req("watch", Scope::Project, "")
+        },
+        None,
+    );
+    assert_eq!(r.status, Status::Done, "{:?}", r.message);
+    let ops: Vec<&str> = r.result["changes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|c| c["key"] == "lease:job")
+        .map(|c| c["op"].as_str().unwrap())
+        .collect();
+    assert_eq!(ops.last(), Some(&"expire"), "{}", r.result);
+    assert!(start.elapsed() < Duration::from_secs(2));
+}

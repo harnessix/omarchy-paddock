@@ -1040,7 +1040,7 @@ impl Service {
     /// every 100 ms. When the time passes first, the status is `waiting`.
     fn watch(
         &self,
-        st: &Store,
+        st: &mut Store,
         ns: &str,
         req: &Request,
         conn: Option<&UnixStream>,
@@ -1055,12 +1055,13 @@ impl Service {
             (None, Some(_)) => st.seq()?,
             (None, None) => st.version(ns, key, crate::state::now())?,
         };
-        let since = crate::state::now();
         loop {
             let now = crate::state::now();
             if let Some(p) = prefix {
-                let mut changes = st.changes(ns, p, known, 1000)?;
-                changes.extend(st.expired_between(ns, p, since, now)?);
+                // An expiry becomes a change in the history, so the cursor
+                // also covers expiries between two watches.
+                st.expire(ns, now)?;
+                let changes = st.changes(ns, p, known, 1000)?;
                 if !changes.is_empty() {
                     let cursor = changes.iter().map(|c| c.version).fold(known, u64::max);
                     return Ok(Response::done(mark(
