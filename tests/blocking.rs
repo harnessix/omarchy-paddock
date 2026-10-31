@@ -3,6 +3,8 @@
 //! --timeout` and a waiting device read end with the "still waiting" exit
 //! code 75. Skipped where the host cannot run bubblewrap or mount FUSE.
 
+mod common;
+
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
@@ -52,8 +54,8 @@ struct World {
 }
 
 fn world(config: &str, name: &str, script: &str) -> World {
-    let base = std::env::var("HOME").map(PathBuf::from).unwrap();
-    let tmp = tempfile::tempdir_in(base).unwrap();
+    // Not in /tmp: the sandbox has its own /tmp.
+    let tmp = common::tempdir();
     let root = tmp.path().to_path_buf();
     let cfg = root.join("cfg/paddock");
     std::fs::create_dir_all(cfg.join("harness.d")).unwrap();

@@ -1890,14 +1890,13 @@ pub(crate) fn new_request_id() -> String {
 }
 
 /// Serve requests on `socket` until the process exits.
-pub fn serve(socket: &Path, broker: Broker) -> Result<()> {
+pub fn serve(socket: &Path, broker: Arc<Broker>) -> Result<()> {
     let _ = std::fs::remove_file(socket);
     if let Some(d) = socket.parent() {
         crate::privfs::dir(d)?;
     }
     let listener = UnixListener::bind(socket)
         .with_context(|| format!("cannot listen on {}", socket.display()))?;
-    let broker = Arc::new(broker);
     log::debug!("serving host requests for sandbox {}", broker.ctx.id);
     std::thread::spawn(move || {
         for conn in listener.incoming().flatten() {

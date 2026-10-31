@@ -115,6 +115,8 @@ exec 3<>/dev/paddock/echo; printf 'hello' >&3; cat <&3; exec 3<&-
 
 A device that the catalog shows as `off` cannot be used. Do not try to turn it on: only the user can, on the host. `paddock-host device NAME [REQUEST]` sends one request and exits with a clear code.
 
+`/dev/paddock/gw` is the gateway: `paddock-host` sends every host request through it, and you never need to use it directly. A request that waits for the user stays one request: if you send the same request again, it joins the one that waits, and the user sees one card. So after exit code 75, send the identical request again, not a changed one.
+
 ## Waiting
 
 Never wait with `sleep`. Each check after a `sleep` costs a turn, and a result that comes between two checks waits for the next one. Use a blocking read. It returns the moment the event happens.

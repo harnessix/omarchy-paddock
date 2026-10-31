@@ -1112,6 +1112,7 @@ pub fn start(
     test: bool,
     ceiling: Option<&[String]>,
     started_by: &[String],
+    gateway: Option<crate::gateway::Handler>,
 ) -> Option<Devices> {
     let cfg = match DevicesCfg::load(env) {
         Ok(c) => c,
@@ -1130,10 +1131,14 @@ pub fn start(
         project: spec.project.clone(),
         started_by: started_by.to_vec(),
     };
-    let devices = enabled(&cfg, test, ceiling, &ctx);
+    let mut devices = enabled(&cfg, test, ceiling, &ctx);
     // Without an enabled device the mount is only a catalog, so a missing
-    // FUSE is not worth a notice at each start.
+    // FUSE is not worth a notice at each start. The gateway does not count:
+    // without the mount, paddock-host uses the host socket.
     let quiet = devices.is_empty();
+    if let Some(h) = gateway {
+        devices.push(Arc::new(crate::gateway::GwDevice::new(&spec.id, h)));
+    }
     let tell = |spec: &mut SandboxSpec, why: String| {
         if quiet {
             log::debug!("no /dev/paddock: {why}");
