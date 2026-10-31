@@ -14,7 +14,7 @@
 use crate::app;
 use crate::env::HostEnv;
 use crate::profile::HarnessFactory;
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -267,18 +267,84 @@ fn xdg_menu(entries: &[Entry]) -> String {
     )
 }
 
-/// The paddock path to write into entries: the one on PATH when it is this
-/// same program (so an upgrade keeps the entries working), else this program.
+/// The paddock path to write into launchers, shell commands, the Omarchy
+/// menu, the mise wrapper, the Hyprland hook and systemd units: the
+/// installed paddock, never a build.
+///
+/// A build of a checkout (`target/debug/paddock`, a test binary) must never
+/// take over the user's own integrations: once its folder is gone, every
+/// entry breaks. So when this program is not the paddock on PATH, or lies in
+/// a `target/` folder, writing is refused, unless the run uses a home folder
+/// that is not the user's real one (tests and development runs set a
+/// temporary HOME).
 pub fn launcher_exe(env: &HostEnv) -> Result<PathBuf> {
     let me = std::env::current_exe()
         .and_then(std::fs::canonicalize)
         .context("cannot find the paddock executable")?;
-    if let Some(on_path) = env.which("paddock") {
-        if std::fs::canonicalize(&on_path).ok().as_deref() == Some(me.as_path()) {
-            return Ok(on_path);
-        }
+    let on_path = env.which("paddock");
+    let on_path_real = on_path
+        .as_deref()
+        .and_then(|p| std::fs::canonicalize(p).ok());
+    match check_exe(&me, on_path_real.as_deref(), home_is_real(env)) {
+        Ok(()) if on_path_real.as_deref() == Some(me.as_path()) => Ok(on_path.unwrap()),
+        Ok(()) => Ok(me),
+        Err(e) => Err(e),
     }
-    Ok(me)
+}
+
+/// Whether `env` uses the user's real home folder, as the account database
+/// says, not as HOME says.
+pub fn home_is_real(env: &HostEnv) -> bool {
+    real_home().is_some_and(|h| {
+        std::fs::canonicalize(&h).unwrap_or(h)
+            == std::fs::canonicalize(&env.home).unwrap_or_else(|_| env.home.clone())
+    })
+}
+
+fn real_home() -> Option<PathBuf> {
+    use std::ffi::CStr;
+    let mut buf = vec![0 as libc::c_char; 16 * 1024];
+    let mut pwd: libc::passwd = unsafe { std::mem::zeroed() };
+    let mut out: *mut libc::passwd = std::ptr::null_mut();
+    // SAFETY: getpwuid_r with a buffer we own; the result points into it.
+    let rc = unsafe {
+        libc::getpwuid_r(
+            libc::getuid(),
+            &mut pwd,
+            buf.as_mut_ptr(),
+            buf.len(),
+            &mut out,
+        )
+    };
+    if rc != 0 || out.is_null() || pwd.pw_dir.is_null() {
+        return None;
+    }
+    let dir = unsafe { CStr::from_ptr(pwd.pw_dir) };
+    Some(PathBuf::from(dir.to_string_lossy().into_owned()))
+}
+
+/// The rule of `launcher_exe`, without the host: `me` is this program,
+/// `on_path` the paddock on PATH, both resolved.
+pub fn check_exe(me: &Path, on_path: Option<&Path>, home_is_real: bool) -> Result<()> {
+    let build = me.components().any(|c| c.as_os_str() == "target");
+    let installed = on_path == Some(me) && !build;
+    if installed || !home_is_real {
+        return Ok(());
+    }
+    bail!(
+        "this paddock is {}, {}; paddock never points your launchers, shell commands, menu, \
+         mise wrapper, Hyprland hook or systemd units at a build. Run the installed paddock \
+         ({}), or install this build first",
+        me.display(),
+        if build {
+            "a build in a target folder"
+        } else {
+            "not the paddock on PATH"
+        },
+        on_path
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "none on PATH".into())
+    )
 }
 
 pub struct Report {
@@ -434,6 +500,37 @@ fn refresh_desktop_database(env: &HostEnv) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_build_never_writes_into_the_real_home() {
+        let installed = Path::new("/home/demo/.local/bin/paddock");
+        let build = Path::new("/home/demo/src/paddock/target/debug/paddock");
+        // The installed paddock, on PATH: fine everywhere.
+        assert!(check_exe(installed, Some(installed), true).is_ok());
+        // A build, with the real home: refused, and it says why.
+        let e = check_exe(build, Some(installed), true)
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("a build in a target folder"), "{e}");
+        assert!(e.contains("/home/demo/.local/bin/paddock"), "{e}");
+        // A build that is on PATH itself is still a build.
+        assert!(check_exe(build, Some(build), true).is_err());
+        // Another copy that is not the one on PATH.
+        let e = check_exe(Path::new("/opt/p/paddock"), Some(installed), true)
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("not the paddock on PATH"), "{e}");
+        assert!(check_exe(Path::new("/opt/p/paddock"), None, true).is_err());
+        // Tests and development runs with a temporary home may.
+        assert!(check_exe(build, Some(installed), false).is_ok());
+    }
+
+    #[test]
+    fn a_temporary_home_is_not_the_real_one() {
+        let t = tempfile::tempdir().unwrap();
+        let env = HostEnv::from_parts(t.path().into(), "demo".into(), 1, 1, Default::default());
+        assert!(!home_is_real(&env));
+    }
 
     #[test]
     fn labels_drop_the_vendor() {

@@ -49,6 +49,10 @@ Keep one change per pull request. Do not commit build output, local configuratio
 
 To report a bug, use the issue form. It asks for the output of `paddock doctor --report`. The report removes your user name, paths and tokens, but read it before you paste it. To report a security problem, do not open a public issue. Follow [SECURITY.md](SECURITY.md).
 
+## Tests
+
+A test that runs the paddock binary must give it temporary folders: `XDG_DATA_HOME` and `XDG_STATE_HOME` (and the other XDG folders), or a cleared environment with a temporary `HOME`. `tests/no_real_folders.rs` checks this. A build that runs with your own folders can write its own path into your launchers and shell commands. paddock refuses that when the home folder is your real one, but the test must not rely on it.
+
 ## Releases
 
 A release PR changes the version in every place that names it: `Cargo.toml`, `Cargo.lock`, `manifest.json`, `pkgbuild/PKGBUILD`, `.github/ISSUE_TEMPLATE/bug_report.yml`, and the install commands in `README.md` and `skills/paddock/SKILL.md`. It also renames the CHANGELOG section "Unreleased" to the version. `tests/release_version.rs` fails when one place is left behind. After the merge, a maintainer pushes the tag `vX.Y.Z` on the merge commit, and `release.yml` builds the binary for it.
