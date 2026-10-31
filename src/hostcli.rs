@@ -7,6 +7,7 @@ use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 
+pub mod device;
 mod git;
 pub mod kv;
 
@@ -36,6 +37,7 @@ USAGE
   paddock-host wait ID [--timeout SECONDS]
   paddock-host kill ID
   paddock-host kv COMMAND [ARG...]              (key-value store, see `paddock-host kv --help`)
+  paddock-host device NAME [REQUEST]            (a device in /dev/paddock, see `paddock-host device --help`)
   paddock-host help [CAPABILITY]
 
 Common options
@@ -89,6 +91,16 @@ EXIT CODES
   6   no host connection: not inside a paddock sandbox, or paddock is too old
   7   the host tried and failed; the message says why
   8   the host rejected the request as invalid, for example a protected path
+  75  still waiting: a blocking read (wait, kv watch, a device) reached its
+      --timeout before the event. Run the same command again.
+
+WAITING FOR AN EVENT
+  Do not wait with sleep. A blocking read returns the moment the event
+  happens and uses no tokens while it waits: `paddock-host wait ID` for a
+  child, `paddock-host kv watch` for a key, `paddock-host device wait TIME`
+  for a time and `paddock-host device ask QUESTION` for an answer of the
+  user. Give each one a --timeout below the time limit of your shell tool.
+  Exit code 75 means that the time passed first: run the same read again.
 
 EXAMPLES
   paddock-host screenshot --reason "check the layout of the settings window"
@@ -264,7 +276,8 @@ Children read your own kv scope with --scope parent, and share tasks with you
 in --scope tree. Run `paddock-host kv --help` for the key names.
 
 wait exits with 0 when the child ended with exit code 0, 1 when it failed or
-was stopped, and 5 when it still runs after --timeout. A child stops when this
+was stopped, and 75 (still waiting) when it still runs after --timeout: run
+the same wait again. A child stops when this
 sandbox ends. Use `paddock-host capabilities --json` to see the limits."#
         }
         _ => return None,
@@ -344,6 +357,7 @@ pub fn main(args: &[String]) -> i32 {
         "git-remote-helper" => return git::remote_helper(rest),
         "gh" => return git::gh_main(rest),
         "kv" => return kv::main(rest),
+        "device" => return device::main(rest),
         "forge" if rest.first().is_some_and(|t| t == "gh") => return git::gh_main(&rest[1..]),
         _ => {}
     }
@@ -566,7 +580,7 @@ fn print_child(c: &serde_json::Value) {
 }
 
 fn print_human(req: &Request, resp: &Response) {
-    if req.cap == "spawn" && resp.status == Status::Timeout && resp.result.is_object() {
+    if req.cap == "spawn" && resp.status == Status::Waiting && resp.result.is_object() {
         eprintln!("paddock-host: {}", resp.message);
         print_child(&resp.result);
         return;
@@ -576,6 +590,7 @@ fn print_human(req: &Request, resp: &Response) {
             Status::Denied => "denied by the user",
             Status::Disabled => "disabled in the user's configuration",
             Status::Timeout => "not answered in time",
+            Status::Waiting => "still waiting",
             Status::Failed => "failed on the host",
             Status::Invalid => "rejected as invalid",
             Status::Done => unreachable!(),

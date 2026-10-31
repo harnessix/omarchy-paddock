@@ -186,6 +186,40 @@ fn next_version(tx: &Transaction) -> rusqlite::Result<u64> {
     )
 }
 
+/// Remove the keys that expired at or before `now`, in `ns` or in every
+/// namespace. Each one becomes a change with the op `expire` in the history,
+/// written by the last writer of the key, so a watch that passes its cursor
+/// sees every expiry, also one that happened between two watches. Returns
+/// how many keys expired.
+fn expire_rows(
+    tx: &Transaction,
+    ns: Option<&str>,
+    now: u64,
+    max_bytes: u64,
+) -> rusqlite::Result<u64> {
+    let rows: Vec<(String, String, String, String)> = {
+        let mut st = tx.prepare(
+            "SELECT ns, key, writer, writer_harness FROM entries
+             WHERE expires IS NOT NULL AND expires <= ?1 AND (?2 IS NULL OR ns = ?2)
+             ORDER BY expires, ns, key",
+        )?;
+        let it = st.query_map(params![now, ns], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+        })?;
+        it.collect::<rusqlite::Result<_>>()?
+    };
+    for (n, key, sandbox, harness) in &rows {
+        tx.execute(
+            "DELETE FROM entries WHERE ns = ?1 AND key = ?2",
+            params![n, key],
+        )?;
+        let version = next_version(tx)?;
+        let writer = Writer { sandbox, harness };
+        record(tx, n, key, version, "expire", None, &writer, max_bytes, now)?;
+    }
+    Ok(rows.len() as u64)
+}
+
 /// Add one change to the history and keep it bounded: at most
 /// `HISTORY_PER_KEY` versions of a key, and at most `max_bytes` for the
 /// namespace.
@@ -452,10 +486,7 @@ impl Store {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        tx.execute(
-            "DELETE FROM entries WHERE ns = ?1 AND expires IS NOT NULL AND expires <= ?2",
-            params![ns, now],
-        )?;
+        expire_rows(&tx, Some(ns), now, quota.bytes)?;
         let mut out = Vec::new();
         for p in puts {
             let cur: Option<(u64, u64)> = tx
@@ -739,10 +770,23 @@ impl Store {
     }
 
     pub fn purge_expired(&mut self, now: u64) -> Result<u64> {
-        Ok(self.conn.execute(
-            "DELETE FROM entries WHERE expires IS NOT NULL AND expires <= ?1",
-            params![now],
-        )? as u64)
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let n = expire_rows(&tx, None, now, u64::MAX)?;
+        tx.commit()?;
+        Ok(n)
+    }
+
+    /// Expire the keys of `ns` whose time to live has passed. A watch runs
+    /// this on each poll, so an expiry shows without a write.
+    pub fn expire(&mut self, ns: &str, now: u64) -> Result<u64> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let n = expire_rows(&tx, Some(ns), now, u64::MAX)?;
+        tx.commit()?;
+        Ok(n)
     }
 
     /// Records of ended sandboxes without data, older than `cutoff`.

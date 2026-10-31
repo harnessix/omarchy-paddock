@@ -363,6 +363,7 @@ fn pending_for(b: &Broker, detail: &str) -> Pending {
         created: state::now(),
         expires: state::now() + 1,
         session_allowed: true,
+        choices: Vec::new(),
         started_by: vec![],
     }
 }
@@ -500,6 +501,7 @@ fn answers_go_through_the_approvals_directory() {
         created: 1,
         expires: 11,
         session_allowed: true,
+        choices: Vec::new(),
         started_by: vec![],
     };
     let env2 = env.clone();
