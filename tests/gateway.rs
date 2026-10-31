@@ -214,8 +214,15 @@ fn the_executor_refuses_forged_and_replayed_grants() {
             .collect(),
         reason: String::new(),
     };
-    let forged =
-        paddock::gateway::sign(&[1u8; 32], "s1", &project, &req, Default::default()).unwrap();
+    let forged = paddock::gateway::sign(
+        &[1u8; 32],
+        "s1",
+        &project,
+        &req,
+        Default::default(),
+        serde_json::Value::Null,
+    )
+    .unwrap();
     let r = ask(&forged);
     assert!(
         r["error"].as_str().unwrap_or("").contains("signature"),
@@ -224,7 +231,8 @@ fn the_executor_refuses_forged_and_replayed_grants() {
     let key = paddock::gateway::key(&env).unwrap();
     let mut path = std::collections::BTreeMap::new();
     path.insert("PATH".to_string(), std::env::var("PATH").unwrap());
-    let good = paddock::gateway::sign(&key, "s1", &project, &req, path).unwrap();
+    let good =
+        paddock::gateway::sign(&key, "s1", &project, &req, path, serde_json::Value::Null).unwrap();
     let r = ask(&good);
     if bwrap_works() {
         assert_eq!(
@@ -299,7 +307,15 @@ fn exec_job(
     host.insert("PATH".to_string(), std::env::var("PATH").unwrap());
     host.insert("PADDOCK_TEST_TOKEN".to_string(), "secret".to_string());
     let key = paddock::gateway::key(&env).unwrap();
-    let job = paddock::gateway::sign(&key, "s1", &w.root.join("project"), &req, host).unwrap();
+    let job = paddock::gateway::sign(
+        &key,
+        "s1",
+        &w.root.join("project"),
+        &req,
+        host,
+        serde_json::Value::Null,
+    )
+    .unwrap();
     let mut s =
         std::os::unix::net::UnixStream::connect(paddock::gatewayd::socket_path(&env)).unwrap();
     writeln!(s, "{}", serde_json::to_string(&job).unwrap()).unwrap();
@@ -386,6 +402,108 @@ fn an_approved_exec_runs_isolated() {
         "lo",
         "{r}"
     );
+    let _ = daemon.kill();
+    let _ = daemon.wait();
+}
+
+/// An approved push runs in the real executor, isolated: from the scratch
+/// repository of the card, to a bare repository on this machine, and the
+/// home folder stays unchanged.
+#[test]
+fn an_approved_push_runs_in_the_executor() {
+    if !bwrap_works() {
+        eprintln!("skipped: bwrap does not work here");
+        return;
+    }
+    let w = world();
+    let git = |dir: &std::path::Path, args: &[&str]| -> String {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(["-c", "user.name=t", "-c", "user.email=t@localhost"])
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git {args:?}: {out:?}");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+    let work = w.root.join("project");
+    let remote = w.root.join("remote.git");
+    git(
+        &w.root,
+        &[
+            "init",
+            "-q",
+            "--bare",
+            "-b",
+            "main",
+            remote.to_str().unwrap(),
+        ],
+    );
+    git(&work, &["init", "-q", "-b", "main"]);
+    git(&work, &["commit", "-q", "--allow-empty", "-m", "first"]);
+    git(
+        &work,
+        &["remote", "add", "origin", remote.to_str().unwrap()],
+    );
+    git(&work, &["push", "-q", "origin", "main"]);
+    git(&work, &["commit", "-q", "--allow-empty", "-m", "second"]);
+    let head = git(&work, &["rev-parse", "HEAD"]);
+
+    let vars = exec_vars(&w);
+    let env = paddock::env::HostEnv::from_parts(
+        w.root.join("home"),
+        "demo".into(),
+        1000,
+        1000,
+        vars.clone(),
+    );
+    let repo = paddock::broker::git::Repo::snapshot(&work).unwrap();
+    let run_dir = w.root.join("run/paddock/s1");
+    std::fs::create_dir_all(&run_dir).unwrap();
+    let mut args = std::collections::BTreeMap::new();
+    args.insert("remote".to_string(), serde_json::json!("origin"));
+    args.insert(
+        "url".to_string(),
+        serde_json::json!(remote.to_str().unwrap()),
+    );
+    args.insert(
+        "refs".to_string(),
+        serde_json::json!([{"src": "HEAD", "sha": head, "dst": "refs/heads/main"}]),
+    );
+    let plan = paddock::broker::git::plan(Some(&repo), &run_dir, &args).unwrap();
+    let req = paddock::broker::Request {
+        v: 1,
+        cap: "git-push".into(),
+        args,
+        reason: String::new(),
+    };
+    let mut daemon = executor(&w, &vars);
+    let key = paddock::gateway::key(&env).unwrap();
+    let mut host = std::collections::BTreeMap::new();
+    for k in ["PATH", "HOME"] {
+        host.insert(k.to_string(), std::env::var(k).unwrap());
+    }
+    let job = paddock::gateway::sign(
+        &key,
+        "s1",
+        &work,
+        &req,
+        host,
+        serde_json::to_value(plan.exec()).unwrap(),
+    )
+    .unwrap();
+    let r = {
+        use std::io::{BufRead, BufReader, Write};
+        let mut s =
+            std::os::unix::net::UnixStream::connect(paddock::gatewayd::socket_path(&env)).unwrap();
+        writeln!(s, "{}", serde_json::to_string(&job).unwrap()).unwrap();
+        let mut line = String::new();
+        BufReader::new(s).read_line(&mut line).unwrap();
+        serde_json::from_str::<serde_json::Value>(&line).unwrap()
+    };
+    assert_eq!(r["ok"]["refs"][0]["ok"], true, "{r}");
+    assert_eq!(git(&remote, &["rev-parse", "main"]), head);
     let _ = daemon.kill();
     let _ = daemon.wait();
 }

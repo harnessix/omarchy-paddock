@@ -27,6 +27,7 @@ use std::process::Command;
 
 /// Host variables that every command gets.
 pub const BASE_ENV: &[&str] = &[
+    "HOME",
     "PATH",
     "LANG",
     "LANGUAGE",
