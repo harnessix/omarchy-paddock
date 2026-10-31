@@ -186,6 +186,11 @@ pub fn run(
         backend.name(),
         built.test_devices,
         built.device_ceiling.as_deref(),
+        &built
+            .spawn
+            .as_ref()
+            .map(|c| c.chain.clone())
+            .unwrap_or_default(),
     );
     // Terminal harnesses that log in through a browser and a localhost callback.
     let _login = if built.profile.launch.login_callback && built.spec.gui.mode != GuiMode::App {

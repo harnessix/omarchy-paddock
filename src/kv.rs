@@ -343,11 +343,14 @@ pub enum Status {
     Timeout,
     Invalid,
     Failed,
+    /// The longest wait of a watch passed and nothing changed yet. The
+    /// caller runs the same watch again (see `crate::waiting`).
+    Waiting,
 }
 
 impl Status {
     /// The exit code of `paddock-host kv`. 3 to 8 mean the same as for the
-    /// other `paddock-host` commands.
+    /// other `paddock-host` commands, and 75 is "still waiting" everywhere.
     pub fn exit_code(self) -> i32 {
         match self {
             Status::Done => 0,
@@ -355,6 +358,7 @@ impl Status {
             Status::Denied => 3,
             Status::Disabled => 4,
             Status::Timeout => 5,
+            Status::Waiting => crate::waiting::EXIT_STILL_WAITING,
             Status::Failed => 7,
             Status::Invalid => 8,
             Status::Conflict => 9,
@@ -530,6 +534,7 @@ impl Service {
             created: crate::state::now(),
             expires: crate::state::now() + self.wait.as_secs(),
             session_allowed: true,
+            choices: Vec::new(),
             started_by: self.id.chain.clone(),
         };
         let (decision, resp) = match self.approver.ask(&self.env, &p, self.wait) {
@@ -1029,11 +1034,13 @@ impl Service {
     /// Wait for a change. With a key: until its version differs from the
     /// known one (without one, from the version now). With a prefix: until a
     /// key with that prefix is written or deleted after the known version
-    /// (without one, after now). Other sandboxes write through other
-    /// processes, so this polls the store.
+    /// (without one, after now), or expires while the watch waits: a lease
+    /// that runs out is free, and a watch on `lease:` wakes for it. Other
+    /// sandboxes write through other processes, so this polls the store
+    /// every 100 ms. When the time passes first, the status is `waiting`.
     fn watch(
         &self,
-        st: &Store,
+        st: &mut Store,
         ns: &str,
         req: &Request,
         conn: Option<&UnixStream>,
@@ -1051,9 +1058,12 @@ impl Service {
         loop {
             let now = crate::state::now();
             if let Some(p) = prefix {
+                // An expiry becomes a change in the history, so the cursor
+                // also covers expiries between two watches.
+                st.expire(ns, now)?;
                 let changes = st.changes(ns, p, known, 1000)?;
-                if let Some(last) = changes.last() {
-                    let cursor = last.version;
+                if !changes.is_empty() {
+                    let cursor = changes.iter().map(|c| c.version).fold(known, u64::max);
                     return Ok(Response::done(mark(
                         serde_json::json!({ "changes": changes, "cursor": cursor }),
                     )));
@@ -1066,8 +1076,8 @@ impl Service {
             }
             if Instant::now() >= end {
                 return Ok(Response::new(
-                    Status::Timeout,
-                    format!("nothing changed in {timeout} seconds"),
+                    Status::Waiting,
+                    format!("still waiting: nothing changed in {timeout} seconds; run the same watch again"),
                 ));
             }
             if conn.is_some_and(peer_gone) {

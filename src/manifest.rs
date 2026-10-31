@@ -15,6 +15,11 @@ use std::path::{Path, PathBuf};
 
 pub const PROJECT_FILE: &str = "paddock.toml";
 
+/// Tables of `~/.config/paddock/config.toml` that other modules read
+/// themselves: `[devices]` (devices.rs) and `[kv]` (kv.rs). A project
+/// `paddock.toml` with one of them is invalid.
+pub const USER_ONLY: &[&str] = &["devices", "kv"];
+
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Manifest {
@@ -219,7 +224,24 @@ impl Manifest {
             .with_context(|| format!("{} does not exist", path.display()))?;
         let text = String::from_utf8(bytes)
             .with_context(|| format!("{} is not UTF-8 text", path.display()))?;
-        toml::from_str(&text).with_context(|| format!("{} is invalid", path.display()))
+        if !follow {
+            return toml::from_str(&text).with_context(|| format!("{} is invalid", path.display()));
+        }
+        Self::parse_user(&text).with_context(|| format!("{} is invalid", path.display()))
+    }
+
+    /// The user configuration. It has tables that only other parts of
+    /// paddock read (`USER_ONLY`), and a project `paddock.toml` must never
+    /// have them, so they are taken out here instead of in the schema: the
+    /// project file still fails on them.
+    pub fn parse_user(text: &str) -> Result<Self> {
+        let mut v: toml::Value = toml::from_str(text)?;
+        if let Some(t) = v.as_table_mut() {
+            for k in USER_ONLY {
+                t.remove(*k);
+            }
+        }
+        Ok(v.try_into()?)
     }
 
     /// User configuration first, then the project file on top of it.
@@ -464,6 +486,24 @@ pub const TEMPLATE: &str = r#"# paddock.toml: sandbox settings for this project.
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn user_only_tables_load_from_the_user_file_and_fail_in_a_project_file() {
+        let text = "backend = \"bwrap\"\n[devices]\nwait = true\n[kv]\nenabled = true\n";
+        let m = Manifest::parse_user(text).unwrap();
+        assert_eq!(m.backend.as_deref(), Some("bwrap"));
+        for k in USER_ONLY {
+            let t = format!("[{k}]\nx = 1\n");
+            assert!(
+                toml::from_str::<Manifest>(&t).is_err(),
+                "[{k}] in a project file"
+            );
+        }
+        let t = tempfile::tempdir().unwrap();
+        let p = t.path().join(PROJECT_FILE);
+        std::fs::write(&p, text).unwrap();
+        assert!(Manifest::read(&p).is_err());
+    }
 
     #[test]
     fn a_planted_project_file_is_never_followed_or_opened() {

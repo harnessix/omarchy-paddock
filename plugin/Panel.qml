@@ -217,7 +217,7 @@ Panel {
   }
   function capabilityGlyph(c) {
     return ({ "screenshot": "󰹑", "exec": "󰆍", "fetch": "󰖟", "clipboard-read": "󰅇",
-              "clipboard-write": "󰅌", "open-url": "󰌹", "notify": "󰂞", "spawn": "󰚩" })[c] || "󰀦"
+              "clipboard-write": "󰅌", "open-url": "󰌹", "notify": "󰂞", "spawn": "󰚩", "ask": "󰘥" })[c] || "󰀦"
   }
   // Seconds now, refreshed every second while requests wait, for countdowns.
   property real now: Date.now() / 1000

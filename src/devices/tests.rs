@@ -7,8 +7,8 @@ fn config_is_off_by_default_and_names_known_devices() {
     let c = DevicesCfg::parse("").unwrap();
     assert!(c.mount);
     assert!(c.enabled.is_empty());
-    assert!(enabled(&c, false, None).is_empty());
-    assert_eq!(enabled(&c, true, None).len(), 1);
+    assert!(enabled_names(&c, false, None).is_empty());
+    assert_eq!(enabled_names(&c, true, None), ["echo"]);
     let c = DevicesCfg::parse("[devices]\necho = true\n").unwrap();
     assert_eq!(c.enabled, ["echo"]);
     let c = DevicesCfg::parse("[devices]\nmount = false\necho = false\n").unwrap();
@@ -26,6 +26,17 @@ fn the_project_file_cannot_turn_devices_on() {
 #[test]
 fn catalog_lists_every_device_with_its_state() {
     let off: serde_json::Value = serde_json::from_slice(&catalog(&[])).unwrap();
+    let names: Vec<&str> = off["devices"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|d| d["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, ["echo", "ask", "wait"]);
+    assert!(off["protocol"]
+        .as_str()
+        .unwrap()
+        .contains("ETIME (still waiting)"));
     assert_eq!(off["devices"][0]["name"], "echo");
     assert_eq!(off["devices"][0]["state"], "off");
     assert!(off["devices"][0]["how_to_enable"]
@@ -98,7 +109,10 @@ fn mounted(deadline: u64) -> Option<Fixture> {
         saw_cancel: saw_cancel.clone(),
         deadline,
     };
-    let fs = DeviceFs::new("test-sandbox", vec![Arc::new(Echo), Arc::new(slow)]);
+    let fs = DeviceFs::new(
+        "test-sandbox",
+        vec![Arc::new(Echo), Arc::new(slow), Arc::new(blocking::Wait)],
+    );
     let m = match mount(&root, fs) {
         Ok(m) => m,
         Err(e) => {
@@ -161,7 +175,8 @@ fn catalog_is_read_only_and_the_folder_fixed() {
         .iter()
         .map(|d| d["name"].as_str().unwrap())
         .collect();
-    assert_eq!(names, ["echo", "slow"]);
+    // The devices that are on, then the built-in ones that are off.
+    assert_eq!(names, ["echo", "slow", "wait", "ask"]);
     assert!(open_rw(&f.root.join(CATALOG)).is_err());
     assert!(std::fs::write(f.root.join(CATALOG), "x").is_err());
     assert!(std::fs::write(f.root.join("new"), "x").is_err());
@@ -173,7 +188,7 @@ fn catalog_is_read_only_and_the_folder_fixed() {
         .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
         .collect();
     list.sort();
-    assert_eq!(list, [".catalog", "echo", "slow"]);
+    assert_eq!(list, [".catalog", "echo", "slow", "wait"]);
 }
 
 #[test]
@@ -199,6 +214,24 @@ fn a_read_fails_at_the_deadline() {
         std::thread::sleep(Duration::from_millis(20));
     }
     assert!(f.saw_cancel.load(Ordering::SeqCst));
+}
+
+#[test]
+fn a_waiting_read_reports_still_waiting_with_etime_through_the_mount() {
+    let Some(f) = mounted(5) else { return };
+    let mut h = open_rw(&f.root.join("wait")).unwrap();
+    h.write_all(br#"{"until": "1h", "timeout": 1}"#).unwrap();
+    let start = Instant::now();
+    let mut out = Vec::new();
+    let e = h.read_to_end(&mut out).unwrap_err();
+    assert_eq!(e.raw_os_error(), Some(crate::waiting::ERRNO_STILL_WAITING));
+    assert!(start.elapsed() < Duration::from_secs(4));
+    // A time that has come returns the line.
+    let mut h = open_rw(&f.root.join("wait")).unwrap();
+    h.write_all(b"0s").unwrap();
+    let mut s = String::new();
+    h.read_to_string(&mut s).unwrap();
+    assert!(s.starts_with("reached "), "{s}");
 }
 
 #[test]
