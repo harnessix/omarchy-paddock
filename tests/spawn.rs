@@ -326,6 +326,23 @@ fn a_sigterm_to_paddock_still_runs_its_exit_steps() {
     }
 }
 
+/// What each child wrote, for the message of a failed test.
+fn children_output(w: &World) -> String {
+    let mut out = String::new();
+    if let Ok(dir) = std::fs::read_dir(w.repo.join(".paddock/inbox")) {
+        for e in dir.flatten() {
+            for f in ["result.json", "output.txt"] {
+                let text = std::fs::read_to_string(e.path().join(f)).unwrap_or_default();
+                out.push_str(&format!(
+                    "--- {}/{f}\n{text}\n",
+                    e.file_name().to_string_lossy()
+                ));
+            }
+        }
+    }
+    out
+}
+
 fn inbox_result(w: &World) -> (serde_json::Value, String) {
     let dir = std::fs::read_dir(w.repo.join(".paddock/inbox"))
         .unwrap()
@@ -528,8 +545,9 @@ fn children_claim_tasks_in_the_tree_scope_and_the_parent_watch_wakes() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
         out.status.success(),
-        "parent failed: {stdout}\n{}",
-        String::from_utf8_lossy(&out.stderr)
+        "parent failed: {stdout}\n{}\n{}",
+        String::from_utf8_lossy(&out.stderr),
+        children_output(&w)
     );
     // The watch woke on the children's results, not on a poll.
     assert!(stdout.contains("WOKE"), "{stdout}");
