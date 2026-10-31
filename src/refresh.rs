@@ -87,6 +87,10 @@ pub fn spawn_if_changed(env: &HostEnv) {
     if !crate::launchers::installed(env) && !crate::shims::installed(env) {
         return;
     }
+    // A build never rewrites the user's integrations.
+    if crate::launchers::launcher_exe(env).is_err() {
+        return;
+    }
     let Ok(me) = std::env::current_exe() else {
         return;
     };
