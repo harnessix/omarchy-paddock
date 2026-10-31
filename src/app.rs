@@ -705,7 +705,8 @@ pub fn desktop_file(env: &HostEnv, name: &str) -> PathBuf {
 pub fn install(env: &HostEnv, name: &str) -> Result<PathBuf> {
     let p = app_profile(env, name)?;
     let app = p.app.clone().unwrap_or_default();
-    let me = std::env::current_exe().and_then(std::fs::canonicalize)?;
+    // Never a build: see launchers::launcher_exe.
+    let me = crate::launchers::launcher_exe(env)?;
     let display = if app.display_name.is_empty() {
         name.to_string()
     } else {
@@ -869,7 +870,8 @@ pub fn claim_links(env: &HostEnv, name: &str) -> Result<Vec<(String, String)>> {
     if schemes.is_empty() {
         return Ok(vec![]);
     }
-    let me = std::env::current_exe().and_then(std::fs::canonicalize)?;
+    // Never a build: see launchers::launcher_exe.
+    let me = crate::launchers::launcher_exe(env)?;
     let mime: String = schemes
         .iter()
         .map(|s| format!("x-scheme-handler/{s};"))

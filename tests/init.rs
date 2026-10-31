@@ -4,7 +4,13 @@
 use std::process::Command;
 
 fn init(dir: &std::path::Path) -> bool {
+    // The user's own folders stay out of tests.
+    let xdg = dir.parent().unwrap().join("xdg");
     Command::new(env!("CARGO_BIN_EXE_paddock"))
+        .env("XDG_CONFIG_HOME", xdg.join("cfg"))
+        .env("XDG_DATA_HOME", xdg.join("data"))
+        .env("XDG_STATE_HOME", xdg.join("state"))
+        .env("XDG_CACHE_HOME", xdg.join("cache"))
         .arg("init")
         .arg(dir)
         .output()
