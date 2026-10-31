@@ -975,115 +975,13 @@ fn perform(env: &HostEnv, ctx: &Context, req: &Request, work: &Work) -> Result<s
         Work::Spawn { .. } | Work::SpawnControl => bail!("spawn was not prepared"),
         // The executor pushes (Broker::execute), never this process.
         Work::Push(_) => bail!("the push runs in the executor"),
-        Work::Forge(call) => return run_forge(env, ctx, req, call),
+        Work::Forge(_) => bail!("gh runs in the executor"),
         Work::Fetch(f) => return fetch(env, ctx, req, f),
         Work::Plain => {}
     }
-    match req.cap.as_str() {
-        "screenshot" => {
-            let grim = env
-                .which("grim")
-                .context("screenshots need grim on the host")?;
-            let dir = inbox(&ctx.project)?;
-            let name = safe_name(
-                arg_str(req, "out").unwrap_or(""),
-                &format!("screenshot-{}.png", state::now()),
-            );
-            let mut cmd = Command::new(grim);
-            match arg_str(req, "target").unwrap_or("screen") {
-                "screen" => {}
-                "window" => {
-                    let geo = active_window_geometry(env)?;
-                    cmd.args(["-g", &geo]);
-                }
-                t => {
-                    cmd.args(["-o", t.trim_start_matches("output:")]);
-                }
-            }
-            // grim writes the PNG to stdout; paddock writes the file through
-            // the inbox folder it opened, so grim never resolves a project path.
-            cmd.arg("-");
-            let out = cmd.stdin(Stdio::null()).stderr(Stdio::piped()).output()?;
-            if !out.status.success() {
-                bail!(
-                    "grim failed: {}",
-                    String::from_utf8_lossy(&out.stderr).trim()
-                );
-            }
-            let (mut f, name) = dir.new_file(&name, 0o644)?;
-            f.write_all(&out.stdout)?;
-            Ok(serde_json::json!({ "path": dir.path().join(name) }))
-        }
-        // The executor runs exec (Broker::execute), never this process.
-        "exec" => bail!("exec runs in the executor"),
-        "fetch" => bail!("fetch was not prepared"),
-        "clipboard-read" => {
-            let wp = env
-                .which("wl-paste")
-                .context("clipboard access needs wl-clipboard on the host")?;
-            let (_, out, _) =
-                run_capture(Command::new(wp).arg("--no-newline"), Duration::from_secs(5))?;
-            Ok(serde_json::json!({ "text": out }))
-        }
-        "clipboard-write" => {
-            let wc = env
-                .which("wl-copy")
-                .context("clipboard access needs wl-clipboard on the host")?;
-            let mut child = Command::new(wc)
-                .stdin(Stdio::piped())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .spawn()?;
-            child
-                .stdin
-                .take()
-                .unwrap()
-                .write_all(arg_str(req, "text").unwrap_or("").as_bytes())?;
-            child.wait()?;
-            Ok(serde_json::json!({}))
-        }
-        "open-url" => {
-            let opener = env
-                .which("xdg-open")
-                .context("opening URLs needs xdg-open on the host")?;
-            Command::new(opener)
-                .arg(arg_str(req, "url").unwrap_or(""))
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .spawn()?;
-            // A login page: let its localhost callback through for a while.
-            crate::login::note_opened(arg_str(req, "url").unwrap_or(""));
-            Ok(serde_json::json!({}))
-        }
-        "notify" => {
-            // Over the session bus: the text never shows in a process list.
-            let n = notify::Note {
-                summary: format!("{}: {}", ctx.harness, arg_str(req, "title").unwrap_or("")),
-                body: arg_str(req, "body").unwrap_or("").to_string(),
-                ..Default::default()
-            };
-            notify::show(env, &n).context("cannot show the notification")?;
-            Ok(serde_json::json!({}))
-        }
-        _ => unreachable!(),
-    }
-}
-
-fn active_window_geometry(env: &HostEnv) -> Result<String> {
-    let hc = env
-        .which("hyprctl")
-        .context("target window needs Hyprland; use screen or output:NAME")?;
-    let out = Command::new(hc).args(["activewindow", "-j"]).output()?;
-    let v: serde_json::Value = serde_json::from_slice(&out.stdout).context("no active window")?;
-    let at = v["at"].as_array().context("no active window")?;
-    let size = v["size"].as_array().context("no active window")?;
-    Ok(format!(
-        "{},{} {}x{}",
-        at[0].as_i64().unwrap_or(0),
-        at[1].as_i64().unwrap_or(0),
-        size[0].as_i64().unwrap_or(0),
-        size[1].as_i64().unwrap_or(0)
-    ))
+    // Every other capability runs in the executor (Broker::run_elsewhere).
+    let _ = (env, ctx);
+    bail!("{} runs in the executor", req.cap)
 }
 
 /// A fetch source, opened before the user is asked. The copy reads from the
@@ -1285,51 +1183,6 @@ fn prepare(env: &HostEnv, ctx: &Context, req: &Request) -> Result<Prepared> {
     }
 }
 
-/// Run a checked forge call in an empty folder: the tool must not read the
-/// project's `.git`, which the sandbox can write.
-fn run_forge(
-    env: &HostEnv,
-    ctx: &Context,
-    req: &Request,
-    call: &forge::Call,
-) -> Result<serde_json::Value> {
-    let exe = env
-        .which(call.tool)
-        .with_context(|| format!("{} is not installed on the host", call.tool))?;
-    let dir = env
-        .paddock_run()
-        .join(&ctx.id)
-        .join(format!("forge-{}", new_request_id()));
-    crate::privfs::dir(&dir)?;
-    let long = call.argv.iter().any(|a| a == "watch" || a == "--watch");
-    let timeout = req
-        .args
-        .get("timeout")
-        .and_then(|t| t.as_u64())
-        .unwrap_or(if long { 1800 } else { 120 })
-        .clamp(1, 3600);
-    let mut cmd = Command::new(exe);
-    cmd.args(&call.argv)
-        .current_dir(&dir)
-        .env("GH_PROMPT_DISABLED", "1")
-        .env("GH_NO_UPDATE_NOTIFIER", "1")
-        .env("GH_SPINNER_DISABLED", "1")
-        .env("NO_COLOR", "1")
-        .env_remove("GH_REPO")
-        .env_remove("GIT_DIR")
-        .env_remove("GIT_WORK_TREE");
-    // Body text goes on stdin (`--body-file -`): the arguments of a host
-    // process are visible to every local user.
-    let r = run_capture_input(
-        &mut cmd,
-        Duration::from_secs(timeout),
-        call.stdin.as_deref().map(str::as_bytes),
-    );
-    let _ = std::fs::remove_dir_all(&dir);
-    let (code, out, err) = r?;
-    Ok(serde_json::json!({ "exit_code": code, "stdout": out, "stderr": err }))
-}
-
 pub struct Broker {
     pub env: HostEnv,
     pub ctx: Context,
@@ -1358,6 +1211,102 @@ impl Broker {
             spawner: None,
             dispatch: None,
             grants: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// The capabilities that the executor runs from a plan of this process:
+    /// gh, the desktop tools, links and notifications.
+    fn run_elsewhere(&self, req: &Request, work: &Work) -> Result<serde_json::Value> {
+        let workdir = || -> Result<PathBuf> {
+            let d = self
+                .env
+                .paddock_run()
+                .join(&self.ctx.id)
+                .join(format!("req-{}", new_request_id()));
+            crate::privfs::dir(&d)?;
+            Ok(d)
+        };
+        match req.cap.as_str() {
+            _ if matches!(work, Work::Forge(_)) => {
+                let Work::Forge(call) = work else {
+                    unreachable!()
+                };
+                // Found with this process's PATH, as before: the executor
+                // runs exactly this program.
+                let exe = self
+                    .env
+                    .which(call.tool)
+                    .with_context(|| format!("{} is not installed on the host", call.tool))?;
+                let long = call.argv.iter().any(|a| a == "watch" || a == "--watch");
+                let dir = workdir()?;
+                let plan = forge::ForgeExec {
+                    tool: exe.display().to_string(),
+                    argv: call.argv.clone(),
+                    stdin: call.stdin.clone(),
+                    timeout: req
+                        .args
+                        .get("timeout")
+                        .and_then(|t| t.as_u64())
+                        .unwrap_or(if long { 1800 } else { 120 })
+                        .clamp(1, 3600),
+                    workdir: dir.clone(),
+                };
+                let r = self.execute(req, serde_json::to_value(&plan)?);
+                let _ = std::fs::remove_dir_all(&dir);
+                r
+            }
+            "screenshot" => {
+                let name = safe_name(
+                    arg_str(req, "out").unwrap_or(""),
+                    &format!("screenshot-{}.png", state::now()),
+                );
+                let dir = workdir()?;
+                let plan = crate::gatewayd::DesktopExec {
+                    workdir: dir.clone(),
+                };
+                let r = self
+                    .execute(req, serde_json::to_value(&plan)?)
+                    .and_then(|_| {
+                        // The folder is paddock's own; the inbox is written
+                        // through the folder that paddock opened.
+                        let png =
+                            std::fs::read(dir.join("shot.png")).context("grim wrote no image")?;
+                        let inbox = inbox(&self.ctx.project)?;
+                        let (mut f, name) = inbox.new_file(&name, 0o644)?;
+                        f.write_all(&png)?;
+                        Ok(serde_json::json!({ "path": inbox.path().join(name) }))
+                    });
+                let _ = std::fs::remove_dir_all(&dir);
+                r
+            }
+            "clipboard-read" | "clipboard-write" => {
+                let dir = workdir()?;
+                let plan = crate::gatewayd::DesktopExec {
+                    workdir: dir.clone(),
+                };
+                let r = self.execute(req, serde_json::to_value(&plan)?);
+                let _ = std::fs::remove_dir_all(&dir);
+                r
+            }
+            "open-url" => {
+                let r = self.execute(req, serde_json::Value::Null)?;
+                // A login page: let its localhost callback through for a while.
+                crate::login::note_opened(arg_str(req, "url").unwrap_or(""));
+                Ok(r)
+            }
+            "notify" => {
+                let n = notify::Note {
+                    summary: format!(
+                        "{}: {}",
+                        self.ctx.harness,
+                        arg_str(req, "title").unwrap_or("")
+                    ),
+                    body: arg_str(req, "body").unwrap_or("").to_string(),
+                    ..Default::default()
+                };
+                self.execute(req, serde_json::to_value(&n)?)
+            }
+            other => bail!("{other} does not run in the executor"),
         }
     }
 
@@ -1811,6 +1760,16 @@ impl Broker {
             (_, Some(false)) => Response::new(Status::Denied, "the user denied the request"),
             _ if matches!(prep.work, Work::Spawn { .. } | Work::SpawnControl) => {
                 self.perform_spawn(req, &prep.work)
+            }
+            _ if matches!(
+                req.cap.as_str(),
+                "screenshot" | "clipboard-read" | "clipboard-write" | "open-url" | "notify"
+            ) || matches!(prep.work, Work::Forge(_)) =>
+            {
+                match self.run_elsewhere(req, &prep.work) {
+                    Ok(result) => Response::done(result),
+                    Err(e) => Response::new(Status::Failed, format!("{e:#}")),
+                }
             }
             _ if req.cap == "exec" => match self.execute(req, serde_json::Value::Null) {
                 Ok(result) => Response::done(result),

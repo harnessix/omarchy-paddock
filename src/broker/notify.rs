@@ -15,7 +15,7 @@ const DEST: &str = "org.freedesktop.Notifications";
 const PATH: &str = "/org/freedesktop/Notifications";
 
 /// One notification. `actions` are (key, label) pairs.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct Note {
     pub summary: String,
     pub body: String,
