@@ -507,3 +507,91 @@ fn an_approved_push_runs_in_the_executor() {
     let _ = daemon.kill();
     let _ = daemon.wait();
 }
+
+/// An approved gh call runs in the real executor: the program that the
+/// broker found, the body on standard input, its own login variables, and
+/// a home folder that it cannot change.
+#[test]
+fn an_approved_gh_call_runs_in_the_executor() {
+    if !bwrap_works() {
+        eprintln!("skipped: bwrap does not work here");
+        return;
+    }
+    use std::os::unix::fs::PermissionsExt;
+    let w = world();
+    let bin = w.root.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let gh = bin.join("gh");
+    std::fs::write(
+        &gh,
+        "#!/bin/sh\necho \"ARGS $*\"\necho \"BODY $(cat)\"\necho \"PROMPT ${GH_PROMPT_DISABLED:-}\"\necho \"TOKEN ${GITHUB_TOKEN:-none}\"\nif touch \"$HOME/paddock-gh-probe\" 2>/dev/null; then echo HOME_WRITABLE; rm -f \"$HOME/paddock-gh-probe\"; else echo HOME_READONLY; fi\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let vars = exec_vars(&w);
+    let env = paddock::env::HostEnv::from_parts(
+        w.root.join("home"),
+        "demo".into(),
+        1000,
+        1000,
+        vars.clone(),
+    );
+    let workdir = w.root.join("run/paddock/s1/req-1");
+    std::fs::create_dir_all(&workdir).unwrap();
+    let plan = paddock::broker::forge::ForgeExec {
+        tool: gh.display().to_string(),
+        argv: vec![
+            "pr".into(),
+            "create".into(),
+            "--body-file".into(),
+            "-".into(),
+        ],
+        stdin: Some("the body".into()),
+        timeout: 30,
+        workdir,
+    };
+    let req = paddock::broker::Request {
+        v: 1,
+        cap: "forge".into(),
+        args: Default::default(),
+        reason: String::new(),
+    };
+    let mut host = std::collections::BTreeMap::new();
+    for k in ["PATH", "HOME"] {
+        host.insert(k.to_string(), std::env::var(k).unwrap());
+    }
+    host.insert("GITHUB_TOKEN".to_string(), "t0k".to_string());
+    host.insert("AWS_SECRET_ACCESS_KEY".to_string(), "nope".to_string());
+    let mut daemon = executor(&w, &vars);
+    let key = paddock::gateway::key(&env).unwrap();
+    let job = paddock::gateway::sign(
+        &key,
+        "s1",
+        &w.root.join("project"),
+        &req,
+        host,
+        serde_json::to_value(&plan).unwrap(),
+    )
+    .unwrap();
+    let r = {
+        use std::io::{BufRead, BufReader, Write};
+        let mut s =
+            std::os::unix::net::UnixStream::connect(paddock::gatewayd::socket_path(&env)).unwrap();
+        writeln!(s, "{}", serde_json::to_string(&job).unwrap()).unwrap();
+        let mut line = String::new();
+        BufReader::new(s).read_line(&mut line).unwrap();
+        serde_json::from_str::<serde_json::Value>(&line).unwrap()
+    };
+    let out = r["ok"]["stdout"].as_str().unwrap_or_default().to_string();
+    for want in [
+        "ARGS pr create --body-file -",
+        "BODY the body",
+        "PROMPT 1",
+        "TOKEN t0k",
+        "HOME_READONLY",
+    ] {
+        assert!(out.contains(want), "{want} missing:\n{r}");
+    }
+    let _ = daemon.kill();
+    let _ = daemon.wait();
+}

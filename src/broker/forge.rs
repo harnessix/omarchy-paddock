@@ -222,6 +222,56 @@ pub struct Call {
     pub stdin: Option<String>,
 }
 
+/// The approved call, for the executor.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ForgeExec {
+    /// The program, found on the host's PATH by the broker.
+    pub tool: String,
+    pub argv: Vec<String>,
+    pub stdin: Option<String>,
+    pub timeout: u64,
+    /// An empty folder of paddock to run in, never the project.
+    pub workdir: std::path::PathBuf,
+}
+
+/// The tools that the executor runs for `forge`.
+pub const EXEC_TOOLS: &[&str] = &["gh"];
+
+/// Variables that the tool gets besides the base ones: its own login and
+/// host settings, the session bus for a keyring, and proxies.
+pub const FORGE_ENV: &[&str] = &[
+    "GH_TOKEN",
+    "GITHUB_TOKEN",
+    "GH_HOST",
+    "GH_ENTERPRISE_TOKEN",
+    "GITHUB_ENTERPRISE_TOKEN",
+    "GH_CONFIG_DIR",
+    "XDG_CONFIG_HOME",
+    "DBUS_SESSION_BUS_ADDRESS",
+    "XDG_RUNTIME_DIR",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "ALL_PROXY",
+    "NO_PROXY",
+    "http_proxy",
+    "https_proxy",
+    "all_proxy",
+    "no_proxy",
+];
+
+/// The settings that make the tool quiet and non-interactive.
+pub fn forge_vars() -> std::collections::BTreeMap<String, String> {
+    [
+        ("GH_PROMPT_DISABLED", "1"),
+        ("GH_NO_UPDATE_NOTIFIER", "1"),
+        ("GH_SPINNER_DISABLED", "1"),
+        ("NO_COLOR", "1"),
+    ]
+    .iter()
+    .map(|(k, v)| (k.to_string(), v.to_string()))
+    .collect()
+}
+
 /// Split body text out of arguments: (the arguments without it, the body).
 /// Handles `--body X`, `-b X`, `--body=X`, `-bX` and `-b=X`; the last body
 /// wins, as in `gh`. Values of other flags and anything after `--` stay.
