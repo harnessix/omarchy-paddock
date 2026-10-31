@@ -140,13 +140,13 @@ fn read_alternates(common: &Path) -> Result<Option<String>> {
 /// borrows these objects, so a change between the card and the push would
 /// push objects of another repository. Each directory is checked with
 /// `lstat`: a symlink here could point into any host repository.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct ObjectStore {
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ObjectStore {
     alternates: Option<String>,
     dirs: Vec<(u64, u64)>,
 }
 
-fn object_store(common: &Path) -> Result<ObjectStore> {
+pub fn object_store(common: &Path) -> Result<ObjectStore> {
     let mut dirs = Vec::new();
     for rel in ["objects", "objects/info", "objects/pack"] {
         let p = common.join(rel);
@@ -601,34 +601,105 @@ pub fn plan(
     })
 }
 
-/// Push after approval. Never runs hooks and never reads the project config.
-pub fn push(plan: &PushPlan) -> Result<serde_json::Value> {
-    // The sandbox keeps running while the card waits. Check the object store
-    // again now: the scratch repository reads objects through it.
-    if object_store(&plan.common_dir)? != plan.store {
-        bail!(
-            "the object store of {} changed while the request waited; paddock does not push from it",
-            plan.common_dir.display()
-        );
+/// The approved push, for the executor: what `push_exec` needs, and
+/// nothing that the sandbox chose after the card was made.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PushExec {
+    /// The scratch repository that borrows the project's objects.
+    pub scratch: PathBuf,
+    pub url: String,
+    pub refs: Vec<PushRef>,
+    pub common_dir: PathBuf,
+    pub store: ObjectStore,
+}
+
+impl PushPlan {
+    pub fn exec(&self) -> PushExec {
+        PushExec {
+            scratch: self.scratch.0.clone(),
+            url: self.url.clone(),
+            refs: self.refs.iter().map(|r| r.r.clone()).collect(),
+            common_dir: self.common_dir.clone(),
+            store: self.store.clone(),
+        }
     }
-    let mut c = scratch_git(&plan.scratch.0);
-    c.args(["push", "--no-verify", "--porcelain", "--", &plan.url]);
-    for r in &plan.refs {
-        c.arg(format!(
+}
+
+/// Host variables that a push may need, besides the base ones: the agent
+/// sockets for SSH and GnuPG, an SSH command, the session bus for a keyring
+/// credential helper, and proxies.
+pub const PUSH_ENV: &[&str] = &[
+    "SSH_AUTH_SOCK",
+    "SSH_ASKPASS",
+    "GIT_SSH",
+    "GIT_SSH_COMMAND",
+    "GNUPGHOME",
+    "DBUS_SESSION_BUS_ADDRESS",
+    "XDG_RUNTIME_DIR",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "ALL_PROXY",
+    "NO_PROXY",
+    "http_proxy",
+    "https_proxy",
+    "all_proxy",
+    "no_proxy",
+];
+
+/// The git command line of an approved push, and the variables that git
+/// gets besides the host ones. Never runs hooks and never reads the project
+/// configuration.
+pub fn push_argv(x: &PushExec) -> (Vec<String>, BTreeMap<String, String>) {
+    let mut a: Vec<String> = ["git", "-C"].iter().map(|s| s.to_string()).collect();
+    a.push(x.scratch.display().to_string());
+    for s in [
+        "-c",
+        "core.hooksPath=/dev/null",
+        "-c",
+        "push.recurseSubmodules=no",
+        "push",
+        "--no-verify",
+        "--porcelain",
+        "--",
+    ] {
+        a.push(s.to_string());
+    }
+    a.push(x.url.clone());
+    for r in &x.refs {
+        a.push(format!(
             "{}{}:{}",
-            if r.r.force { "+" } else { "" },
-            r.r.sha,
-            r.r.dst
+            if r.force { "+" } else { "" },
+            r.sha,
+            r.dst
         ));
     }
-    let (code, out, err) = super::run_capture(&mut c, Duration::from_secs(600))?;
+    let env = [("GIT_TERMINAL_PROMPT".to_string(), "0".to_string())].into();
+    (a, env)
+}
+
+/// Run an approved push with `run`, which starts the command (isolated in
+/// the executor), and read git's porcelain output.
+pub fn push_exec(
+    x: &PushExec,
+    run: impl FnOnce(&[String], &BTreeMap<String, String>) -> Result<(i32, String, String)>,
+) -> Result<serde_json::Value> {
+    // The sandbox keeps running while the card waits. Check the object store
+    // again now: the scratch repository reads objects through it.
+    if object_store(&x.common_dir)? != x.store {
+        bail!(
+            "the object store of {} changed while the request waited; paddock does not push from it",
+            x.common_dir.display()
+        );
+    }
+    let (argv, env) = push_argv(x);
+    let (code, out, err) = run(&argv, &env)?;
     // Porcelain lines: FLAG \t FROM:TO \t SUMMARY. A `!` flag is a rejection.
     let mut results = Vec::new();
-    for r in &plan.refs {
+    for r in &x.refs {
         let line = out.lines().find(|l| {
             l.split('\t')
                 .nth(1)
-                .is_some_and(|ft| ft.ends_with(&format!(":{}", r.r.dst)))
+                .is_some_and(|ft| ft.ends_with(&format!(":{}", r.dst)))
         });
         let (ok, message) = match line {
             Some(l) => {
@@ -637,9 +708,20 @@ pub fn push(plan: &PushPlan) -> Result<serde_json::Value> {
             }
             None => (false, "the host push failed".to_string()),
         };
-        results.push(serde_json::json!({ "dst": r.r.dst, "ok": ok, "message": message }));
+        results.push(serde_json::json!({ "dst": r.dst, "ok": ok, "message": message }));
     }
     Ok(serde_json::json!({ "exit_code": code, "refs": results, "stderr": err }))
+}
+
+/// Push in this process, as the tests do: the same command, without the
+/// executor.
+pub fn push(plan: &PushPlan) -> Result<serde_json::Value> {
+    push_exec(&plan.exec(), |argv, env| {
+        let mut c = Command::new(&argv[0]);
+        c.args(&argv[1..]).envs(env);
+        git_env(&mut c);
+        super::run_capture(&mut c, Duration::from_secs(600))
+    })
 }
 
 #[cfg(test)]

@@ -494,6 +494,8 @@ The sandbox has no SSH key, no git credential helper and no `gh` login. paddock 
 
 For `git push`, the sandbox git configuration sends the push to paddock on the host. The approval card shows the remote URL, each local and remote branch, the commits (at most 20) and whether it is a force push. The host pushes from a scratch repository that has no configuration and no hooks of its own. A file that the agent writes in `.git` cannot run a program on the host.
 
+The push itself runs in the gateway executor, from the plan that the card showed: the scratch repository, the URL and the refs are part of the signed grant, so the executor pushes exactly what you approved. It runs isolated, like `exec`, but with your credentials readable: the home folder is read-only (your git and SSH configuration, keys and credential helpers still work), only the scratch repository and a remote on this machine are writable, and of your environment only the variables that git and SSH need pass (`SSH_AUTH_SOCK`, `GIT_SSH_COMMAND`, the session bus for a keyring helper, and proxies).
+
 - Force pushes, branch deletions and pushes to the default branch ask every time. "Allow for this session" is not offered for them.
 - "Allow for this session" covers one remote and one branch.
 - paddock reads the remotes when the sandbox starts. Inside the sandbox, `.git/config` is read-only. If the agent names another remote, for example with `git -c`, the card marks it as new and asks every time. The host always pushes to the URL that a remote had at the start.
