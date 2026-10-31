@@ -31,7 +31,7 @@ paddock supports Omarchy (Arch Linux with Hyprland). Other distributions are bes
 `omarchy plugin add` installs only the bar widget. The `paddock` command is a separate install: the prebuilt binary from the latest GitHub release (see the README), or `bin/install` from a clone.
 
 ```sh
-git clone https://github.com/harnessix/omarchy-paddock
+git clone --branch v0.1.7 https://github.com/harnessix/omarchy-paddock   # the latest release
 cd omarchy-paddock
 bin/install                     # system packages, build, then paddock doctor
 ```
@@ -55,7 +55,7 @@ With `--yes`, `paddock setup` prints the package install command and never runs 
 paddock update --check          # is there a newer release, and what would an update do
 ```
 
-Ask the user before you run `paddock update --yes`: it replaces the paddock binary and updates the bar widget. If a pacman package owns the binary, `paddock update` refuses and prints what to run instead (pull the clone and run `bin/install` again). `paddock doctor` also says when a newer release exists.
+Ask the user before you run `paddock update --yes`: it replaces the paddock binary and updates the bar widget. If a pacman package owns the binary, `paddock update` refuses and prints what to run instead (check out the new release tag in the clone and run `bin/install` again). `paddock doctor` also says when a newer release exists.
 
 ## Check
 
@@ -75,11 +75,13 @@ Most users never type `paddock`. Turn on both of these, and tell the user what t
 paddock setup --yes --shims --launchers
 ```
 
-`--shims`: `claude`, `codex` and others start in a sandbox in bash and zsh. `--launchers`: menu entries in a "Paddock" folder (Super+Space on Omarchy). `paddock shims install` and `paddock launchers install` do the same one at a time.
+`--shims`: `claude`, `codex` and others start in a sandbox in bash and zsh. After the user installs another agent, the next harness start adds its menu entry and shim; `paddock refresh` does it at once, and `paddock doctor` names what is missing. `--launchers`: menu entries in a "Paddock" folder (Super+Space on Omarchy). `paddock shims install` and `paddock launchers install` do the same one at a time.
 
-On Omarchy, `paddock shims install --scope omarchy-agent` puts only the agents that `omarchy-agent` starts (the agent key, the console, the agents panel, the alias `a`) in a sandbox. Typed commands and scripts do not change. Ask the user before you run it, and tell them what it changes: one marked block in `~/.config/mise/config.toml`, and from then on every agent start from Omarchy runs through `paddock wrap`. `paddock shims remove` undoes it. If paddock reports that the file already has its own `[wrappers.omarchy-agent]`, do not edit or remove the user's entry; tell the user.
+On Omarchy, `paddock shims install --scope omarchy-agent` puts only the agents that `omarchy-agent` starts (the agent key, the console, the agents panel, the alias `a`) in a sandbox. Typed commands and scripts do not change. Ask the user before you run it, and tell them what it changes: one marked block in `~/.config/mise/config.toml`, one in `~/.config/hypr/hyprland.lua`, and from then on every agent start from Omarchy runs through `paddock wrap`. `paddock shims remove` undoes it. If paddock reports that the file already has its own `[wrappers.omarchy-agent]`, do not edit or remove the user's entry; tell the user.
 
-Sessions of claude, codex and grok that `omarchy-agent` starts reach the host history, so the Omarchy agents panel counts them: claude gets only the host folder of its own project in `~/.claude/projects`, and codex and grok copy new history back every five minutes and at exit. A token that a sandbox refreshes reaches the host login within a minute, so the panel's limits stay current. A login goes back only to its own store: the main login, an Omarchy account, or an isolated store. The panel never shows an isolated login (`--auth isolated:NAME`); `paddock doctor` lists them. Do not copy an isolated login into the host home to make it show; if the user wants it in the panel, they add it as an Omarchy account. Do not bind more history folders by hand.
+Sessions of claude, codex and grok that `omarchy-agent` starts reach the host history, so the Omarchy agents panel counts them: claude gets only the host folder of its own project in `~/.claude/projects`, and codex and grok copy new history back every five minutes and at exit. The panel never shows an isolated login (`--auth isolated:NAME`); `paddock doctor` lists them. Do not copy login files between the sandbox and the host by hand, and do not send test requests to a vendor's endpoints with the user's login. Do not bind more history folders by hand.
+
+The same scope adds one marked block at the end of `~/.config/hypr/hyprland.lua`. From the next login, the panel's limit checks go through paddock: while a sandbox holds the login of Claude Code or Grok Build, paddock checks it from a sandbox and the host does not. A held Codex login is not checked until the sandbox exits. Do not run `omarchy-agent-usage-update --force` or a collector yourself to test this: each run asks the vendor with the user's login. `paddock doctor` shows the state.
 
 Every agent that `omarchy-agent` can start has a profile. muse and openclaw still start on the host, with a notice: muse needs its own sandbox, and the agent of openclaw runs in a host service. Do not try to turn off muse's sandbox to make it fit. Many profiles come from documentation; `paddock doctor` lists what is not verified.
 

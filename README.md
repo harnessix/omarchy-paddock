@@ -50,7 +50,7 @@ paddock moves the boundary from "which commands can run" to "which files exist".
    omarchy plugin add https://github.com/harnessix/omarchy-paddock --enable
    ```
 
-2. Install the `paddock` command: the prebuilt binary from the [latest release](https://github.com/harnessix/omarchy-paddock/releases/latest), or `bin/install` from a clone. Both are described below.
+2. Install the `paddock` command from the latest release, v0.1.7: the prebuilt binary, or `bin/install` from a clone of that tag. Both are described below.
 
 3. Run the setup. It checks the system packages, and offers the shell commands, the launchers, the bar widget and the default backend, one step at a time. Each step says what it changes and how to undo it. A second run shows the state and changes nothing unless you ask. The last step lists where you turn off the use of your data for training (see [Privacy defaults](#privacy-defaults)).
 
@@ -62,22 +62,28 @@ paddock moves the boundary from "which commands can run" to "which files exist".
 
 ### From a clone or a release
 
-paddock is a Rust command and an Omarchy bar plugin in one repository. Clone the repository, and run the installer from its root. It installs the system packages, builds paddock, and runs `paddock doctor`.
+paddock is a Rust command and an Omarchy bar plugin in one repository. The commands below install the latest release, v0.1.7. The `main` branch can hold changes that are not released yet.
+
+Clone the release tag, and run the installer from its root. It installs the system packages, builds paddock, and runs `paddock doctor`.
 
 ```sh
-git clone https://github.com/harnessix/omarchy-paddock
+git clone --branch v0.1.7 https://github.com/harnessix/omarchy-paddock
 cd omarchy-paddock
 bin/install
 ```
 
-Without a Rust toolchain, use the prebuilt binary from the [latest release](https://github.com/harnessix/omarchy-paddock/releases/latest). It is one file. Check its checksum, copy it to `~/.local/bin`, and run `paddock doctor`, which prints the command that installs the system packages below:
+Without a Rust toolchain, use the prebuilt binary of the release. It is one file. Download it with its checksum, check the checksum, copy the binary to `~/.local/bin`, and run `paddock doctor`, which prints the command that installs the system packages below:
 
 ```sh
-sha256sum -c paddock-*-x86_64-linux.tar.gz.sha256
-tar -xzf paddock-*-x86_64-linux.tar.gz
-install -m 755 paddock-*-x86_64-linux/paddock ~/.local/bin/paddock
+curl -fLO https://github.com/harnessix/omarchy-paddock/releases/download/v0.1.7/paddock-0.1.7-x86_64-linux.tar.gz
+curl -fLO https://github.com/harnessix/omarchy-paddock/releases/download/v0.1.7/paddock-0.1.7-x86_64-linux.tar.gz.sha256
+sha256sum -c paddock-0.1.7-x86_64-linux.tar.gz.sha256
+tar -xzf paddock-0.1.7-x86_64-linux.tar.gz
+install -m 755 paddock-0.1.7-x86_64-linux/paddock ~/.local/bin/paddock
 paddock doctor
 ```
+
+All releases are on the [releases page](https://github.com/harnessix/omarchy-paddock/releases).
 
 On Arch Linux, the installer installs a package with makepkg. It also knows apt and dnf, and then copies the binary to `~/.local/bin`; that path is best effort and is not tested on every release (see [Support scope](#support-scope)). Use `bin/install --minimal` to skip the desktop packages.
 
@@ -102,6 +108,8 @@ To add the bar widget on Omarchy, point `omarchy plugin add` at this repository:
 omarchy plugin add https://github.com/harnessix/omarchy-paddock --enable
 ```
 
+`omarchy plugin add` always installs the widget from the default branch, because it takes no tag. `paddock update` updates the widget together with the command.
+
 The widget lists running sandboxes with their backend, network, display and login. Press Enter on a sandbox to go to the terminal that runs it (Hyprland). The row actions open the project folder, copy its path, show the display window of a sandbox in `window` mode, and stop the sandbox after a second press. The New button starts a sandbox in two steps: pick a recent project, then a harness that is installed on this machine, and paddock opens a terminal that runs it. The Checks button runs `paddock doctor`. Every action has a key, and the panel footer lists them.
 
 ### Update
@@ -113,7 +121,7 @@ paddock update            # asks first; --yes updates without asking
 
 `paddock update` asks the GitHub API for the latest release. It downloads the tarball and its `.sha256` into a private folder, checks the checksum, and checks that the new binary prints the expected version. Then it writes the new binary next to the old one and renames it into place, so a cut download never leaves half a binary. It talks only to `api.github.com`, `github.com` and GitHub's download hosts over HTTPS, follows no redirect to another host, and uses your `HTTPS_PROXY`. If the bar widget is installed, it also runs `omarchy plugin update harnessix.paddock --yes`.
 
-If a package owns the binary (the Arch package that `bin/install` builds), `paddock update` does not overwrite it. Run `git pull` and `bin/install` in your clone instead. `paddock update` runs only on the host, never in a sandbox.
+If a package owns the binary (the Arch package that `bin/install` builds), `paddock update` does not overwrite it. In your clone, check out the new release tag and run `bin/install` again, for example `git fetch --tags && git checkout vX.Y.Z && bin/install`, with the tag that `paddock update --check` names. `paddock update` runs only on the host, never in a sandbox.
 
 `paddock doctor` says when a newer release exists. It checks at most once a day and waits at most two seconds; `PADDOCK_NO_UPDATE_CHECK=1` turns the check off. It also says when a desktop app was updated on the host while its sandbox runs, so that you restart it.
 
@@ -327,7 +335,7 @@ Who talks to the host proxy depends on the backend. On docker and podman, the pa
 
 ## Logins and MCP
 
-By default, a sandbox uses your existing login (auth mode `shared`). paddock copies the credential files of the harness from your home directory into the sandbox at start. If the harness refreshes a token in the sandbox, paddock writes it back within a minute, while the sandbox runs, so tools that read the login on the host (for example the limits in the Omarchy agents panel) stay current. If the host refreshes the token instead, paddock copies the new one into the sandbox. If the file changed on both sides, the host version stays, and paddock tells you at exit. A login goes back only to the place that it came from: your main login, an Omarchy account folder, or an isolated store. An isolated login never reaches your home directory, so the agents panel does not show it.
+By default, a sandbox uses your existing login (auth mode `shared`). paddock copies the credential files of the harness from your home directory into the sandbox at start. If the harness refreshes a token in the sandbox, paddock writes it back when the sandbox exits. If the file also changed on the host in the meantime, the host version stays, and paddock tells you.
 
 Some harnesses keep their login in the system keyring. Copilot CLI is one of them. Its sandbox gets a private keyring of its own (gnome-keyring, on a private session bus), encrypted with a password that paddock keeps on the host. The sandbox cannot reach your host keyring, and your host keyring does not see the sandbox's login. So you log in once inside the sandbox, and the login stays for later runs.
 
@@ -733,6 +741,7 @@ After `install`, typing `claude` in a new shell runs `paddock run claude` in the
 - In your home directory, the command stops with an error, because paddock does not use the home directory as a project. Go to a project first.
 - Shell functions win over PATH, so version managers such as mise do not bypass them. Scripts and programs that start `claude` themselves are not covered: only interactive bash and zsh shells. For the agents that Omarchy starts, see the next section.
 - If paddock or the script is gone, each function runs the real program, and the line in the rc file does nothing.
+- When you install another agent, or a newer paddock brings a profile, the next harness start updates the script in the background (see [Keeping the menu and the shims current](#keeping-the-menu-and-the-shims-current)).
 - `paddock doctor` lists the commands that start in a sandbox, the rc file that loads them, and how to turn them off. Each run also prints a `paddock:` line with the sandbox it started, so you always see when a shim takes over.
 
 ### Only the agents that Omarchy starts
@@ -755,7 +764,7 @@ paddock shims remove                          # removes both scopes
 
 - The arguments stay the same. paddock adds no auto-approval flags and removes none. It adds only the telemetry switches of the profile (see [Privacy defaults](#privacy-defaults)).
 - The project is the current folder. The home folder is no project. If `omarchy-agent` starts in the home folder (when `~/Work` does not exist), the agent works in a scratch project of its own, `~/.local/share/paddock/scratch/<agent>`. The `paddock:` line names it, `paddock files` lists it, and `paddock gc --scratch` removes old ones.
-- An `env` prefix keeps its variables. For Claude Code, Codex and Grok Build, Omarchy's account switch sets `CLAUDE_CONFIG_DIR`, `CODEX_HOME` or `GROK_HOME`. paddock uses that folder as the login of the sandbox: it copies the login in at the start, and copies a refreshed token back while the sandbox runs, the same as for your main login. The pin `OMARCHY_AGENT_<AGENT>_HOME` stays.
+- An `env` prefix keeps its variables. For Claude Code, Codex and Grok Build, Omarchy's account switch sets `CLAUDE_CONFIG_DIR`, `CODEX_HOME` or `GROK_HOME`. paddock uses that folder as the login of the sandbox: it copies the login in at the start, and copies a refreshed token back at the end, the same as for your main login. The pin `OMARCHY_AGENT_<AGENT>_HOME` stays.
 - The shell form `bash -c '…' amp PROMPT` runs whole in the sandbox, with `$0` set to the agent program. An absolute path, such as a user install in `~/.local/bin`, runs that program.
 - The exit code passes through.
 - A command without a paddock profile runs without a sandbox. paddock shows a notification that names it, so a start never fails only because paddock does not know an agent yet.
@@ -784,7 +793,16 @@ The agents panel reads the session history of each agent from fixed places in yo
 - Codex (`~/.codex/sessions`) and Grok Build (`~/.grok/sessions`) keep their history by date or by session. paddock copies new history files back every five minutes while the sandbox runs, and at the end of the session. It copies a file only when the host has none, or when the sandbox only added to it. It never follows a symlink in the sandbox home.
 - With an account folder (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `GROK_HOME`), the history goes to that folder, the same as on the host.
 - An isolated login (`--auth isolated:NAME`) keeps its history in the sandbox home.
-- paddock never writes the panel's own usage records. The panel's collectors count the sessions the same way as sessions on the host.
+- The panel's collectors count the sessions the same way as sessions on the host.
+
+The panel also shows each agent's limits. Its collectors ask the vendor, with the login on the host. While a sandbox runs, it has a copy of that login, so a check from the host would use one login in two places at once. With this scope, a login is checked from one side only:
+
+- paddock adds one marked block at the end of `~/.config/hypr/hyprland.lua`, where Omarchy asks for your own configuration. The block loads a file of paddock, which puts one folder first on the `PATH` of the programs that Hyprland starts, ahead of Omarchy's `bin` folder. The folder has one command in it: `omarchy-agent-usage-update`, which the panel runs for each refresh. Before paddock writes the file, `luac -p` (if installed) checks that it still compiles. It takes effect at your next login.
+- If no sandbox holds a login, Omarchy's command runs as before.
+- If a sandbox holds the login of Claude Code or Grok Build, the host skips that agent (`--except`), and paddock runs Omarchy's own collector in a sandbox instead. That sandbox has network mode egress, sees your home read-only, and sees the sandbox's copy of the login in place of the host file. Its record goes where Omarchy's goes. These collectors only read a login. They never refresh it.
+- The Codex collector starts `codex app-server`, which can refresh the login itself. So while a sandbox holds a Codex login, nobody checks it. The panel shows the last numbers, marked "Limits paused", until the sandbox exits.
+- paddock checks only when the panel asks. It adds no timer of its own.
+- `paddock shims remove` removes the block, byte for byte, and the folder. `paddock doctor` shows whether the panel's checks go through paddock.
 
 Inside the sandbox, the installs of the agents are read-only. mise updates them on the host before each start (`auto_update`). Where a vendor documents a switch, paddock turns the agent's own self-update off in the sandbox. Other self-updates fail with "Read-only file system".
 
@@ -805,6 +823,16 @@ paddock launchers list      # what install would create
 paddock launchers install
 paddock launchers remove    # removes everything that install wrote, and nothing else
 ```
+
+### Keeping the menu and the shims current
+
+The menu entries, the Omarchy menu block and the shell shims list the harnesses that were installed when you turned them on. paddock keeps them current:
+
+- On a harness start, paddock compares a cheap signal with the one of the last update: its version and the modification times of the folders on `PATH`. Installing an agent with mise or into `~/.local/bin` changes a folder on `PATH`. When the signal changed, paddock runs `paddock refresh --background` in the background, and the start does not wait.
+- `paddock update` runs `paddock refresh` with the new version.
+- `paddock refresh` adds the entries and shims of new harnesses and removes those of harnesses that are gone. The background run only adds: with a smaller `PATH`, it could miss a harness, and a missing shim would start that harness without the sandbox.
+- Only the parts that you turned on change. `~/.bashrc` and `~/.zshrc` do not change.
+- `paddock doctor` names the harnesses that the menu or the shims miss.
 
 ## Project settings
 

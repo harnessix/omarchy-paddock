@@ -10,8 +10,9 @@
 //!   the same way. A file is copied only when the host has none, or when the
 //!   sandbox only appended to it.
 //!
-//! paddock never writes the panel's own usage records: Omarchy's collectors
-//! read this history as they read a session on the host.
+//! This module never writes the panel's usage records: Omarchy's collectors
+//! read this history as they read a session on the host. For limits, see
+//! omarchy_usage.rs.
 
 use crate::env::HostEnv;
 use crate::profile::Profile;

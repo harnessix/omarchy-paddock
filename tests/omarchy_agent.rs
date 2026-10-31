@@ -11,6 +11,8 @@
 //!   path build the same command, also for a user install in ~/.local/bin.
 //!   paddock relies on that to treat both paths the same.
 
+mod common;
+
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
@@ -70,9 +72,8 @@ fn write_exec(p: &Path, text: &str) {
 }
 
 fn world() -> World {
-    // In the home, as the other end-to-end tests: the sandbox has its own /tmp.
-    let base = std::env::var("HOME").map(PathBuf::from).unwrap();
-    let tmp = tempfile::tempdir_in(base).unwrap();
+    // Not in /tmp: the sandbox has its own /tmp.
+    let tmp = common::tempdir();
     let root = tmp.path().to_path_buf();
     let home = root.join("home");
     let proj = home.join("proj");

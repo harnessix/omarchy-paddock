@@ -131,6 +131,13 @@ pub fn run(
     capture: bool,
     quiet: bool,
 ) -> Result<Outcome> {
+    // From here on, a SIGTERM (`kill`, a spawn parent that ends) or a SIGHUP
+    // (a closed terminal) must not end paddock before its exit steps: the
+    // device mount, the login and history copies, the session record.
+    // Before the sandbox starts, paddock notes it and does not start it;
+    // after, it passes SIGTERM to the sandbox, as `paddock stop` does, and
+    // waits. The old handlers come back when `run` returns.
+    let forwarding = Forward::install();
     let interactive = !capture && std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
     // App mode: a restricted Wayland socket and a portal-only session bus,
     // both alive until the sandbox exits.
@@ -296,9 +303,13 @@ pub fn run(
             });
         }
     }
+    if forwarding.stop_requested() {
+        bail!("paddock was asked to stop before the sandbox started");
+    }
     let mut child = cmd
         .spawn()
         .with_context(|| format!("cannot start {}", launch.program.display()))?;
+    forwarding.set_child(child.id());
     if let (Some(data), Some(mut w)) = (stdin, child.stdin.take()) {
         // A thread, so a harness that does not read cannot block paddock.
         std::thread::spawn(move || {
@@ -334,6 +345,7 @@ pub fn run(
         host_pid: std::process::id(),
         parent: built.spawn.as_ref().map(|c| c.parent.clone()),
         spawn_id: built.spawn.as_ref().map(|c| c.spawn_id.clone()),
+        logins: auth.host_logins(),
     };
     running.register(env)?;
     // Kept after exit, so `paddock files` can list what the sandbox left.
@@ -396,7 +408,7 @@ pub fn run(
             })
         });
 
-    let live = LiveSync::start(auth, history, AUTH_EVERY, HISTORY_EVERY);
+    let live = HistorySync::start(history, HISTORY_EVERY);
 
     // The child owns the terminal. Ctrl-C reaches it directly; paddock waits.
     let old_int = unsafe { libc::signal(libc::SIGINT, libc::SIG_IGN) };
@@ -409,6 +421,11 @@ pub fn run(
     unsafe {
         libc::signal(libc::SIGINT, old_int);
         libc::signal(libc::SIGQUIT, old_quit);
+    }
+    if forwarding.hung_up() {
+        // The terminal is gone: a write to it would fail and end the exit
+        // steps half way.
+        quiet_stdio();
     }
 
     // The children of this sandbox end with it.
@@ -424,14 +441,8 @@ pub fn run(
             late.join(", ")
         );
     }
-    let (mut auth, history, mut synced, copied) = live.finish();
-    let last = auth.copy_out()?;
-    synced.saved.extend(last.saved);
-    synced.conflicts.extend(last.conflicts);
-    for v in [&mut synced.saved, &mut synced.conflicts] {
-        v.sort();
-        v.dedup();
-    }
+    let (history, copied) = live.finish();
+    let synced = auth.copy_out()?;
     match history.as_ref().map(|h| h.copy_out()).unwrap_or(Ok(vec![])) {
         Ok(files) if copied + files.len() > 0 => log::info!(
             "copied {} session file(s) back to the host history",
@@ -692,113 +703,174 @@ fn provision(
     Ok(status.success())
 }
 
-/// Logins and history synced while the sandbox runs, so the host sees a
-/// refreshed token and new sessions before the sandbox exits.
-struct LiveSync {
+/// History copied to the host while the sandbox runs, so the Omarchy agents
+/// panel counts new sessions before the sandbox exits. Logins are not synced
+/// here: a login goes back to its store only at exit.
+struct HistorySync {
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    thread: std::thread::JoinHandle<(
-        AuthSync,
-        Option<crate::history::CopyBack>,
-        state::SyncResult,
-        usize,
-    )>,
+    thread: std::thread::JoinHandle<(Option<crate::history::CopyBack>, usize)>,
 }
 
-/// How often a login is compared, and how often history is copied.
-const AUTH_EVERY: Duration = Duration::from_secs(60);
+/// How often history is copied.
 const HISTORY_EVERY: Duration = Duration::from_secs(300);
 
-impl LiveSync {
-    fn start(
-        mut auth: AuthSync,
-        history: Option<crate::history::CopyBack>,
-        auth_every: Duration,
-        history_every: Duration,
-    ) -> Self {
+impl HistorySync {
+    fn start(history: Option<crate::history::CopyBack>, every: Duration) -> Self {
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let flag = stop.clone();
         let thread = std::thread::spawn(move || {
-            let mut synced = state::SyncResult {
-                saved: vec![],
-                conflicts: vec![],
-            };
             let mut copied = 0;
-            let (mut auth_at, mut history_at) = (Instant::now(), Instant::now());
-            while !flag.load(std::sync::atomic::Ordering::SeqCst) {
+            let mut at = Instant::now();
+            while history.is_some() && !flag.load(std::sync::atomic::Ordering::SeqCst) {
                 std::thread::sleep(Duration::from_millis(200));
-                if auth_at.elapsed() >= auth_every {
-                    auth_at = Instant::now();
-                    match auth.sync_running() {
-                        Ok(r) => {
-                            for f in &r.saved {
-                                log::debug!("saved a refreshed login to {}", f.display());
-                            }
-                            synced.saved.extend(r.saved);
-                            synced.conflicts.extend(r.conflicts);
-                        }
-                        Err(e) => log::debug!("cannot sync the login: {e:#}"),
-                    }
+                if at.elapsed() < every {
+                    continue;
                 }
-                if let Some(h) = history
-                    .as_ref()
-                    .filter(|_| history_at.elapsed() >= history_every)
-                {
-                    history_at = Instant::now();
+                at = Instant::now();
+                if let Some(h) = &history {
                     match h.copy_out() {
                         Ok(files) => copied += files.len(),
                         Err(e) => log::debug!("cannot copy the session history: {e:#}"),
                     }
                 }
             }
-            (auth, history, synced, copied)
+            (history, copied)
         });
         Self { stop, thread }
     }
 
-    /// Stop the thread and return what it synced.
-    fn finish(
-        self,
-    ) -> (
-        AuthSync,
-        Option<crate::history::CopyBack>,
-        state::SyncResult,
-        usize,
-    ) {
+    /// Stop the thread and return the history and the files it copied.
+    fn finish(self) -> (Option<crate::history::CopyBack>, usize) {
         self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
-        self.thread.join().expect("the sync thread does not panic")
+        self.thread
+            .join()
+            .expect("the history thread does not panic")
+    }
+}
+
+/// The sandbox process that SIGTERM and SIGHUP are passed to (0 before it
+/// starts), whether a stop came before it started, and whether a SIGHUP came.
+static FORWARD_PID: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+static STOP_BEFORE_START: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static HUNG_UP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+extern "C" fn forward_signal(sig: libc::c_int) {
+    use std::sync::atomic::Ordering;
+    if sig == libc::SIGHUP {
+        HUNG_UP.store(true, Ordering::SeqCst);
+    }
+    let pid = FORWARD_PID.load(Ordering::SeqCst);
+    if pid > 0 {
+        // SAFETY: kill(2) is async-signal-safe.
+        unsafe { libc::kill(pid, libc::SIGTERM) };
+    } else {
+        STOP_BEFORE_START.store(true, Ordering::SeqCst);
+    }
+}
+
+/// The handlers for SIGTERM and SIGHUP during one run. Dropping it puts the
+/// previous handlers back.
+struct Forward {
+    old: Vec<(libc::c_int, libc::sigaction)>,
+}
+
+impl Forward {
+    fn install() -> Self {
+        use std::sync::atomic::Ordering;
+        HUNG_UP.store(false, Ordering::SeqCst);
+        STOP_BEFORE_START.store(false, Ordering::SeqCst);
+        FORWARD_PID.store(0, Ordering::SeqCst);
+        let mut old = Vec::new();
+        for sig in [libc::SIGTERM, libc::SIGHUP] {
+            // SAFETY: a plain sigaction(2) with a handler that only calls
+            // async-signal-safe functions.
+            unsafe {
+                let mut sa: libc::sigaction = std::mem::zeroed();
+                sa.sa_sigaction = forward_signal as extern "C" fn(libc::c_int) as usize;
+                sa.sa_flags = libc::SA_RESTART;
+                libc::sigemptyset(&mut sa.sa_mask);
+                let mut prev: libc::sigaction = std::mem::zeroed();
+                libc::sigaction(sig, &sa, &mut prev);
+                old.push((sig, prev));
+            }
+        }
+        Self { old }
+    }
+
+    /// Pass later signals to the sandbox. A stop that came before is passed
+    /// on at once.
+    fn set_child(&self, pid: u32) {
+        use std::sync::atomic::Ordering;
+        FORWARD_PID.store(pid as i32, Ordering::SeqCst);
+        if STOP_BEFORE_START.swap(false, Ordering::SeqCst) {
+            // SAFETY: a plain kill(2) on the sandbox process.
+            unsafe { libc::kill(pid as i32, libc::SIGTERM) };
+        }
+    }
+
+    fn stop_requested(&self) -> bool {
+        STOP_BEFORE_START.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn hung_up(&self) -> bool {
+        HUNG_UP.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+impl Drop for Forward {
+    fn drop(&mut self) {
+        for (sig, prev) in &self.old {
+            // SAFETY: restores the handler that `install` saved.
+            unsafe { libc::sigaction(*sig, prev, std::ptr::null_mut()) };
+        }
+        FORWARD_PID.store(0, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// Point standard output and error at /dev/null.
+fn quiet_stdio() {
+    // SAFETY: open(2) and dup2(2) on our own descriptors.
+    unsafe {
+        let fd = libc::open(c"/dev/null".as_ptr(), libc::O_WRONLY);
+        if fd >= 0 {
+            libc::dup2(fd, 1);
+            libc::dup2(fd, 2);
+            libc::close(fd);
+        }
     }
 }
 
 #[cfg(test)]
-mod live_sync_tests {
+mod history_sync_tests {
     use super::*;
     use crate::profile::Profile;
     use std::collections::BTreeMap;
 
     #[test]
-    fn a_refresh_reaches_the_host_before_the_sandbox_exits() {
+    fn new_history_reaches_the_host_before_the_sandbox_exits() {
         let t = tempfile::tempdir().unwrap();
         let host_home = t.path().join("host");
         let sb = t.path().join("sandbox");
-        std::fs::create_dir_all(host_home.join(".tool")).unwrap();
-        std::fs::create_dir_all(&sb).unwrap();
-        std::fs::write(host_home.join(".tool/token"), "t1").unwrap();
+        std::fs::create_dir_all(sb.join(".t/sessions")).unwrap();
+        std::fs::create_dir_all(&host_home).unwrap();
         let env = HostEnv::from_parts(host_home.clone(), "demo".into(), 1, 1, BTreeMap::new());
-        let p: Profile =
-            toml::from_str("name = \"t\"\n[state]\nauth = [\".tool/token\"]\n").unwrap();
-        let auth = AuthSync::copy_in(&env, &p, &state::AuthMode::Shared, &sb).unwrap();
-        let live = LiveSync::start(auth, None, Duration::ZERO, Duration::MAX);
-        std::fs::write(sb.join(".tool/token"), "t2").unwrap();
+        let p: Profile = toml::from_str(
+            "name = \"t\"\n[state.history]\ncopy_back = [\".t/sessions\"]\nfiles = [\"*.jsonl\"]\n",
+        )
+        .unwrap();
+        let history = crate::history::CopyBack::new(&env, &p, &state::AuthMode::Shared, &sb);
+        let live = HistorySync::start(Some(history), Duration::ZERO);
+        std::fs::write(sb.join(".t/sessions/a.jsonl"), "{}\n").unwrap();
+        let host = host_home.join(".t/sessions/a.jsonl");
         let deadline = Instant::now() + Duration::from_secs(5);
-        while std::fs::read_to_string(host_home.join(".tool/token")).unwrap() != "t2" {
+        while !host.exists() {
             assert!(
                 Instant::now() < deadline,
-                "the refresh did not reach the host"
+                "the history did not reach the host"
             );
             std::thread::sleep(Duration::from_millis(50));
         }
-        let (_, _, synced, copied) = live.finish();
-        assert_eq!(synced.saved, vec![host_home.join(".tool/token")]);
-        assert_eq!(copied, 0);
+        let (_, copied) = live.finish();
+        assert_eq!(copied, 1);
     }
 }

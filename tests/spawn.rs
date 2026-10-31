@@ -4,6 +4,8 @@
 //! child. A parent hands tasks to two children through the tree scope of
 //! paddock kv. Skipped where the host cannot run bubblewrap.
 
+mod common;
+
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -45,8 +47,8 @@ fn toml_str(s: &str) -> String {
 }
 
 fn world(parent_script: &str) -> World {
-    let base = std::env::var("HOME").map(PathBuf::from).unwrap();
-    let tmp = tempfile::tempdir_in(base).unwrap();
+    // Not in /tmp: the sandbox has its own /tmp.
+    let tmp = common::tempdir();
     let root = tmp.path().to_path_buf();
     let cfg = root.join("cfg/paddock");
     std::fs::create_dir_all(cfg.join("harness.d")).unwrap();
@@ -278,6 +280,50 @@ fn stopping_the_parent_stops_the_child() {
     let result: serde_json::Value =
         serde_json::from_slice(&std::fs::read(dir.join("result.json")).unwrap()).unwrap();
     assert_eq!(result["state"], "stopped", "{result}");
+}
+
+/// The `fuse.paddock` mounts under a folder.
+fn device_mounts(root: &std::path::Path) -> Vec<String> {
+    std::fs::read_to_string("/proc/self/mountinfo")
+        .unwrap_or_default()
+        .lines()
+        .filter(|l| l.contains(" - fuse.paddock "))
+        .filter_map(|l| l.split(' ').nth(4).map(str::to_string))
+        .filter(|mp| mp.starts_with(&root.display().to_string()))
+        .collect()
+}
+
+#[test]
+fn a_sigterm_to_paddock_still_runs_its_exit_steps() {
+    if !bwrap_works() {
+        eprintln!("skipped: bwrap cannot create a user namespace here");
+        return;
+    }
+    let w = world("sleep 300");
+    let mut parent = start_parent(&w);
+    let id = wait_for("the sandbox", 90, || {
+        ps(&w)
+            .first()
+            .and_then(|s| s["id"].as_str().map(str::to_string))
+    });
+    let had_devices = !device_mounts(&w.root).is_empty();
+    // SAFETY: a plain kill(2) on the paddock process of this test.
+    unsafe { libc::kill(parent.id() as i32, libc::SIGTERM) };
+    let status = wait_for("paddock to exit", 60, || parent.try_wait().unwrap());
+    // paddock passed the signal on and ended with its sandbox, not killed by it.
+    assert!(
+        std::os::unix::process::ExitStatusExt::signal(&status).is_none(),
+        "{status:?}"
+    );
+    assert!(ps(&w).is_empty());
+    assert!(
+        device_mounts(&w.root).is_empty(),
+        "{:?}",
+        device_mounts(&w.root)
+    );
+    if had_devices {
+        eprintln!("the device mount of {id} was removed");
+    }
 }
 
 fn inbox_result(w: &World) -> (serde_json::Value, String) {

@@ -287,6 +287,13 @@ pub struct Report {
 }
 
 pub fn install(env: &HostEnv) -> Result<Report> {
+    install_with(env, true)
+}
+
+/// With `prune`, entries of harnesses that are gone are removed. Without
+/// it, entries are only added: a background refresh with a smaller PATH
+/// must not remove a working entry.
+pub fn install_with(env: &HostEnv, prune: bool) -> Result<Report> {
     let paddock = launcher_exe(env)?;
     let entries = detect(env)?;
 
@@ -314,6 +321,30 @@ pub fn install(env: &HostEnv) -> Result<Report> {
             created.push(e.desktop_file.clone());
         }
     }
+    // Entries of harnesses that are gone: paddock's terminal entries, and
+    // app entries that paddock created. Entries the user made stay.
+    let wanted: Vec<&PathBuf> = entries.iter().map(|e| &e.desktop_file).collect();
+    let dir = if prune {
+        std::fs::read_dir(applications_dir(env)).ok()
+    } else {
+        None
+    };
+    if let Some(dir) = dir {
+        for e in dir.flatten() {
+            let n = e.file_name().to_string_lossy().into_owned();
+            if n.starts_with(CLI_PREFIX) && n.ends_with(".desktop") && !wanted.contains(&&e.path())
+            {
+                std::fs::remove_file(e.path())?;
+            }
+        }
+    }
+    created.retain(|f| {
+        if !prune || wanted.contains(&f) || !f.starts_with(applications_dir(env)) {
+            return true;
+        }
+        let _ = std::fs::remove_file(f);
+        false
+    });
     crate::privfs::write(&record_file(env), serde_json::to_string_pretty(&created)?)?;
 
     // A folder for menu-based desktops.

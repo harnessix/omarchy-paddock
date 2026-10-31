@@ -315,6 +315,21 @@ enum Cmd {
     /// (`paddock-host spawn`). The parent's paddock starts this.
     #[command(hide = true)]
     SpawnChild { job: PathBuf },
+    /// Update the launcher entries, the Omarchy menu and the shell shims to
+    /// the harnesses installed now. Only the parts that are turned on.
+    Refresh {
+        /// Print nothing, and only add entries: the run that a harness start
+        /// begins.
+        #[arg(long)]
+        background: bool,
+    },
+    /// The Omarchy agents panel's `omarchy-agent-usage-update`, through
+    /// paddock: a login that a sandbox holds is checked from paddock's side.
+    #[command(hide = true)]
+    OmarchyUsageUpdate {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
     /// Inside a container sandbox: pass connections to the host proxy socket.
     #[command(hide = true)]
     Relay {
@@ -914,6 +929,14 @@ fn real_main() -> Result<i32> {
     }
     let env = HostEnv::detect()?;
     paddock::privfs::secure_roots(&env);
+    // A harness start: bring the menu and the shims up to date in the
+    // background when harnesses or paddock changed.
+    if matches!(
+        cli.cmd,
+        Cmd::Run(_) | Cmd::External(_) | Cmd::Wrap { .. } | Cmd::Shell(_)
+    ) {
+        paddock::refresh::spawn_if_changed(&env);
+    }
     match cli.cmd {
         Cmd::Relay { .. } | Cmd::Host { .. } | Cmd::Inbound | Cmd::Portal => unreachable!(),
         Cmd::SpawnChild { job } => paddock::spawn::child_main(&env, &job),
@@ -1174,6 +1197,21 @@ fn real_main() -> Result<i32> {
             Ok(0)
         }
         Cmd::Pick { harness } => pick(&env, &harness),
+        Cmd::Refresh { background } => {
+            let r = paddock::refresh::sync(&env, !background)?;
+            if !background {
+                match &r.launchers {
+                    Some(l) => println!("menu entries: {}", l.join(", ")),
+                    None => println!("menu entries: off (paddock launchers install)"),
+                }
+                match &r.shims {
+                    Some(s) => println!("shell shims: {}", s.join(", ")),
+                    None => println!("shell shims: off (paddock shims install)"),
+                }
+            }
+            Ok(0)
+        }
+        Cmd::OmarchyUsageUpdate { args } => paddock::omarchy_usage::update(&env, &args),
         Cmd::Wrap { command } => paddock::wrap::main(env, &command),
         Cmd::Shims {
             cmd: ShimsCmd::Exec { program, args },
@@ -1196,6 +1234,13 @@ fn real_main() -> Result<i32> {
                 r.config.display()
             );
             println!("Wrote the shim folder {}.", r.shims.display());
+            match paddock::omarchy_usage::install(&env) {
+                Ok(_) => println!(
+                    "Added one marked block to {}: the agents panel checks the limits of a login that a sandbox holds from paddock's side. It takes effect at your next login.",
+                    paddock::omarchy_usage::hypr_config(&env).display()
+                ),
+                Err(e) => println!("The agents panel keeps checking limits on the host: {e:#}"),
+            }
             if let Err(e) = &r.reshim {
                 println!("mise reshim did not run: {e}. Run it yourself, or the key keeps starting agents without a sandbox.");
             }
@@ -1264,7 +1309,10 @@ fn real_main() -> Result<i32> {
                         println!("removed {}", p.display());
                     }
                     let (removed, reshim) = paddock::omarchy::remove(&env)?;
-                    for p in removed {
+                    for p in removed
+                        .into_iter()
+                        .chain(paddock::omarchy_usage::remove(&env)?)
+                    {
                         println!("removed {}", p.display());
                     }
                     if let Some(Err(e)) = reshim {
@@ -1736,7 +1784,7 @@ fn update_cmd(env: &HostEnv, check: bool, yes: bool) -> Result<i32> {
     }
     if newer {
         match &owner {
-            Some(o) => println!("{}", update::package_hint(o)),
+            Some(o) => println!("{}", update::package_hint(o, &rel.version)),
             None => println!(
                 "An update downloads {} and its .sha256 from GitHub into a private folder, checks the checksum and the version of the new binary, and then replaces {}.",
                 rel.tarball(),
@@ -1778,6 +1826,11 @@ fn update_cmd(env: &HostEnv, check: bool, yes: bool) -> Result<i32> {
         update::install(env, &gh as &dyn Source, &rel, &target, None, &tar)?;
         println!("Updated {} to paddock {}.", target.display(), rel.version);
         println!("Running sandboxes keep the old version until they exit.");
+        // The new version may bring profiles: its menu entries and shims.
+        let _ = std::process::Command::new(&target)
+            .arg("refresh")
+            .stdin(std::process::Stdio::null())
+            .status();
     }
     if plugin {
         update::update_plugin(env)?;

@@ -274,10 +274,17 @@ pub fn report(env: &HostEnv) -> Result<bool> {
         println!("  off      harness commands run without a sandbox; paddock shims install makes the sandbox the default");
     }
 
+    for l in crate::refresh::doctor_lines(env) {
+        println!("{l}");
+    }
+
     let s = crate::omarchy::status(env);
     if s.block || s.shims || env.which(crate::omarchy::SCOPE).is_some() {
         println!("\nOmarchy agents (paddock shims --scope omarchy-agent):");
         for l in crate::omarchy::doctor_lines(env) {
+            println!("{l}");
+        }
+        for l in crate::omarchy_usage::doctor_lines(env) {
             println!("{l}");
         }
         // Isolated logins stay out of the host: the agents panel never sees
