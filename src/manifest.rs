@@ -16,9 +16,10 @@ use std::path::{Path, PathBuf};
 pub const PROJECT_FILE: &str = "paddock.toml";
 
 /// Tables of `~/.config/paddock/config.toml` that other modules read
-/// themselves: `[devices]` (devices.rs) and `[kv]` (kv.rs). A project
+/// themselves: `[devices]` (devices.rs), `[kv]` (kv.rs) and `[exec]`
+/// (gatewayd.rs). A project
 /// `paddock.toml` with one of them is invalid.
-pub const USER_ONLY: &[&str] = &["devices", "kv"];
+pub const USER_ONLY: &[&str] = &["devices", "kv", "exec"];
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]

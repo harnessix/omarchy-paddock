@@ -140,6 +140,10 @@ A plain read of a waiting device fails with `ETIME` ("Timer expired") instead of
 
 If the sandbox has its own display (for a desktop app that you develop), capture it with `paddock-screenshot` instead. That needs no approval.
 
+## Commands on the host
+
+`paddock-host exec -- COMMAND` runs one command on the host after the user approves it, in an isolated unit: the project is writable, the home folder is empty, and only `PATH` and the language pass from the host environment. A command that needs your keys, another folder or a token fails there by design. Say what it needs, and let the user decide whether to widen `[exec]` on the host.
+
 ## Answers
 
 Exit code 3 means that the user denied the request. Plain `git push` exits with 1 instead and prints that the host refused. `paddock-host git push` exits with 3. Do not send it again. Ask in the conversation what the user wants instead. Exit code 5 means that nobody answered in time. Tell the user, and continue with other work. Exit code 75 means "still waiting" after a blocking read: run the same read again. The full reference, with every option and exit code, is `paddock-host --help`.

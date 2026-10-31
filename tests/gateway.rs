@@ -226,14 +226,164 @@ fn the_executor_refuses_forged_and_replayed_grants() {
     path.insert("PATH".to_string(), std::env::var("PATH").unwrap());
     let good = paddock::gateway::sign(&key, "s1", &project, &req, path).unwrap();
     let r = ask(&good);
-    assert_eq!(
-        r["ok"]["stdout"].as_str().unwrap_or("").trim(),
-        project.display().to_string(),
-        "{r}"
-    );
+    if bwrap_works() {
+        assert_eq!(
+            r["ok"]["stdout"].as_str().unwrap_or("").trim(),
+            project.display().to_string(),
+            "{r}"
+        );
+    } else {
+        // No way to isolate the command here: the executor still runs and
+        // says so, instead of running it without isolation.
+        assert!(
+            r["error"].as_str().unwrap_or("").contains("isolation"),
+            "{r}"
+        );
+    }
     let r = ask(&good);
     assert!(
         r["error"].as_str().unwrap_or("").contains("used already"),
+        "{r}"
+    );
+    let _ = daemon.kill();
+    let _ = daemon.wait();
+}
+
+/// Start the executor with the folders of `w`, and wait for its socket.
+fn executor(w: &World, vars: &std::collections::BTreeMap<String, String>) -> std::process::Child {
+    let env = paddock::env::HostEnv::from_parts(
+        w.root.join("home"),
+        "demo".into(),
+        1000,
+        1000,
+        vars.clone(),
+    );
+    let child = Command::new(env!("CARGO_BIN_EXE_paddock"))
+        .args(["gatewayd", "--idle", "5"])
+        .envs(vars)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let sock = paddock::gatewayd::socket_path(&env);
+    let start = Instant::now();
+    while !sock.exists() && start.elapsed() < Duration::from_secs(10) {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    child
+}
+
+fn exec_job(
+    w: &World,
+    vars: &std::collections::BTreeMap<String, String>,
+    script: &str,
+) -> serde_json::Value {
+    use std::io::{BufRead, BufReader, Write};
+    let env = paddock::env::HostEnv::from_parts(
+        w.root.join("home"),
+        "demo".into(),
+        1000,
+        1000,
+        vars.clone(),
+    );
+    let req = paddock::broker::Request {
+        v: 1,
+        cap: "exec".into(),
+        args: [("argv".to_string(), serde_json::json!(["sh", "-c", script]))]
+            .into_iter()
+            .collect(),
+        reason: String::new(),
+    };
+    let mut host = std::collections::BTreeMap::new();
+    host.insert("PATH".to_string(), std::env::var("PATH").unwrap());
+    host.insert("PADDOCK_TEST_TOKEN".to_string(), "secret".to_string());
+    let key = paddock::gateway::key(&env).unwrap();
+    let job = paddock::gateway::sign(&key, "s1", &w.root.join("project"), &req, host).unwrap();
+    let mut s =
+        std::os::unix::net::UnixStream::connect(paddock::gatewayd::socket_path(&env)).unwrap();
+    writeln!(s, "{}", serde_json::to_string(&job).unwrap()).unwrap();
+    let mut line = String::new();
+    BufReader::new(s).read_line(&mut line).unwrap();
+    serde_json::from_str(&line).unwrap()
+}
+
+fn exec_vars(w: &World) -> std::collections::BTreeMap<String, String> {
+    let mut vars = std::collections::BTreeMap::new();
+    for (k, d) in [
+        ("XDG_STATE_HOME", "state"),
+        ("XDG_RUNTIME_DIR", "run"),
+        ("XDG_CONFIG_HOME", "cfg"),
+    ] {
+        vars.insert(k.to_string(), w.root.join(d).display().to_string());
+    }
+    // systemd-run needs the real runtime folder and session bus of the user
+    // manager, and the real HOME for the unit; the test folders stay ours.
+    for k in ["HOME", "PATH", "DBUS_SESSION_BUS_ADDRESS"] {
+        if let Ok(v) = std::env::var(k) {
+            vars.insert(k.to_string(), v);
+        }
+    }
+    vars
+}
+
+#[test]
+fn an_approved_exec_runs_isolated() {
+    if !bwrap_works() {
+        eprintln!("skipped: bwrap does not work here");
+        return;
+    }
+    let w = world();
+    std::fs::write(w.root.join("outside.txt"), "private").unwrap();
+    let vars = exec_vars(&w);
+    let mut daemon = executor(&w, &vars);
+    let outside = w.root.join("outside.txt");
+    let r = exec_job(
+        &w,
+        &vars,
+        &format!(
+            "test -e '{}' && echo OUTSIDE_VISIBLE || echo OUTSIDE_HIDDEN; \
+             touch /usr/paddock-x 2>/dev/null && echo USR_WRITABLE || echo USR_RO; \
+             touch made && echo PROJECT_RW; \
+             echo TOKEN=${{PADDOCK_TEST_TOKEN:-none}}; \
+             test -n \"$PATH\" && echo PATH_SET",
+            outside.display()
+        ),
+    );
+    let out = r["ok"]["stdout"].as_str().unwrap_or_default().to_string();
+    assert_eq!(r["ok"]["exit_code"], 0, "{r}");
+    for want in [
+        "OUTSIDE_HIDDEN",
+        "USR_RO",
+        "PROJECT_RW",
+        "TOKEN=none",
+        "PATH_SET",
+    ] {
+        assert!(out.contains(want), "{want} missing:\n{r}");
+    }
+    assert!(w.root.join("project/made").exists());
+    let _ = daemon.kill();
+    let _ = daemon.wait();
+    // The killed executor left its socket file behind.
+    let _ = std::fs::remove_file(w.root.join("run/paddock/gatewayd.sock"));
+
+    // [exec] network = false: only the loopback device.
+    std::fs::write(
+        w.root.join("cfg/paddock/config.toml"),
+        "[exec]\nnetwork = false\n",
+    )
+    .unwrap();
+    let mut daemon = executor(&w, &vars);
+    // /proc/net/dev lists the devices of the command's own network
+    // namespace (/sys can show the host's).
+    let r = exec_job(
+        &w,
+        &vars,
+        "tail -n +3 /proc/net/dev | cut -d: -f1 | tr -d ' '",
+    );
+    assert_eq!(
+        r["ok"]["stdout"].as_str().unwrap_or_default().trim(),
+        "lo",
         "{r}"
     );
     let _ = daemon.kill();

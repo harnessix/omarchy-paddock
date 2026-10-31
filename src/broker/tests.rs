@@ -36,11 +36,14 @@ fn setup(answer: Option<Answer>, policy: HostPolicy) -> (tempfile::TempDir, Brok
         depth: 0,
         role: None,
     };
-    let mut b = Broker::new(env, ctx, policy, fixed.clone());
-    // The executor runs in this process: the same signature checks.
+    let mut b = Broker::new(env.clone(), ctx, policy, fixed.clone());
+    // The executor runs in this process: the same signature checks, no
+    // isolation (the tests of execbox and tests/gateway.rs cover that).
     b.dispatch = Some(Arc::new(crate::gatewayd::InProcess {
         key: vec![9u8; 32],
         seen: Default::default(),
+        env,
+        isolation: crate::execbox::Isolation::None,
     }));
     (tmp, b, fixed)
 }

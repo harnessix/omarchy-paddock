@@ -35,8 +35,12 @@ pub fn socket_path(env: &HostEnv) -> PathBuf {
 }
 
 /// Run one job that `verify` accepted. The result is the JSON that the
-/// broker returns to the sandbox.
-fn run(job: &Job) -> Result<serde_json::Value> {
+/// broker returns to the sandbox. `how` is the isolation of a command.
+fn run(
+    env: &HostEnv,
+    how: Result<crate::execbox::Isolation, String>,
+    job: &Job,
+) -> Result<serde_json::Value> {
     match job.request.cap.as_str() {
         "exec" => {
             let argv: Vec<String> = job
@@ -53,13 +57,27 @@ fn run(job: &Job) -> Result<serde_json::Value> {
                 .and_then(|t| t.as_u64())
                 .unwrap_or(120)
                 .clamp(1, 3600);
-            let mut cmd = std::process::Command::new(&argv[0]);
-            cmd.args(&argv[1..])
-                .current_dir(&job.grant.project)
-                .env_clear()
-                .envs(&job.env);
+            let how = how.map_err(|e| anyhow::anyhow!("{e}"))?;
+            let cfg = crate::execbox::ExecCfg::load(env)?;
+            let unit = format!(
+                "paddock-exec-{}",
+                &job.grant.nonce[..12.min(job.grant.nonce.len())]
+            );
+            let mut cmd = crate::execbox::command(
+                how,
+                &cfg,
+                &env.home,
+                &job.grant.project,
+                &argv,
+                &cfg.pass_env(&job.env),
+                timeout,
+                &unit,
+            );
             let (code, out, err) =
-                crate::broker::run_capture(&mut cmd, Duration::from_secs(timeout))?;
+                crate::broker::run_capture(&mut cmd, Duration::from_secs(timeout + 10))?;
+            if let Some(why) = crate::execbox::setup_failure(how, code, &err) {
+                bail!("{why}");
+            }
             Ok(serde_json::json!({ "exit_code": code, "stdout": out, "stderr": err }))
         }
         other => bail!("the executor does not run {other} yet"),
@@ -67,29 +85,47 @@ fn run(job: &Job) -> Result<serde_json::Value> {
 }
 
 /// Check a job and run it. Every refusal is an error with the reason.
-pub fn handle(key: &[u8], seen: &Seen, job: &Job) -> Result<serde_json::Value> {
+pub fn handle(
+    env: &HostEnv,
+    how: Result<crate::execbox::Isolation, String>,
+    key: &[u8],
+    seen: &Seen,
+    job: &Job,
+) -> Result<serde_json::Value> {
     gateway::verify(key, job, seen, crate::state::now())
         .map_err(|r| anyhow::anyhow!("the executor refused the request: {r}"))?;
-    run(job)
+    run(env, how, job)
 }
 
 /// The answer on the socket: `{"ok": RESULT}` or `{"error": "TEXT"}`.
-fn answer(key: &[u8], seen: &Seen, line: &str) -> serde_json::Value {
+fn answer(
+    env: &HostEnv,
+    how: Result<crate::execbox::Isolation, String>,
+    key: &[u8],
+    seen: &Seen,
+    line: &str,
+) -> serde_json::Value {
     let job: Job = match serde_json::from_str(line) {
         Ok(j) => j,
         Err(e) => return serde_json::json!({ "error": format!("bad job: {e}") }),
     };
-    match handle(key, seen, &job) {
+    match handle(env, how, key, seen, &job) {
         Ok(v) => serde_json::json!({ "ok": v }),
         Err(e) => serde_json::json!({ "error": format!("{e:#}") }),
     }
 }
 
-fn serve_conn(key: &[u8], seen: &Seen, conn: UnixStream) -> Result<()> {
+fn serve_conn(
+    env: &HostEnv,
+    how: Result<crate::execbox::Isolation, String>,
+    key: &[u8],
+    seen: &Seen,
+    conn: UnixStream,
+) -> Result<()> {
     let mut reader = BufReader::new(conn.try_clone()?.take(MAX_JOB));
     let mut line = String::new();
     reader.read_line(&mut line)?;
-    let reply = answer(key, seen, line.trim());
+    let reply = answer(env, how, key, seen, line.trim());
     let mut w = conn;
     writeln!(w, "{reply}")?;
     Ok(())
@@ -129,6 +165,10 @@ fn listener(env: &HostEnv) -> Result<Option<UnixListener>> {
 pub fn main(env: &HostEnv, idle: Duration) -> Result<i32> {
     crate::update::refuse_in_sandbox(env, "paddock gatewayd")?;
     let key: Arc<Vec<u8>> = Arc::new(gateway::key(env).context("cannot read the gateway key")?);
+    // How exec is isolated is decided at its first use: an executor on a
+    // host without systemd or bwrap still starts, and refuses only exec.
+    let how = Arc::new(std::sync::OnceLock::new());
+    let shared = Arc::new(env.clone());
     let Some(l) = listener(env)? else {
         return Ok(0);
     };
@@ -143,10 +183,18 @@ pub fn main(env: &HostEnv, idle: Duration) -> Result<i32> {
                 conn.set_nonblocking(false)?;
                 last.store(start.elapsed().as_secs(), Ordering::SeqCst);
                 running.fetch_add(1, Ordering::SeqCst);
-                let (key, seen, last, running) =
-                    (key.clone(), seen.clone(), last.clone(), running.clone());
+                let how = how.clone();
+                let (env, key, seen, last, running) = (
+                    shared.clone(),
+                    key.clone(),
+                    seen.clone(),
+                    last.clone(),
+                    running.clone(),
+                );
                 std::thread::spawn(move || {
-                    if let Err(e) = serve_conn(&key, &seen, conn) {
+                    let iso = how
+                        .get_or_init(|| crate::execbox::detect(&env).map_err(|e| format!("{e:#}")));
+                    if let Err(e) = serve_conn(&env, iso.clone(), &key, &seen, conn) {
                         log::debug!("gateway connection failed: {e:#}");
                     }
                     last.store(start.elapsed().as_secs(), Ordering::SeqCst);
@@ -255,11 +303,14 @@ impl Dispatch for Remote {
 pub struct InProcess {
     pub key: Vec<u8>,
     pub seen: Seen,
+    /// The executor's view of the host (its user configuration).
+    pub env: HostEnv,
+    pub isolation: crate::execbox::Isolation,
 }
 
 impl Dispatch for InProcess {
     fn dispatch(&self, job: &Job, _wait: Duration) -> Result<serde_json::Value> {
-        handle(&self.key, &self.seen, job)
+        handle(&self.env, Ok(self.isolation), &self.key, &self.seen, job)
     }
     fn signing_key(&self, _env: &HostEnv) -> Result<Vec<u8>> {
         Ok(self.key.clone())
@@ -425,6 +476,34 @@ mod tests {
             socket_path(&env),
             Path::new("/run/user/1000/paddock/gatewayd.sock")
         );
+    }
+
+    #[test]
+    fn without_isolation_exec_is_refused_not_run() {
+        let t = tempfile::tempdir().unwrap();
+        let env = HostEnv::from_parts(t.path().join("home"), "u".into(), 1, 1, Default::default());
+        let key = [3u8; 32];
+        let req = Request {
+            v: 1,
+            cap: "exec".into(),
+            args: [("argv".to_string(), serde_json::json!(["touch", "ran"]))]
+                .into_iter()
+                .collect(),
+            reason: String::new(),
+        };
+        let job = gateway::sign(&key, "s", t.path(), &req, Default::default()).unwrap();
+        let seen = Seen::default();
+        let no = || {
+            Err(
+                "exec needs a systemd user instance or bwrap to run a command in isolation"
+                    .to_string(),
+            )
+        };
+        let e = handle(&env, no(), &key, &seen, &job).unwrap_err();
+        assert!(format!("{e:#}").contains("isolation"), "{e:#}");
+        assert!(!t.path().join("ran").exists());
+        let e = handle(&env, no(), &key, &seen, &job).unwrap_err();
+        assert!(format!("{e:#}").contains("used already"), "{e:#}");
     }
 
     #[test]
