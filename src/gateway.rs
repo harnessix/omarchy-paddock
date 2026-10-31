@@ -336,6 +336,10 @@ pub struct Job {
     pub request: Request,
     /// From the host process of paddock, never from the sandbox.
     pub env: std::collections::BTreeMap<String, String>,
+    /// What the host worked out for the request before the card, for
+    /// example the scratch repository and URL of a push. Null for exec.
+    #[serde(default)]
+    pub plan: serde_json::Value,
     pub mac: String,
 }
 
@@ -344,8 +348,10 @@ fn signed_bytes(
     grant: &Grant,
     request: &Request,
     env: &std::collections::BTreeMap<String, String>,
+    plan: &serde_json::Value,
 ) -> Vec<u8> {
     let v = serde_json::json!({
+        "plan": plan,
         "grant": grant,
         "request": serde_json::from_slice::<serde_json::Value>(&canonical(request))
             .expect("canonical() is JSON"),
@@ -422,6 +428,7 @@ pub fn sign(
     project: &std::path::Path,
     request: &Request,
     env: std::collections::BTreeMap<String, String>,
+    plan: serde_json::Value,
 ) -> std::io::Result<Job> {
     let grant = Grant {
         v: 1,
@@ -432,11 +439,12 @@ pub fn sign(
         expires: crate::state::now() + GRANT_LIFETIME,
         nonce: random_hex(16)?,
     };
-    let mac = crate::manifest::hex(&hmac(key, &signed_bytes(&grant, request, &env)));
+    let mac = crate::manifest::hex(&hmac(key, &signed_bytes(&grant, request, &env, &plan)));
     Ok(Job {
         grant,
         request: request.clone(),
         env,
+        plan,
         mac,
     })
 }
@@ -468,7 +476,10 @@ pub struct Seen(Mutex<HashMap<String, u64>>);
 /// Check a job: the signature, the time, that it is new, and that the
 /// grant covers exactly this request.
 pub fn verify(key: &[u8], job: &Job, seen: &Seen, now: u64) -> Result<(), Refused> {
-    let want = hmac(key, &signed_bytes(&job.grant, &job.request, &job.env));
+    let want = hmac(
+        key,
+        &signed_bytes(&job.grant, &job.request, &job.env, &job.plan),
+    );
     let got = crate::manifest::unhex(&job.mac).unwrap_or_default();
     if !same(&want, &got) {
         return Err(Refused::Signature);
@@ -665,7 +676,15 @@ mod tests {
         let r = req("exec", serde_json::json!({"argv": ["ls"]}), "why");
         let env: std::collections::BTreeMap<String, String> =
             [("PATH".to_string(), "/usr/bin".to_string())].into();
-        let job = sign(&key, "s1", std::path::Path::new("/p"), &r, env).unwrap();
+        let job = sign(
+            &key,
+            "s1",
+            std::path::Path::new("/p"),
+            &r,
+            env,
+            serde_json::json!({"scratch": "/s"}),
+        )
+        .unwrap();
         let now = crate::state::now();
         let seen = Seen::default();
         assert_eq!(verify(&key, &job, &seen, now), Ok(()));
@@ -714,10 +733,14 @@ mod tests {
             std::path::Path::new("/p"),
             &other,
             Default::default(),
+            serde_json::Value::Null,
         )
         .unwrap();
         j.grant.hash = job.grant.hash.clone();
-        j.mac = crate::manifest::hex(&hmac(&key, &signed_bytes(&j.grant, &j.request, &j.env)));
+        j.mac = crate::manifest::hex(&hmac(
+            &key,
+            &signed_bytes(&j.grant, &j.request, &j.env, &j.plan),
+        ));
         assert_eq!(
             verify(&key, &j, &Seen::default(), now),
             Err(Refused::Mismatch)

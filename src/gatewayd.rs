@@ -27,6 +27,8 @@ use std::time::{Duration, Instant};
 
 /// The largest job: a request of the gateway and the environment.
 const MAX_JOB: u64 = 1 << 20;
+/// The longest push.
+const PUSH_TIMEOUT: u64 = 600;
 /// Exit after this long without a connection.
 pub const IDLE: Duration = Duration::from_secs(120);
 
@@ -79,6 +81,57 @@ fn run(
                 bail!("{why}");
             }
             Ok(serde_json::json!({ "exit_code": code, "stdout": out, "stderr": err }))
+        }
+        "git-push" => {
+            let x: crate::broker::git::PushExec =
+                serde_json::from_value(job.plan.clone()).context("a push needs its plan")?;
+            let how = how.map_err(|e| anyhow::anyhow!("{e}"))?;
+            // The user's credentials stay readable (git and ssh configuration,
+            // keys, agent sockets) but nothing in the home folder can change;
+            // only the scratch repository is writable.
+            // A remote on this machine (a path or file:// URL) is the one
+            // folder outside the scratch repository that the push writes.
+            let local = x
+                .url
+                .strip_prefix("file://")
+                .unwrap_or(&x.url)
+                .starts_with('/')
+                .then(|| PathBuf::from(x.url.strip_prefix("file://").unwrap_or(&x.url)))
+                .filter(|p| p.exists());
+            let cfg = crate::execbox::ExecCfg {
+                home: crate::execbox::Home::ReadOnly,
+                network: true,
+                paths: local.into_iter().collect(),
+                ro_paths: Vec::new(),
+                env: crate::broker::git::PUSH_ENV
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect(),
+            };
+            let unit = format!(
+                "paddock-push-{}",
+                &job.grant.nonce[..12.min(job.grant.nonce.len())]
+            );
+            crate::broker::git::push_exec(&x, |argv, extra| {
+                let mut vars = cfg.pass_env(&job.env);
+                vars.extend(extra.clone());
+                let mut cmd = crate::execbox::command(
+                    how,
+                    &cfg,
+                    &env.home,
+                    &x.scratch,
+                    argv,
+                    &vars,
+                    PUSH_TIMEOUT,
+                    &unit,
+                );
+                let (code, out, err) =
+                    crate::broker::run_capture(&mut cmd, Duration::from_secs(PUSH_TIMEOUT + 10))?;
+                if let Some(why) = crate::execbox::setup_failure(how, code, &err) {
+                    bail!("{why}");
+                }
+                Ok((code, out, err))
+            })
         }
         other => bail!("the executor does not run {other} yet"),
     }
@@ -330,14 +383,18 @@ pub fn execute(
     sandbox: &str,
     project: &Path,
     req: &Request,
+    plan: serde_json::Value,
 ) -> Result<serde_json::Value> {
-    let job = gateway::sign(key, sandbox, project, req, host_env())?;
-    let timeout = req
-        .args
-        .get("timeout")
-        .and_then(|t| t.as_u64())
-        .unwrap_or(120)
-        .clamp(1, 3600);
+    let job = gateway::sign(key, sandbox, project, req, host_env(), plan)?;
+    let timeout = match req.cap.as_str() {
+        "git-push" => PUSH_TIMEOUT,
+        _ => req
+            .args
+            .get("timeout")
+            .and_then(|t| t.as_u64())
+            .unwrap_or(120)
+            .clamp(1, 3600),
+    };
     dispatch.dispatch(&job, Duration::from_secs(timeout + 30))
 }
 
@@ -491,7 +548,15 @@ mod tests {
                 .collect(),
             reason: String::new(),
         };
-        let job = gateway::sign(&key, "s", t.path(), &req, Default::default()).unwrap();
+        let job = gateway::sign(
+            &key,
+            "s",
+            t.path(),
+            &req,
+            Default::default(),
+            serde_json::Value::Null,
+        )
+        .unwrap();
         let seen = Seen::default();
         let no = || {
             Err(
@@ -504,6 +569,97 @@ mod tests {
         assert!(!t.path().join("ran").exists());
         let e = handle(&env, no(), &key, &seen, &job).unwrap_err();
         assert!(format!("{e:#}").contains("used already"), "{e:#}");
+    }
+
+    /// A push in a real systemd unit (home read-only, only the scratch
+    /// repository and the local remote writable), where this host has a
+    /// systemd user instance. Opt in: `cargo test --lib gatewayd -- --ignored`.
+    #[test]
+    #[ignore]
+    fn a_push_runs_in_a_systemd_unit() {
+        let host = HostEnv::detect().unwrap();
+        if crate::execbox::detect(&host).ok() != Some(crate::execbox::Isolation::Systemd) {
+            eprintln!("skipped: no systemd user instance");
+            return;
+        }
+        let t = tempfile::Builder::new()
+            .prefix("paddock-push-")
+            .tempdir_in(host.home.join(".cache"))
+            .unwrap();
+        let git = |dir: &Path, args: &[&str]| -> String {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(["-c", "user.name=t", "-c", "user.email=t@localhost"])
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?}: {out:?}");
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        let work = t.path().join("work");
+        let remote = t.path().join("remote.git");
+        std::fs::create_dir_all(&work).unwrap();
+        git(
+            t.path(),
+            &[
+                "init",
+                "-q",
+                "--bare",
+                "-b",
+                "main",
+                remote.to_str().unwrap(),
+            ],
+        );
+        git(&work, &["init", "-q", "-b", "main"]);
+        git(&work, &["commit", "-q", "--allow-empty", "-m", "first"]);
+        git(
+            &work,
+            &["remote", "add", "origin", remote.to_str().unwrap()],
+        );
+        git(&work, &["push", "-q", "origin", "main"]);
+        git(&work, &["commit", "-q", "--allow-empty", "-m", "second"]);
+        let head = git(&work, &["rev-parse", "HEAD"]);
+        let repo = crate::broker::git::Repo::snapshot(&work).unwrap();
+        let run_dir = t.path().join("run");
+        std::fs::create_dir_all(&run_dir).unwrap();
+        let mut args = std::collections::BTreeMap::new();
+        args.insert("remote".to_string(), serde_json::json!("origin"));
+        args.insert(
+            "url".to_string(),
+            serde_json::json!(remote.to_str().unwrap()),
+        );
+        args.insert(
+            "refs".to_string(),
+            serde_json::json!([{"src": "HEAD", "sha": head, "dst": "refs/heads/main"}]),
+        );
+        let plan = crate::broker::git::plan(Some(&repo), &run_dir, &args).unwrap();
+        let req = Request {
+            v: 1,
+            cap: "git-push".into(),
+            args,
+            reason: String::new(),
+        };
+        let key = [5u8; 32];
+        let job = gateway::sign(
+            &key,
+            "s",
+            &work,
+            &req,
+            host_env(),
+            serde_json::to_value(plan.exec()).unwrap(),
+        )
+        .unwrap();
+        let r = handle(
+            &host,
+            Ok(crate::execbox::Isolation::Systemd),
+            &key,
+            &Seen::default(),
+            &job,
+        )
+        .unwrap();
+        assert_eq!(r["refs"][0]["ok"], true, "{r}");
+        assert_eq!(git(&remote, &["rev-parse", "main"]), head);
     }
 
     #[test]

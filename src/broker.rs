@@ -973,7 +973,8 @@ pub fn run_capture_input(
 fn perform(env: &HostEnv, ctx: &Context, req: &Request, work: &Work) -> Result<serde_json::Value> {
     match work {
         Work::Spawn { .. } | Work::SpawnControl => bail!("spawn was not prepared"),
-        Work::Push(plan) => return git::push(plan),
+        // The executor pushes (Broker::execute), never this process.
+        Work::Push(_) => bail!("the push runs in the executor"),
         Work::Forge(call) => return run_forge(env, ctx, req, call),
         Work::Fetch(f) => return fetch(env, ctx, req, f),
         Work::Plain => {}
@@ -1362,7 +1363,7 @@ impl Broker {
 
     /// exec does not run in this process: it is signed for exactly this
     /// request and run by the executor, which checks the signature first.
-    fn execute(&self, req: &Request) -> Result<serde_json::Value> {
+    fn execute(&self, req: &Request, plan: serde_json::Value) -> Result<serde_json::Value> {
         let remote;
         let dispatch: &dyn crate::gatewayd::Dispatch = match &self.dispatch {
             Some(d) => d.as_ref(),
@@ -1372,7 +1373,7 @@ impl Broker {
             }
         };
         let key = dispatch.signing_key(&self.env)?;
-        crate::gatewayd::execute(dispatch, &key, &self.ctx.id, &self.ctx.project, req)
+        crate::gatewayd::execute(dispatch, &key, &self.ctx.id, &self.ctx.project, req, plan)
     }
 
     /// The mode of a capability for this sandbox. Spawn is off when this
@@ -1811,10 +1812,23 @@ impl Broker {
             _ if matches!(prep.work, Work::Spawn { .. } | Work::SpawnControl) => {
                 self.perform_spawn(req, &prep.work)
             }
-            _ if req.cap == "exec" => match self.execute(req) {
+            _ if req.cap == "exec" => match self.execute(req, serde_json::Value::Null) {
                 Ok(result) => Response::done(result),
                 Err(e) => Response::new(Status::Failed, format!("{e:#}")),
             },
+            // The push runs in the executor too, from the plan of the card.
+            _ if matches!(prep.work, Work::Push(_)) => {
+                let Work::Push(plan) = &prep.work else {
+                    unreachable!()
+                };
+                match serde_json::to_value(plan.exec())
+                    .map_err(anyhow::Error::from)
+                    .and_then(|p| self.execute(req, p))
+                {
+                    Ok(result) => Response::done(result),
+                    Err(e) => Response::new(Status::Failed, format!("{e:#}")),
+                }
+            }
             _ => match perform(&self.env, &self.ctx, req, &prep.work) {
                 Ok(result) => Response::done(result),
                 Err(e) => Response::new(Status::Failed, format!("{e:#}")),
