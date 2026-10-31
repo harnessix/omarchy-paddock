@@ -45,7 +45,7 @@ EXAMPLES
 "#;
 
 /// Where the devices are: `$PADDOCK_DEVICES` (srt) or `/dev/paddock`.
-fn root() -> std::path::PathBuf {
+pub fn root() -> std::path::PathBuf {
     std::env::var("PADDOCK_DEVICES")
         .unwrap_or_else(|_| crate::devices::MOUNT_IN_SANDBOX.to_string())
         .into()
@@ -64,7 +64,7 @@ pub fn exit_for_errno(errno: i32) -> i32 {
     }
 }
 
-fn describe(errno: i32) -> &'static str {
+pub fn describe(errno: i32) -> &'static str {
     match errno {
         e if e == waiting::ERRNO_STILL_WAITING => "still waiting",
         libc::EACCES | libc::EPERM => "the user declined",
