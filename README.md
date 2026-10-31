@@ -468,7 +468,17 @@ ro_paths = ["/srv/data"]
 env = ["GOPATH"]       # more variables to pass, by name
 ```
 
-`paddock gateway install` lets systemd start it instead, on the first request (socket activation); `paddock gateway remove` turns that off. The other capabilities move to the executor next, and each one gets its own limits there. `fetch` never copies paddock's own folders, with the key, into a sandbox.
+`paddock gateway install` lets systemd start it instead, on the first request (socket activation); `paddock gateway remove` turns that off. Every capability except `fetch` and `spawn` now runs in the executor, each with its own limits:
+
+| Capability | In the executor |
+| :--- | :--- |
+| `exec` | isolated as below |
+| `git-push`, `forge` | home read-only (your login and keys stay usable), only the scratch or an empty folder writable, network on, only the variables of git, SSH or gh |
+| `screenshot`, `clipboard-read`, `clipboard-write` | no home, no network, of the runtime folder only the Wayland socket and the compositor's sockets; `wl-copy` keeps a copied text in a unit of its own until you copy something else |
+| `open-url` | through the desktop portal (OpenURI), which starts your browser outside paddock; `xdg-open` with only the variables of a browser where there is no portal |
+| `notify` | a message on the session bus |
+
+`fetch` stays in the paddock process: it opens the file before it asks you, so a path that changes during the wait changes nothing, and the executor would add no limit to reading that one file. `spawn` starts a sandbox, which only paddock does. `fetch` never copies paddock's own folders, with the key, into a sandbox.
 
 A request that asks waits for your answer for up to two minutes. You can answer in three places, and the first answer wins:
 

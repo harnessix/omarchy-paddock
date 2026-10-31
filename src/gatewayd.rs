@@ -133,8 +133,353 @@ fn run(
                 Ok((code, out, err))
             })
         }
+        "forge" => {
+            let x: crate::broker::forge::ForgeExec =
+                serde_json::from_value(job.plan.clone()).context("a forge call needs its plan")?;
+            let name = Path::new(&x.tool)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("");
+            if !Path::new(&x.tool).is_absolute()
+                || !crate::broker::forge::EXEC_TOOLS.contains(&name)
+            {
+                bail!("the executor does not run {}", x.tool);
+            }
+            let how = how.map_err(|e| anyhow::anyhow!("{e}"))?;
+            // Like a push: the login stays readable, nothing in the home
+            // folder can change, and it runs in an empty folder of paddock.
+            let cfg = crate::execbox::ExecCfg {
+                home: crate::execbox::Home::ReadOnly,
+                network: true,
+                paths: Vec::new(),
+                ro_paths: Vec::new(),
+                env: crate::broker::forge::FORGE_ENV
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect(),
+            };
+            let mut vars = cfg.pass_env(&job.env);
+            vars.extend(crate::broker::forge::forge_vars());
+            let mut argv = vec![x.tool.clone()];
+            argv.extend(x.argv.iter().cloned());
+            let unit = unit_name("forge", job);
+            let mut cmd = crate::execbox::command(
+                how, &cfg, &env.home, &x.workdir, &argv, &vars, x.timeout, &unit,
+            );
+            let (code, out, err) = crate::broker::run_capture_input(
+                &mut cmd,
+                Duration::from_secs(x.timeout + 10),
+                x.stdin.as_deref().map(str::as_bytes),
+            )?;
+            if let Some(why) = crate::execbox::setup_failure(how, code, &err) {
+                bail!("{why}");
+            }
+            Ok(serde_json::json!({ "exit_code": code, "stdout": out, "stderr": err }))
+        }
+        "screenshot" | "clipboard-read" | "clipboard-write" => {
+            let x: DesktopExec = serde_json::from_value(job.plan.clone())
+                .context("a desktop request needs its plan")?;
+            let how = how.map_err(|e| anyhow::anyhow!("{e}"))?;
+            desktop(env, how, job, &x)
+        }
+        "open-url" => {
+            let url = job
+                .request
+                .args
+                .get("url")
+                .and_then(|u| u.as_str())
+                .context("open-url needs a url")?;
+            open_url(env, url, &job.env)?;
+            Ok(serde_json::json!({}))
+        }
+        "notify" => {
+            let n: crate::broker::notify::Note = serde_json::from_value(job.plan.clone())
+                .context("a notification needs its text")?;
+            crate::broker::notify::show(env, &n).context("cannot show the notification")?;
+            Ok(serde_json::json!({}))
+        }
         other => bail!("the executor does not run {other} yet"),
     }
+}
+
+fn unit_name(kind: &str, job: &Job) -> String {
+    format!(
+        "paddock-{kind}-{}",
+        &job.grant.nonce[..12.min(job.grant.nonce.len())]
+    )
+}
+
+/// What a desktop request needs from the host: the folder where a
+/// screenshot goes (an empty folder of paddock, which the broker reads
+/// afterwards) and the request's own arguments.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct DesktopExec {
+    pub workdir: PathBuf,
+}
+
+/// Host variables that the desktop tools need: the Wayland display and the
+/// compositor.
+const DESKTOP_ENV: &[&str] = &[
+    "WAYLAND_DISPLAY",
+    "XDG_RUNTIME_DIR",
+    "HYPRLAND_INSTANCE_SIGNATURE",
+];
+
+/// The isolation of a desktop tool: no home, no network, and of the runtime
+/// folder only the Wayland socket and the compositor's sockets.
+fn desktop_cfg(job: &Job, workdir: &Path) -> crate::execbox::ExecCfg {
+    let mut ro = Vec::new();
+    if let (Some(rt), Some(wl)) = (
+        job.env.get("XDG_RUNTIME_DIR"),
+        job.env.get("WAYLAND_DISPLAY"),
+    ) {
+        ro.push(Path::new(rt).join(wl));
+        if let Some(sig) = job.env.get("HYPRLAND_INSTANCE_SIGNATURE") {
+            ro.push(Path::new(rt).join("hypr").join(sig));
+        }
+    }
+    crate::execbox::ExecCfg {
+        home: crate::execbox::Home::Hidden,
+        network: false,
+        paths: vec![workdir.to_path_buf()],
+        ro_paths: ro.into_iter().filter(|p| p.exists()).collect(),
+        env: DESKTOP_ENV.iter().map(|s| s.to_string()).collect(),
+    }
+}
+
+fn desktop(
+    env: &HostEnv,
+    how: crate::execbox::Isolation,
+    job: &Job,
+    x: &DesktopExec,
+) -> Result<serde_json::Value> {
+    let cfg = desktop_cfg(job, &x.workdir);
+    let vars = cfg.pass_env(&job.env);
+    let arg = |k: &str| {
+        job.request
+            .args
+            .get(k)
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+    };
+    let run = |argv: Vec<String>, unit: &str| -> Result<(i32, String, String)> {
+        let mut cmd =
+            crate::execbox::command(how, &cfg, &env.home, &x.workdir, &argv, &vars, 30, unit);
+        let r = crate::broker::run_capture(&mut cmd, Duration::from_secs(40))?;
+        if let Some(why) = crate::execbox::setup_failure(how, r.0, &r.2) {
+            bail!("{why}");
+        }
+        Ok(r)
+    };
+    match job.request.cap.as_str() {
+        "screenshot" => {
+            let mut argv = vec!["grim".to_string()];
+            match arg("target") {
+                "" | "screen" => {}
+                "window" => {
+                    let (_, out, _) = run(
+                        vec!["hyprctl".into(), "activewindow".into(), "-j".into()],
+                        &unit_name("hyprctl", job),
+                    )?;
+                    argv.extend(["-g".to_string(), window_geometry(&out)?]);
+                }
+                t => argv.extend([
+                    "-o".to_string(),
+                    t.trim_start_matches("output:").to_string(),
+                ]),
+            }
+            argv.push(x.workdir.join("shot.png").display().to_string());
+            let (code, _, err) = run(argv, &unit_name("screenshot", job))?;
+            if code != 0 {
+                bail!("grim failed: {}", err.trim());
+            }
+            Ok(serde_json::json!({ "file": "shot.png" }))
+        }
+        "clipboard-read" => {
+            let (_, out, _) = run(
+                vec!["wl-paste".into(), "--no-newline".into()],
+                &unit_name("paste", job),
+            )?;
+            Ok(serde_json::json!({ "text": out }))
+        }
+        "clipboard-write" => {
+            copy(env, how, &cfg, &vars, arg("text"), &unit_name("copy", job))?;
+            Ok(serde_json::json!({}))
+        }
+        _ => unreachable!(),
+    }
+}
+
+/// `x,y wxh` of the active window from `hyprctl activewindow -j`.
+fn window_geometry(json: &str) -> Result<String> {
+    let v: serde_json::Value = serde_json::from_str(json).context("no active window")?;
+    let at = v["at"].as_array().context("no active window")?;
+    let size = v["size"].as_array().context("no active window")?;
+    Ok(format!(
+        "{},{} {}x{}",
+        at[0].as_i64().unwrap_or(0),
+        at[1].as_i64().unwrap_or(0),
+        size[0].as_i64().unwrap_or(0),
+        size[1].as_i64().unwrap_or(0)
+    ))
+}
+
+/// Base64 (RFC 4648), for `StandardInputData=`.
+pub fn base64(data: &[u8]) -> String {
+    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+    for c in data.chunks(3) {
+        let b = [c[0], *c.get(1).unwrap_or(&0), *c.get(2).unwrap_or(&0)];
+        let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
+        for i in 0..4 {
+            if i <= c.len() {
+                out.push(T[((n >> (18 - 6 * i)) & 63) as usize] as char);
+            } else {
+                out.push('=');
+            }
+        }
+    }
+    out
+}
+
+/// Put text on the clipboard. `wl-copy --foreground` keeps it there until
+/// something else is copied, so it runs in its own unit (or process) that
+/// outlives this request.
+fn copy(
+    env: &HostEnv,
+    how: crate::execbox::Isolation,
+    cfg: &crate::execbox::ExecCfg,
+    vars: &std::collections::BTreeMap<String, String>,
+    text: &str,
+    unit: &str,
+) -> Result<()> {
+    use std::os::unix::process::CommandExt;
+    let argv = vec!["wl-copy".to_string(), "--foreground".to_string()];
+    // Its working folder: empty, paddock's own, and still there after this
+    // request (the request's folder is removed when it ends).
+    let cwd = env.paddock_run().join("clipboard");
+    crate::privfs::dir(&cwd)?;
+    // Not the request's folder, which is removed when the request ends.
+    let cfg = &crate::execbox::ExecCfg {
+        paths: Vec::new(),
+        ..cfg.clone()
+    };
+    match how {
+        crate::execbox::Isolation::Systemd => {
+            let cmd = crate::execbox::command(how, cfg, &env.home, &cwd, &argv, vars, 86_400, unit);
+            // No --pipe and no --wait: the unit stays after this request.
+            let args: Vec<String> = cmd
+                .get_args()
+                .map(|a| a.to_string_lossy().into_owned())
+                .filter(|a| a != "--pipe" && a != "--wait")
+                .collect();
+            let mut c = std::process::Command::new("systemd-run");
+            let i = args.iter().position(|a| a == "--").unwrap_or(args.len());
+            c.args(&args[..i])
+                .arg("-p")
+                .arg(format!("StandardInputData={}", base64(text.as_bytes())))
+                .args(&args[i..]);
+            // The variables go in --setenv; systemd-run itself needs only the
+            // way to the user manager.
+            c.env_clear();
+            for k in ["XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS"] {
+                if let Ok(v) = std::env::var(k) {
+                    c.env(k, v);
+                }
+            }
+            let out = c.stdin(std::process::Stdio::null()).output()?;
+            if !out.status.success() {
+                bail!(
+                    "cannot start wl-copy: {}",
+                    String::from_utf8_lossy(&out.stderr).trim()
+                );
+            }
+        }
+        _ => {
+            let c = crate::execbox::command(how, cfg, &env.home, &cwd, &argv, vars, 86_400, unit);
+            let args: Vec<String> = c
+                .get_args()
+                .map(|a| a.to_string_lossy().into_owned())
+                .filter(|a| a != "--die-with-parent")
+                .collect();
+            let prog = c.get_program().to_os_string();
+            let envs: Vec<(std::ffi::OsString, std::ffi::OsString)> = c
+                .get_envs()
+                .filter_map(|(k, v)| v.map(|v| (k.to_os_string(), v.to_os_string())))
+                .collect();
+            let mut c = std::process::Command::new(prog);
+            c.args(args).env_clear().envs(envs);
+            // Its own session: it stays after the executor exits.
+            unsafe {
+                c.pre_exec(|| {
+                    libc::setsid();
+                    Ok(())
+                });
+            }
+            let mut child = c
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .context("cannot start wl-copy")?;
+            std::io::Write::write_all(&mut child.stdin.take().unwrap(), text.as_bytes())?;
+        }
+    }
+    Ok(())
+}
+
+/// Open a link in the user's browser: through the desktop portal (the
+/// desktop starts the browser, outside paddock), else with xdg-open and
+/// only the variables that a browser needs.
+fn open_url(
+    env: &HostEnv,
+    url: &str,
+    host: &std::collections::BTreeMap<String, String>,
+) -> Result<()> {
+    if portal_open_uri(env, url).is_ok() {
+        return Ok(());
+    }
+    let opener = env
+        .which("xdg-open")
+        .context("opening URLs needs xdg-open on the host")?;
+    let mut c = std::process::Command::new(opener);
+    c.arg(url).env_clear();
+    for k in [
+        "HOME",
+        "PATH",
+        "LANG",
+        "LC_ALL",
+        "WAYLAND_DISPLAY",
+        "DISPLAY",
+        "XDG_RUNTIME_DIR",
+        "DBUS_SESSION_BUS_ADDRESS",
+        "XDG_CURRENT_DESKTOP",
+        "XDG_SESSION_TYPE",
+        "BROWSER",
+    ] {
+        if let Some(v) = host.get(k) {
+            c.env(k, v);
+        }
+    }
+    c.stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .context("cannot start xdg-open")?;
+    Ok(())
+}
+
+fn portal_open_uri(env: &HostEnv, url: &str) -> Result<()> {
+    let conn = crate::broker::notify::session(env)?;
+    let p = zbus::blocking::Proxy::new(
+        &conn,
+        "org.freedesktop.portal.Desktop",
+        "/org/freedesktop/portal/desktop",
+        "org.freedesktop.portal.OpenURI",
+    )?;
+    let opts: std::collections::HashMap<&str, zbus::zvariant::Value<'_>> = Default::default();
+    let _: zbus::zvariant::OwnedObjectPath = p.call("OpenURI", &("", url, opts))?;
+    Ok(())
 }
 
 /// Check a job and run it. Every refusal is an error with the reason.
@@ -660,6 +1005,112 @@ mod tests {
         .unwrap();
         assert_eq!(r["refs"][0]["ok"], true, "{r}");
         assert_eq!(git(&remote, &["rev-parse", "main"]), head);
+    }
+
+    #[test]
+    fn base64_matches_rfc_4648() {
+        for (raw, want) in [
+            ("", ""),
+            ("f", "Zg=="),
+            ("fo", "Zm8="),
+            ("foo", "Zm9v"),
+            ("foob", "Zm9vYg=="),
+            ("fooba", "Zm9vYmE="),
+            ("foobar", "Zm9vYmFy"),
+        ] {
+            assert_eq!(base64(raw.as_bytes()), want, "{raw}");
+        }
+    }
+
+    #[test]
+    fn the_active_window_becomes_a_grim_geometry() {
+        let j = r#"{"at": [10, 20], "size": [800, 600], "title": "x"}"#;
+        assert_eq!(window_geometry(j).unwrap(), "10,20 800x600");
+        assert!(window_geometry("{}").is_err());
+    }
+
+    #[test]
+    fn a_desktop_tool_sees_the_display_and_nothing_else() {
+        let t = tempfile::tempdir().unwrap();
+        let rt = t.path().join("run");
+        std::fs::create_dir_all(rt.join("hypr/sig")).unwrap();
+        std::fs::write(rt.join("wayland-1"), "").unwrap();
+        let job = Job {
+            grant: gateway::Grant {
+                v: 1,
+                hash: String::new(),
+                cap: "screenshot".into(),
+                sandbox: "s".into(),
+                project: "/p".into(),
+                expires: 0,
+                nonce: "n".into(),
+            },
+            request: Request {
+                v: 1,
+                cap: "screenshot".into(),
+                args: Default::default(),
+                reason: String::new(),
+            },
+            env: [
+                ("XDG_RUNTIME_DIR", rt.to_str().unwrap()),
+                ("WAYLAND_DISPLAY", "wayland-1"),
+                ("HYPRLAND_INSTANCE_SIGNATURE", "sig"),
+                ("GITHUB_TOKEN", "secret"),
+            ]
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect(),
+            plan: serde_json::Value::Null,
+            mac: String::new(),
+        };
+        let c = desktop_cfg(&job, Path::new("/w"));
+        assert_eq!(c.home, crate::execbox::Home::Hidden);
+        assert!(!c.network);
+        assert_eq!(c.paths, [PathBuf::from("/w")]);
+        assert_eq!(c.ro_paths, [rt.join("wayland-1"), rt.join("hypr/sig")]);
+        let vars = c.pass_env(&job.env);
+        assert!(vars.contains_key("WAYLAND_DISPLAY"));
+        assert!(!vars.contains_key("GITHUB_TOKEN"));
+    }
+
+    #[test]
+    fn the_executor_runs_only_gh_by_an_absolute_path() {
+        let t = tempfile::tempdir().unwrap();
+        let env = HostEnv::from_parts(t.path().join("home"), "u".into(), 1, 1, Default::default());
+        let key = [4u8; 32];
+        for tool in ["gh", "/usr/bin/curl", "/tmp/gh/../sh"] {
+            let plan = crate::broker::forge::ForgeExec {
+                tool: tool.into(),
+                argv: vec!["--version".into()],
+                stdin: None,
+                timeout: 5,
+                workdir: t.path().into(),
+            };
+            let req = Request {
+                v: 1,
+                cap: "forge".into(),
+                args: Default::default(),
+                reason: String::new(),
+            };
+            let job = gateway::sign(
+                &key,
+                "s",
+                t.path(),
+                &req,
+                Default::default(),
+                serde_json::to_value(&plan).unwrap(),
+            )
+            .unwrap();
+            let e = handle(
+                &env,
+                Ok(crate::execbox::Isolation::None),
+                &key,
+                &Seen::default(),
+                &job,
+            )
+            .unwrap_err();
+            assert!(format!("{e:#}").contains("does not run"), "{tool}: {e:#}");
+        }
     }
 
     #[test]
