@@ -133,9 +133,12 @@ instead; that needs no approval."#
 
   paddock-host exec [--timeout SECONDS] -- COMMAND [ARG...]
 
-The command runs in the project directory on the host, with the user's host
-environment, without a shell. To use shell syntax, run sh -c 'TEXT' as the
-command. The user sees the exact command line before it runs. "Allow for this
+The command runs on the host, in the project directory, without a shell, in
+an isolated unit: the system is read-only, the project read-write, the home
+folder empty (no keys, browsers or other projects), and only PATH, the
+language and the time zone pass from the host environment. The user can
+widen this in [exec] of their configuration. To use shell syntax, run
+sh -c 'TEXT' as the command. The user sees the exact command line before it runs. "Allow for this
 session" covers only the identical command line. The configuration cannot set
 exec to allow: every new command line needs an answer.
 --timeout stops the command after SECONDS (default 120, at most 3600).

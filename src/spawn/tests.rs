@@ -398,6 +398,8 @@ fn broker(
     b.dispatch = Some(Arc::new(crate::gatewayd::InProcess {
         key: vec![9u8; 32],
         seen: Default::default(),
+        env: s.env.clone(),
+        isolation: crate::execbox::Isolation::None,
     }));
     let sp = Spawner::with_program(
         &s.env,

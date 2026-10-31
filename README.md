@@ -446,7 +446,7 @@ Sometimes the agent needs one thing from your computer: a screenshot of the real
 | Capability | What the host does | Default |
 | :--- | :--- | :--- |
 | `screenshot` | Captures the screen, one output or the focused window | ask |
-| `exec` | Runs one command in the project folder, without a shell | ask, and never allow |
+| `exec` | Runs one command in the project folder, without a shell, isolated (see below) | ask, and never allow |
 | `fetch` | Copies one host file or folder into the project, at most 64 MiB | ask |
 | `clipboard-read`, `clipboard-write` | Reads or sets the host clipboard | ask |
 | `open-url` | Opens an http or https link in your browser, for example a harness login page | ask |
@@ -457,7 +457,18 @@ Sometimes the agent needs one thing from your computer: a screenshot of the real
 
 A request travels through the gateway device `/dev/paddock/gw`, which every sandbox with `/dev/paddock` has. `paddock-host` writes the request there and reads the result. paddock normalizes each request and names it by a hash of its capability and arguments. The same request sent again while it waits joins the one that waits: you see one card, and the work runs once. A read waits at most 100 seconds (a `timeout` in the request sets 1 to 600); when that passes first, the read fails with `ETIME` ("still waiting"), and `paddock-host` sends the same request again on its own. An agent can also write to the device itself. A sandbox without `/dev/paddock` uses the host socket as before.
 
-The paddock process that runs a sandbox decides and asks you, but it does not run an approved command itself. For `exec`, it signs a grant for exactly that request: a hash of the capability and the arguments, the sandbox, the project, a lifetime of 30 seconds and a random number. It signs with HMAC-SHA256 and a key in `~/.local/state/paddock/gateway.key` (mode 0600). A separate process, `paddock gatewayd`, checks the signature, the time, that the grant was not used before, and that it covers this request, and only then runs the command. paddock starts the executor when a request needs it, and the executor stops after two minutes without requests. `paddock gateway install` lets systemd start it instead, on the first request (socket activation); `paddock gateway remove` turns that off. The other capabilities move to the executor next, and each one gets its own limits there. `fetch` never copies paddock's own folders, with the key, into a sandbox.
+The paddock process that runs a sandbox decides and asks you, but it does not run an approved command itself. For `exec`, it signs a grant for exactly that request: a hash of the capability and the arguments, the sandbox, the project, a lifetime of 30 seconds and a random number. It signs with HMAC-SHA256 and a key in `~/.local/state/paddock/gateway.key` (mode 0600). A separate process, `paddock gatewayd`, checks the signature, the time, that the grant was not used before, and that it covers this request, and only then runs the command. paddock starts the executor when a request needs it, and the executor stops after two minutes without requests. The command of an approved `exec` runs isolated, in a transient systemd user unit (`systemd-run --user`), or with bwrap where there is no systemd user instance. It sees the system read-only, the project read-write, an empty home folder and its own `/tmp`. It can use the network, but it cannot gain privileges or, under systemd, create namespaces. Of your environment, only `PATH`, the language, the time zone, `TERM`, `USER` and `LOGNAME` pass: tokens in your environment stay out. `[exec]` in `~/.config/paddock/config.toml` widens this, and a project `paddock.toml` cannot set it:
+
+```toml
+[exec]
+home = "hidden"        # hidden (default), read-only, or full
+network = true         # false: no network at all
+paths = ["~/src/lib"]  # more folders, read-write
+ro_paths = ["/srv/data"]
+env = ["GOPATH"]       # more variables to pass, by name
+```
+
+`paddock gateway install` lets systemd start it instead, on the first request (socket activation); `paddock gateway remove` turns that off. The other capabilities move to the executor next, and each one gets its own limits there. `fetch` never copies paddock's own folders, with the key, into a sandbox.
 
 A request that asks waits for your answer for up to two minutes. You can answer in three places, and the first answer wins:
 
