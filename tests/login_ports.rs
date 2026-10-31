@@ -43,6 +43,11 @@ fn start(cfg: &std::path::Path, ws: &std::path::Path, login_ports: bool, port: u
         ])
         .arg(ws)
         .env("XDG_CONFIG_HOME", cfg)
+        // Never the user's own folders. The runtime folder stays: the app
+        // needs the Wayland session.
+        .env("XDG_DATA_HOME", cfg.join("../data"))
+        .env("XDG_STATE_HOME", cfg.join("../state"))
+        .env("XDG_CACHE_HOME", cfg.join("../cache"))
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn()
