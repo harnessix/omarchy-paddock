@@ -366,10 +366,12 @@ fn random_hex(n: usize) -> std::io::Result<String> {
     Ok(crate::manifest::hex(&b))
 }
 
-/// The signing key, `gateway.key` in paddock's state folder (mode 0600).
+/// The signing key, `gateway.key` in paddock's runtime folder (mode 0600).
 /// The first caller makes it. Sandboxes never see paddock's folders, and
 /// `fetch` refuses them.
 pub fn key(env: &crate::env::HostEnv) -> std::io::Result<Vec<u8>> {
+    // The key of an older paddock, kept across logins.
+    let _ = std::fs::remove_file(env.paddock_state().join("gateway.key"));
     let path = key_file(env);
     match std::fs::read(&path) {
         Ok(k) if k.len() == 32 => return Ok(k),
@@ -417,8 +419,10 @@ pub fn key(env: &crate::env::HostEnv) -> std::io::Result<Vec<u8>> {
     }
 }
 
+/// The key lives in paddock's runtime folder (`$XDG_RUNTIME_DIR/paddock`),
+/// which is in memory and empty at each login: every session gets a new key.
 pub fn key_file(env: &crate::env::HostEnv) -> std::path::PathBuf {
-    env.paddock_state().join("gateway.key")
+    env.paddock_run().join("gateway.key")
 }
 
 /// Sign an approved request for the executor.

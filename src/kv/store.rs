@@ -781,6 +781,17 @@ impl Store {
     /// Expire the keys of `ns` whose time to live has passed. A watch runs
     /// this on each poll, so an expiry shows without a write.
     pub fn expire(&mut self, ns: &str, now: u64) -> Result<u64> {
+        // Most polls find nothing: a read first, so that a watch does not
+        // take the write lock from the writers every time.
+        let due: bool = self.conn.query_row(
+            "SELECT EXISTS (SELECT 1 FROM entries
+             WHERE ns = ?1 AND expires IS NOT NULL AND expires <= ?2)",
+            params![ns, now],
+            |r| r.get(0),
+        )?;
+        if !due {
+            return Ok(0);
+        }
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;

@@ -151,6 +151,22 @@ impl HostEnv {
     }
 }
 
+/// Start `cmd`, and try again a few times when the program is still open
+/// for writing somewhere ("Text file busy"): a script that was just written,
+/// or whose writer another thread forked a moment ago, cannot run yet.
+pub fn spawn_retrying(cmd: &mut Command) -> std::io::Result<std::process::Child> {
+    let mut tries = 0;
+    loop {
+        match cmd.spawn() {
+            Err(e) if e.raw_os_error() == Some(libc::ETXTBSY) && tries < 10 => {
+                tries += 1;
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            r => return r,
+        }
+    }
+}
+
 pub fn is_executable(p: &Path) -> bool {
     use std::os::unix::fs::PermissionsExt;
     std::fs::metadata(p)

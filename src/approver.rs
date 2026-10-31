@@ -247,13 +247,14 @@ pub fn run_hook(hook: &HookConfig, p: &Pending) -> (Option<Answer>, String) {
         return (None, "not a capability the approver may answer".into());
     }
     let input = serde_json::json!({ "api_version": "paddock.approval-request/v1", "request": p });
-    let child = Command::new(&hook.command[0])
-        .args(&hook.command[1..])
-        .env("PADDOCK_APPROVAL", "1")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn();
+    let child = crate::env::spawn_retrying(
+        Command::new(&hook.command[0])
+            .args(&hook.command[1..])
+            .env("PADDOCK_APPROVAL", "1")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null()),
+    );
     let mut child = match child {
         Ok(c) => c,
         Err(e) => return (None, format!("cannot start the approver: {e}")),
