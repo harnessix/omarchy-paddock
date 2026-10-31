@@ -395,6 +395,10 @@ fn broker(
         role: None,
     };
     let mut b = Broker::new(s.env.clone(), ctx, HostPolicy::default(), approver);
+    b.dispatch = Some(Arc::new(crate::gatewayd::InProcess {
+        key: vec![9u8; 32],
+        seen: Default::default(),
+    }));
     let sp = Spawner::with_program(
         &s.env,
         cfg,

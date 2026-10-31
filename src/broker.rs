@@ -1013,19 +1013,8 @@ fn perform(env: &HostEnv, ctx: &Context, req: &Request, work: &Work) -> Result<s
             f.write_all(&out.stdout)?;
             Ok(serde_json::json!({ "path": dir.path().join(name) }))
         }
-        "exec" => {
-            let a = argv(req);
-            let timeout = req
-                .args
-                .get("timeout")
-                .and_then(|t| t.as_u64())
-                .unwrap_or(120)
-                .clamp(1, 3600);
-            let mut cmd = Command::new(&a[0]);
-            cmd.args(&a[1..]).current_dir(&ctx.project);
-            let (code, out, err) = run_capture(&mut cmd, Duration::from_secs(timeout))?;
-            Ok(serde_json::json!({ "exit_code": code, "stdout": out, "stderr": err }))
-        }
+        // The executor runs exec (Broker::execute), never this process.
+        "exec" => bail!("exec runs in the executor"),
         "fetch" => bail!("fetch was not prepared"),
         "clipboard-read" => {
             let wp = env
@@ -1117,7 +1106,14 @@ fn check_fetch(env: &HostEnv, asked: &Path, real: &Path, dir: bool) -> Result<()
             }
         }
     }
-    denied.push(env.paddock_data().join("auth"));
+    // paddock's own folders: sandbox homes of other projects, approvals,
+    // the audit log, paddock kv, the gateway key, the configuration.
+    denied.extend([
+        env.paddock_data(),
+        env.paddock_state(),
+        env.paddock_config(),
+        env.paddock_cache(),
+    ]);
     for d in denied {
         let canon = std::fs::canonicalize(&d).ok();
         let hit =
@@ -1340,6 +1336,9 @@ pub struct Broker {
     pub approver: Arc<dyn Approver>,
     /// This sandbox's children. None: spawn is not available here.
     pub spawner: Option<Arc<crate::spawn::Spawner>>,
+    /// Where approved work runs that this process does not run itself: the
+    /// executor (`paddock gatewayd`). The tests run it in this process.
+    pub dispatch: Option<Arc<dyn crate::gatewayd::Dispatch>>,
     grants: Mutex<Vec<String>>,
 }
 
@@ -1356,8 +1355,24 @@ impl Broker {
             policy,
             approver,
             spawner: None,
+            dispatch: None,
             grants: Mutex::new(Vec::new()),
         }
+    }
+
+    /// exec does not run in this process: it is signed for exactly this
+    /// request and run by the executor, which checks the signature first.
+    fn execute(&self, req: &Request) -> Result<serde_json::Value> {
+        let remote;
+        let dispatch: &dyn crate::gatewayd::Dispatch = match &self.dispatch {
+            Some(d) => d.as_ref(),
+            None => {
+                remote = crate::gatewayd::Remote::new(&self.env)?;
+                &remote
+            }
+        };
+        let key = dispatch.signing_key(&self.env)?;
+        crate::gatewayd::execute(dispatch, &key, &self.ctx.id, &self.ctx.project, req)
     }
 
     /// The mode of a capability for this sandbox. Spawn is off when this
@@ -1796,6 +1811,10 @@ impl Broker {
             _ if matches!(prep.work, Work::Spawn { .. } | Work::SpawnControl) => {
                 self.perform_spawn(req, &prep.work)
             }
+            _ if req.cap == "exec" => match self.execute(req) {
+                Ok(result) => Response::done(result),
+                Err(e) => Response::new(Status::Failed, format!("{e:#}")),
+            },
             _ => match perform(&self.env, &self.ctx, req, &prep.work) {
                 Ok(result) => Response::done(result),
                 Err(e) => Response::new(Status::Failed, format!("{e:#}")),

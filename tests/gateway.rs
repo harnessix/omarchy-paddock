@@ -163,3 +163,79 @@ fn a_host_request_goes_through_the_gateway_and_attaches_when_sent_again() {
     let ran = std::fs::read_to_string(w.root.join("project/ran.log")).unwrap();
     assert_eq!(ran, "ran\n");
 }
+
+/// The executor itself, on its socket: a job signed with another key is
+/// refused, a good one runs once, and the same grant again is refused.
+#[test]
+fn the_executor_refuses_forged_and_replayed_grants() {
+    use std::io::{BufRead, BufReader, Write};
+    let w = world();
+    let mut vars = std::collections::BTreeMap::new();
+    for (k, d) in [
+        ("XDG_STATE_HOME", "state"),
+        ("XDG_RUNTIME_DIR", "run"),
+        ("XDG_CONFIG_HOME", "cfg"),
+    ] {
+        vars.insert(k.to_string(), w.root.join(d).display().to_string());
+    }
+    let env = paddock::env::HostEnv::from_parts(
+        w.root.join("home"),
+        "demo".into(),
+        1000,
+        1000,
+        vars.clone(),
+    );
+    let mut daemon = Command::new(env!("CARGO_BIN_EXE_paddock"))
+        .args(["gatewayd", "--idle", "5"])
+        .envs(&vars)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let sock = paddock::gatewayd::socket_path(&env);
+    let start = Instant::now();
+    while !sock.exists() && start.elapsed() < Duration::from_secs(10) {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let ask = |job: &paddock::gateway::Job| -> serde_json::Value {
+        let mut s = std::os::unix::net::UnixStream::connect(&sock).unwrap();
+        writeln!(s, "{}", serde_json::to_string(job).unwrap()).unwrap();
+        let mut line = String::new();
+        BufReader::new(s).read_line(&mut line).unwrap();
+        serde_json::from_str(&line).unwrap()
+    };
+    let project = w.root.join("project");
+    let req = paddock::broker::Request {
+        v: 1,
+        cap: "exec".into(),
+        args: [("argv".to_string(), serde_json::json!(["pwd"]))]
+            .into_iter()
+            .collect(),
+        reason: String::new(),
+    };
+    let forged =
+        paddock::gateway::sign(&[1u8; 32], "s1", &project, &req, Default::default()).unwrap();
+    let r = ask(&forged);
+    assert!(
+        r["error"].as_str().unwrap_or("").contains("signature"),
+        "{r}"
+    );
+    let key = paddock::gateway::key(&env).unwrap();
+    let mut path = std::collections::BTreeMap::new();
+    path.insert("PATH".to_string(), std::env::var("PATH").unwrap());
+    let good = paddock::gateway::sign(&key, "s1", &project, &req, path).unwrap();
+    let r = ask(&good);
+    assert_eq!(
+        r["ok"]["stdout"].as_str().unwrap_or("").trim(),
+        project.display().to_string(),
+        "{r}"
+    );
+    let r = ask(&good);
+    assert!(
+        r["error"].as_str().unwrap_or("").contains("used already"),
+        "{r}"
+    );
+    let _ = daemon.kill();
+    let _ = daemon.wait();
+}

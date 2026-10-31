@@ -302,6 +302,9 @@ pub fn report(env: &HostEnv) -> Result<bool> {
         }
     }
 
+    println!("\nGateway (host requests):");
+    println!("{}", crate::gatewayd::status_line(env));
+
     println!("\nUpdates:");
     for l in crate::update::doctor_lines(env) {
         println!("{l}");
