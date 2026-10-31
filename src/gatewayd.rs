@@ -412,10 +412,10 @@ mod tests {
         let s = socket_unit();
         assert!(s.contains("ListenStream=%t/paddock/gatewayd.sock"));
         assert!(s.contains("SocketMode=0600"));
-        let svc = service_unit(Path::new("/home/u/.local/bin/paddock"));
-        assert!(svc.contains("ExecStart=/home/u/.local/bin/paddock gatewayd"));
+        let svc = service_unit(Path::new("/home/demo/.local/bin/paddock"));
+        assert!(svc.contains("ExecStart=/home/demo/.local/bin/paddock gatewayd"));
         let env = HostEnv::from_parts(
-            "/home/u".into(),
+            "/home/demo".into(),
             "u".into(),
             1000,
             1000,
