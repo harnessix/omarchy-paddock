@@ -226,11 +226,20 @@ fn the_executor_refuses_forged_and_replayed_grants() {
     path.insert("PATH".to_string(), std::env::var("PATH").unwrap());
     let good = paddock::gateway::sign(&key, "s1", &project, &req, path).unwrap();
     let r = ask(&good);
-    assert_eq!(
-        r["ok"]["stdout"].as_str().unwrap_or("").trim(),
-        project.display().to_string(),
-        "{r}"
-    );
+    if bwrap_works() {
+        assert_eq!(
+            r["ok"]["stdout"].as_str().unwrap_or("").trim(),
+            project.display().to_string(),
+            "{r}"
+        );
+    } else {
+        // No way to isolate the command here: the executor still runs and
+        // says so, instead of running it without isolation.
+        assert!(
+            r["error"].as_str().unwrap_or("").contains("isolation"),
+            "{r}"
+        );
+    }
     let r = ask(&good);
     assert!(
         r["error"].as_str().unwrap_or("").contains("used already"),
