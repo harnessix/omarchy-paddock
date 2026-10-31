@@ -201,6 +201,90 @@ impl Ledger {
     }
 }
 
+/// What runs a request once it is in the ledger: the broker of the sandbox
+/// (ask the user, then execute).
+pub type Handler = std::sync::Arc<dyn Fn(Request) -> Response + Send + Sync>;
+
+/// The largest request: the same limit as the broker socket.
+pub const MAX_REQUEST: usize = 64 * 1024;
+/// The largest response, for example the output of a command.
+pub const MAX_RESPONSE: usize = 8 << 20;
+
+/// `/dev/paddock/gw`: a host request as a device. Write a request (the
+/// JSON of `paddock-host`, with an optional `timeout` for this read in
+/// seconds), read the response. When the time limit of the read passes
+/// first, the read fails with ETIME (still waiting) and the request keeps
+/// waiting: send the same request again to attach to it.
+pub struct GwDevice {
+    sandbox: String,
+    ledger: Arc<Ledger>,
+    handler: Handler,
+}
+
+impl GwDevice {
+    pub fn new(sandbox: &str, handler: Handler) -> Self {
+        Self {
+            sandbox: sandbox.to_string(),
+            ledger: Ledger::new(),
+            handler,
+        }
+    }
+}
+
+pub fn info() -> crate::devices::Info {
+    crate::devices::Info {
+        request: "a host request as JSON: {\"v\":1,\"cap\":\"...\",\"args\":{...},\"reason\":\"...\"}, and an optional \"timeout\" in seconds for this read".into(),
+        response: "the response as JSON: {\"status\":\"done|denied|disabled|timeout|failed|invalid\",...}. ETIME: still waiting, send the same request again".into(),
+        limits: crate::devices::Limits {
+            max_request: MAX_REQUEST,
+            max_response: MAX_RESPONSE,
+            deadline_seconds: crate::waiting::MAX_READ_TIMEOUT + 5,
+        },
+    }
+}
+
+impl crate::devices::Device for GwDevice {
+    fn name(&self) -> &str {
+        "gw"
+    }
+
+    fn info(&self) -> crate::devices::Info {
+        info()
+    }
+
+    fn call(
+        &self,
+        call: &crate::devices::Call,
+        request: &[u8],
+    ) -> Result<Vec<u8>, crate::devices::DevError> {
+        use crate::devices::DevError;
+        let mut v: serde_json::Value =
+            serde_json::from_slice(request).map_err(|_| DevError::Invalid)?;
+        let o = v.as_object_mut().ok_or(DevError::Invalid)?;
+        let timeout = match o.remove("timeout") {
+            None => crate::waiting::DEFAULT_READ_TIMEOUT,
+            Some(t) => t
+                .as_u64()
+                .filter(|t| (1..=crate::waiting::MAX_READ_TIMEOUT).contains(t))
+                .ok_or(DevError::Invalid)?,
+        };
+        let req: Request = serde_json::from_value(v).map_err(|_| DevError::Invalid)?;
+        let handler = self.handler.clone();
+        let hash = match self.ledger.submit(&self.sandbox, req, move |r| handler(r)) {
+            Ok(h) => h,
+            Err(resp) => return serde_json::to_vec(&resp).map_err(|_| DevError::Failed),
+        };
+        match self
+            .ledger
+            .wait(&hash, Duration::from_secs(timeout), || call.cancelled())
+        {
+            Wait::Done(resp) => serde_json::to_vec(&resp).map_err(|_| DevError::Failed),
+            Wait::StillWaiting => Err(DevError::Waiting),
+            Wait::Cancelled => Err(DevError::Cancelled),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

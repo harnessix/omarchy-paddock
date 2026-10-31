@@ -158,7 +158,7 @@ pub fn run(
         None
     };
     backend.prepare(env, &built.spec, interactive)?;
-    let (repo, spawner) = start_broker(env, &mut built, interactive, backend.name())?;
+    let (repo, spawner, broker) = start_broker(env, &mut built, interactive, backend.name())?;
     // paddock kv and the devices. Each one is optional: when it cannot start,
     // the sandbox starts without it and a notice says why.
     let kv_approver: std::sync::Arc<dyn crate::broker::Approver> = built
@@ -191,6 +191,7 @@ pub fn run(
             .as_ref()
             .map(|c| c.chain.clone())
             .unwrap_or_default(),
+        broker.map(|b| -> crate::gateway::Handler { std::sync::Arc::new(move |r| b.handle(&r)) }),
     );
     // Terminal harnesses that log in through a browser and a localhost callback.
     let _login = if built.profile.launch.login_callback && built.spec.gui.mode != GuiMode::App {
@@ -535,6 +536,7 @@ pub fn select_backend(env: &HostEnv, built: &Built) -> Result<Box<dyn Backend>> 
 type BrokerStart = (
     Option<crate::broker::git::Repo>,
     Option<std::sync::Arc<crate::spawn::Spawner>>,
+    Option<std::sync::Arc<crate::broker::Broker>>,
 );
 
 fn start_broker(
@@ -618,7 +620,10 @@ fn start_broker(
     };
     let mut broker = crate::broker::Broker::new(env.clone(), ctx, policy, approver);
     broker.spawner = spawner.clone();
-    crate::broker::serve(&sock, broker)?;
+    // One broker for the socket and the gateway device: the same policy,
+    // session grants, approvals and audit.
+    let broker = std::sync::Arc::new(broker);
+    crate::broker::serve(&sock, broker.clone())?;
     built.spec.host_socket = Some(sock);
     // The client is paddock itself. A small wrapper gives it the name that
     // agents use, the same way on every backend.
@@ -647,7 +652,7 @@ fn start_broker(
     let gh = run_dir.join("gh");
     gui::write_file(&gh, "#!/bin/sh\nexec paddock host gh \"$@\"\n", 0o755)?;
     built.spec.add_tool("gh", gh, "gh through the host");
-    Ok((repo, spawner))
+    Ok((repo, spawner, Some(broker)))
 }
 
 /// The captured output of a sandbox. Everything is read, so the sandbox

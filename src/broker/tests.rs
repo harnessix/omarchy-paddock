@@ -521,7 +521,7 @@ fn answers_go_through_the_approvals_directory() {
 fn the_client_talks_to_the_broker_over_the_socket() {
     let (t, b, _) = setup(Some(Answer::Once), HostPolicy::default());
     let sock = t.path().join("host.sock");
-    serve(&sock, b).unwrap();
+    serve(&sock, std::sync::Arc::new(b)).unwrap();
     std::env::set_var("PADDOCK_HOST_SOCKET", &sock);
     let r = crate::hostcli::send(&exec(&["echo", "via socket"])).unwrap();
     assert_eq!(r.status, Status::Done);
