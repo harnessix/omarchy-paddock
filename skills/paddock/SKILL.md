@@ -20,6 +20,7 @@ You configure a security boundary for the user. Some changes make it weaker. For
 - Turning on a device: `[devices] NAME = true`. A device runs on the host and can cost money or reach a host service.
 - Opening the paddock kv `user` scope: `[kv] user = "allow"`, or `[kv] child_project_write = true`. What one agent writes there, agents of other projects read.
 - Keeping vendor telemetry: `[privacy] telemetry = "vendor"`. paddock turns telemetry off in every sandbox by default.
+- Handing the gateway executor to systemd: `paddock gateway install` writes two systemd user units. Without it, paddock starts the executor itself; nothing breaks.
 - Turning on spawn: adding a harness to `[spawn] harnesses`, `[host] spawn = "allow"`, or a higher `max_running`, `max_depth`, `timeout`, `max_mem` or `max_cpus`. Spawn lets a sandbox use the login and the quota of another harness. Ask the user first, and name the harnesses and the limits.
 
 Do not edit files under `~/.local/share/paddock`, `~/.local/state/paddock` or `~/.cache/paddock` by hand. Use the commands.

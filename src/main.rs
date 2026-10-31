@@ -323,6 +323,20 @@ enum Cmd {
         #[arg(long)]
         background: bool,
     },
+    /// The executor of approved host requests: let systemd start it on the
+    /// first request (socket activation), or turn that off again.
+    Gateway {
+        #[command(subcommand)]
+        cmd: GatewayCmd,
+    },
+    /// The executor of approved host requests (started by paddock or by
+    /// systemd socket activation).
+    #[command(hide = true)]
+    Gatewayd {
+        /// Exit after this many seconds without a connection.
+        #[arg(long, default_value_t = 120)]
+        idle: u64,
+    },
     /// The Omarchy agents panel's `omarchy-agent-usage-update`, through
     /// paddock: a login that a sandbox holds is checked from paddock's side.
     #[command(hide = true)]
@@ -344,6 +358,16 @@ enum Cmd {
     },
     #[command(external_subcommand)]
     External(Vec<String>),
+}
+
+#[derive(Subcommand)]
+enum GatewayCmd {
+    /// Write the systemd user units and turn the socket on.
+    Install,
+    /// Turn the socket off and remove the units that paddock wrote.
+    Remove,
+    /// How the executor starts.
+    Status,
 }
 
 #[derive(Subcommand)]
@@ -1215,6 +1239,28 @@ fn real_main() -> Result<i32> {
             Ok(0)
         }
         Cmd::Pick { harness } => pick(&env, &harness),
+        Cmd::Gateway { cmd } => {
+            use paddock::gatewayd;
+            match cmd {
+                GatewayCmd::Install => {
+                    for p in gatewayd::install(&env)? {
+                        println!("wrote {}", p.display());
+                    }
+                    println!("systemd now starts the gateway executor on the first request. Undo with: paddock gateway remove");
+                }
+                GatewayCmd::Remove => {
+                    for p in gatewayd::remove(&env)? {
+                        println!("removed {}", p.display());
+                    }
+                    println!("paddock starts the gateway executor itself when a request needs it.");
+                }
+                GatewayCmd::Status => println!("{}", gatewayd::status_line(&env)),
+            }
+            Ok(0)
+        }
+        Cmd::Gatewayd { idle } => {
+            paddock::gatewayd::main(&env, std::time::Duration::from_secs(idle))
+        }
         Cmd::Refresh { background } => {
             let r = paddock::refresh::sync(&env, !background)?;
             if !background {

@@ -36,7 +36,13 @@ fn setup(answer: Option<Answer>, policy: HostPolicy) -> (tempfile::TempDir, Brok
         depth: 0,
         role: None,
     };
-    (tmp, Broker::new(env, ctx, policy, fixed.clone()), fixed)
+    let mut b = Broker::new(env, ctx, policy, fixed.clone());
+    // The executor runs in this process: the same signature checks.
+    b.dispatch = Some(Arc::new(crate::gatewayd::InProcess {
+        key: vec![9u8; 32],
+        seen: Default::default(),
+    }));
+    (tmp, b, fixed)
 }
 
 fn req(cap: &str, args: serde_json::Value) -> Request {
@@ -721,4 +727,23 @@ fn inbox_never_follows_a_planted_link() {
         std::fs::read_to_string(project.join(".paddock/.gitignore")).unwrap(),
         "*\n"
     );
+}
+
+#[test]
+fn fetch_refuses_paddock_s_own_folders_and_the_gateway_key() {
+    let (_t, b, fixed) = setup(Some(Answer::Once), HostPolicy::default());
+    let key = crate::gateway::key_file(&b.env);
+    crate::gateway::key(&b.env).unwrap();
+    let audit = b.env.paddock_state().join("host-audit.jsonl");
+    std::fs::write(&audit, "{}\n").unwrap();
+    let home = b.env.paddock_data().join("homes/claude/shared/other");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::write(home.join("notes.md"), "private").unwrap();
+    for p in [key, audit, home.join("notes.md"), b.env.paddock_data()] {
+        let r = b.handle(&req("fetch", serde_json::json!({ "path": p })));
+        assert_eq!(r.status, Status::Invalid, "{}: {}", p.display(), r.message);
+        assert!(r.message.contains("protected"), "{}", r.message);
+    }
+    // Refused before the user is asked.
+    assert_eq!(fixed.asked.load(Ordering::SeqCst), 0);
 }
