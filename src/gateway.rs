@@ -285,6 +285,209 @@ impl crate::devices::Device for GwDevice {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Grants: what the user approved, signed, for the executor.
+
+/// HMAC-SHA256 (RFC 2104).
+pub fn hmac(key: &[u8], msg: &[u8]) -> [u8; 32] {
+    let mut k = [0u8; 64];
+    if key.len() > 64 {
+        k[..32].copy_from_slice(&Sha256::digest(key));
+    } else {
+        k[..key.len()].copy_from_slice(key);
+    }
+    let mut inner = Sha256::new();
+    inner.update(k.map(|b| b ^ 0x36));
+    inner.update(msg);
+    let mut outer = Sha256::new();
+    outer.update(k.map(|b| b ^ 0x5c));
+    outer.update(inner.finalize());
+    outer.finalize().into()
+}
+
+/// Equal bytes, in a time that does not depend on where they differ.
+pub fn same(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).fold(0u8, |d, (x, y)| d | (x ^ y)) == 0
+}
+
+/// How long a grant is valid after the user approved it.
+pub const GRANT_LIFETIME: u64 = 30;
+
+/// One approved request for the executor. Valid once, for a short time.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Grant {
+    pub v: u32,
+    /// `request_hash(sandbox, request)`.
+    pub hash: String,
+    pub cap: String,
+    pub sandbox: String,
+    pub project: std::path::PathBuf,
+    /// Unix time after which the executor refuses it.
+    pub expires: u64,
+    /// Random, so that a grant cannot be used twice.
+    pub nonce: String,
+}
+
+/// What paddock sends to the executor: the grant, the request it covers,
+/// the host environment for the command, and the signature over all of it.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct Job {
+    pub grant: Grant,
+    pub request: Request,
+    /// From the host process of paddock, never from the sandbox.
+    pub env: std::collections::BTreeMap<String, String>,
+    pub mac: String,
+}
+
+/// The bytes that the signature covers.
+fn signed_bytes(
+    grant: &Grant,
+    request: &Request,
+    env: &std::collections::BTreeMap<String, String>,
+) -> Vec<u8> {
+    let v = serde_json::json!({
+        "grant": grant,
+        "request": serde_json::from_slice::<serde_json::Value>(&canonical(request))
+            .expect("canonical() is JSON"),
+        "env": env,
+    });
+    serde_json::to_vec(&sorted(&v)).expect("a JSON value serializes")
+}
+
+fn random_hex(n: usize) -> std::io::Result<String> {
+    let mut b = vec![0u8; n];
+    std::io::Read::read_exact(&mut std::fs::File::open("/dev/urandom")?, &mut b)?;
+    Ok(crate::manifest::hex(&b))
+}
+
+/// The signing key, `gateway.key` in paddock's state folder (mode 0600).
+/// The first caller makes it. Sandboxes never see paddock's folders, and
+/// `fetch` refuses them.
+pub fn key(env: &crate::env::HostEnv) -> std::io::Result<Vec<u8>> {
+    let path = key_file(env);
+    match std::fs::read(&path) {
+        Ok(k) if k.len() == 32 => return Ok(k),
+        Ok(_) => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("{} is not a 32-byte key", path.display()),
+            ))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+    let mut k = vec![0u8; 32];
+    std::io::Read::read_exact(&mut std::fs::File::open("/dev/urandom")?, &mut k)?;
+    if let Some(d) = path.parent() {
+        crate::privfs::dir(d)?;
+    }
+    // Two processes can start at once: the first file wins.
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&path)
+    {
+        Ok(mut f) => {
+            f.write_all(&k)?;
+            f.sync_all()?;
+            Ok(k)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            std::thread::sleep(Duration::from_millis(50));
+            let k = std::fs::read(&path)?;
+            if k.len() == 32 {
+                Ok(k)
+            } else {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "the gateway key is incomplete",
+                ))
+            }
+        }
+        Err(e) => Err(e),
+    }
+}
+
+pub fn key_file(env: &crate::env::HostEnv) -> std::path::PathBuf {
+    env.paddock_state().join("gateway.key")
+}
+
+/// Sign an approved request for the executor.
+pub fn sign(
+    key: &[u8],
+    sandbox: &str,
+    project: &std::path::Path,
+    request: &Request,
+    env: std::collections::BTreeMap<String, String>,
+) -> std::io::Result<Job> {
+    let grant = Grant {
+        v: 1,
+        hash: request_hash(sandbox, request),
+        cap: request.cap.clone(),
+        sandbox: sandbox.to_string(),
+        project: project.to_path_buf(),
+        expires: crate::state::now() + GRANT_LIFETIME,
+        nonce: random_hex(16)?,
+    };
+    let mac = crate::manifest::hex(&hmac(key, &signed_bytes(&grant, request, &env)));
+    Ok(Job {
+        grant,
+        request: request.clone(),
+        env,
+        mac,
+    })
+}
+
+/// Why the executor refuses a job.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Refused {
+    Signature,
+    Expired,
+    Replayed,
+    Mismatch,
+}
+
+impl std::fmt::Display for Refused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Refused::Signature => "the signature does not match",
+            Refused::Expired => "the grant expired",
+            Refused::Replayed => "the grant was used already",
+            Refused::Mismatch => "the grant does not cover this request",
+        })
+    }
+}
+
+/// Nonces of grants that the executor accepted, until they expire.
+#[derive(Default)]
+pub struct Seen(Mutex<HashMap<String, u64>>);
+
+/// Check a job: the signature, the time, that it is new, and that the
+/// grant covers exactly this request.
+pub fn verify(key: &[u8], job: &Job, seen: &Seen, now: u64) -> Result<(), Refused> {
+    let want = hmac(key, &signed_bytes(&job.grant, &job.request, &job.env));
+    let got = crate::manifest::unhex(&job.mac).unwrap_or_default();
+    if !same(&want, &got) {
+        return Err(Refused::Signature);
+    }
+    let g = &job.grant;
+    if g.expires < now || g.expires > now + GRANT_LIFETIME + 5 {
+        return Err(Refused::Expired);
+    }
+    if g.v != 1 || g.cap != job.request.cap || g.hash != request_hash(&g.sandbox, &job.request) {
+        return Err(Refused::Mismatch);
+    }
+    let mut seen = seen.0.lock().unwrap();
+    seen.retain(|_, exp| *exp >= now);
+    if seen.insert(g.nonce.clone(), g.expires).is_some() {
+        return Err(Refused::Replayed);
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -432,5 +635,114 @@ mod tests {
                 |_| done("")
             )
             .is_ok());
+    }
+
+    #[test]
+    fn hmac_matches_rfc_4231() {
+        // Test case 1.
+        assert_eq!(
+            crate::manifest::hex(&hmac(&[0x0b; 20], b"Hi There")),
+            "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7"
+        );
+        // Test case 2.
+        assert_eq!(
+            crate::manifest::hex(&hmac(b"Jefe", b"what do ya want for nothing?")),
+            "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843"
+        );
+        // Test case 6: a key longer than the block.
+        assert_eq!(
+            crate::manifest::hex(&hmac(
+                &[0xaa; 131],
+                b"Test Using Larger Than Block-Size Key - Hash Key First"
+            )),
+            "60e431591ee0b67f0d8a26aacbf5b77f8e0bc6213728c5140546040f0ee37f54"
+        );
+    }
+
+    #[test]
+    fn the_executor_runs_only_what_was_signed_once_and_in_time() {
+        let key = [7u8; 32];
+        let r = req("exec", serde_json::json!({"argv": ["ls"]}), "why");
+        let env: std::collections::BTreeMap<String, String> =
+            [("PATH".to_string(), "/usr/bin".to_string())].into();
+        let job = sign(&key, "s1", std::path::Path::new("/p"), &r, env).unwrap();
+        let now = crate::state::now();
+        let seen = Seen::default();
+        assert_eq!(verify(&key, &job, &seen, now), Ok(()));
+        // The same grant twice.
+        assert_eq!(verify(&key, &job, &seen, now), Err(Refused::Replayed));
+        // Another key.
+        assert_eq!(
+            verify(&[8u8; 32], &job, &Seen::default(), now),
+            Err(Refused::Signature)
+        );
+        // A changed argument, a changed environment, a changed project.
+        let mut j = job.clone();
+        j.request
+            .args
+            .insert("argv".into(), serde_json::json!(["rm", "-rf", "/"]));
+        assert_eq!(
+            verify(&key, &j, &Seen::default(), now),
+            Err(Refused::Signature)
+        );
+        let mut j = job.clone();
+        j.env.insert("LD_PRELOAD".into(), "/x.so".into());
+        assert_eq!(
+            verify(&key, &j, &Seen::default(), now),
+            Err(Refused::Signature)
+        );
+        let mut j = job.clone();
+        j.grant.project = "/".into();
+        assert_eq!(
+            verify(&key, &j, &Seen::default(), now),
+            Err(Refused::Signature)
+        );
+        // The reason is not part of what runs.
+        let mut j = job.clone();
+        j.request.reason = "other words".into();
+        assert_eq!(verify(&key, &j, &Seen::default(), now), Ok(()));
+        // Too late, or a grant that claims to be valid far ahead.
+        assert_eq!(
+            verify(&key, &job, &Seen::default(), now + GRANT_LIFETIME + 1),
+            Err(Refused::Expired)
+        );
+        // A grant signed for one request does not cover another.
+        let other = req("exec", serde_json::json!({"argv": ["id"]}), "");
+        let mut j = sign(
+            &key,
+            "s1",
+            std::path::Path::new("/p"),
+            &other,
+            Default::default(),
+        )
+        .unwrap();
+        j.grant.hash = job.grant.hash.clone();
+        j.mac = crate::manifest::hex(&hmac(&key, &signed_bytes(&j.grant, &j.request, &j.env)));
+        assert_eq!(
+            verify(&key, &j, &Seen::default(), now),
+            Err(Refused::Mismatch)
+        );
+    }
+
+    #[test]
+    fn the_key_is_made_once_and_kept_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let t = tempfile::tempdir().unwrap();
+        let env = crate::env::HostEnv::from_parts(
+            t.path().join("home"),
+            "demo".into(),
+            1,
+            1,
+            Default::default(),
+        );
+        let a = key(&env).unwrap();
+        assert_eq!(a.len(), 32);
+        assert_eq!(key(&env).unwrap(), a);
+        let mode = std::fs::metadata(key_file(&env))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
     }
 }
