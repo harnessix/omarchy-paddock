@@ -1588,10 +1588,14 @@ pub fn pasture_ns(id: &Identity) -> Ns {
 pub struct Served {
     root: PathBuf,
     sandbox: String,
+    monitor: Option<crate::monitor::Watch>,
 }
 
 impl Served {
     pub fn finish(self) {
+        if let Some(m) = &self.monitor {
+            m.finish();
+        }
         if let Err(e) = Store::open(&shard::registry(&self.root))
             .and_then(|s| s.finish(&self.sandbox, crate::state::now()))
         {
@@ -1625,6 +1629,7 @@ pub fn serve(socket: &Path, svc: Service) -> Result<Served> {
     let served = Served {
         root: svc.root.clone(),
         sandbox: svc.id.sandbox.clone(),
+        monitor: None,
     };
     let svc = Arc::new(svc);
     std::thread::spawn(move || {
@@ -1684,11 +1689,12 @@ pub fn start(
         chain: lineage.chain,
     };
     watch_timers(env.clone(), id.clone(), kv_root(env), cfg.clone());
-    crate::monitor::watch(env.clone(), id.clone());
+    let monitor = crate::monitor::watch(env.clone(), id.clone());
     let svc = Service::new(env.clone(), id, cfg, approver, Duration::from_secs(wait));
     let sock = env.paddock_run().join(&spec.id).join("kv.sock");
     match serve(&sock, svc) {
-        Ok(s) => {
+        Ok(mut s) => {
+            s.monitor = Some(monitor);
             spec.kv_socket = Some(sock);
             Some(s)
         }

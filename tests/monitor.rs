@@ -1,6 +1,6 @@
-//! The tunnel watch end to end: a bwrap sandbox runs a copy of `sleep`
+//! The monitor watch end to end: a bwrap sandbox runs a copy of `sleep`
 //! named `ngrok`, and paddock names it in the run folder and in
-//! `paddock ps --json`. Needs a systemd user instance and the session bus
+//! `paddock ps --json`, next to the traffic count. Needs a systemd user instance and the session bus
 //! (for the scope); `[monitor] notify = false` keeps the desktop quiet.
 //! Temporary folders for everything else.
 
@@ -135,11 +135,21 @@ fn a_tunnel_tool_in_a_sandbox_is_reported() {
         return;
     }
     let file = w.root.join("run/paddock").join(&id).join("monitor.json");
-    let text = wait_for("monitor.json", || std::fs::read_to_string(&file).ok());
-    let v: serde_json::Value = serde_json::from_str(&text).unwrap();
-    assert_eq!(v["tunnels"], serde_json::json!(["ngrok"]), "{text}");
+    // The traffic count writes the file too, so wait for the tunnel.
+    let v = wait_for("monitor.json", || {
+        let text = std::fs::read_to_string(&file).ok()?;
+        let v: serde_json::Value = serde_json::from_str(&text).ok()?;
+        v["tunnels"]
+            .as_array()
+            .is_some_and(|a| !a.is_empty())
+            .then_some(v)
+    });
+    assert_eq!(v["tunnels"], serde_json::json!(["ngrok"]), "{v}");
     let sb = w.ps().into_iter().next().unwrap();
     assert_eq!(sb["tunnels"], serde_json::json!(["ngrok"]), "{sb}");
+    // With --network none the sandbox has `lo` only: the count stays zero.
+    assert!(sb["traffic"]["sent"].is_u64(), "{sb}");
+    assert!(sb["traffic"]["received"].is_u64(), "{sb}");
 
     let _ = w.paddock().args(["stop", &id]).output();
     wait_for("paddock to exit", || child.try_wait().unwrap());

@@ -333,7 +333,11 @@ Who talks to the host proxy depends on the backend. On docker and podman, the pa
 
 `paddock doctor --escape --network egress --online` checks all of this: DNS and HTTPS work, and the host loopback, the other host addresses, and direct connections that bypass the proxy do not.
 
-### Tunnel watch
+### Monitoring
+
+paddock watches each bwrap or srt sandbox that runs in its scope (a systemd user instance). It counts on this computer, keeps the numbers here and contacts no vendor service. It never reads content. You get a desktop notification and a line in the audit log (`paddock log`, capability `monitor`) once per sandbox and finding, so you never need to read logs.
+
+#### Tunnel watch
 
 A tunnel lets a machine outside reach into the sandbox, or lets the sandbox reach past its network rules. While a bwrap or srt sandbox runs in its scope (a systemd user instance), paddock looks at the command lines of its processes every 10 seconds. It reports `ssh` with `-R`, `-L` or `-D`, and `ngrok`, `cloudflared`, `frpc`, `frps`, `bore`, `chisel`, `lt` (localtunnel) and `tailscale funnel`.
 
@@ -344,6 +348,26 @@ A tunnel lets a machine outside reach into the sandbox, or lets the sandbox reac
 - It is a notice, not a barrier: a process can rename itself or rewrite its command line. The network rules of the sandbox still hold either way.
 - docker and podman sandboxes, and sandboxes without a scope, are not watched.
 - In `~/.config/paddock/config.toml`, `[monitor] tunnels = false` turns the watch off, and `[monitor] notify = false` keeps the audit line but shows no notification. A project `paddock.toml` cannot change either.
+
+#### Traffic
+
+Every 10 seconds paddock reads the byte counters of the sandbox's own network namespace (`/proc/PID/net/dev`, all interfaces but `lo`). It never sees what goes through them.
+
+- `paddock ps --json` shows `traffic: {"sent": N, "received": N}` for each sandbox, in bytes since its start.
+- paddock keeps the sent bytes per hour of each harness and project in `~/.local/state/paddock/monitor/`: numbers only, the last 30 days. The baseline is the median of the hours with traffic.
+- paddock tells you once per sandbox and reason when the sent bytes of the current hour pass `upload_per_hour` (default 5G), or pass `factor` (default 10) times the baseline, after 5 hours with traffic. The audit line holds numbers only.
+- The settings go in `[monitor]` of `~/.config/paddock/config.toml`, and a project `paddock.toml` cannot set them:
+
+```toml
+[monitor]
+traffic = true            # false turns the count off
+upload_per_hour = "5G"    # K, M or G (1024 based), or plain bytes
+factor = 10
+notify = true             # false keeps the audit line, without a notification
+```
+
+- docker and podman sandboxes, sandboxes with `--network host` and sandboxes without a scope are not counted.
+- srt sends through a local proxy, so most of its traffic goes over `lo` and does not count.
 
 ## Logins and MCP
 
