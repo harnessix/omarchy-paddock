@@ -12,6 +12,7 @@ pub mod devices;
 pub mod doctor;
 pub mod env;
 pub mod execbox;
+pub mod forage;
 pub mod freeze;
 pub mod gateway;
 pub mod gatewayd;

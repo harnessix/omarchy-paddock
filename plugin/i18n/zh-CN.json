@@ -208,5 +208,6 @@
   "msg.revoked": "凭据已撤销，之后用它的请求都会被拒绝。",
   "msg.revokeFailed": "paddock 没能撤销凭据。",
   "row.timer": "计时 %1：%2 / %3",
-  "row.timerOver": "计时 %1：%2 / %3，已超时"
+  "row.timerOver": "计时 %1：%2 / %3，已超时",
+  "forage.overgrazing": "%1 %2：已用 %3%，按现在的速度 %4 后用完，%5 后才重置"
 }

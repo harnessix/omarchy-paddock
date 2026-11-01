@@ -779,6 +779,24 @@ paddock timer stop ID review
 - `paddock ps --json` and the bar panel show the timer of each sandbox that is closest to its end.
 - The keys `timer:*` change only through the timer commands, never with `paddock-host kv put`.
 
+## Forage: how much of the limits is left
+
+An agent that hands out work needs to know which account has room. `paddock forage` and, inside the sandbox, `paddock-host forage` show for each limit window of each account:
+
+- the share used, and when the window resets;
+- the rate now, from the last two checks, and the usual rate, from earlier windows;
+- when the window runs out at the rate now, and OVERGRAZING when that is before the reset.
+
+```sh
+paddock forage                       # every account with numbers
+paddock forage codex --refresh       # ask for fresh numbers first
+paddock-host forage --refresh        # inside: your harness's account and those you may start
+```
+
+The numbers come from the Omarchy agents panel's records. paddock asks for fresh ones with the panel's own command, at most once in 5 minutes per account; a login that a sandbox holds is checked from paddock's side, as for the panel. While a sandbox has a running timer, paddock also asks every 15 minutes, so that the rates are known when someone asks. These checks reach the services as the panel does. paddock keeps the numbers, and nothing else, in `~/.local/state/paddock/forage/`. The bar panel shows a line for each account that runs out before it resets.
+
+The rates are simple: the slope between two checks, and the median of earlier windows. The fewer the checks, the rougher the estimate.
+
 ## Devices: /dev/paddock
 
 A device is a host service that the sandbox uses as a file. Each sandbox gets its own small file system at `/dev/paddock`. The paddock process on the host serves it, so paddock knows which sandbox calls. No root and no credentials enter the sandbox.

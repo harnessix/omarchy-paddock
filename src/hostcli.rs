@@ -8,6 +8,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 
 pub mod device;
+pub mod forage;
 mod git;
 pub mod kv;
 pub mod timer;
@@ -39,6 +40,7 @@ USAGE
   paddock-host kill ID
   paddock-host kv COMMAND [ARG...]              (key-value store, see `paddock-host kv --help`)
   paddock-host timer COMMAND [ARG...]           (task timers, see `paddock-host timer --help`)
+  paddock-host forage [--refresh] [--json]      (limits left and how fast they go)
   paddock-host device NAME [REQUEST]            (a device in /dev/paddock, see `paddock-host device --help`)
   paddock-host help [CAPABILITY]
 
@@ -396,6 +398,7 @@ pub fn main(args: &[String]) -> i32 {
         "gh" => return git::gh_main(rest),
         "kv" => return kv::main(rest),
         "timer" => return timer::main(rest),
+        "forage" => return forage::main(rest),
         "device" => return device::main(rest),
         "forge" if rest.first().is_some_and(|t| t == "gh") => return git::gh_main(&rest[1..]),
         _ => {}

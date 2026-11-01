@@ -422,3 +422,41 @@ fn a_kept_codex_login_is_checked_in_the_keeper_sandbox() {
     // The host's own folder was never written: the overlay took the writes.
     assert!(!w.home.join(".codex/used.log").exists());
 }
+
+#[test]
+fn forage_refreshes_at_most_once_in_five_minutes_and_keeps_a_ledger() {
+    let w = world();
+    // Omarchy's update writes a fresh record each time it runs.
+    write_exec(
+        &w.home.join("omarchy/bin/omarchy-agent-usage-update"),
+        r#"#!/bin/sh
+printf '%s\n' "$*" >> "$HOME/real.log"
+n=$(wc -l < "$HOME/real.log")
+mkdir -p "$HOME/.local/state/omarchy/agents/usage"
+printf '{"id":"grok","limitsFetchedAt":%s000,"limitsStale":false,"limits":[{"label":"Weekly","percent":0.%s,"resetsAt":"2099-01-01T00:00:00+00:00"}]}\n' "$(date +%s)" "$n" > "$HOME/.local/state/omarchy/agents/usage/grok.json"
+"#,
+    );
+    let run = |args: &[&str]| {
+        let out = Command::new(env!("CARGO_BIN_EXE_paddock"))
+            .arg("forage")
+            .args(args)
+            .env_clear()
+            .envs(&w.vars)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{out:?}");
+        serde_json::from_slice::<serde_json::Value>(&out.stdout).unwrap()
+    };
+    let v = run(&["grok", "--refresh", "--json"]);
+    assert_eq!(v["windows"][0]["agent"], "grok", "{v}");
+    assert_eq!(v["windows"][0]["used"], 0.1);
+    assert_eq!(w.real_log(), "grok\n");
+    // Asked again within five minutes: Omarchy is not asked.
+    run(&["grok", "--refresh", "--json"]);
+    assert_eq!(w.real_log(), "grok\n");
+    // The ledger holds the numbers only.
+    let ledger =
+        std::fs::read_to_string(w.home.join(".local/state/paddock/forage/grok.jsonl")).unwrap();
+    assert_eq!(ledger.lines().count(), 1, "{ledger}");
+    assert!(ledger.contains("\"used\":0.1"));
+}

@@ -87,7 +87,8 @@ const MAX_BATCH: usize = 100;
 /// The values of one mset hold at most this many times `max_value`.
 const BATCH_VALUES: usize = 16;
 pub const OPS: &[&str] = &[
-    "get", "mget", "put", "mset", "delete", "list", "history", "watch", "claim", "release", "timer",
+    "get", "mget", "put", "mset", "delete", "list", "history", "watch", "claim", "release",
+    "timer", "forage",
 ];
 const WRITE_OPS: &[&str] = &["put", "mset", "delete", "claim", "release", "timer"];
 
@@ -969,6 +970,7 @@ impl Service {
             }
             "claim" => self.claim(st, ns, key, req.ttl.unwrap_or(60), quota, now)?,
             "timer" => self.timer(st, req, ns, quota, now)?,
+            "forage" => self.forage(req),
             "release" => self.release(st, ns, key, req.force == Some(true), quota, now)?,
             "watch" => self.watch(st, ns, req, conn, &mark)?,
             _ => unreachable!(),
@@ -976,6 +978,28 @@ impl Service {
     }
 
     /// Take the lease `lease:<name>`, or renew it when this sandbox holds it.
+    /// The forage ledger (forage.rs) for the accounts that this sandbox can
+    /// hand work to: its own harness's, and those of the harnesses that it
+    /// may start. `action = "refresh"` asks for fresh numbers first.
+    fn forage(&self, req: &Request) -> Response {
+        let mut agents = vec![crate::forage::agent_of(&self.id.harness)];
+        if let Ok(cfg) = crate::spawn::SpawnCfg::load(&self.env) {
+            agents.extend(cfg.harnesses.iter().map(|h| crate::forage::agent_of(h)));
+        }
+        agents.sort();
+        agents.dedup();
+        if req.action.as_deref() == Some("refresh") {
+            if let Err(e) = crate::forage::refresh(&self.env, &agents) {
+                log::debug!("forage refresh: {e:#}");
+            }
+        }
+        let windows: Vec<crate::forage::Window> = agents
+            .iter()
+            .flat_map(|a| crate::forage::windows(&self.env, a))
+            .collect();
+        Response::done(serde_json::json!({ "windows": windows, "agents": agents }))
+    }
+
     /// The timer operations (timer.rs). A timer counts the time of the
     /// sandbox that starts it; only its owner extends or stops it, anyone
     /// else asks the user for more time.
@@ -1389,6 +1413,7 @@ fn timer_tick(env: &HostEnv, id: &Identity, root: &Path, cfg: &KvCfg) -> Result<
         harness: "paddock",
     };
     let mut summary = Vec::new();
+    let mut timed = false;
     for (ns, scope) in spaces {
         let file = ns.file(root)?;
         if !file.is_file() {
@@ -1401,6 +1426,9 @@ fn timer_tick(env: &HostEnv, id: &Identity, root: &Path, cfg: &KvCfg) -> Result<
             }
             let s = t.status(now, &timer::frozen_periods(env, &id.sandbox, now));
             summary.push(s.clone());
+            if !s.stopped && !s.over {
+                timed = true;
+            }
             if s.stopped || !s.over {
                 continue;
             }
@@ -1445,6 +1473,12 @@ fn timer_tick(env: &HostEnv, id: &Identity, root: &Path, cfg: &KvCfg) -> Result<
                 }
                 timer_notice(env, id, "paddock froze a sandbox: its time is up", &format!("{reason}. paddock thaw {} lets it continue; paddock timer extend gives it more time.", id.sandbox));
             }
+        }
+    }
+    // A timed task: keep the forage ledger fresh for its account.
+    if timed {
+        if let Err(e) = crate::forage::sample_if_due(env, &crate::forage::agent_of(&id.harness)) {
+            log::debug!("forage sample: {e:#}");
         }
     }
     crate::privfs::write(

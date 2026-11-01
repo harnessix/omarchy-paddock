@@ -48,6 +48,8 @@ Panel {
   property var recentProjects: []
   // paddock kv. The overview has counts and names only, never a value; a
   // value is read when the user opens one key, and shown as plain text.
+  // Limit windows that run out before they reset (`paddock forage`).
+  property var overgrazing: []
   property var kvScopes: []          // rows of the kv view
   property int kvKeyTotal: 0
   property var kvTarget: null        // the scope open in the keys view
@@ -435,6 +437,7 @@ Panel {
   // Only while the panel is open: the bar shows nothing of paddock kv.
   function refreshKv(force) {
     if (!root.opened && !force) return
+    if (!forageProc.running) { forageProc.buffer = ""; forageProc.running = true }
     if (!kvOverviewProc.running) { kvOverviewProc.buffer = ""; kvOverviewProc.running = true }
     if (view === "keys" || view === "key") refreshKvKeys()
   }
@@ -893,6 +896,26 @@ Panel {
     repeat: true
     triggeredOnStart: true
     onTriggered: root.refreshApprovals()
+  }
+
+  JsonProc {
+    id: forageProc
+    command: ["sh", "-c", root.launcher, "paddock", "forage", "--json"]
+    onExited: function(exitCode) {
+      // An older paddock has no forage: show nothing.
+      if (exitCode !== 0) { root.overgrazing = []; return }
+      try {
+        var p = JSON.parse(buffer)
+        var raw = p && p.api_version === "paddock.forage/v1" && Array.isArray(p.windows) ? p.windows.slice(0, 32) : []
+        root.overgrazing = raw.filter(function(w) { return w && w.overgrazing === true }).slice(0, 4).map(function(w) {
+          return { agent: root.plain(w.agent, 24), label: root.plain(w.label, 40),
+                   used: Math.round(Number(w.used || 0) * 100),
+                   runsOut: Number(w.runs_out || 0), resets: Number(w.resets || 0) }
+        })
+      } catch (e) {
+        root.overgrazing = []
+      }
+    }
   }
 
   JsonProc {
@@ -1372,6 +1395,26 @@ Panel {
                   iconText: "󰉋"; tooltipText: strings.t("action.reveal")
                   onClicked: root.revealFile(modelData)
                 }
+              }
+            }
+          }
+
+          // Accounts that run out before they reset: a line each, no cursor.
+          Column {
+            width: parent.width
+            spacing: Style.space(2)
+            visible: root.view === "list" && root.overgrazing.length > 0
+            Repeater {
+              model: root.view === "list" ? root.overgrazing : []
+              delegate: PlainText {
+                required property var modelData
+                width: parent.width
+                wrapMode: Text.WordWrap
+                color: root.urgent
+                font.pixelSize: Style.font.caption
+                text: strings.t("forage.overgrazing").arg(modelData.agent).arg(modelData.label)
+                  .arg(modelData.used).arg(root.span(Math.max(0, modelData.runsOut - Date.now() / 1000)))
+                  .arg(root.span(Math.max(0, modelData.resets - Date.now() / 1000)))
               }
             }
           }
