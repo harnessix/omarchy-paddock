@@ -97,6 +97,7 @@ Panel {
   function actionsFor(s) {
     var a = ["folder", "copy"]
     if (s && s.windowPid > 0) a.push("display")
+    if (s && s.canFreeze) a.push("freeze")
     a.push("stop")
     return a
   }
@@ -316,8 +317,19 @@ Panel {
       root.refresh()
     })
   }
+  // Freeze a running sandbox, or thaw a frozen one.
+  function toggleFreeze(s) {
+    var verb = s.frozenSince > 0 ? "thaw" : "freeze"
+    runPaddock([verb, s.id], function(code) {
+      root.say(code === 0
+        ? strings.t(verb === "thaw" ? "msg.thawed" : "msg.frozen")
+        : strings.t("msg.freezeFailed"))
+      root.refresh()
+    })
+  }
   function runAction(s, name) {
     if (name === "folder") openFolder(s)
+    else if (name === "freeze") toggleFreeze(s)
     else if (name === "copy") copyPath(s)
     else if (name === "display") showDisplay(s)
     else if (name === "stop") stop(s)
@@ -471,6 +483,9 @@ Panel {
             network: root.plain(r.network, 12),
             auth: root.plain(r.auth || "", 40),
             started: Number(r.started || 0),
+            frozenSince: Number(r.frozen_since || 0),
+            // Its own scope (bwrap, srt), or a container that can pause.
+            canFreeze: (typeof r.unit === "string" && r.unit !== "") || r.backend === "docker" || r.backend === "podman",
             windowPid: Number.isInteger(r.window_pid) && r.window_pid > 0 ? r.window_pid : 0,
             warning: Array.isArray(r.warnings) && r.warnings.length ? root.plain(r.warnings[0], 200) : "",
             // A sandbox that another sandbox started (paddock-host spawn).
@@ -918,7 +933,8 @@ Panel {
                   ? strings.t("row.childTitle").arg(modelData.harness).arg(modelData.parentHarness || modelData.parent)
                   : strings.t("row.title").arg(modelData.harness).arg(modelData.projectName)
                 caption: strings.t("row.detail").arg(modelData.backend).arg(modelData.network).arg(modelData.gui).arg(root.uptime(modelData.started))
-                caption2: modelData.warning !== "" ? modelData.warning
+                caption2: modelData.frozenSince > 0 ? strings.t("row.frozen").arg(root.uptime(modelData.frozenSince))
+                  : modelData.warning !== "" ? modelData.warning
                   : (modelData.parent !== "" ? strings.t("row.startedBy").arg(modelData.parent)
                   : (modelData.auth !== "" && modelData.auth !== "shared" ? strings.t("row.auth").arg(modelData.auth) : ""))
                 caption2Color: modelData.warning !== "" ? root.urgent : root.dim
@@ -943,6 +959,14 @@ Panel {
                 }
                 ActionButton {
                   sandboxIndex: index + root.approvals.length; position: modelData.windowPid > 0 ? 3 : 2
+                  visible: modelData.canFreeze
+                  iconText: modelData.frozenSince > 0 ? "󰐊" : "󰏤"
+                  tooltipText: modelData.frozenSince > 0 ? strings.t("action.thaw") : strings.t("action.freeze")
+                  onClicked: root.toggleFreeze(modelData)
+                }
+                ActionButton {
+                  sandboxIndex: index + root.approvals.length
+                  position: (modelData.windowPid > 0 ? 3 : 2) + (modelData.canFreeze ? 1 : 0)
                   iconText: root.confirmId === modelData.id ? "󰗖" : "󰓛"
                   tooltipText: root.confirmId === modelData.id ? strings.t("action.confirmStop") : strings.t("action.stop")
                   foreground: root.confirmId === modelData.id ? root.urgent : root.fg

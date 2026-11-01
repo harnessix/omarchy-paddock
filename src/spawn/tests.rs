@@ -810,6 +810,8 @@ fn ps_lists_children_under_their_parent() {
         parent: parent.map(str::to_string),
         spawn_id: None,
         logins: Vec::new(),
+        unit: None,
+        kv_project: None,
     };
     let list = vec![
         r("a", None, 1),

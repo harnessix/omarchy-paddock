@@ -685,6 +685,24 @@ A prefix watch also wakes when a key under the prefix expires. So `watch --prefi
 
 A question from `ask` shows on the approval card in the bar, with the choices as buttons. Click the text field to type another answer, and press Enter. Escape gives the keyboard back. "Dismiss" ends the question, and the agent gets `EACCES` (exit code 3). Without the bar, a desktop notification shows the question and its choices. On the command line, use `paddock approvals` and `paddock approvals answer ID --text -`, then type the answer and press Ctrl-D: read from standard input, it never shows in the process list or your shell history. Your answer goes to the agent only. The audit log records the sizes of the question and the answer, never the text. A question stays open while the agent reads it again; paddock removes it two minutes after the last read, or when the sandbox ends. At most 8 questions of all sandboxes wait at once, host requests come first on the card, and after you dismiss a question, that sandbox cannot ask again for 30 seconds. Control characters and invisible format characters are removed from questions before they are shown.
 
+
+### Freeze a sandbox
+
+A frozen sandbox uses no CPU and keeps its memory, the harness too. Thawed, it continues where it stopped, without a new start and without losing the agent's context.
+
+```sh
+paddock freeze <id> --reason "wait for CI"   # --tree: also the sandboxes it started
+paddock thaw <id>
+paddock ps                                    # shows "frozen 12m"
+```
+
+With a systemd user instance, every bwrap or srt sandbox runs in a scope of its own, `paddock-sb-<id>`, and `paddock freeze` freezes that scope with the cgroup freezer. paddock never freezes a scope that is not its own, such as the one of your terminal. docker and podman sandboxes are paused with `pause` instead. A sandbox that started without a systemd user instance cannot be frozen. The bar panel has a key for it on each row, and shows how long a sandbox has been frozen.
+
+- `paddock stop` thaws a frozen sandbox first, so that it can end.
+- Each freeze and thaw goes to the audit log, with the reason.
+- The other agents of the project see the state in paddock kv: `sandbox:<id>` in the project scope is `{"state": "suspended", ...}` while it is frozen and `running` after.
+- The clock keeps running while a sandbox is frozen: a harness timeout or a model's prompt cache can run out. A lease in paddock kv expires as usual.
+
 ## App mode
 
 Desktop agent apps run in a sandbox too: ChatGPT with Codex, Claude Desktop, VS Code, and flatpak apps. They get the same file, git, secrets, environment and network rules as a terminal harness, and their windows are normal windows on your desktop. Flatpak apps have some limits, described at the end of this section.

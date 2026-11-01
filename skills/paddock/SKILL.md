@@ -99,6 +99,7 @@ paddock claude --worktree       # a new branch in a new worktree; review the dif
 paddock app run vscode ~/src/api   # a desktop app in a sandbox
 paddock ps                      # running sandboxes
 paddock stop <id>               # stop one
+paddock freeze <id>             # freeze one: no CPU, memory kept; paddock thaw <id> continues it
 paddock explain claude          # every mount, variable and rule, and where it comes from
 ```
 

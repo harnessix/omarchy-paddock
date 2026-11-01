@@ -751,6 +751,8 @@ mod tests {
             parent: None,
             spawn_id: None,
             logins,
+            unit: None,
+            kv_project: None,
         }
     }
 

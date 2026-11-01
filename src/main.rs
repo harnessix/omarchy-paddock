@@ -104,6 +104,24 @@ enum Cmd {
     },
     /// Stop a running sandbox.
     Stop { id: String },
+    /// Freeze a running sandbox: it uses no CPU and keeps its memory until
+    /// you thaw it.
+    Freeze {
+        id: String,
+        /// Also the sandboxes that it started.
+        #[arg(long)]
+        tree: bool,
+        /// Why, for the audit log and for the other agents in paddock kv.
+        #[arg(long, default_value = "")]
+        reason: String,
+    },
+    /// Thaw a frozen sandbox: it continues where it stopped.
+    Thaw {
+        id: String,
+        /// Also the sandboxes that it started.
+        #[arg(long)]
+        tree: bool,
+    },
     /// Show the disk space of sandbox homes, images, worktrees and records.
     #[command(after_help = DU_HELP)]
     Du {
@@ -919,6 +937,18 @@ fn explain(env: &HostEnv, a: &RunArgs, json: bool) -> Result<()> {
 }
 
 fn main() {
+    // The start of a sandbox in a scope of its own (freeze.rs): stop, let
+    // paddock move this process into the scope, then become the sandbox.
+    // Before anything else, so the environment and the arguments pass as
+    // they are.
+    let argv: Vec<std::ffi::OsString> = std::env::args_os().collect();
+    if argv
+        .get(1)
+        .is_some_and(|a| a == paddock::freeze::SCOPE_EXEC)
+        && argv.len() > 2
+    {
+        std::process::exit(paddock::freeze::scope_exec(&argv[2..]));
+    }
     match real_main() {
         Ok(code) => std::process::exit(code),
         Err(e) => {
@@ -1557,13 +1587,38 @@ fn real_main() -> Result<i32> {
             }
             Ok(0)
         }
+        Cmd::Freeze { id, tree, reason } => {
+            for f in paddock::freeze::freeze(&env, &id, tree, &reason)? {
+                println!("Froze {f}. Thaw it with: paddock thaw {f}");
+            }
+            Ok(0)
+        }
+        Cmd::Thaw { id, tree } => {
+            for f in paddock::freeze::thaw(&env, &id, tree)? {
+                println!("Thawed {f}.");
+            }
+            Ok(0)
+        }
         Cmd::Ps { json } => {
             // Children follow their parent.
             let list = state::tree_order(Running::list(&env));
             if json {
+                let rows: Vec<serde_json::Value> = list
+                    .iter()
+                    .map(|r| {
+                        let mut v = serde_json::to_value(r).unwrap_or_default();
+                        if let (Some(o), Some((since, reason))) =
+                            (v.as_object_mut(), paddock::freeze::frozen(&env, &r.id))
+                        {
+                            o.insert("frozen_since".into(), since.into());
+                            o.insert("frozen_reason".into(), reason.into());
+                        }
+                        v
+                    })
+                    .collect();
                 println!(
                     "{}",
-                    serde_json::json!({ "api_version": "paddock.ps/v1", "sandboxes": list })
+                    serde_json::json!({ "api_version": "paddock.ps/v1", "sandboxes": rows })
                 );
             } else if list.is_empty() {
                 println!("No running sandboxes.");
@@ -1572,8 +1627,11 @@ fn real_main() -> Result<i32> {
                 let depth = |r: &Running| state::depth_in(&list, r);
                 for r in &list {
                     let id = format!("{}{}", "  ".repeat(depth(r)), r.id);
+                    let frozen = paddock::freeze::frozen(&env, &r.id)
+                        .map(|(since, _)| format!("  frozen {}m", now.saturating_sub(since) / 60))
+                        .unwrap_or_default();
                     println!(
-                        "{:<28} {:<8} {:<7} {:<7} {:>5}m  {}",
+                        "{:<28} {:<8} {:<7} {:<7} {:>5}m  {}{frozen}",
                         id,
                         r.harness,
                         r.backend,
@@ -1643,6 +1701,8 @@ fn real_main() -> Result<i32> {
             // The sandboxes that this one started stop with it. Its own
             // paddock stops them too when it ends; this does not wait for that.
             let children = state::descendants(&all, &id);
+            // A frozen process gets SIGTERM only when it thaws.
+            let _ = paddock::freeze::thaw(&env, &id, true);
             for c in &children {
                 unsafe { libc::kill(c.pid as i32, libc::SIGTERM) };
             }
