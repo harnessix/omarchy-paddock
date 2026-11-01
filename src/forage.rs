@@ -181,6 +181,11 @@ pub fn refresh(env: &HostEnv, agents: &[String]) -> Result<Vec<String>> {
     for a in &due {
         crate::privfs::write(&ledger_dir(env).join(format!("{a}.asked")), now.to_string())?;
     }
+    // In unit tests the executable is the test binary, which would read
+    // the arguments as test filters and run the tests again.
+    if cfg!(test) {
+        return Ok(due);
+    }
     let me = std::env::current_exe().context("cannot find the paddock executable")?;
     let status = std::process::Command::new(me)
         .arg("omarchy-usage-update")
@@ -211,6 +216,21 @@ pub fn sample_if_due(env: &HostEnv, agent: &str) -> Result<()> {
         refresh(env, &[agent.to_string()])?;
     }
     Ok(())
+}
+
+/// The samples of one window of an agent, oldest first: the ledger's, and
+/// the record's when it is newer.
+pub fn samples(env: &HostEnv, agent: &str, label: &str) -> Vec<Sample> {
+    let mut out: Vec<Sample> = read_ledger(env, agent)
+        .into_iter()
+        .filter(|s| s.label == label)
+        .collect();
+    if let Some((_, false, rec)) = read_record(env, agent) {
+        out.extend(rec.into_iter().filter(|s| s.label == label));
+    }
+    out.sort_by_key(|s| s.at);
+    out.dedup_by_key(|s| s.at);
+    out
 }
 
 /// The agents whose usage records exist.

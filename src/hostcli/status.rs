@@ -50,16 +50,27 @@ pub fn lines(
             continue;
         }
         let n = |k: &str| t[k].as_u64().unwrap_or(0);
-        let (used, budget, left) = (n("used"), n("budget"), n("left"));
+        let (budget, left) = (n("budget"), n("left"));
+        let q = &t["quota"];
+        let share = q["share"].as_f64().unwrap_or(0.0);
+        let q_left = q["left"].as_f64().unwrap_or(0.0);
+        let used = serde_json::from_value::<crate::timer::Status>(t.clone())
+            .map(|s| crate::timer::describe(&s))
+            .unwrap_or_default();
         let line = format!(
-            "timer {}: used {} of {}, {}{}",
+            "timer {}: used {}, {}{}",
             t["name"].as_str().unwrap_or(""),
-            format_duration(used),
-            format_duration(budget),
+            used,
             if t["over"] == true {
-                "time is up".to_string()
-            } else {
+                if q["over"] == true {
+                    "the quota budget is used up".to_string()
+                } else {
+                    "time is up".to_string()
+                }
+            } else if budget > 0 {
                 format!("{} left", format_duration(left))
+            } else {
+                format!("{:.0}% of the quota budget left", q_left * 100.0)
             },
             if t["hard"] == true {
                 " (hard: the sandbox is frozen at the end)"
@@ -67,7 +78,9 @@ pub fn lines(
                 ""
             }
         );
-        if t["over"] == true || left * 5 <= budget {
+        let near_time = budget > 0 && left * 5 <= budget;
+        let near_quota = share > 0.0 && q_left * 5.0 <= share;
+        if t["over"] == true || near_time || near_quota {
             urgent.push(line.clone());
         }
         all.push(line);
@@ -244,6 +257,29 @@ mod tests {
         let mut stopped = t("done", 8000, 7200, true);
         stopped["stopped"] = true.into();
         assert!(lines(&[stopped], &[], 1000).0.is_empty());
+    }
+
+    #[test]
+    fn a_quota_budget_needs_attention_near_its_end() {
+        let q = |used: f64, over: bool| {
+            serde_json::json!({"name": "q", "used": 30, "budget": 0, "left": 0, "over": over, "hard": false, "stopped": false, "started": 0, "owner": "a", "subject": "a", "wall": 30,
+            "quota": {"agent": "codex", "window": "Weekly", "share": 0.1, "used": used, "left": (0.1 - used).max(0.0), "over": over, "fetched": 0}})
+        };
+        let (all, urgent) = lines(&[q(0.02, false)], &[], 1000);
+        assert!(urgent.is_empty(), "{urgent:?}");
+        assert!(
+            all[0].contains("2% of 10% of codex Weekly")
+                && all[0].contains("8% of the quota budget left"),
+            "{all:?}"
+        );
+        assert!(!all[0].contains("time is up"), "{all:?}");
+        let (_, urgent) = lines(&[q(0.09, false)], &[], 1000);
+        assert_eq!(urgent.len(), 1);
+        let (_, urgent) = lines(&[q(0.12, true)], &[], 1000);
+        assert!(
+            urgent[0].contains("the quota budget is used up"),
+            "{urgent:?}"
+        );
     }
 
     #[test]
