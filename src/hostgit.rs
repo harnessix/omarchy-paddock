@@ -575,6 +575,21 @@ impl Checkout {
         run(cmd.args(args))
     }
 
+    /// The same, with `who` (name, email) as the author and committer of a
+    /// new commit. None leaves the identity to the repository configuration.
+    pub fn run_as(&self, who: Option<(&str, &str)>, args: &[&str]) -> Result<String> {
+        self.layout.guard()?;
+        let mut cmd = hardened(&self.layout.git_dir, Some(&self.layout.work_tree));
+        cmd.current_dir(&self.layout.work_tree);
+        if let Some((name, email)) = who {
+            cmd.env("GIT_AUTHOR_NAME", name)
+                .env("GIT_AUTHOR_EMAIL", email)
+                .env("GIT_COMMITTER_NAME", name)
+                .env("GIT_COMMITTER_EMAIL", email);
+        }
+        run(cmd.args(args))
+    }
+
     /// The same, with a private index file instead of the repository's
     /// own, and paddock as the author of a commit. `index` must be in a
     /// folder that only the host can write.

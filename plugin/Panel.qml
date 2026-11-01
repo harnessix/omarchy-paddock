@@ -59,13 +59,19 @@ Panel {
   readonly property bool kvVisible: kvScopes.length > 0
   readonly property int kvPastureCount: kvScopes.filter(function(t) { return t.kind === "pasture" }).length
   readonly property var kvRows: buildKvRows(kvKeys, kvCollapsed)
+  // Worktrees that paddock made, from `paddock worktree list --json`.
+  // Paths and branches come from sandboxes: plain text, separate arguments.
+  property var worktrees: []
+  property real worktreesRead: 0
+  readonly property bool worktreesVisible: worktrees.length > 0
+  readonly property int worktreesUnmerged: worktrees.filter(function(w) { return w.unmerged !== 0 }).length
   property var harnesses: []
   // "ok", "missing" (paddock is not on PATH), or "error"
   property string pluginState: "ok"
   property bool loaded: false
 
   // View and cursor.
-  property string view: "list"          // list | project | harness | kv | keys | key
+  property string view: "list"          // list | project | harness | kv | keys | key | worktrees
   property int selectedIndex: 0
   property int actionIndex: -1           // -1: the row itself; 0..n: a row action
   property bool cursorActive: false
@@ -127,6 +133,7 @@ Panel {
     root.controller.show()
     // refresh() reads paddock kv only while the panel is open.
     refreshKv(true)
+    refreshWorktrees(true)
   }
   function close() { root.confirmId = ""; root.view = "list"; root.controller.hide() }
   function toggle() { if (root.opened) root.close(); else root.open("") }
@@ -175,7 +182,8 @@ Panel {
     if (view === "kv") return kvScopes.length
     if (view === "keys") return kvRows.length
     if (view === "key") return 0
-    return approvals.length + sandboxes.length + artifacts.length + (kvVisible ? 1 : 0)
+    if (view === "worktrees") return worktrees.length
+    return approvals.length + sandboxes.length + artifacts.length + (kvVisible ? 1 : 0) + (worktreesVisible ? 1 : 0)
   }
 
   // In the list view, approvals come first, then sandboxes, in one cursor order.
@@ -185,6 +193,9 @@ Panel {
   function isArtifactRow(i) { return view === "list" && artifacts.length > 0 && i >= approvals.length + sandboxes.length && i < approvals.length + sandboxes.length + artifacts.length }
   // The shared data row comes last.
   function isKvRow(i) { return view === "list" && kvVisible && i === approvals.length + sandboxes.length + artifacts.length }
+  // The worktrees row follows it.
+  function worktreesRowIndex() { return approvals.length + sandboxes.length + artifacts.length + (kvVisible ? 1 : 0) }
+  function isWorktreesRow(i) { return view === "list" && worktreesVisible && i === worktreesRowIndex() }
   function artifactAt(i) { return artifacts[i - approvals.length - sandboxes.length] }
   function dirName(path) {
     var p = String(path || "")
@@ -349,11 +360,13 @@ Panel {
       root.refresh()
     })
   }
-  // The credentials a sandbox uses through the gateway and the ssh agent channel.
+  // The credentials a sandbox uses through the gateway, the ssh agent
+  // channel and the secret files in /dev/paddock/secret.
   function usedCredentials(s) {
     var parts = []
     if (s.gateway !== "") parts.push(strings.t("row.gateway").arg(s.gateway))
     if (s.agent !== "") parts.push(strings.t("row.agent").arg(s.agent))
+    if (s.secretFiles !== "") parts.push(strings.t("row.secretFile").arg(s.secretFiles))
     return parts.join(" · ")
   }
 
@@ -441,6 +454,7 @@ Panel {
     if (view === "key") { view = "keys"; kvEntry = null; return true }
     if (view === "keys") { view = "kv"; kvKeys = []; kvTarget = null; selectedIndex = 0; return true }
     if (view === "kv") { view = "list"; selectedIndex = 0; return true }
+    if (view === "worktrees") { view = "list"; selectedIndex = 0; actionIndex = -1; return true }
     if (view === "harness") { view = "project"; selectedIndex = 0; return true }
     if (view === "project") { view = "list"; selectedIndex = 0; return true }
     return false
@@ -592,6 +606,70 @@ Panel {
     kvCopyProc.running = true
   }
 
+  // Worktrees. `paddock worktree list` runs a sandboxed git status for
+  // each one, so the panel reads it at most every 30 seconds.
+  function refreshWorktrees(force) {
+    if (!root.opened && !force) return
+    if (!force && Date.now() - root.worktreesRead < 30000) return
+    if (worktreesProc.running) return
+    root.worktreesRead = Date.now()
+    worktreesProc.buffer = ""
+    worktreesProc.running = true
+  }
+  function worktreesCaption() {
+    return strings.tn("wt.count", worktrees.length).arg(Commons.I18n.formatNumber(worktrees.length))
+      + (worktreesUnmerged > 0 ? " · " + strings.tn("wt.unmergedCount", worktreesUnmerged).arg(Commons.I18n.formatNumber(worktreesUnmerged)) : "")
+  }
+  function openWorktrees() {
+    root.view = "worktrees"
+    root.selectedIndex = 0
+    root.actionIndex = -1
+    root.confirmId = ""
+    refreshWorktrees(true)
+  }
+  function wtSafePath(p) { return typeof p === "string" && p.charAt(0) === "/" && p.length <= 1024 && !/[\u0000-\u001f\u007f]/.test(p) }
+  function wtCaption(w) {
+    var parts = [w.branch !== "" ? w.branch : strings.t("wt.noBranch")]
+    parts.push(w.unmerged < 0 ? strings.t("wt.commitsUnknown")
+      : strings.tn("wt.commits", w.unmerged).arg(Commons.I18n.formatNumber(w.unmerged)))
+    if (w.dirty === true) parts.push(strings.t("wt.dirty"))
+    return parts.join(" · ")
+  }
+  function wtMerge(w) {
+    if (!wtSafePath(w.path)) return
+    root.confirmId = ""
+    runPaddock(["worktree", "merge", w.path], function(code) {
+      root.say(code === 0 ? strings.t("wt.merged") : strings.t("wt.mergeFailed").arg(root.baseName(w.path)))
+      root.refreshWorktrees(true)
+    })
+  }
+  // Like a kv delete: the first press asks.
+  function wtRemove(w) {
+    if (!wtSafePath(w.path)) return
+    if (root.confirmId !== "wt:" + w.path) {
+      root.confirmId = "wt:" + w.path
+      confirmTimer.restart()
+      root.say(strings.t("wt.confirmRemove").arg(w.branch !== "" ? w.branch : root.baseName(w.path)))
+      return
+    }
+    root.confirmId = ""
+    runPaddock(["worktree", "remove", w.path], function(code) {
+      root.say(code === 0 ? strings.t("wt.removed") : strings.t("wt.removeFailed").arg(root.baseName(w.path)))
+      root.actionIndex = -1
+      root.refreshWorktrees(true)
+    })
+  }
+  function wtOpen(w) {
+    if (!wtSafePath(w.path)) return
+    Quickshell.execDetached(["xdg-open", w.path])
+    root.close()
+  }
+  function wtAction(w, i) {
+    if (i === 0) wtMerge(w)
+    else if (i === 1) wtRemove(w)
+    else wtOpen(w)
+  }
+
   // Footer and state actions.
   function runChecks() {
     Quickshell.execDetached(["env", "PADDOCK_HOLD=" + strings.t("terminal.pressEnter"), "sh", "-c", root.terminal, "paddock-terminal",
@@ -615,9 +693,14 @@ Panel {
     root.selectedIndex = Math.max(0, Math.min(n - 1, root.selectedIndex + dy))
   }
   function moveAction(dx) {
+    if (view === "worktrees" && rowCount() > 0) {
+      root.cursorActive = true
+      root.actionIndex = Math.max(-1, Math.min(2, root.actionIndex + dx))
+      return
+    }
     if (view !== "list" || rowCount() === 0) return
     root.cursorActive = true
-    if (isApprovalRow(selectedIndex) || isKvRow(selectedIndex)) return
+    if (isApprovalRow(selectedIndex) || isKvRow(selectedIndex) || isWorktreesRow(selectedIndex)) return
     var n = isArtifactRow(selectedIndex) ? 2 : actionsFor(sandboxAt(selectedIndex)).length
     root.actionIndex = Math.max(-1, Math.min(n - 1, root.actionIndex + dx))
   }
@@ -640,8 +723,14 @@ Panel {
       return
     }
     if (view === "key") return
+    if (view === "worktrees") {
+      var w = worktrees[selectedIndex]
+      if (w) wtAction(w, actionIndex)
+      return
+    }
     if (isApprovalRow(selectedIndex)) { answerOnCard(); return }
     if (isKvRow(selectedIndex)) { openKv(); return }
+    if (isWorktreesRow(selectedIndex)) { openWorktrees(); return }
     if (isArtifactRow(selectedIndex)) {
       var f = artifactAt(selectedIndex)
       if (actionIndex === 1) revealFile(f); else recoverFile(f)
@@ -750,8 +839,12 @@ Panel {
             gateway: Array.isArray(r.gateway) ? r.gateway.slice(0, 8).map(function(c) { return root.plain(c, 64) }).join(", ") : "",
             // Credentials it uses through the ssh agent channel.
             agent: Array.isArray(r.agent) ? r.agent.slice(0, 8).map(function(c) { return root.plain(c, 64) }).join(", ") : "",
-            // paddock credentials revoke covers gateway and agent credentials.
-            revocable: (Array.isArray(r.gateway) && r.gateway.length > 0) || (Array.isArray(r.agent) && r.agent.length > 0),
+            // Credentials it reads as files in /dev/paddock/secret.
+            secretFiles: Array.isArray(r.secret_files) ? r.secret_files.slice(0, 8).map(function(c) { return root.plain(c, 64) }).join(", ") : "",
+            // paddock credentials revoke covers gateway and agent credentials
+            // and secret files.
+            revocable: (Array.isArray(r.gateway) && r.gateway.length > 0) || (Array.isArray(r.agent) && r.agent.length > 0)
+              || (Array.isArray(r.secret_files) && r.secret_files.length > 0),
             // Monitoring findings that the user did not say OK to, outside
             // muted projects (monitor.rs): "tunnel: ngrok", "+N".
             monitor: root.monitorText(r.monitor_marks),
@@ -1012,6 +1105,34 @@ Panel {
   }
 
   JsonProc {
+    id: worktreesProc
+    command: ["sh", "-c", root.launcher, "paddock", "worktree", "list", "--json"]
+    onExited: function(exitCode) {
+      // An older paddock has no worktree command: show nothing.
+      if (exitCode !== 0) { root.worktrees = []; return }
+      try {
+        var p = JSON.parse(buffer)
+        if (!p || p.api_version !== "paddock.worktrees/v1") throw "version"
+        var raw = Array.isArray(p.worktrees) ? p.worktrees.slice(0, 64) : []
+        var clean = []
+        for (var i = 0; i < raw.length; i++) {
+          var w = raw[i] || {}
+          if (!root.wtSafePath(w.path)) continue
+          clean.push({ path: String(w.path), branch: root.plain(w.branch, 140),
+                       repoName: root.plain(root.baseName(w.repo), 48),
+                       unmerged: w.unmerged === null || w.unmerged === undefined ? -1 : Math.max(0, Math.floor(Number(w.unmerged))),
+                       dirty: w.dirty === true, running: w.running === true })
+        }
+        root.worktrees = clean
+        if (root.view === "worktrees" && root.selectedIndex >= clean.length) root.selectedIndex = Math.max(0, clean.length - 1)
+      } catch (e) {
+        root.debugLog("cannot read paddock worktree list: " + e)
+        root.worktrees = []
+      }
+    }
+  }
+
+  JsonProc {
     id: kvListProc
     onExited: function(exitCode) {
       if (exitCode !== 0) { root.kvKeys = []; return }
@@ -1207,8 +1328,13 @@ Panel {
           if (kr && !kr.group) root.kvRemove(kr)
           return
         }
+        if (root.view === "worktrees") {
+          var wr = root.worktrees[root.selectedIndex]
+          if (wr) root.wtRemove(wr)
+          return
+        }
         if (root.view !== "list" || root.rowCount() === 0) return
-        if (root.isKvRow(root.selectedIndex)) return
+        if (root.isKvRow(root.selectedIndex) || root.isWorktreesRow(root.selectedIndex)) return
         if (root.isApprovalRow(root.selectedIndex)) root.answer(root.approvals[root.selectedIndex], "deny")
         else if (root.isArtifactRow(root.selectedIndex)) return
         else root.stop(root.sandboxAt(root.selectedIndex))
@@ -1217,6 +1343,7 @@ Panel {
         if (root.view === "list" && (text === "n" || text === "N")) root.startNew()
         else if (text === "r" || text === "R") root.refresh()
         else if (root.view === "list" && root.kvVisible && (text === "k" || text === "K")) root.openKv()
+        else if (root.view === "list" && root.worktreesVisible && (text === "w" || text === "W")) root.openWorktrees()
         else if (root.view === "key" && (text === "c" || text === "C")) root.kvCopy()
       }
 
@@ -1240,12 +1367,14 @@ Panel {
             title: root.view === "project" ? strings.t("new.chooseProject")
               : root.view === "harness" ? strings.t("new.chooseHarness")
               : root.view === "kv" ? strings.t("kv.title")
+              : root.view === "worktrees" ? strings.t("wt.title")
               : root.view === "keys" ? root.kvScopeTitle(root.kvTarget)
               : root.view === "key" && root.kvEntry ? root.kvEntry.key
               : strings.t("panel.title")
             meta: {
               if (root.view === "project") return strings.t("new.stepProject")
               if (root.view === "harness") return strings.t("new.stepHarness")
+              if (root.view === "worktrees") return root.worktreesCaption()
               if (root.view === "kv")
                 return (root.kvPastureCount > 0 ? strings.tn("kv.rowPastures", root.kvPastureCount).arg(Commons.I18n.formatNumber(root.kvPastureCount)) + " · " : "")
                   + strings.tn("kv.keys", root.kvKeyTotal).arg(Commons.I18n.formatNumber(root.kvKeyTotal))
@@ -1362,7 +1491,7 @@ Panel {
                   : modelData.timer !== null ? strings.t(modelData.timer.over ? "row.timerOver" : "row.timer")
                       .arg(modelData.timer.name).arg(root.span(modelData.timer.used)).arg(root.span(modelData.timer.budget))
                   : modelData.credentials !== "" ? strings.t("row.holdsCredentials").arg(modelData.credentials)
-                  : modelData.gateway !== "" || modelData.agent !== "" ? root.usedCredentials(modelData)
+                  : modelData.gateway !== "" || modelData.agent !== "" || modelData.secretFiles !== "" ? root.usedCredentials(modelData)
                   : (modelData.parent !== "" ? strings.t("row.startedBy").arg(modelData.parent)
                   : (modelData.auth !== "" && modelData.auth !== "shared" ? strings.t("row.auth").arg(modelData.auth)
                   : (modelData.pasture !== "" ? strings.t("row.pasture").arg(modelData.pasture) : "")))
@@ -1497,6 +1626,70 @@ Panel {
               caption: (root.kvPastureCount > 0 ? strings.tn("kv.rowPastures", root.kvPastureCount).arg(Commons.I18n.formatNumber(root.kvPastureCount)) + " · " : "")
                 + strings.tn("kv.keys", root.kvKeyTotal).arg(Commons.I18n.formatNumber(root.kvKeyTotal))
               onActivated: root.openKv()
+            }
+          }
+
+          // Worktrees of apps and --worktree runs: one row that opens their view.
+          Column {
+            width: parent.width
+            spacing: Style.space(2)
+            visible: root.view === "list" && root.worktreesVisible
+            ListRow {
+              rowIndex: root.worktreesRowIndex()
+              glyph: "󰘬"
+              title: strings.t("wt.row")
+              caption: root.worktreesCaption()
+              onActivated: root.openWorktrees()
+            }
+          }
+
+          // The worktrees view: Merge, Remove (press twice), Open folder.
+          Column {
+            width: parent.width
+            spacing: Style.space(2)
+            visible: root.view === "worktrees"
+            PlainText {
+              width: parent.width
+              wrapMode: Text.WordWrap
+              color: root.dim
+              font.pixelSize: Style.font.caption
+              bottomPadding: Style.space(6)
+              text: root.worktrees.length === 0 ? strings.t("wt.empty") : strings.t("wt.intro")
+            }
+            Repeater {
+              model: root.view === "worktrees" ? root.worktrees : []
+              delegate: ListRow {
+                required property var modelData
+                required property int index
+                rowIndex: index
+                glyph: "󰘬"
+                glyphColor: root.confirmId === "wt:" + modelData.path ? root.urgent : root.fg
+                title: modelData.repoName !== "" ? modelData.repoName + " · " + root.baseName(modelData.path) : root.baseName(modelData.path)
+                caption: root.wtCaption(modelData)
+                caption2: modelData.running ? strings.t("wt.running") : ""
+                showActions: true
+                onActivated: root.wtOpen(modelData)
+
+                ActionButton {
+                  sandboxIndex: index; position: 0
+                  iconText: "󰘭"; tooltipText: strings.t("wt.merge")
+                  onClicked: root.wtMerge(modelData)
+                }
+                ActionButton {
+                  sandboxIndex: index; position: 1
+                  readonly property bool asking: root.confirmId === "wt:" + modelData.path
+                  iconText: asking ? "󰗖" : "󰆴"
+                  tooltipText: asking ? strings.t("kv.confirm") : strings.t("wt.remove")
+                  foreground: asking ? root.urgent : root.fg
+                  hoverColor: root.urgent
+                  onClicked: root.wtRemove(modelData)
+                }
+                ActionButton {
+                  sandboxIndex: index; position: 2
+                  iconText: "󰉋"; tooltipText: strings.t("wt.open")
+                  onClicked: root.wtOpen(modelData)
+                }
+              }
             }
           }
 
@@ -1738,12 +1931,14 @@ Panel {
               font.pixelSize: Style.font.caption
               wrapMode: Text.WordWrap
               text: root.view === "kv" ? strings.t("keys.kv")
+                : root.view === "worktrees" ? strings.t("keys.wt")
                 : root.view === "keys" ? strings.t("keys.kvKeys")
                 : root.view === "key" ? strings.t("keys.kvKey")
                 : root.view !== "list" ? strings.t("keys.new")
                 : root.isApprovalRow(root.selectedIndex) && root.approvals.length > 0 ? strings.t("keys.toCard")
                 : root.isArtifactRow(root.selectedIndex) && root.artifacts.length > 0 ? strings.t("keys.files")
                 : root.isKvRow(root.selectedIndex) ? strings.t("keys.kvRow")
+                : root.isWorktreesRow(root.selectedIndex) ? strings.t("keys.wtRow")
                 : strings.t("keys.list")
             }
             Button {

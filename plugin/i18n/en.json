@@ -228,6 +228,7 @@
   "popup.ask.credentials": "Give these credentials to %1 in %2? The agent can read them.",
   "row.gateway": "uses %1 through the gateway",
   "row.agent": "ssh agent: %1",
+  "row.secretFile": "secret file: %1",
   "action.revoke": "Revoke credentials",
   "msg.revoked": "Credentials revoked. The next request with them is refused.",
   "msg.revokeFailed": "paddock could not revoke the credentials.",
@@ -246,5 +247,35 @@
   "row.boundary": {
     "one": "%1 denied · read it: paddock boundary %2",
     "other": "%1 denied · read them: paddock boundary %2"
-  }
+  },
+  "wt.row": "Worktrees",
+  "wt.title": "Worktrees",
+  "wt.count": {
+    "one": "%1 worktree",
+    "other": "%1 worktrees"
+  },
+  "wt.unmergedCount": {
+    "one": "%1 with unmerged commits",
+    "other": "%1 with unmerged commits"
+  },
+  "wt.intro": "Branches that apps and --worktree runs worked on. Merge one into the current branch of its repository, or remove it. To keep it, do nothing.",
+  "wt.empty": "No worktrees.",
+  "wt.noBranch": "no branch",
+  "wt.commits": {
+    "one": "%1 unmerged commit",
+    "other": "%1 unmerged commits"
+  },
+  "wt.commitsUnknown": "unmerged commits unknown",
+  "wt.dirty": "uncommitted changes",
+  "wt.running": "A sandbox works in it",
+  "wt.merge": "Merge into the current branch",
+  "wt.remove": "Remove the worktree and its branch",
+  "wt.open": "Open the folder",
+  "wt.confirmRemove": "Remove %1 and its branch? Press again to remove it.",
+  "wt.merged": "Merged.",
+  "wt.mergeFailed": "paddock could not merge it. paddock worktree merge %1 tells why.",
+  "wt.removed": "Worktree removed.",
+  "wt.removeFailed": "paddock could not remove it. paddock worktree remove %1 tells why.",
+  "keys.wt": "↵ open folder · ←→ merge, remove · Del remove · Esc back",
+  "keys.wtRow": "↵ or W worktrees"
 }

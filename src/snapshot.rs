@@ -766,15 +766,9 @@ pub fn render_plan(meta: &Meta, plan: &Plan) -> String {
     t
 }
 
-/// "2026-11-02 14:05" in UTC.
+/// "2026-11-02 14:05" in local time.
 pub fn time(unix: u64) -> String {
-    let secs = unix % 86_400;
-    format!(
-        "{} {:02}:{:02}",
-        crate::storage::date(unix),
-        secs / 3600,
-        (secs % 3600) / 60
-    )
+    crate::storage::local_time(unix)
 }
 
 /// `paddock undo --list`.

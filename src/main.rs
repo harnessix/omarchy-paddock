@@ -378,6 +378,11 @@ enum Cmd {
         #[arg(short = 'n', long, default_value_t = 20)]
         lines: usize,
     },
+    /// The git worktrees that paddock made for --worktree runs and apps: list, merge or remove them.
+    Worktree {
+        #[command(subcommand)]
+        cmd: WorktreeCmd,
+    },
     /// Run desktop agent apps (ChatGPT/Codex, Claude, VS Code, flatpak apps) in a sandbox.
     #[command(after_help = APP_HELP)]
     App {
@@ -766,6 +771,28 @@ enum ApprovalsCmd {
         /// input, so it never shows in the process list or the shell history.
         #[arg(long, allow_hyphen_values = true)]
         text: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum WorktreeCmd {
+    /// List the worktrees with their branch, unmerged commits and state.
+    List {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Merge the branch into the current branch of the repository. No hook runs.
+    Merge {
+        /// The worktree path, its folder name or its branch.
+        target: String,
+    },
+    /// Remove the worktree and delete its branch. To keep both, do nothing.
+    Remove {
+        /// The worktree path, its folder name or its branch.
+        target: String,
+        /// Also with unmerged commits or uncommitted changes.
+        #[arg(long)]
+        force: bool,
     },
 }
 
@@ -1385,6 +1412,7 @@ fn real_main() -> Result<i32> {
             }
             Ok(0)
         }
+        Cmd::Worktree { cmd } => worktree_cmd(&env, cmd),
         Cmd::Log { json, lines } => {
             let text =
                 std::fs::read_to_string(paddock::broker::audit_file(&env)).unwrap_or_default();
@@ -3450,6 +3478,26 @@ fn pick_dir_gui(env: &HostEnv, name: &str) -> Option<PathBuf> {
         .ok()?;
     let dir = String::from_utf8_lossy(&out.stdout).trim().to_string();
     (out.status.success() && !dir.is_empty()).then(|| PathBuf::from(dir))
+}
+
+fn worktree_cmd(env: &HostEnv, cmd: WorktreeCmd) -> Result<i32> {
+    use paddock::worktree;
+    let all = worktree::list(env);
+    match cmd {
+        WorktreeCmd::List { json: true } => println!(
+            "{}",
+            serde_json::json!({ "api_version": "paddock.worktrees/v1", "worktrees": all })
+        ),
+        WorktreeCmd::List { json: false } => print!("{}", worktree::render(&all)),
+        WorktreeCmd::Merge { target } => {
+            println!("{}", worktree::merge(env, &worktree::find(&all, &target)?)?)
+        }
+        WorktreeCmd::Remove { target, force } => println!(
+            "{}",
+            worktree::remove(env, &worktree::find(&all, &target)?, force)?
+        ),
+    }
+    Ok(0)
 }
 
 fn app_cmd(env: &HostEnv, cmd: AppCmd) -> Result<i32> {
