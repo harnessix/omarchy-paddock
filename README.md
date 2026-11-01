@@ -232,6 +232,33 @@ If the project has a `mise.toml` or `.tool-versions` file, paddock installs its 
 
 If the shared installs already hold every version, paddock skips the first step. This does not apply to `latest`. Every project uses the shared tools. A tool in the sandbox home belongs to one project and its harness. If you set `mise_install = false` in `[setup]` of `paddock.toml`, paddock skips both steps. The srt backend cannot mount the shared installs, so it installs every tool in the sandbox home.
 
+## Undo a run
+
+The project is writable in the sandbox, and host tools run some project files later, for example `.envrc`, `mise.toml` hooks and editor tasks. Before each start, paddock takes a snapshot of the project files, so one command undoes a bad run.
+
+```sh
+paddock undo                  # the last session of this project
+paddock undo --list           # the snapshots: time, harness, size
+paddock undo claude-app-1a2b3c --yes
+```
+
+`paddock undo` lists the files that the run added, changed and deleted, and asks before it restores. Changed and deleted files come back from the snapshot. Added files go to `~/.local/share/paddock/undo-trash/TIME/`, so you can undo an undo by hand. The command refuses while a sandbox of the project runs. A file that changed after the session ended (you or another agent edited it) gets a warning and stays as it is. `--force` restores it too. At exit, paddock names `paddock undo` when the run changed files.
+
+The snapshot:
+
+- lives in `~/.local/share/paddock/snapshots/PROJECT/SESSION/`. paddock keeps the last 10 for each project.
+- leaves out `.git/`, which has its own history, and the folders that `.gitignore` ignores, such as `target` and `node_modules`. paddock asks its hardened host git for that list. Outside git, it leaves out `target`, `node_modules`, `.venv`, `dist` and `build`. `paddock undo` never touches these paths.
+- shares the file data with the project on btrfs, xfs and bcachefs (`FICLONE`), so it takes almost no space. On other file systems, paddock copies the files only while the copy stays under `[snapshot] max`.
+- has a time limit of 20 seconds. A slower snapshot is dropped with a notice, and the sandbox starts anyway.
+
+A `--worktree` run has its own branch and gets no snapshot. Set the options in `~/.config/paddock/config.toml`:
+
+```toml
+[snapshot]
+enabled = true     # the default
+max = "500M"       # the largest full copy, without shared file data
+```
+
 ## Files outside the project
 
 The project is shared with the host, so the agent's changes there are already yours. A file that the agent saves anywhere else, for example to `~/Desktop` or `~/Downloads`, stays in the private sandbox home. You do not see it until you recover it.
@@ -274,6 +301,7 @@ Each harness gets its own home in each project, so the homes grow with the numbe
 - The paddock images of docker and podman, and whether each is current or in use.
 - The worktrees that `--worktree` created, with their unmerged commits.
 - The session records of `paddock files`, and the keyring passwords of app homes.
+- The project snapshots and the undo trash of `paddock undo`.
 
 On btrfs, a size counts only the data that no other file shares. On other file systems, it counts the allocated blocks, as `du` does. The first line names the kind. `paddock du --json` prints the same data as JSON.
 
@@ -294,6 +322,7 @@ paddock gc --homes --yes                    # remove them
 - Session records that ended more than 30 days ago.
 - Homes of harnesses whose profile no longer exists.
 - Old shared caches that paddock no longer uses, such as `~/.cache/paddock/shared/mise-installs`. paddock keeps them while a sandbox runs.
+- Project snapshots whose project is gone.
 
 paddock also does this after it builds a new image. To turn that off, set `PADDOCK_GC_AFTER_BUILD=0`.
 
@@ -302,6 +331,7 @@ The other items need a flag that names them:
 - `--homes` adds homes whose project is gone, or that were not used for `--older-than` days (default 90). A home holds the transcripts and settings of a harness in one project. A terminal harness keeps its login in your home or in `~/.local/share/paddock/auth`, so the login stays.
 - A desktop app keeps its login in its home. If you delete the home, you must log in again. These homes also need `--include-app-logins`.
 - `--worktrees` adds paddock worktrees. A worktree with unmerged commits or uncommitted changes also needs `--force`. paddock then keeps its branch, so the commits stay in the repository.
+- `--snapshots` adds project snapshots and undo trash folders older than `--older-than` days. The files that an undo moved to the trash are lost.
 - `--scratch` adds scratch projects that were not used for `--older-than` days. An agent from `omarchy-agent` works in one when it starts in the home folder (see [Only the agents that Omarchy starts](#only-the-agents-that-omarchy-starts)). Its files are lost.
 
 paddock never removes the home or worktree of a running sandbox. It deletes only inside its own directories. It never follows a symlink, so a link in a sandbox home cannot point it at your files. A sandbox can edit the `.paddock-origin` file in its home, which records the project. paddock uses that file only when it matches the folder name of the home, which contains a hash of the project path.

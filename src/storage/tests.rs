@@ -169,6 +169,7 @@ fn inventory(homes: Vec<Home>) -> Inventory {
         any_running: false,
         build_cache: vec![],
         scratch: vec![],
+        snapshots: vec![],
     }
 }
 
@@ -818,4 +819,42 @@ fn podman_df_table_parses() {
             ("8f76cb6270bc".to_string(), 593_100_000)
         ]
     );
+}
+
+#[test]
+fn gc_removes_snapshots_of_gone_projects_and_old_ones_with_the_flag() {
+    let now = 1_000 * DAY;
+    let snap = |path: &str, exists: bool, started: u64, trash: bool| SnapshotDir {
+        path: path.into(),
+        project: (!trash).then(|| PathBuf::from("/src/app")),
+        harness: "fake".into(),
+        started,
+        bytes: 10,
+        project_exists: exists,
+        trash,
+    };
+    let mut inv = inventory(vec![]);
+    inv.snapshots = vec![
+        snap("/d/snapshots/app-1/gone", false, now, false),
+        snap("/d/snapshots/app-1/new", true, now, false),
+        snap("/d/snapshots/app-1/old", true, 0, false),
+        snap("/d/undo-trash/1-old", true, 0, true),
+    ];
+    let items = plan(&inv, &opts(), now);
+    let gone = find(&items, "snapshot gone").unwrap();
+    assert!(gone.selected());
+    assert_eq!(gone.tier, Tier::Auto);
+    assert!(find(&items, "snapshot new").is_none());
+    assert_eq!(
+        find(&items, "snapshot old").unwrap().needs,
+        vec!["--snapshots"]
+    );
+    assert!(!find(&items, "undo trash").unwrap().selected());
+    let o = GcOptions {
+        snapshots: true,
+        ..opts()
+    };
+    let items = plan(&inv, &o, now);
+    assert!(find(&items, "snapshot old").unwrap().selected());
+    assert!(find(&items, "undo trash").unwrap().selected());
 }

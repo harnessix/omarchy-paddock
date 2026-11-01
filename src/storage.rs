@@ -257,6 +257,53 @@ pub struct Inventory {
     pub build_cache: Vec<BuildRecord>,
     /// Scratch projects of `paddock wrap` starts in the home folder.
     pub scratch: Vec<Scratch>,
+    /// Project snapshots (`paddock undo`) and the undo trash.
+    pub snapshots: Vec<SnapshotDir>,
+}
+
+/// A project snapshot, or a folder of the undo trash (`trash`).
+#[derive(Debug, Clone, Serialize)]
+pub struct SnapshotDir {
+    pub path: PathBuf,
+    pub project: Option<PathBuf>,
+    pub harness: String,
+    pub started: u64,
+    pub bytes: u64,
+    pub project_exists: bool,
+    pub trash: bool,
+}
+
+/// The snapshots and the undo trash folders.
+pub fn scan_snapshots(env: &HostEnv) -> Vec<SnapshotDir> {
+    let mut out = Vec::new();
+    for base in subdirs(&crate::snapshot::root(env)) {
+        for (path, m) in crate::snapshot::list(&base) {
+            out.push(SnapshotDir {
+                path,
+                project_exists: m.project.is_dir(),
+                project: Some(m.project),
+                harness: m.harness,
+                started: m.started,
+                bytes: m.bytes,
+                trash: false,
+            });
+        }
+    }
+    for path in subdirs(&crate::snapshot::trash_root(env)) {
+        let started = std::fs::metadata(&path)
+            .map(|m| m.mtime().max(0) as u64)
+            .unwrap_or(0);
+        out.push(SnapshotDir {
+            bytes: allocated(&path),
+            path,
+            project: None,
+            harness: String::new(),
+            started,
+            project_exists: true,
+            trash: true,
+        });
+    }
+    out
 }
 
 /// A scratch project (`$XDG_DATA_HOME/paddock/scratch/<harness>`): where an
@@ -530,6 +577,8 @@ pub fn removable_roots(env: &HostEnv) -> Vec<PathBuf> {
         scratch_root(env),
         crate::borrow::root(env),
         crate::borrow::meta_root(env),
+        crate::snapshot::root(env),
+        crate::snapshot::trash_root(env),
     ]
 }
 
@@ -1125,6 +1174,7 @@ pub fn scan(env: &HostEnv, host: &Host, with_sizes: bool) -> Inventory {
         any_running: !running.is_empty(),
         build_cache,
         scratch,
+        snapshots: scan_snapshots(env),
     };
     if with_sizes {
         measure(&mut inv, |_| true);
@@ -1181,6 +1231,9 @@ pub struct GcOptions {
     pub scratch: bool,
     /// Also share the data of identical files in the sandbox homes.
     pub dedupe: bool,
+    /// Also project snapshots and undo trash folders older than
+    /// `older_than_days`.
+    pub snapshots: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -1411,6 +1464,37 @@ pub fn plan(inv: &Inventory, o: &GcOptions, now: u64) -> Vec<Item> {
             needs,
             action: Action::Path {
                 path: h.path.clone(),
+            },
+        });
+    }
+    for c in &inv.snapshots {
+        let gone = !c.trash && !c.project_exists;
+        if !gone && c.started > old {
+            continue;
+        }
+        let mut needs = Vec::new();
+        if !gone {
+            need(&mut needs, o.snapshots, "--snapshots");
+        }
+        let what = match &c.project {
+            Some(p) if !c.trash => format!("snapshot {} of {}", name(&c.path), p.display()),
+            _ => format!("undo trash {}", c.path.display()),
+        };
+        items.push(Item {
+            what,
+            tier: if gone { Tier::Auto } else { Tier::Consent },
+            bytes: c.bytes,
+            reason: if gone {
+                "its project is gone".into()
+            } else {
+                format!("{} days old", now.saturating_sub(c.started) / DAY)
+            },
+            warning: c
+                .trash
+                .then(|| "the files that an undo moved away are lost".to_string()),
+            needs,
+            action: Action::Path {
+                path: c.path.clone(),
             },
         });
     }
@@ -1835,6 +1919,32 @@ pub fn render_du(env: &HostEnv, inv: &Inventory, now: u64) -> String {
                 c.harness,
                 tilde(&c.path),
                 if c.running { " [running]" } else { "" }
+            ));
+        }
+    }
+    if !inv.snapshots.is_empty() {
+        t.push_str(&format!(
+            "\nProject snapshots and undo trash (`paddock undo`): {}\n",
+            human(inv.snapshots.iter().map(|c| c.bytes).sum())
+        ));
+        for c in &inv.snapshots {
+            let what = match &c.project {
+                Some(p) if !c.trash => format!(
+                    "{} {}{}",
+                    c.harness,
+                    tilde(p),
+                    if c.project_exists {
+                        ""
+                    } else {
+                        " [project gone]"
+                    }
+                ),
+                _ => format!("trash {}", tilde(&c.path)),
+            };
+            t.push_str(&format!(
+                "  {:>9}  {:<12}  {what}\n",
+                human(c.bytes),
+                ago(now, c.started),
             ));
         }
     }

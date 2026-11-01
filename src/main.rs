@@ -154,6 +154,10 @@ enum Cmd {
         /// wrap`) that were not used for --older-than days. Their files are lost.
         #[arg(long)]
         scratch: bool,
+        /// Also project snapshots and undo trash folders older than --older-than
+        /// days. paddock removes the snapshots of a project that is gone without it.
+        #[arg(long)]
+        snapshots: bool,
         /// With --worktrees: also worktrees with unmerged commits or uncommitted changes.
         #[arg(long)]
         force: bool,
@@ -167,6 +171,20 @@ enum Cmd {
         id: Option<String>,
         #[arg(long)]
         json: bool,
+    },
+    /// Bring the project back to its snapshot from before a sandbox started.
+    Undo {
+        /// A session id from `paddock undo --list`. Without it, the last session of this project.
+        session: Option<String>,
+        /// List the snapshots of this project.
+        #[arg(long)]
+        list: bool,
+        /// Restore without a question.
+        #[arg(long, short = 'y')]
+        yes: bool,
+        /// Also restore files that changed after the session ended.
+        #[arg(long)]
+        force: bool,
     },
     /// Copy files from a sandbox home to the host, then remove the sandbox copy.
     Recover {
@@ -1996,6 +2014,12 @@ fn real_main() -> Result<i32> {
             Ok(0)
         }
         Cmd::Files { id, json } => files_cmd(&env, id.as_deref(), json),
+        Cmd::Undo {
+            session,
+            list,
+            yes,
+            force,
+        } => paddock::snapshot::undo_cmd(&env, session.as_deref(), list, yes, force),
         Cmd::Kv { cmd } => {
             use paddock::kv::host;
             match cmd {
@@ -2052,6 +2076,7 @@ fn real_main() -> Result<i32> {
             force,
             scratch,
             dedupe,
+            snapshots,
             json,
         } => gc_cmd(
             &env,
@@ -2064,6 +2089,7 @@ fn real_main() -> Result<i32> {
                 force,
                 scratch,
                 dedupe,
+                snapshots,
             },
             json,
         ),
