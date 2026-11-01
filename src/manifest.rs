@@ -20,7 +20,15 @@ pub const PROJECT_FILE: &str = "paddock.toml";
 /// (pasture.rs), `[credentials]` (credentials.rs) and `[exec]`
 /// (gatewayd.rs). A project
 /// `paddock.toml` with one of them is invalid.
-pub const USER_ONLY: &[&str] = &["devices", "kv", "exec", "pastures", "credentials", "logins"];
+pub const USER_ONLY: &[&str] = &[
+    "devices",
+    "kv",
+    "exec",
+    "pastures",
+    "credentials",
+    "logins",
+    "status",
+];
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]

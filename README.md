@@ -797,6 +797,21 @@ The numbers come from the Omarchy agents panel's records. paddock asks for fresh
 
 The rates are simple: the slope between two checks, and the median of earlier windows. The fewer the checks, the rougher the estimate.
 
+### In the agent's context
+
+An agent that forgot its timer does not ask for it. So for Claude Code, paddock adds three hooks (with `--settings`; Claude Code merges them with your own hooks) that run `paddock-host status`:
+
+- at the start of a session, on resume and after a compaction: every timer and every limit, in a few lines;
+- on each prompt: only what needs attention: a timer with less than a fifth of its time left or past its end, and a limit that runs out before it resets or is 90% used;
+- after each tool: the same, and the same lines at most once in 10 minutes.
+
+The hooks print nothing when nothing needs attention, and never stop the agent. Other harnesses get the same advice from the paddock-host skill. To turn the hooks off, set this in `~/.config/paddock/config.toml`:
+
+```toml
+[status]
+hooks = false
+```
+
 ## Devices: /dev/paddock
 
 A device is a host service that the sandbox uses as a file. Each sandbox gets its own small file system at `/dev/paddock`. The paddock process on the host serves it, so paddock knows which sandbox calls. No root and no credentials enter the sandbox.
