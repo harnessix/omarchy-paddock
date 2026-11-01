@@ -418,7 +418,7 @@ On docker and podman, the container gets the same proxy and the same rules. On s
 
 ### Monitoring
 
-paddock watches each bwrap or srt sandbox that runs in its scope (a systemd user instance). It counts on this computer, keeps the numbers here and contacts no vendor service. It never reads content. You get a desktop notification and a line in the audit log (`paddock log`, capability `monitor`) once per sandbox and finding, so you never need to read logs.
+paddock watches each bwrap or srt sandbox that runs in its scope (a systemd user instance), and the connections of the host proxy. It counts on this computer, keeps the numbers here and contacts no vendor service. It never reads content. You get a desktop notification and a line in the audit log (`paddock log`, capability `monitor`) once per sandbox and finding, so you never need to read logs.
 
 #### Tunnel watch
 
@@ -463,13 +463,23 @@ A key or a token that a sandbox plants in its home can keep access later. paddoc
 - In `~/.config/paddock/config.toml`, `[monitor] credentials = false` turns the check off, and `[monitor] notify = false` keeps the audit lines without a notification.
 - It works with every backend, as long as paddock kv runs.
 
+#### Egress targets
+
+The host proxy sees the target of each connection of docker and podman sandboxes, and of network mode `api` on every backend. paddock records the target host of each allowed connection per harness in `~/.local/state/paddock/monitor/egress-<harness>.json`: the host name, first seen, last seen and a count. It never records a path or content, and keeps the last 90 days. The boundary log has the refused connections.
+
+- paddock tells you once per sandbox and reason when a harness connects to a host it never reached before (`new_host`), or to more than 10 new hosts within 10 minutes (`new_hosts`). The alert is an audit line (capability `monitor`), a notification and a panel mark.
+- A new install does not alert on everything: the rules start after 20 sandbox runs of the harness, or 7 days after its first recorded run.
+- In `~/.config/paddock/config.toml`, `[monitor] egress = false` turns the record off, and `[monitor] notify = false` keeps the audit line without a notification. A project `paddock.toml` cannot change either.
+- bwrap and srt sandboxes in network mode `egress` do not use the host proxy, so paddock does not see their targets.
+
 #### Findings in the panel, OK and mute
 
-The bar panel marks a sandbox with findings: its row gets a line in the urgent color, such as `tunnel: ngrok`, `upload: 6.2 GB this hour` or `new credential file: ~/.ssh/id_ed25519`, and `+N` for more. A frozen sandbox and warnings come first, timers after.
+The bar panel marks a sandbox with findings: its row gets a line in the urgent color, such as `tunnel: ngrok`, `upload: 6.2 GB this hour`, `new credential file: ~/.ssh/id_ed25519` or `new host: example.com`, and `+N` for more. A frozen sandbox and warnings come first, timers after.
 
 - The OK action on the row (or `paddock monitor ack ID`) clears the mark of that sandbox until a new finding. paddock writes the acknowledgement into the run folder. The audit log keeps the findings.
 - `paddock monitor list` prints the findings of the running sandboxes, and `--json` prints them as JSON. `paddock ps --json` shows the marked ones in `monitor_marks`.
 - `monitor.json` in the run folder flags upload alerts in `alerts` (`upload_per_hour`, `factor`) and keeps the bytes of the alert's hour in `alert_sent`.
+- `monitor-egress.json` in the run folder keeps the egress findings: the new host, or the count of new hosts.
 - A project that is noisy on purpose gets no notification and no mark when you mute it. The audit lines stay. A muted path covers its folders too.
 
 ```sh

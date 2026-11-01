@@ -28,6 +28,8 @@
 //! `~/.netrc`, token files and the like) every few minutes and once at the
 //! end. It records paths and sizes, never content. A change to a login file
 //! of the harness profile is a token refresh: it counts, with no alert.
+//!
+//! The host proxy records the target hosts of each harness (`egress`).
 
 use crate::env::HostEnv;
 use crate::kv::Identity;
@@ -36,6 +38,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+
+pub mod egress;
 
 /// The capability name in the audit log.
 pub const CAPABILITY: &str = "monitor";
@@ -61,6 +65,7 @@ pub struct MonitorCfg {
     /// An hour that sends this many times the usual hour makes an alert.
     pub factor: f64,
     pub credentials: bool,
+    pub egress: bool,
 }
 
 /// The default `upload_per_hour`: 5 GB.
@@ -126,6 +131,7 @@ impl MonitorCfg {
             upload_per_hour,
             factor,
             credentials: get("credentials"),
+            egress: get("egress"),
         }
     }
 }
@@ -245,9 +251,10 @@ pub fn read_credential_files(env: &HostEnv, sandbox: &str) -> Vec<CredFile> {
 /// One finding of a sandbox, for the panel and `paddock monitor list`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Finding {
-    /// `tunnel`, `upload` or `credential_file`.
+    /// `tunnel`, `upload`, `credential_file`, `new_host` or `new_hosts`.
     pub kind: &'static str,
-    /// The tool, the bytes of the hour (`6.2 GB`), or the path (`~/.netrc`).
+    /// The tool, the bytes of the hour (`6.2 GB`), the path (`~/.netrc`),
+    /// the host, or the count of new hosts.
     pub detail: String,
     /// The user said OK to it (`paddock monitor ack`).
     pub acked: bool,
@@ -259,6 +266,8 @@ impl Finding {
         match self.kind {
             "tunnel" => format!("tunnel: {}", self.detail),
             "upload" => format!("upload: {} this hour", self.detail),
+            "new_host" => format!("new host: {}", self.detail),
+            "new_hosts" => format!("new hosts: {} in 10 minutes", self.detail),
             _ => format!("new credential file: {}", self.detail),
         }
     }
@@ -279,6 +288,8 @@ struct Ack {
     alerts: BTreeSet<String>,
     #[serde(default)]
     credential_files: BTreeSet<String>,
+    #[serde(default)]
+    egress: BTreeSet<String>,
 }
 
 fn load_ack(file: &Path) -> Ack {
@@ -288,7 +299,7 @@ fn load_ack(file: &Path) -> Ack {
         .unwrap_or_default()
 }
 
-fn findings_of(rec: &Record, ack: &Ack) -> Vec<Finding> {
+fn findings_of(rec: &Record, egress: &BTreeMap<String, String>, ack: &Ack) -> Vec<Finding> {
     let mut out: Vec<Finding> = rec
         .tunnels
         .iter()
@@ -315,6 +326,18 @@ fn findings_of(rec: &Record, ack: &Ack) -> Vec<Finding> {
         detail: format!("~/{}", f.path),
         acked: ack.credential_files.contains(&f.path),
     }));
+    for (reason, detail) in egress {
+        let kind = match reason.as_str() {
+            "new_host" => "new_host",
+            "new_hosts" => "new_hosts",
+            _ => continue,
+        };
+        out.push(Finding {
+            kind,
+            detail: detail.clone(),
+            acked: ack.egress.contains(reason),
+        });
+    }
     out
 }
 
@@ -322,6 +345,7 @@ fn findings_of(rec: &Record, ack: &Ack) -> Vec<Finding> {
 pub fn findings(env: &HostEnv, sandbox: &str) -> Vec<Finding> {
     findings_of(
         &load_record(&seen_file(env, sandbox)),
+        &egress::load_found(&egress::found_file(env, sandbox)),
         &load_ack(&ack_file(env, sandbox)),
     )
 }
@@ -343,6 +367,7 @@ pub fn marks(env: &HostEnv, sandbox: &str, project: &Path) -> Vec<Finding> {
 /// many findings it acknowledged.
 pub fn ack(env: &HostEnv, sandbox: &str) -> std::io::Result<usize> {
     let rec = load_record(&seen_file(env, sandbox));
+    let found = egress::load_found(&egress::found_file(env, sandbox));
     let ack = Ack {
         tunnels: rec.tunnels.clone(),
         alerts: rec.alerts.clone(),
@@ -351,8 +376,9 @@ pub fn ack(env: &HostEnv, sandbox: &str) -> std::io::Result<usize> {
             .iter()
             .map(|f| f.path.clone())
             .collect(),
+        egress: found.keys().cloned().collect(),
     };
-    let count = findings_of(&rec, &ack).len();
+    let count = findings_of(&rec, &found, &ack).len();
     let file = ack_file(env, sandbox);
     if let Some(d) = file.parent() {
         crate::privfs::dir(d)?;
@@ -797,7 +823,16 @@ pub struct Baseline {
 
 /// The baseline file of a harness in a project.
 pub fn baseline_file(env: &HostEnv, harness: &str, project: &Path) -> PathBuf {
-    let name: String = harness
+    env.paddock_state().join("monitor").join(format!(
+        "{}-{}.json",
+        file_name(harness),
+        crate::kv::shard::project_hash(project)
+    ))
+}
+
+/// A harness name that is safe in a file name.
+fn file_name(harness: &str) -> String {
+    harness
         .chars()
         .map(|c| {
             if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
@@ -806,11 +841,7 @@ pub fn baseline_file(env: &HostEnv, harness: &str, project: &Path) -> PathBuf {
                 '_'
             }
         })
-        .collect();
-    env.paddock_state().join("monitor").join(format!(
-        "{name}-{}.json",
-        crate::kv::shard::project_hash(project)
-    ))
+        .collect()
 }
 
 impl Baseline {
@@ -1396,12 +1427,13 @@ mod tests {
                 upload_per_hour: 5 << 30,
                 factor: 10.0,
                 credentials: true,
+                egress: true,
             }
         );
         let off = MonitorCfg::parse(
-            "[monitor]\ntunnels = false\nnotify = false\ntraffic = false\nupload_per_hour = \"300M\"\nfactor = 4\ncredentials = false\n",
+            "[monitor]\ntunnels = false\nnotify = false\ntraffic = false\nupload_per_hour = \"300M\"\nfactor = 4\ncredentials = false\negress = false\n",
         );
-        assert!(!off.tunnels && !off.notify && !off.traffic && !off.credentials);
+        assert!(!off.tunnels && !off.notify && !off.traffic && !off.credentials && !off.egress);
         assert_eq!((off.upload_per_hour, off.factor), (300 << 20, 4.0));
         let num = MonitorCfg::parse("[monitor]\nupload_per_hour = 1000\nfactor = 2.5\n");
         assert_eq!((num.upload_per_hour, num.factor), (1000, 2.5));
@@ -1808,6 +1840,26 @@ Inter-|   Receive                                                |  Transmit
         let mut other = Seen::open(seen_file(&env, "s2"));
         other.fresh(vec![tunnel_in(&argv("ngrok http 80")).unwrap()]);
         assert_eq!(marks(&env, "s2", project).len(), 1);
+    }
+
+    #[test]
+    fn egress_findings_reach_the_marks_and_the_ack() {
+        let tmp = tempfile::tempdir().unwrap();
+        let env = test_env(tmp.path());
+        let project = Path::new("/work/app");
+        let file = egress::found_file(&env, "s1");
+        crate::privfs::dir(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, r#"{"new_host":"new.example","new_hosts":"11"}"#).unwrap();
+        let texts: Vec<String> = marks(&env, "s1", project)
+            .iter()
+            .map(Finding::text)
+            .collect();
+        assert_eq!(
+            texts,
+            ["new host: new.example", "new hosts: 11 in 10 minutes"]
+        );
+        assert_eq!(ack(&env, "s1").unwrap(), 2);
+        assert!(marks(&env, "s1", project).is_empty());
     }
 
     #[test]

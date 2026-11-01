@@ -239,6 +239,8 @@
   "row.monitorTunnel": "tunnel: %1",
   "row.monitorUpload": "upload: %1 this hour",
   "row.monitorCredential": "new credential file: %1",
+  "row.monitorNewHost": "new host: %1",
+  "row.monitorNewHosts": "new hosts: %1 in 10 minutes",
   "row.monitorMore": "%1 +%2",
   "action.ack": "OK, clear the mark",
   "msg.acked": "The mark is cleared. The audit log keeps the findings.",

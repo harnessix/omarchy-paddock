@@ -221,6 +221,8 @@
   "row.monitorTunnel": "隧道：%1",
   "row.monitorUpload": "上传：本小时 %1",
   "row.monitorCredential": "新凭据文件：%1",
+  "row.monitorNewHost": "新主机：%1",
+  "row.monitorNewHosts": "新主机：10 分钟内 %1 个",
   "row.monitorMore": "%1 +%2",
   "action.ack": "知道了，清除标记",
   "msg.acked": "标记已清除。审计日志保留这些发现。",

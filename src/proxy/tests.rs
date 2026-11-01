@@ -881,3 +881,32 @@ fn api_refusals_reach_the_boundary_log() {
     assert_eq!(lines[1].target, "api.example.com:80");
     assert_eq!(lines[1].rule, "network mode api: plain HTTP");
 }
+
+#[test]
+fn a_connection_records_its_host_for_the_egress_monitor() {
+    let port = echo_server();
+    let dir = tempfile::tempdir().unwrap();
+    let history = dir.path().join("monitor").join("egress-h.json");
+    let tracker = Mutex::new(crate::monitor::egress::Tracker::new(
+        history.clone(),
+        dir.path().join("found.json"),
+    ));
+    let (_d, sock) = start(HostProxy {
+        allow_loopback: vec![port],
+        egress: Some(Egress(Arc::new(move |host: &str| {
+            tracker.lock().unwrap().connect(host, 100);
+        }))),
+        ..Default::default()
+    });
+    let (code, mut s) = connect(&sock, &format!("localhost:{port}"));
+    assert_eq!(code, 200);
+    roundtrip(&mut s, b"hello");
+    let h = crate::monitor::egress::History::load(&history);
+    assert_eq!(h.hosts.keys().collect::<Vec<_>>(), ["localhost"]);
+    assert_eq!(h.hosts["localhost"].count, 1);
+    // A refused target is not recorded.
+    let (code, _) = connect(&sock, "127.0.0.1:1");
+    assert_eq!(code, 403);
+    let h = crate::monitor::egress::History::load(&history);
+    assert_eq!(h.hosts.len(), 1);
+}
