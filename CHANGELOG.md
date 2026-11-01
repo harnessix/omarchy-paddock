@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- New: host principals for paddock kv. `[kv.principals.NAME]` in the user configuration names a host script or CI job and its pastures. `paddock kv put|delete|watch|claim|release --as NAME --pasture P` writes and watches as that principal, with the writer `principal:NAME`. The first write to a pasture in a session asks on an approval card. A principal frees only its own leases and has the quotas of a sandbox writer.
 - New: `paddock worktree list`, `paddock worktree merge PATH|BRANCH` and `paddock worktree remove PATH|BRANCH [--force]` for the worktrees of apps and `--worktree` runs. `merge` uses the hardened host git, runs no hook and refuses a repository with uncommitted changes. `remove` deletes the branch too and refuses unmerged commits without `--force`. The bar panel has a "Worktrees" row with Merge, Remove and Open folder buttons, and the notification after an app ends has Merge and Remove buttons.
 - The bar panel lists the secret files of a sandbox ("secret file: NAME", `as = "file"` credentials), and its revoke button covers them.
 - `paddock undo --list` and `paddock undo` show the snapshot time in the local time zone. Before, they showed it in UTC.

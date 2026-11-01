@@ -1080,6 +1080,25 @@ A write can depend on the current version of a key (`--if-version`). A key can e
 
 On the host, `paddock kv list` shows the pastures of the current folder and their keys. `paddock kv list --pasture NAME`, `paddock kv get KEY --pasture NAME`, `paddock kv delete KEY --pasture NAME` and `paddock kv release NAME --pasture NAME` read one of them. The pasture of a sandbox without one is `solo-<sandbox id>`. `--user`, `--sandbox ID` and `--tree ROOT-ID` choose another scope.
 
+### Host scripts as principals
+
+A host script or a CI job on the same machine can hand tasks to agents and wait for their results. It acts as a named principal from the user configuration:
+
+```toml
+[kv.principals.ci]
+pastures = ["review"]       # pastures of the current project that it may use
+write = true                # false: read and watch only
+```
+
+- `paddock kv put KEY [VALUE] --as ci --pasture review` writes a key (without VALUE, it reads standard input). `--ttl`, `--version` and `--project` work as for `paddock-host kv`.
+- `paddock kv watch KEY --as ci --pasture review` waits for a change. `--prefix`, `--version` and `--timeout` work as inside a sandbox. Exit code 75 means "still waiting".
+- `paddock kv claim NAME --ttl 60 --as ci --pasture review`, `paddock kv release NAME --as ci --pasture review` and `paddock kv delete KEY --as ci --pasture review` work on the pasture as that principal.
+- Each entry records the writer `principal:ci`. Agents see that name, and read the entry as untrusted data, as every entry of a pasture.
+- The first write of a principal to a pasture asks you on an approval card ("let `ci` write to the pasture `review`"). "Allow for this session" covers that principal and pasture until your login session ends. paddock keeps the grant in the run folder.
+- paddock refuses a principal that is not in the configuration, and a pasture that is not in its list.
+- A principal claims and releases only its own leases. To free the lease of a sandbox, use `paddock kv release NAME --pasture NAME` without `--as`.
+- A principal has the same quotas as a sandbox in the pasture. The audit log records the principal, the pasture, the key, the operation and the size, never the value.
+
 Older paddock versions kept one `project` scope for all sandboxes of a project, in `store.db`. Sandboxes no longer read it, because nobody chose to share it. `paddock kv list --legacy` shows it, and `paddock gc` removes it when nothing changed it for `keep_days`.
 
 The limits and the `user` scope are in `~/.config/paddock/config.toml`. A project `paddock.toml` cannot change them.

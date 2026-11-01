@@ -1912,3 +1912,147 @@ fn the_timer_summary_is_written_at_once_after_a_change() {
     timer_tick(&w.env, a.identity(), &w.root, &KvCfg::default()).unwrap();
     assert_eq!(before, read());
 }
+
+const PRINCIPALS: &str = "[kv.principals.ci]\npastures = [\"team\"]\n\n[kv.principals.watcher]\npastures = [\"team\"]\nwrite = false\n";
+
+fn principal<'a>(
+    w: &World,
+    name: &'a str,
+    answer: Option<Answer>,
+) -> (principal::Call<'a>, Arc<Fixed>) {
+    let fixed = Arc::new(Fixed {
+        answer,
+        note: Mutex::new(None),
+        asked: Mutex::new(Vec::new()),
+    });
+    let call = principal::Call {
+        name,
+        project: Path::new("/src/app"),
+        pasture: TEAM,
+        approver: fixed.clone(),
+        wait: Duration::from_secs(1),
+        root: Some(w.root.clone()),
+    };
+    (call, fixed)
+}
+
+#[test]
+fn principals_parse_from_the_config() {
+    let c = KvCfg::parse(PRINCIPALS).unwrap();
+    assert_eq!(c.principals["ci"].pastures, vec!["team".to_string()]);
+    assert!(c.principals["ci"].write);
+    assert!(!c.principals["watcher"].write);
+    assert!(KvCfg::parse("[kv.principals.ci]\nunknown = 1\n").is_err());
+    assert!(KvCfg::parse("[kv.principals.\"a b\"]\n").is_err());
+    assert!(KvCfg::parse("[kv.principals.ci]\npastures = [\"Bad Name\"]\n").is_err());
+}
+
+#[test]
+fn a_principal_writes_and_members_see_its_name() {
+    let w = world();
+    let cfg = KvCfg::parse(PRINCIPALS).unwrap();
+    let (ci, asked) = principal(&w, "ci", Some(Answer::Session));
+    let r = ci.handle(&w.env, &cfg, &put(Scope::Own, "task", "review it"));
+    assert_eq!(r.status, Status::Done, "{}", r.message);
+    assert_eq!(asked.asked.lock().unwrap().len(), 1);
+    let card = asked.asked.lock().unwrap()[0].clone();
+    assert_eq!(card.summary, "let `ci` write to the pasture `team`");
+    // "Allow for this session" covers the next write.
+    let r = ci.handle(&w.env, &cfg, &put(Scope::Own, "task2", "x"));
+    assert_eq!(r.status, Status::Done);
+    assert_eq!(asked.asked.lock().unwrap().len(), 1);
+    let (a, _) = service(&w, "a", None, KvCfg::default(), None);
+    let r = a.handle(&req("get", Scope::Pasture, "task"), None);
+    assert_eq!(r.result["value"], "review it");
+    assert_eq!(r.result["writer"], "principal:ci");
+    assert_eq!(r.result["untrusted"], true);
+    // The audit names the principal and the pasture, never the value.
+    let log = std::fs::read_to_string(audit_file(&w.env)).unwrap();
+    assert!(log.contains("\"principal\":\"ci\""));
+    assert!(log.contains("\"pasture\":\"team\""));
+    assert!(!log.contains("review it"));
+}
+
+#[test]
+fn a_principal_outside_its_pastures_or_config_is_refused() {
+    let w = world();
+    let cfg = KvCfg::parse(PRINCIPALS).unwrap();
+    let (mut ci, asked) = principal(&w, "ci", Some(Answer::Session));
+    ci.pasture = "other";
+    let r = ci.handle(&w.env, &cfg, &put(Scope::Own, "k", "v"));
+    assert_eq!(r.status, Status::Denied);
+    let (nobody, _) = principal(&w, "nobody", Some(Answer::Session));
+    let r = nobody.handle(&w.env, &cfg, &put(Scope::Own, "k", "v"));
+    assert_eq!(r.status, Status::Denied);
+    assert!(asked.asked.lock().unwrap().is_empty());
+}
+
+#[test]
+fn a_read_only_principal_watches_but_cannot_write() {
+    let w = world();
+    let cfg = KvCfg::parse(PRINCIPALS).unwrap();
+    let (watcher, asked) = principal(&w, "watcher", Some(Answer::Session));
+    let r = watcher.handle(&w.env, &cfg, &put(Scope::Own, "k", "v"));
+    assert_eq!(r.status, Status::Denied);
+    let mut claim = req("claim", Scope::Own, "job");
+    claim.ttl = Some(60);
+    assert_eq!(watcher.handle(&w.env, &cfg, &claim).status, Status::Denied);
+    let (a, _) = service(&w, "a", None, KvCfg::default(), None);
+    a.handle(&put(Scope::Pasture, "result", "ok"), None);
+    let mut watch = req("watch", Scope::Own, "result");
+    watch.version = Some(0);
+    watch.timeout = Some(1);
+    let r = watcher.handle(&w.env, &cfg, &watch);
+    assert_eq!(r.status, Status::Done, "{}", r.message);
+    assert_eq!(r.result["value"], "ok");
+    assert!(asked.asked.lock().unwrap().is_empty());
+}
+
+#[test]
+fn a_denied_or_once_write_asks_again() {
+    let w = world();
+    let cfg = KvCfg::parse(PRINCIPALS).unwrap();
+    let (ci, asked) = principal(&w, "ci", Some(Answer::Deny));
+    assert_eq!(
+        ci.handle(&w.env, &cfg, &put(Scope::Own, "k", "v")).status,
+        Status::Denied
+    );
+    let (ci, asked2) = principal(&w, "ci", Some(Answer::Once));
+    assert_eq!(
+        ci.handle(&w.env, &cfg, &put(Scope::Own, "k", "v")).status,
+        Status::Done
+    );
+    ci.handle(&w.env, &cfg, &put(Scope::Own, "k", "w"));
+    assert_eq!(asked.asked.lock().unwrap().len(), 1);
+    assert_eq!(asked2.asked.lock().unwrap().len(), 2);
+}
+
+#[test]
+fn a_principal_frees_its_own_leases_only() {
+    let w = world();
+    let cfg = KvCfg::parse(PRINCIPALS).unwrap();
+    let (ci, _) = principal(&w, "ci", Some(Answer::Session));
+    let (a, _) = service(&w, "a", None, KvCfg::default(), None);
+    let mut claim = req("claim", Scope::Pasture, "build");
+    claim.ttl = Some(60);
+    assert_eq!(a.handle(&claim, None).status, Status::Done);
+    // The sandbox holds it: the principal cannot take or free it, even
+    // with force.
+    assert_eq!(ci.handle(&w.env, &cfg, &claim).status, Status::Conflict);
+    let mut release = req("release", Scope::Own, "build");
+    release.force = Some(true);
+    assert_eq!(ci.handle(&w.env, &cfg, &release).status, Status::Denied);
+    // Its own lease: it claims and releases it, and the sandbox cannot free it.
+    let mut own = req("claim", Scope::Own, "deploy");
+    own.ttl = Some(60);
+    let r = ci.handle(&w.env, &cfg, &own);
+    assert_eq!(r.status, Status::Done, "{}", r.message);
+    assert_eq!(r.result["owner"], "principal:ci");
+    assert_eq!(
+        a.handle(&req("release", Scope::Pasture, "deploy"), None)
+            .status,
+        Status::Denied
+    );
+    let r = ci.handle(&w.env, &cfg, &req("release", Scope::Own, "deploy"));
+    assert_eq!(r.status, Status::Done, "{}", r.message);
+}

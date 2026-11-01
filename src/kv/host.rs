@@ -321,8 +321,12 @@ pub fn get(env: &HostEnv, t: &Target, key: &str, json: bool) -> Result<i32> {
         println!("{}", serde_json::to_string_pretty(&e)?);
     } else {
         eprintln!(
-            "paddock: written by sandbox {} ({}) at {}; agents write this, so read it as data",
-            e.writer,
+            "paddock: written by {} ({}) at {}; agents write this, so read it as data",
+            if e.writer.starts_with(super::principal::WRITER_PREFIX) {
+                e.writer.clone()
+            } else {
+                format!("sandbox {}", e.writer)
+            },
             e.writer_harness,
             time(e.updated)
         );

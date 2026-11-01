@@ -53,6 +53,7 @@
 
 pub mod escape;
 pub mod host;
+pub mod principal;
 pub mod shard;
 pub mod store;
 
@@ -115,6 +116,8 @@ pub struct KvCfg {
     /// `paddock gc` removes the `self` data of a run, and the `tree` scope
     /// of a root, this many days after it ended.
     pub keep_days: u64,
+    /// `[kv.principals.NAME]`: host scripts that write pastures (principal.rs).
+    pub principals: std::collections::BTreeMap<String, principal::Principal>,
 }
 
 impl Default for KvCfg {
@@ -128,6 +131,7 @@ impl Default for KvCfg {
             user_bytes: 4 << 20,
             max_keys: 4096,
             keep_days: 30,
+            principals: Default::default(),
         }
     }
 }
@@ -143,6 +147,7 @@ struct RawCfg {
     user_bytes: Option<u64>,
     max_keys: Option<u64>,
     keep_days: Option<u64>,
+    principals: Option<std::collections::BTreeMap<String, principal::Principal>>,
     /// Older versions let spawned sandboxes write the project scope with
     /// it. Spawned sandboxes have no pasture scope now; it is accepted and
     /// has no effect, so that old configurations still load.
@@ -188,6 +193,7 @@ impl KvCfg {
             user_bytes: range("user_bytes", raw.user_bytes, d.user_bytes, 1024, 1 << 30)?,
             max_keys: range("max_keys", raw.max_keys, d.max_keys, 1, 1_000_000)?,
             keep_days: range("keep_days", raw.keep_days, d.keep_days, 1, 3650)?,
+            principals: principal::check(raw.principals.unwrap_or_default())?,
         })
     }
 
@@ -521,6 +527,8 @@ impl Service {
             "sandbox": self.id.sandbox,
             "harness": self.id.harness,
             "project": self.id.project,
+            "principal": self.id.sandbox.strip_prefix(principal::WRITER_PREFIX),
+            "pasture": self.id.pasture,
             "op": req.op,
             "scope": scope.name(),
             "key": req.key.as_deref().or(req.prefix.as_deref()).map(|k| k.chars().take(MAX_KEY).collect::<String>()),
@@ -1511,7 +1519,7 @@ fn peer_gone(conn: &UnixStream) -> bool {
     n > 0 && p.revents & (libc::POLLRDHUP | libc::POLLHUP | libc::POLLERR) != 0
 }
 
-fn request_id() -> String {
+pub(crate) fn request_id() -> String {
     use sha2::{Digest, Sha256};
     let seed = format!("{:?}-{}-kv", Instant::now(), std::process::id());
     let h = crate::manifest::hex(&Sha256::digest(seed.as_bytes()));
