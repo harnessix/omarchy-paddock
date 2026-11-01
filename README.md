@@ -302,6 +302,7 @@ Each harness gets its own home in each project, so the homes grow with the numbe
 - The worktrees that `--worktree` created, with their unmerged commits.
 - The session records of `paddock files`, and the keyring passwords of app homes.
 - The project snapshots and the undo trash of `paddock undo`.
+- The caches in the homes, by class (see [Caches](#caches)).
 
 On btrfs, a size counts only the data that no other file shares. On other file systems, it counts the allocated blocks, as `du` does. The first line names the kind. `paddock du --json` prints the same data as JSON.
 
@@ -323,6 +324,7 @@ paddock gc --homes --yes                    # remove them
 - Homes of harnesses whose profile no longer exists.
 - Old shared caches that paddock no longer uses, such as `~/.cache/paddock/shared/mise-installs`. paddock keeps them while a sandbox runs.
 - Project snapshots whose project is gone.
+- Pure caches in the homes of sandboxes that do not run (see [Caches](#caches)).
 
 paddock also does this after it builds a new image. To turn that off, set `PADDOCK_GC_AFTER_BUILD=0`.
 
@@ -335,6 +337,21 @@ The other items need a flag that names them:
 - `--scratch` adds scratch projects that were not used for `--older-than` days. An agent from `omarchy-agent` works in one when it starts in the home folder (see [Only the agents that Omarchy starts](#only-the-agents-that-omarchy-starts)). Its files are lost.
 
 paddock never removes the home or worktree of a running sandbox. It deletes only inside its own directories. It never follows a symlink, so a link in a sandbox home cannot point it at your files. A sandbox can edit the `.paddock-origin` file in its home, which records the project. paddock uses that file only when it matches the folder name of the home, which contains a hash of the project path.
+
+### Caches
+
+paddock sorts the caches in a sandbox home into three classes. `paddock du` shows the size of each class.
+
+- Pure caches rebuild themselves: the mesa shader cache, the fontconfig cache, the `Cache`, `Code Cache` and `GPUCache` folders of Electron and Chromium apps under `~/.config/APP`, and `~/.codex/cache`. In the sandbox, each of them with a known path is an empty tmpfs, so it is gone at exit. The tmpfs uses memory while the sandbox runs. The Electron folders get their names from the app, so `paddock gc --yes` clears them instead. paddock never clears a login, settings or history folder.
+- Package caches check each entry themselves: `~/.npm`, `~/.cache/pip` and `~/.cache/uv`. A project with a `package.json`, a `pyproject.toml` or a similar file gets one shared copy for all projects, in `~/.cache/paddock/shared`. A harness that installs through npm (Claude Code, codex, gemini, copilot) gets the shared `~/.npm` in every project.
+- Runtimes, such as `.codex/packages` and `.copilot/pkg`, stay in the home. Deduplication shares their data.
+
+The list of pure caches is in `src/storage/caches.rs`. A harness profile adds its own with `[state] scratch = ["PATH"]`, relative to the home. A path with `*` matches one folder name, and only `paddock gc` clears it. To turn off the tmpfs mounts and the gc step, set this in `~/.config/paddock/config.toml`:
+
+```toml
+[storage]
+tmpfs_caches = false
+```
 
 ### Deduplication
 
@@ -1386,6 +1403,7 @@ yolo_args = ["--yes-to-everything"]
 auth = [".myagent/token.json"]
 import_ro = [".myagent/config.toml"]
 env_pass = ["MYAGENT_API_KEY"]
+scratch = [".myagent/cache"]      # pure caches: a tmpfs in the sandbox
 
 # Telemetry switches, set only inside the sandbox. Cite the vendor's documentation.
 [privacy]

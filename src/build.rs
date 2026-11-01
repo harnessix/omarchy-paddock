@@ -610,6 +610,8 @@ pub fn build_with(env: &HostEnv, opts: &Options, harness: Harness) -> Result<Bui
         d.apply(&cx, &mut spec)
             .with_context(|| format!("detector {}", d.name()))?;
     }
+    detect::npm_harness(env, &harness, &mut spec)?;
+    crate::storage::caches::mount(env, &profile, &mut spec);
     spec.setup.extend(m.setup.run.iter().cloned());
     spec.lan = m.network.lan == Some(true);
     if !matches!(spec.network, Network::None | Network::Api) {
@@ -1162,6 +1164,74 @@ mod tests {
         // muse keeps its own sandbox: `paddock muse` says what that means.
         let (_t, b) = privacy_spec("muse", "", "");
         assert!(b.spec.warnings.iter().any(|w| w.contains("own sandbox")));
+    }
+
+    #[test]
+    fn pure_caches_are_tmpfs_in_the_spec_unless_the_user_turns_them_off() {
+        use crate::spec::MountKind;
+        let tmpfs = |b: &Built| -> Vec<PathBuf> {
+            b.spec
+                .mounts
+                .iter()
+                .filter(|m| m.kind == MountKind::Tmpfs)
+                .filter_map(|m| m.dst.strip_prefix(&b.spec.home).ok())
+                .map(Path::to_path_buf)
+                .collect()
+        };
+        let (_t, b) = privacy_spec("codex", "", "");
+        let on = tmpfs(&b);
+        for p in [
+            ".cache/mesa_shader_cache",
+            ".cache/fontconfig",
+            ".codex/cache",
+        ] {
+            assert!(on.contains(&PathBuf::from(p)), "{p}: {on:?}");
+        }
+        // Paths only known after the app ran are for gc, never a mount.
+        assert!(!on.iter().any(|p| p.to_string_lossy().contains('*')));
+        // Never a login or a settings file.
+        assert!(!on.iter().any(|p| p.starts_with(".codex/auth.json")));
+        let (_t, b) = privacy_spec("claude", "", "");
+        assert!(!tmpfs(&b).contains(&PathBuf::from(".codex/cache")));
+        let (_t, b) = privacy_spec("codex", "[storage]\ntmpfs_caches = false\n", "");
+        assert!(tmpfs(&b).is_empty(), "{:?}", tmpfs(&b));
+    }
+
+    #[test]
+    fn an_npm_harness_shares_the_npm_cache_without_a_package_json() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let proj = tmp.path().join("proj");
+        let pkg = tmp.path().join("tools/lib/node_modules/fake-agent");
+        std::fs::create_dir_all(&proj).unwrap();
+        std::fs::create_dir_all(pkg.join("bin")).unwrap();
+        let env = HostEnv::from_parts(home, "t".into(), 1000, 1000, Default::default());
+        let profile: Profile = toml::from_str("name = \"fake\"\n").unwrap();
+        let opts = Options {
+            harness: "fake".into(),
+            project: Some(proj.clone()),
+            assume_yes: true,
+            ..Default::default()
+        };
+        let npm = |exe: PathBuf| {
+            let h = Harness {
+                profile: profile.clone(),
+                exe,
+                install_mounts: vec![],
+                path_dirs: vec![],
+                source: "test".into(),
+            };
+            let b = build_with(&env, &opts, h).unwrap();
+            let dst = b.spec.home.join(".npm");
+            b.spec
+                .mounts
+                .iter()
+                .find(|m| m.dst == dst)
+                .and_then(|m| m.src.clone())
+        };
+        let shared = npm(pkg.join("bin/agent.js")).expect("an npm harness gets .npm");
+        assert_eq!(shared, env.paddock_cache().join("shared/npm"));
+        assert_eq!(npm(PathBuf::from("/usr/bin/true")), None);
     }
 
     #[test]

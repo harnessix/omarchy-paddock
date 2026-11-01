@@ -199,6 +199,11 @@ pub struct State {
     pub account: Option<Account>,
     /// Session history that tools on the host read (history.rs).
     pub history: Option<History>,
+    /// Pure caches of this harness, relative to HOME, that rebuild
+    /// themselves. They add to the table in storage/caches.rs: a path
+    /// without `*` is a tmpfs in the sandbox, and `paddock gc` clears them.
+    #[serde(default)]
+    pub scratch: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -344,7 +349,7 @@ pub struct Training {
     pub url: String,
 }
 
-const BUILTIN: &[(&str, &str)] = &[
+pub(crate) const BUILTIN: &[(&str, &str)] = &[
     ("agy", include_str!("../profiles/agy.toml")),
     (
         "chatgpt-desktop",

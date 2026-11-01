@@ -21,6 +21,7 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 
+pub mod caches;
 pub mod dedupe;
 
 pub const ORIGIN_FILE: &str = ".paddock-origin";
@@ -170,6 +171,9 @@ pub struct Home {
     pub running: bool,
     /// What deleting the home loses.
     pub loses: String,
+    /// Cache folders in the home with their class, relative to it.
+    #[serde(skip)]
+    pub caches: Vec<(caches::Class, PathBuf)>,
 }
 
 impl Home {
@@ -259,6 +263,10 @@ pub struct Inventory {
     pub scratch: Vec<Scratch>,
     /// Project snapshots (`paddock undo`) and the undo trash.
     pub snapshots: Vec<SnapshotDir>,
+    /// `[storage] tmpfs_caches`: gc clears the pure caches in the homes.
+    pub tmpfs_caches: bool,
+    /// The bytes of each cache class, when measured.
+    pub classes: Vec<ClassUse>,
 }
 
 /// A project snapshot, or a folder of the undo trash (`trash`).
@@ -304,6 +312,14 @@ pub fn scan_snapshots(env: &HostEnv) -> Vec<SnapshotDir> {
         });
     }
     out
+}
+
+/// The disk use of one cache class (storage/caches.rs).
+#[derive(Debug, Clone, Serialize)]
+pub struct ClassUse {
+    pub class: caches::Class,
+    pub bytes: u64,
+    pub folders: usize,
 }
 
 /// A scratch project (`$XDG_DATA_HOME/paddock/scratch/<harness>`): where an
@@ -494,15 +510,21 @@ pub struct Host<'a> {
     /// Profile name to "is a desktop app". None when the profiles cannot be
     /// read: then no home counts as orphaned.
     pub profiles: Option<BTreeMap<String, bool>>,
+    /// Profile name to its pure cache paths. A home of another harness
+    /// uses the table alone.
+    pub scratch: BTreeMap<String, Vec<String>>,
 }
 
 impl<'a> Host<'a> {
     pub fn real(env: &HostEnv, containers: &'a dyn Containers) -> Self {
+        let mut scratch = BTreeMap::new();
         let profiles = crate::profile::HarnessFactory::new(env).ok().map(|f| {
             f.names()
                 .into_iter()
                 .map(|n| {
-                    let app = f.profile(&n).is_some_and(|p| p.app.is_some());
+                    let p = f.profile(&n);
+                    scratch.insert(n.clone(), caches::scratch(p).0);
+                    let app = p.is_some_and(|p| p.app.is_some());
                     (n, app)
                 })
                 .collect()
@@ -511,6 +533,7 @@ impl<'a> Host<'a> {
             containers,
             current_tags: current_tags(env),
             profiles,
+            scratch,
         }
     }
 }
@@ -1018,7 +1041,16 @@ pub fn scan(env: &HostEnv, host: &Host, with_sizes: bool) -> Inventory {
                     },
                     None => (true, origin.as_ref().is_some_and(|o| o.app)),
                 };
+                let table;
+                let scratch = match host.scratch.get(&harness) {
+                    Some(s) => s,
+                    None => {
+                        table = caches::scratch(None).0;
+                        &table
+                    }
+                };
                 homes.push(Home {
+                    caches: caches::find(&path, scratch),
                     project_exists: project.as_ref().map(|p| p.is_dir()),
                     project,
                     origin: check,
@@ -1175,11 +1207,61 @@ pub fn scan(env: &HostEnv, host: &Host, with_sizes: bool) -> Inventory {
         build_cache,
         scratch,
         snapshots: scan_snapshots(env),
+        tmpfs_caches: caches::enabled(env),
+        classes: vec![],
     };
     if with_sizes {
         measure(&mut inv, |_| true);
+        inv.classes = class_use(env, &inv.homes);
     }
     inv
+}
+
+/// Measure the cache folders of every home by class. The shared package
+/// caches count once, in their shared folder.
+fn class_use(env: &HostEnv, homes: &[Home]) -> Vec<ClassUse> {
+    let mut paths: Vec<(caches::Class, PathBuf)> = homes
+        .iter()
+        .flat_map(|h| h.caches.iter().map(|(c, r)| (*c, h.path.join(r))))
+        .collect();
+    for (rel, c) in caches::TABLE {
+        if *c != caches::Class::Shared {
+            continue;
+        }
+        let name = match *rel {
+            ".npm" => "npm",
+            ".cache/pip" => "pip",
+            ".cache/uv" => "uv",
+            _ => continue,
+        };
+        let p = shared_cache(env).join(name);
+        if std::fs::symlink_metadata(&p).is_ok_and(|m| m.is_dir()) {
+            paths.push((*c, p));
+        }
+    }
+    let list: Vec<PathBuf> = paths.iter().map(|(_, p)| p.clone()).collect();
+    let (v, _) = sizes(&list);
+    let mut by: BTreeMap<caches::Class, (u64, usize)> = BTreeMap::new();
+    for ((c, _), b) in paths.iter().zip(v) {
+        let e = by.entry(*c).or_default();
+        e.0 += b;
+        e.1 += 1;
+    }
+    [
+        caches::Class::Scratch,
+        caches::Class::Shared,
+        caches::Class::Runtime,
+    ]
+    .into_iter()
+    .map(|class| {
+        let (bytes, folders) = by.get(&class).copied().unwrap_or_default();
+        ClassUse {
+            class,
+            bytes,
+            folders,
+        }
+    })
+    .collect()
 }
 
 /// Fill in the sizes of the homes and worktrees that `want` names.
@@ -1271,6 +1353,11 @@ pub enum Action {
     /// paddock kv: the `self` data of these finished runs, and expired keys.
     Kv {
         sandboxes: Vec<String>,
+    },
+    /// Pure cache folders in a home, relative to it (storage/caches.rs).
+    Caches {
+        home: PathBuf,
+        folders: Vec<PathBuf>,
     },
 }
 
@@ -1498,6 +1585,49 @@ pub fn plan(inv: &Inventory, o: &GcOptions, now: u64) -> Vec<Item> {
             },
         });
     }
+    // Pure caches rebuild themselves. A home that this plan removes
+    // without a question needs no item of its own.
+    let gone: BTreeSet<PathBuf> = items
+        .iter()
+        .filter(|i| i.tier == Tier::Auto)
+        .filter_map(|i| match &i.action {
+            Action::Path { path } => Some(path.clone()),
+            _ => None,
+        })
+        .collect();
+    for h in &inv.homes {
+        if !inv.tmpfs_caches || h.running || gone.contains(&h.path) {
+            continue;
+        }
+        let folders: Vec<PathBuf> = h
+            .caches
+            .iter()
+            .filter(|(c, _)| *c == caches::Class::Scratch)
+            .map(|(_, r)| r.clone())
+            .collect();
+        if folders.is_empty() {
+            continue;
+        }
+        items.push(Item {
+            what: format!("pure caches in {}", home_label(h)),
+            tier: Tier::Auto,
+            bytes: 0,
+            reason: format!(
+                "they rebuild themselves: {}",
+                folders
+                    .iter()
+                    .map(|f| f.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            warning: None,
+            needs: vec![],
+            action: Action::Caches {
+                home: h.path.clone(),
+                folders,
+            },
+        });
+    }
     for c in &inv.scratch {
         if c.running || c.last_active > old {
             continue;
@@ -1599,6 +1729,22 @@ pub fn measure_plan(inv: &mut Inventory, items: &mut [Item]) {
         .into_iter()
         .filter(|p| homes.contains(p) || wts.contains(p))
         .collect();
+    let cache_paths: Vec<PathBuf> = items
+        .iter()
+        .flat_map(|i| match &i.action {
+            Action::Caches { home, folders } => folders.iter().map(|f| home.join(f)).collect(),
+            _ => vec![],
+        })
+        .collect();
+    if !cache_paths.is_empty() {
+        let (v, _) = sizes(&cache_paths);
+        let mut it = v.into_iter();
+        for i in items.iter_mut() {
+            if let Action::Caches { folders, .. } = &i.action {
+                i.bytes = it.by_ref().take(folders.len()).sum();
+            }
+        }
+    }
     if want.is_empty() {
         return;
     }
@@ -1730,6 +1876,20 @@ pub fn apply(env: &HostEnv, containers: &dyn Containers, items: &[Item]) -> Vec<
                 Err(anyhow::anyhow!("a sandbox started in it; skipped"))
             }
             Action::Path { path } => remove_path(env, path),
+            Action::Caches { home, .. } if running_homes.contains(home) => {
+                Err(anyhow::anyhow!("a sandbox started in it; skipped"))
+            }
+            // The walk starts at paddock's own folder and never follows a
+            // symlink that the sandbox planted on the way.
+            Action::Caches { home, folders } => (|| {
+                let (root, rel) = check_removable(env, home)?;
+                let root = crate::safefs::Root::open(&root)?;
+                for f in folders {
+                    root.remove_tree(&rel.join(f))
+                        .with_context(|| format!("remove {}", home.join(f).display()))?;
+                }
+                Ok(())
+            })(),
             Action::Kv { sandboxes } => {
                 crate::kv::gc_apply(env, sandboxes, state::now()).map(|_| ())
             }
@@ -1905,6 +2065,20 @@ pub fn render_du(env: &HostEnv, inv: &Inventory, now: u64) -> String {
             h.auth,
             h.loses
         ));
+    }
+    if !inv.classes.is_empty() {
+        t.push_str("\nCaches in the homes, by class:\n");
+        for c in &inv.classes {
+            t.push_str(&format!(
+                "  {:>9}  {} in {} folders\n",
+                human(c.bytes),
+                c.class.label(),
+                c.folders
+            ));
+        }
+        if !inv.tmpfs_caches {
+            t.push_str("  tmpfs and gc for pure caches are off ([storage] tmpfs_caches = false)\n");
+        }
     }
     if !inv.scratch.is_empty() {
         t.push_str(&format!(
