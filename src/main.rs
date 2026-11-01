@@ -1294,6 +1294,15 @@ fn real_main() -> Result<i32> {
                     if !p.reason.is_empty() {
                         println!("    reason given by the agent: {}", p.reason);
                     }
+                    if p.capability != broker::ASK_CAPABILITY && !p.choices.is_empty() {
+                        println!("    choices: {}", p.choices.join(" | "));
+                        println!(
+                            "    answer: paddock approvals answer {} --text {}, or deny\n",
+                            p.id,
+                            p.choices.join("|")
+                        );
+                        continue;
+                    }
                     if p.capability == broker::ASK_CAPABILITY {
                         if !p.choices.is_empty() {
                             println!("    choices: {}", p.choices.join(" | "));

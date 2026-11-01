@@ -73,7 +73,24 @@ pub struct SpawnCfg {
     /// The most CPU time of one child, in percent of one CPU (150: 1.5
     /// CPUs). None: no limit.
     pub max_cpu_percent: Option<u32>,
+    /// What happens when a child reaches its time limit.
+    pub on_timeout: OnTimeout,
 }
+
+/// `[spawn] on_timeout`: what paddock does with a child at its time limit.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum OnTimeout {
+    /// Stop the child.
+    #[default]
+    Stop,
+    /// Freeze the child and ask the user: more time, or stop.
+    Ask,
+}
+
+/// The answers on the card of a child at its time limit, and the seconds
+/// that each one adds.
+pub const MORE_TIME: [(&str, u64); 3] = [("15m", 900), ("30m", 1800), ("1h", 3600)];
 
 impl Default for SpawnCfg {
     fn default() -> Self {
@@ -84,6 +101,7 @@ impl Default for SpawnCfg {
             timeout: DEFAULT_TIMEOUT,
             max_mem: None,
             max_cpu_percent: None,
+            on_timeout: OnTimeout::Stop,
         }
     }
 }
@@ -294,8 +312,15 @@ impl SpawnCfg {
                     };
                     c.max_cpu_percent = Some(parse_cpus(&s).context("[spawn] max_cpus")?);
                 }
+                "on_timeout" => {
+                    c.on_timeout = match v.as_str() {
+                        Some("stop") => OnTimeout::Stop,
+                        Some("ask") => OnTimeout::Ask,
+                        _ => bail!("[spawn] on_timeout must be \"stop\" or \"ask\""),
+                    }
+                }
                 other => bail!(
-                    "[spawn] {other}: unknown setting. Known: harnesses, max_running, max_depth, timeout, max_mem, max_cpus"
+                    "[spawn] {other}: unknown setting. Known: harnesses, max_running, max_depth, timeout, max_mem, max_cpus, on_timeout"
                 ),
             }
         }
@@ -678,6 +703,69 @@ pub struct Status {
     /// the parent's uncommitted files.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub from_head: Option<String>,
+    /// Seconds that the child stayed frozen at its time limit while the
+    /// user decided. They do not count against the limit.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub frozen_s: u64,
+}
+
+fn is_zero(n: &u64) -> bool {
+    *n == 0
+}
+
+/// What the user decided on the card of a child at its time limit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Choice {
+    /// More time: one of the choices on the card.
+    More(String),
+    /// Stop the child.
+    Stop,
+    /// No answer within the approval wait, or the child stopped meanwhile.
+    NoAnswer,
+}
+
+/// Freeze, thaw and the question at the time limit (`on_timeout = "ask"`).
+/// Tests fake it, so they need no real freezer and no card.
+pub trait TimeoutSeam: Send + Sync {
+    /// Freeze the child's sandbox and its own children.
+    fn freeze(&self, sandbox: &str) -> Result<()>;
+    fn thaw(&self, sandbox: &str) -> Result<()>;
+    /// Put the card up and wait for the answer, at most `wait`. Stop
+    /// waiting when `cancelled` turns true.
+    fn ask(
+        &self,
+        card: &crate::broker::Pending,
+        wait: Duration,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Choice;
+}
+
+/// The real seam: `freeze::freeze`, `freeze::thaw` and the approval card.
+pub struct HostSeam(pub HostEnv);
+
+impl TimeoutSeam for HostSeam {
+    fn freeze(&self, sandbox: &str) -> Result<()> {
+        crate::freeze::freeze(
+            &self.0,
+            sandbox,
+            true,
+            "a spawned child reached its time limit",
+        )
+        .map(|_| ())
+    }
+
+    fn thaw(&self, sandbox: &str) -> Result<()> {
+        crate::freeze::thaw(&self.0, sandbox, true).map(|_| ())
+    }
+
+    fn ask(
+        &self,
+        card: &crate::broker::Pending,
+        wait: Duration,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Choice {
+        crate::broker::ask_choice(&self.0, card, wait, cancelled)
+    }
 }
 
 struct Entry {
@@ -702,6 +790,12 @@ pub struct Spawner {
     scope: std::sync::OnceLock<Option<PathBuf>>,
     children: Mutex<BTreeMap<String, Entry>>,
     changed: Condvar,
+    /// Freeze, thaw and the card at the time limit in `ask` mode.
+    pub seam: Arc<dyn TimeoutSeam>,
+    /// How long the card at the time limit waits: the approval wait.
+    pub approval_wait: Duration,
+    /// The answers on that card and the seconds that each one adds.
+    pub more_time: Vec<(String, u64)>,
 }
 
 fn new_spawn_id() -> String {
@@ -787,6 +881,9 @@ impl Spawner {
             scope: std::sync::OnceLock::new(),
             children: Mutex::new(BTreeMap::new()),
             changed: Condvar::new(),
+            seam: Arc::new(HostSeam(env.clone())),
+            approval_wait: Duration::from_secs(crate::broker::HostPolicy::default().wait),
+            more_time: MORE_TIME.iter().map(|(n, s)| (n.to_string(), *s)).collect(),
         }
     }
 
@@ -874,6 +971,7 @@ impl Spawner {
                         }
                         .into(),
                         from_head: None,
+                        frozen_s: 0,
                     },
                     pid: 0,
                     stop: None,
@@ -949,11 +1047,22 @@ impl Spawner {
             // settings below apply to it. paddock stops the child itself at
             // the timeout, so it can save its login; the scope's runtime
             // limit is the backstop a minute later.
+            //
+            // With `on_timeout = "ask"` the scope gets no runtime limit.
+            // systemd counts RuntimeMaxSec in wall-clock time from the start
+            // of the scope, frozen time included, so it would kill a child
+            // that waits on the card or got more time. Raising it at each
+            // answer needs a second D-Bus call that can fail, and then the
+            // child dies anyway. The backstop is not needed for safety:
+            // paddock's own timer stops the child, and when the parent's
+            // paddock dies, the parent-death signal below ends the child.
             Some(tool) => {
                 let mut c = std::process::Command::new(tool);
                 c.args(["--user", "--scope", "--quiet", "--collect", "--unit", unit]);
-                c.arg("-p")
-                    .arg(format!("RuntimeMaxSec={}", limits.timeout + 60));
+                if self.cfg.on_timeout == OnTimeout::Stop {
+                    c.arg("-p")
+                        .arg(format!("RuntimeMaxSec={}", limits.timeout + 60));
+                }
                 if let Some(m) = limits.mem {
                     c.arg("-p").arg(format!("MemoryMax={m}"));
                     c.arg("-p").arg("MemorySwapMax=0");
@@ -1010,7 +1119,10 @@ impl Spawner {
         let pid = child.id();
         let _ = started.send(Ok(pid));
         let begin = Instant::now();
-        let timeout = Duration::from_secs(limits.timeout);
+        // The limit grows when the user gives more time. The time frozen
+        // at the limit does not count.
+        let mut limit = Duration::from_secs(limits.timeout);
+        let mut frozen = Duration::ZERO;
         let code = loop {
             match child.try_wait() {
                 Ok(Some(s)) => break s.code(),
@@ -1023,8 +1135,11 @@ impl Spawner {
                 .unwrap()
                 .get(id)
                 .is_some_and(|e| e.stop.is_some());
-            if begin.elapsed() > timeout && !stopping {
-                self.stop_one(id, State::TimedOut);
+            let used = begin.elapsed().saturating_sub(frozen);
+            if used > limit && !stopping {
+                let (more, paused) = self.at_limit(id, used);
+                limit += more;
+                frozen += paused;
             }
             let late = self
                 .children
@@ -1057,7 +1172,9 @@ impl Spawner {
         };
         let r = result.unwrap_or_default();
         // The scope's runtime limit ends the child without a result.
-        let ran = state::now().saturating_sub(status.started);
+        let ran = state::now()
+            .saturating_sub(status.started)
+            .saturating_sub(status.frozen_s);
         let stop = stop.or((r.exit_code.is_none()
             && r.error.is_none()
             && ran >= status.limits.timeout)
@@ -1072,7 +1189,12 @@ impl Spawner {
             (Some(e), _) => e.clone(),
             (None, State::TimedOut) => format!(
                 "stopped by {} after the time limit of {} seconds",
-                status.enforced_by, status.limits.timeout
+                if self.cfg.on_timeout == OnTimeout::Ask {
+                    "paddock"
+                } else {
+                    &status.enforced_by
+                },
+                status.limits.timeout
             ),
             (None, State::Stopped) => "stopped before it finished".into(),
             (None, State::Failed) => format!(
@@ -1104,6 +1226,157 @@ impl Spawner {
             e.status = done;
         }
         self.changed.notify_all();
+    }
+
+    /// The child reached its time limit. In `stop` mode, stop it. In `ask`
+    /// mode, freeze it and ask the user for more time. Returns the time
+    /// added to the limit and the time that the child stayed frozen.
+    fn at_limit(&self, id: &str, used: Duration) -> (Duration, Duration) {
+        let none = (Duration::ZERO, Duration::ZERO);
+        if self.cfg.on_timeout == OnTimeout::Stop {
+            self.stop_one(id, State::TimedOut);
+            return none;
+        }
+        let Some(status) = self.status(id) else {
+            return none;
+        };
+        let since = Instant::now();
+        if let Err(e) = self.seam.freeze(&status.sandbox) {
+            log::warn!(
+                "spawn {id}: cannot freeze the child at its time limit, so paddock stops it: {e:#}"
+            );
+            self.stop_one(id, State::TimedOut);
+            self.audit_limit(&status, used, "stopped: cannot freeze", "paddock");
+            return none;
+        }
+        self.set_message(id, "frozen at its time limit: waits for the user");
+        let card = self.limit_card(&status, used);
+        let cancelled = || {
+            self.children
+                .lock()
+                .unwrap()
+                .get(id)
+                .is_none_or(|e| e.stop.is_some())
+        };
+        let choice = self.seam.ask(&card, self.approval_wait, &cancelled);
+        let paused = since.elapsed();
+        let stopped_meanwhile = cancelled();
+        let more = match &choice {
+            Choice::More(c) if !stopped_meanwhile => {
+                self.more_time.iter().find(|(n, _)| n == c).map(|(_, s)| *s)
+            }
+            _ => None,
+        };
+        if more.is_none() {
+            // The stop signal waits while the child is frozen: the thaw
+            // below lets it end and save its login, as at any other stop.
+            self.stop_one(id, State::TimedOut);
+        }
+        let thawed = match self.seam.thaw(&status.sandbox) {
+            Ok(()) => true,
+            Err(e) => {
+                log::warn!("spawn {id}: cannot thaw the child: {e:#}");
+                false
+            }
+        };
+        let (add, decision, by) = match (more, &choice) {
+            (Some(s), Choice::More(c)) if thawed => (s, format!("more time: {c}"), "user"),
+            (Some(_), _) => {
+                self.stop_one(id, State::TimedOut);
+                (0, "stopped: cannot thaw".to_string(), "paddock")
+            }
+            _ if stopped_meanwhile => (0, "stopped while it waited".into(), "paddock"),
+            (None, Choice::Stop) => (0, "stop".into(), "user"),
+            _ => (0, "no answer: stop".into(), "paddock"),
+        };
+        {
+            let mut ch = self.children.lock().unwrap();
+            if let Some(e) = ch.get_mut(id) {
+                e.status.frozen_s += paused.as_secs();
+                e.status.limits.timeout += add;
+                e.status.message.clear();
+            }
+        }
+        let after = self.status(id).unwrap_or(status);
+        self.audit_limit(&after, used, &decision, by);
+        self.changed.notify_all();
+        (Duration::from_secs(add), paused)
+    }
+
+    fn set_message(&self, id: &str, m: &str) {
+        if let Some(e) = self.children.lock().unwrap().get_mut(id) {
+            e.status.message = m.to_string();
+        }
+    }
+
+    /// The card of a child at its time limit: the parent, the child, the
+    /// harness, the role and the time used.
+    fn limit_card(&self, s: &Status, used: Duration) -> crate::broker::Pending {
+        let now = state::now();
+        let wait = self.approval_wait.as_secs();
+        let choices: Vec<String> = self.more_time.iter().map(|(n, _)| n.clone()).collect();
+        let detail = format!(
+            "{} reached its time limit. paddock froze it, so its work stays in place.\n\
+             Parent: {} ({})\n\
+             Child: {} ({}), branch {}\n\
+             Role: {}\n\
+             Time used: {} of {} seconds (frozen time not counted)\n\n\
+             Give it more time ({}), or stop it. Without an answer in {wait} seconds, paddock stops it.",
+            s.sandbox,
+            self.ceiling.parent,
+            self.ceiling.parent_harness,
+            s.sandbox,
+            s.harness,
+            s.branch,
+            s.role.describe(),
+            used.as_secs(),
+            s.limits.timeout,
+            choices.join(", "),
+        );
+        crate::broker::Pending {
+            id: crate::broker::new_request_id(),
+            sandbox: s.sandbox.clone(),
+            harness: s.harness.clone(),
+            project: self.project.clone(),
+            capability: crate::broker::TIMEOUT_CAPABILITY.into(),
+            summary: format!("{} reached its time limit", s.sandbox),
+            detail,
+            reason: String::new(),
+            created: now,
+            expires: now + wait,
+            session_allowed: false,
+            started_by: self.ceiling.chain.clone(),
+            choices,
+        }
+    }
+
+    /// One audit line per decision at the time limit.
+    fn audit_limit(&self, s: &Status, used: Duration, decision: &str, by: &str) {
+        let line = serde_json::json!({
+            "time": state::now(),
+            "sandbox": self.ceiling.parent,
+            "harness": self.ceiling.parent_harness,
+            "project": self.project,
+            "capability": "spawn",
+            "detail": format!(
+                "child {} ({}) at its time limit after {} s",
+                s.sandbox,
+                s.harness,
+                used.as_secs()
+            ),
+            "decision": decision,
+            "by": by,
+            "parent": self.ceiling.parent,
+            "chain": self.ceiling.chain,
+            "child": s.sandbox,
+            "spawn_id": s.id,
+            "child_harness": s.harness,
+            "role": s.role,
+            "used_s": used.as_secs(),
+            "limit_s": s.limits.timeout,
+            "frozen_s": s.frozen_s,
+        });
+        crate::broker::audit_line(&self.env, &line);
     }
 
     /// Write `result:<spawn id>` into the `tree` scope of paddock kv. A
