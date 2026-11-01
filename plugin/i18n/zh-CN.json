@@ -136,5 +136,11 @@
   "new.otherFolder": "选择其他文件夹…",
   "new.otherFolderHint": "这台电脑上的任意项目文件夹",
   "new.chooseFolderTitle": "为 paddock 选择项目文件夹",
-  "new.noZenity": "安装 zenity 后可以选择任意文件夹"
+  "new.noZenity": "安装 zenity 后可以选择任意文件夹",
+  "action.freeze": "冻结这个沙箱（保留内存，不占 CPU）",
+  "action.thaw": "解冻这个沙箱：从停下的地方继续",
+  "row.frozen": "已冻结 %1",
+  "msg.frozen": "已冻结",
+  "msg.thawed": "已解冻",
+  "msg.freezeFailed": "paddock 无法冻结或解冻它"
 }
