@@ -285,6 +285,10 @@ pub struct SandboxSpec {
     pub devices: Option<PathBuf>,
     /// Information for the user, printed at start.
     pub notices: Vec<String>,
+    /// Denials that the build decided (withheld variables, MCP servers that
+    /// do not start): kind, target and rule. The start writes them into the
+    /// boundary log.
+    pub boundary: Vec<(String, String, String)>,
     /// Host PATH entries and the harness folder, appended after the
     /// sandbox's own entries. An entry already on PATH is skipped.
     pub inherit_path: Vec<PathBuf>,
@@ -295,6 +299,12 @@ pub struct SandboxSpec {
 }
 
 impl SandboxSpec {
+    /// Note a denial for the boundary log of this sandbox.
+    pub fn deny(&mut self, kind: &str, target: &str, rule: &str) {
+        self.boundary
+            .push((kind.to_string(), target.to_string(), rule.to_string()));
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         id: String,
@@ -343,6 +353,7 @@ impl SandboxSpec {
             identity: Default::default(),
             devices: None,
             notices: Vec::new(),
+            boundary: Vec::new(),
             inherit_path: Vec::new(),
             generated: Vec::new(),
             home_settings: Vec::new(),

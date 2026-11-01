@@ -649,6 +649,32 @@ fn audit(
         line["chain"] = serde_json::json!(ctx.chain);
     }
     audit_line(env, &line);
+    if let Some(rule) = boundary_rule(decision, resp) {
+        crate::boundary::record(
+            env,
+            &ctx.id,
+            crate::boundary::HOST,
+            &format!("{}: {detail}", req.cap),
+            &rule,
+        );
+    }
+}
+
+/// The rule for the boundary log when the broker refused or denied a
+/// request. None for allowed requests, failures and timeouts. A denial note
+/// of the user stays out: the log keeps paddock's own words only.
+fn boundary_rule(decision: &str, resp: &Response) -> Option<String> {
+    let refused = ["invalid", "disabled", "refused", "denied"]
+        .iter()
+        .any(|d| decision.starts_with(d));
+    if !refused {
+        return None;
+    }
+    if decision.starts_with("denied") {
+        return Some(decision.to_string());
+    }
+    let msg: String = resp.message.chars().take(300).collect();
+    Some(format!("{decision}: {msg}"))
 }
 
 /// Append one line to the audit log.
@@ -2068,6 +2094,11 @@ impl Broker {
     pub fn handle(&self, req: &Request) -> Response {
         if req.cap == "capabilities" {
             return Response::done(self.capabilities());
+        }
+        // The sandbox reads its own boundary log: a read, never asked.
+        if req.cap == "boundary" {
+            let lines = crate::boundary::read(&self.env, &self.ctx.id);
+            return Response::done(crate::boundary::to_json(&lines));
         }
         let invalid = |e: anyhow::Error| {
             let r = Response::new(Status::Invalid, format!("{e:#}"));

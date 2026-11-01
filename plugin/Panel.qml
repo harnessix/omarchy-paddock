@@ -755,6 +755,8 @@ Panel {
             // Monitoring findings that the user did not say OK to, outside
             // muted projects (monitor.rs): "tunnel: ngrok", "+N".
             monitor: root.monitorText(r.monitor_marks),
+            // Denials in the boundary log (paddock boundary ID).
+            boundaryCount: Math.max(0, Math.floor(Number(r.boundary_count || 0))),
             parentHarness: "",
             depth: 0,
             children: 0
@@ -1095,6 +1097,8 @@ Panel {
     property string caption: ""
     property string caption2: ""
     property color caption2Color: root.dim
+    // The boundary log count and the command that reads it (boundary.rs).
+    property string caption3: ""
     property bool showActions: false
     // Levels below a parent row: a sandbox that another sandbox started.
     property int indent: 0
@@ -1153,6 +1157,7 @@ Panel {
         PlainText { width: parent.width; text: row.title }
         PlainText { width: parent.width; visible: text !== ""; text: row.caption; color: root.dim; font.pixelSize: Style.font.caption }
         PlainText { width: parent.width; visible: text !== ""; text: row.caption2; color: row.caption2Color; font.pixelSize: Style.font.caption }
+        PlainText { width: parent.width; visible: text !== ""; text: row.caption3; color: root.dim; font.pixelSize: Style.font.caption }
       }
 
       RowLayout {
@@ -1362,6 +1367,10 @@ Panel {
                   : (modelData.auth !== "" && modelData.auth !== "shared" ? strings.t("row.auth").arg(modelData.auth)
                   : (modelData.pasture !== "" ? strings.t("row.pasture").arg(modelData.pasture) : "")))
                 caption2Color: modelData.warning !== "" || (modelData.frozenSince === 0 && (modelData.monitor !== "" || modelData.credentials !== "" || (modelData.timer !== null && modelData.timer.over))) ? root.urgent : root.dim
+                // Text only: reading the log is a command, the row runs nothing new.
+                caption3: modelData.boundaryCount > 0
+                  ? strings.tn("row.boundary", modelData.boundaryCount).arg(Commons.I18n.formatNumber(modelData.boundaryCount)).arg(modelData.id)
+                  : ""
                 showActions: true
                 onActivated: root.goToTerminal(modelData)
 

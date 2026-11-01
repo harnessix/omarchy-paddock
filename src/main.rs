@@ -102,6 +102,15 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
+    /// Show what the sandbox boundary denied, grouped by kind and target.
+    Boundary {
+        id: String,
+        #[arg(long)]
+        json: bool,
+        /// Keep running and print each new denial.
+        #[arg(long)]
+        follow: bool,
+    },
     /// Stop a running sandbox.
     Stop { id: String },
     /// Freeze a running sandbox: it uses no CPU and keeps its memory until
@@ -1950,6 +1959,12 @@ fn real_main() -> Result<i32> {
                                 serde_json::to_value(timers).unwrap_or_default(),
                             );
                         }
+                        if let Some(o) = v.as_object_mut() {
+                            o.insert(
+                                "boundary_count".into(),
+                                paddock::boundary::count(&env, &r.id).into(),
+                            );
+                        }
                         let tunnels = paddock::monitor::read_seen(&env, &r.id);
                         if let (Some(o), false) = (v.as_object_mut(), tunnels.is_empty()) {
                             o.insert("tunnels".into(), tunnels.into());
@@ -2283,6 +2298,7 @@ fn real_main() -> Result<i32> {
             }
             Ok(0)
         }
+        Cmd::Boundary { id, json, follow } => paddock::boundary::cmd(&env, &id, json, follow),
         Cmd::Stop { id } => {
             let all = Running::list(&env);
             stop_one(&env, &all, &id)

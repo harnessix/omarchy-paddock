@@ -401,20 +401,29 @@ pub fn apply(
                 }
             }
             Status::Remote => {}
-            Status::NeedsAllow(_) => blocked.push(format!("{} (needs [mcp] allow)", s.name)),
-            Status::NeedsPort(p) => blocked.push(format!(
-                "{} (needs host port {p} in [network] host_ports)",
-                s.name
+            Status::NeedsAllow(_) => {
+                blocked.push((s.name.clone(), "needs [mcp] allow".to_string()))
+            }
+            Status::NeedsPort(p) => blocked.push((
+                s.name.clone(),
+                format!("needs host port {p} in [network] host_ports"),
             )),
-            Status::NotFound(c) => blocked.push(format!("{} (command {c} not found)", s.name)),
+            Status::NotFound(c) => blocked.push((s.name.clone(), format!("command {c} not found"))),
         }
     }
     if !blocked.is_empty() {
         spec.warnings.push(format!(
             "these MCP servers will not start in the sandbox: {}. Run `paddock mcp {}` for details",
-            blocked.join(", "),
+            blocked
+                .iter()
+                .map(|(n, why)| format!("{n} ({why})"))
+                .collect::<Vec<_>>()
+                .join(", "),
             profile.name
         ));
+        for (name, why) in &blocked {
+            spec.deny(crate::boundary::MCP, name, why);
+        }
     }
 }
 
@@ -634,6 +643,16 @@ mod tests {
             .warnings
             .iter()
             .any(|w| w.contains("needs [mcp] allow")));
+        assert_eq!(
+            spec.boundary,
+            vec![("mcp".into(), "s".into(), "needs [mcp] allow".into())]
+        );
+        crate::boundary::record_start(&e, &spec);
+        let lines = crate::boundary::read(&e, "t");
+        assert_eq!(
+            (lines[0].kind.as_str(), lines[0].target.as_str()),
+            ("mcp", "s")
+        );
 
         m.mcp.allow.push("s".into());
         let mut spec2 = spec.clone();
