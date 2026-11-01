@@ -89,7 +89,8 @@ impl Backend for Bwrap {
                 "--disable-userns",
             ],
         );
-        if spec.network != Network::None {
+        // Network mode api has no network either: only the proxy socket.
+        if matches!(spec.network, Network::Egress | Network::Host) {
             a.push("--share-net".into());
         }
         arg(&mut a, &["--hostname", "paddock"]);
@@ -296,8 +297,8 @@ impl Backend for Bwrap {
                 files,
             });
         }
-        if !spec.publish.is_empty() && spec.network == Network::None {
-            bail!("ports cannot be published with network mode 'none'");
+        if !spec.publish.is_empty() && matches!(spec.network, Network::None | Network::Api) {
+            bail!("ports cannot be published with network modes 'none' and 'api'");
         }
         Ok(Launch {
             program: bwrap,

@@ -401,7 +401,7 @@ impl Backend for Docker {
         a.push("--network".into());
         a.push(match spec.network {
             Network::None => "none".into(),
-            Network::Egress => "none".into(),
+            Network::Egress | Network::Api => "none".into(),
             Network::Host => "host".into(),
             Network::Allowlist => bail!("network mode 'allowlist' needs the srt backend"),
         });

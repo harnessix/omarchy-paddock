@@ -194,7 +194,9 @@ pub fn settings(env: &HostEnv, spec: &SandboxSpec) -> Result<serde_json::Value> 
     }
     let domains: Vec<String> = match spec.network {
         Network::None => vec![],
-        Network::Allowlist => {
+        // srt's own proxy enforces the list. It does not check the TLS
+        // server name the way the paddock proxy does.
+        Network::Allowlist | Network::Api => {
             let mut d = spec.allow_domains.clone();
             d.extend(
                 spec.host_ports
@@ -204,7 +206,7 @@ pub fn settings(env: &HostEnv, spec: &SandboxSpec) -> Result<serde_json::Value> 
             d
         }
         Network::Egress | Network::Host => bail!(
-            "the srt backend supports network modes 'allowlist' and 'none'; use bwrap for '{}'",
+            "the srt backend supports network modes 'api', 'allowlist' and 'none'; use bwrap for '{}'",
             format!("{:?}", spec.network).to_lowercase()
         ),
     };
@@ -265,7 +267,7 @@ impl Backend for Srt {
             }
         }
         if matches!(spec.network, Network::Egress | Network::Host) {
-            bail!("the srt backend supports network modes 'allowlist' and 'none'");
+            bail!("the srt backend supports network modes 'api', 'allowlist' and 'none'");
         }
         if matches!(spec.gui.mode, GuiMode::Window | GuiMode::Host) {
             bail!("the srt backend supports display modes 'off', 'headless' and 'app'");

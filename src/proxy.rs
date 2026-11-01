@@ -30,6 +30,10 @@ use url::Url;
 
 pub const RELAY_PORT: u16 = 3128;
 pub const SOCKET_IN_SANDBOX: &str = "/run/paddock/proxy.sock";
+/// Network mode `api`: the local port of the relay to the proxy, and the
+/// proxy socket in the sandbox.
+pub const API_PORT: u16 = 3131;
+pub const API_SOCKET_IN_SANDBOX: &str = "/run/paddock/api-proxy.sock";
 
 pub const PROXY_VARS: &[&str] = &[
     "HTTPS_PROXY",
@@ -183,6 +187,9 @@ pub struct HostProxy {
     pub idle: Duration,
     /// Connections handled at the same time.
     pub max_conns: usize,
+    /// Network mode `api`: only CONNECT to listed hosts, with a matching TLS
+    /// server name. Plain HTTP is refused.
+    pub api: Option<allow::ApiPolicy>,
     /// Trust only this TLS config for `https://` proxies, instead of the
     /// system trust store. Tests use it for a local CA.
     #[cfg(test)]
@@ -199,6 +206,7 @@ impl Default for HostProxy {
             allow_lan: false,
             idle: Duration::from_secs(15 * 60),
             max_conns: 512,
+            api: None,
             #[cfg(test)]
             tls: None,
         }
@@ -670,6 +678,13 @@ fn handle(cfg: &HostProxy, mut client: UnixStream) -> Result<()> {
             respond(&mut client, 400, "Bad Request");
             bail!("bad CONNECT target {target}");
         };
+        if let Some(api) = &cfg.api {
+            if let Err(why) = api.list.check(&host, port) {
+                api.refuse(&host, &why);
+                respond(&mut client, 403, "Forbidden");
+                bail!("refused: {host}:{port}: {why}");
+            }
+        }
         let mut up = match open_tunnel(cfg, &host, port) {
             Ok(up) => up,
             Err(e) => {
@@ -678,11 +693,33 @@ fn handle(cfg: &HostProxy, mut client: UnixStream) -> Result<()> {
             }
         };
         client.write_all(b"HTTP/1.1 200 Connection established\r\n\r\n")?;
+        let rest = match &cfg.api {
+            Some(api) => match checked_hello(&mut client, rest, &host) {
+                Ok(bytes) => bytes,
+                Err(why) => {
+                    api.refuse(&host, &why);
+                    let _ = client.shutdown(Shutdown::Both);
+                    bail!("refused: {host}:{port}: {why}");
+                }
+            },
+            None => rest,
+        };
         if !rest.is_empty() {
             up.write_all(&rest)?;
         }
         splice(client, up, cfg.idle);
         return Ok(());
+    }
+
+    if let Some(api) = &cfg.api {
+        let host = Url::parse(&target)
+            .ok()
+            .as_ref()
+            .and_then(host_of)
+            .unwrap_or_default();
+        api.refuse(&host, "plain HTTP");
+        respond(&mut client, 403, "Forbidden");
+        bail!("refused: plain HTTP to {host} in network mode api");
     }
 
     // A plain HTTP request in absolute form.
@@ -751,6 +788,26 @@ fn handle(cfg: &HostProxy, mut client: UnixStream) -> Result<()> {
     }
     splice(client, up, cfg.idle);
     Ok(())
+}
+
+/// Network mode `api`: read the TLS ClientHello that follows the CONNECT
+/// and check its server name against `host`. Nothing goes upstream before
+/// this check. Returns the bytes to forward: the early bytes and the hello.
+fn checked_hello(
+    client: &mut UnixStream,
+    early: Vec<u8>,
+    host: &str,
+) -> std::result::Result<Vec<u8>, String> {
+    let _ = client.set_read_timeout(Some(HEAD_TIMEOUT));
+    let mut r = std::io::Cursor::new(early).chain(&*client);
+    let (raw, msg) = allow::read_client_hello(&mut r)?;
+    allow::check_sni(&msg, host)?;
+    let (cur, _) = r.into_inner();
+    let pos = cur.position() as usize;
+    let mut out = raw;
+    out.extend_from_slice(&cur.get_ref()[pos..]);
+    let _ = client.set_read_timeout(None);
+    Ok(out)
 }
 
 /// Serve the proxy on a Unix socket until the process exits.
@@ -836,6 +893,7 @@ pub fn relay(listen: &str, socket: &Path, forward: &[u16], ready: Option<&Path>)
     Ok(())
 }
 
+pub mod allow;
 pub(crate) mod tls;
 
 #[cfg(test)]

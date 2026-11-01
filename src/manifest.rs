@@ -164,7 +164,7 @@ pub struct NetworkCfg {
     /// Host loopback ports the sandbox can reach, for example a local MCP server.
     #[serde(default)]
     pub host_ports: Vec<u16>,
-    /// Extra domains for network mode `allowlist`, besides the harness's own.
+    /// Extra domains for network modes `api` and `allowlist`, besides the harness's own.
     #[serde(default)]
     pub allow: Vec<String>,
     /// Let the sandbox reach private and link-local networks (the LAN).
@@ -471,9 +471,9 @@ pub const TEMPLATE: &str = r#"# paddock.toml: sandbox settings for this project.
 # reveal = [".env.test"]      # do not hide these
 
 [network]
-# mode = "egress"             # none | egress | allowlist | host
+# mode = "egress"             # none | api | egress | allowlist | host
 # publish = [5173]            # ports reachable from the host
-# allow = ["crates.io"]       # extra domains for mode = "allowlist" (srt backend)
+# allow = ["crates.io"]       # extra domains for modes "api" and "allowlist"
 # lan = true                # reach private networks: routers, NAS, other machines on the LAN
 # host_ports = [8765]         # host loopback ports reachable from the sandbox (local MCP servers)
 
