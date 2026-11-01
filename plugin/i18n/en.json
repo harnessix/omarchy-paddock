@@ -218,5 +218,7 @@
   "keys.kvKeys": "↵ open, or open a group · Del delete or free · Esc back",
   "keys.kvKey": "C copy · Del delete or free · Esc back",
   "keys.kvRow": "↵ or K shared data",
-  "row.pasture": "pasture %1"
+  "row.pasture": "pasture %1",
+  "row.holdsCredentials": "holds the values of %1",
+  "popup.ask.credentials": "Give these credentials to %1 in %2? The agent can read them."
 }
