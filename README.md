@@ -1056,7 +1056,8 @@ With a systemd user instance, every bwrap or srt sandbox runs in a scope of its 
 - `paddock stop` thaws a frozen sandbox first, so that it can end.
 - Each freeze and thaw goes to the audit log, with the reason.
 - The other members of its pasture see the state in paddock kv: `sandbox:<id>` in the `pasture` scope is `{"state": "suspended", ...}` while it is frozen and `running` after.
-- The clock keeps running while a sandbox is frozen: a harness timeout or a model's prompt cache can run out. A lease in paddock kv expires as usual.
+- The clock keeps running while a sandbox is frozen: a harness timeout or a model's prompt cache can run out.
+- Leases in paddock kv follow `[suspend] leases` in the user configuration. With `keep` (the default), the leases of a frozen sandbox stop counting down and run again after the thaw with the time they had left; another agent that claims one gets a conflict with `owner_state: "suspended"`. If the sandbox ends while frozen, its leases count down again. With `release`, paddock frees them when it freezes the sandbox, with one audit line per lease. The rule holds for every freeze: `paddock freeze`, a hard timer, and the gateway.
 
 ## App mode
 

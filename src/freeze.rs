@@ -13,12 +13,64 @@
 //! - Only paddock on the host freezes and thaws. Each one goes to the audit
 //!   log with its reason, and paddock kv shows the state of the sandbox
 //!   (`sandbox:<id>` in the project scope).
+//! - The leases of a frozen sandbox in paddock kv follow `[suspend] leases`
+//!   of the user configuration: `keep` (default) stops their time to live
+//!   until the thaw, `release` frees them at once. Every freeze goes through
+//!   `freeze` here (`paddock freeze`, hard timers, a child at its time
+//!   limit), so the rule holds for each one.
 
 use crate::env::HostEnv;
 use crate::state::Running;
 use anyhow::{bail, Context as _, Result};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
+
+/// What happens to the leases of a sandbox while it is frozen.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Leases {
+    /// The leases stay, and their time to live stops until the thaw.
+    #[default]
+    Keep,
+    /// paddock frees the leases when it freezes the sandbox.
+    Release,
+}
+
+/// `[suspend]` of the user configuration. A project file cannot set it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SuspendCfg {
+    pub leases: Leases,
+}
+
+#[derive(Debug, Default, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawSuspend {
+    leases: Option<Leases>,
+}
+
+impl SuspendCfg {
+    pub fn load(env: &HostEnv) -> Result<Self> {
+        let file = env.paddock_config().join("config.toml");
+        let Ok(text) = std::fs::read_to_string(&file) else {
+            return Ok(Self::default());
+        };
+        Self::parse(&text).with_context(|| format!("[suspend] in {} is invalid", file.display()))
+    }
+
+    pub fn parse(text: &str) -> Result<Self> {
+        let v: toml::Value = toml::from_str(text)?;
+        let raw: RawSuspend = match v.get("suspend") {
+            Some(t) => t
+                .clone()
+                .try_into()
+                .context("[suspend] leases must be \"keep\" or \"release\"")?,
+            None => RawSuspend::default(),
+        };
+        Ok(Self {
+            leases: raw.leases.unwrap_or_default(),
+        })
+    }
+}
 
 /// The scope of a sandbox.
 pub fn scope_name(id: &str) -> String {
@@ -213,6 +265,53 @@ fn kv_state(env: &HostEnv, r: &Running, state: &str, now: u64) {
     }
 }
 
+/// Apply `[suspend] leases` to a sandbox that was just frozen. A bad
+/// `[suspend]` table keeps the leases: the default, and nothing is lost.
+/// Returns the leases that it released.
+pub fn leases_frozen(env: &HostEnv, root: &Path, r: &Running, now: u64) -> Vec<String> {
+    let rule = SuspendCfg::load(env).unwrap_or_else(|e| {
+        log::warn!("{e:#}; the leases of {} stay", r.id);
+        SuspendCfg::default()
+    });
+    match rule.leases {
+        Leases::Keep => {
+            if let Err(e) = crate::kv::pause_leases(root, &r.id, now) {
+                log::warn!("cannot pause the leases of {}: {e:#}", r.id);
+            }
+            Vec::new()
+        }
+        Leases::Release => {
+            let cfg = crate::kv::KvCfg::load(env).unwrap_or_default();
+            match crate::kv::release_leases(root, &r.id, &cfg, now) {
+                Ok(keys) => keys
+                    .into_iter()
+                    .map(|(scope, key)| {
+                        // Key names only: never a value.
+                        audit(
+                            env,
+                            r,
+                            "lease released",
+                            &format!("{key} ({scope} scope): the sandbox is frozen"),
+                        );
+                        key
+                    })
+                    .collect(),
+                Err(e) => {
+                    log::warn!("cannot release the leases of {}: {e:#}", r.id);
+                    Vec::new()
+                }
+            }
+        }
+    }
+}
+
+/// A thawed sandbox: its paused leases run again with the time they had.
+pub fn leases_thawed(root: &Path, id: &str, now: u64) {
+    if let Err(e) = crate::kv::resume_leases(root, id, now) {
+        log::warn!("cannot resume the leases of {id}: {e:#}");
+    }
+}
+
 fn audit(env: &HostEnv, r: &Running, decision: &str, reason: &str) {
     crate::broker::audit_line(
         env,
@@ -255,6 +354,7 @@ pub fn freeze(env: &HostEnv, id: &str, tree: bool, reason: &str) -> Result<Vec<S
         )?;
         kv_state(env, t, "suspended", now);
         audit(env, t, "frozen", reason);
+        leases_frozen(env, &crate::kv::kv_root(env), t, now);
         done.push(t.id.clone());
     }
     Ok(done)
@@ -282,6 +382,7 @@ pub fn thaw(env: &HostEnv, id: &str, tree: bool) -> Result<Vec<String>> {
         // Timers do not count the frozen time.
         crate::timer::record_frozen(env, &t.id, since, now);
         let _ = std::fs::remove_file(frozen_file(env, &t.id));
+        leases_thawed(&crate::kv::kv_root(env), &t.id, now);
         kv_state(env, t, "running", now);
         audit(
             env,
@@ -317,6 +418,29 @@ mod tests {
             "paddock-sb-claude-repo-8a48be.scope"
         );
         assert_eq!(scope_name("a b/c"), "paddock-sb-a_b_c.scope");
+    }
+
+    #[test]
+    fn suspend_config_parses_both_lease_rules() {
+        assert_eq!(SuspendCfg::parse("").unwrap().leases, Leases::Keep);
+        assert_eq!(
+            SuspendCfg::parse("[suspend]\n").unwrap().leases,
+            Leases::Keep
+        );
+        assert_eq!(
+            SuspendCfg::parse("[suspend]\nleases = \"keep\"\n")
+                .unwrap()
+                .leases,
+            Leases::Keep
+        );
+        assert_eq!(
+            SuspendCfg::parse("[suspend]\nleases = \"release\"\n")
+                .unwrap()
+                .leases,
+            Leases::Release
+        );
+        assert!(SuspendCfg::parse("[suspend]\nleases = \"drop\"\n").is_err());
+        assert!(SuspendCfg::parse("[suspend]\nother = 1\n").is_err());
     }
 
     #[test]

@@ -1742,3 +1742,123 @@ fn a_ration_without_usage_numbers_keeps_its_time() {
     assert_eq!((s.owner.as_str(), s.budget, s.hard), ("user", 3600, true));
     assert!(s.quota.is_none());
 }
+
+/// A frozen holder, as `paddock freeze` records it: no real freeze.
+fn frozen_holder(id: &str) -> crate::state::Running {
+    serde_json::from_value(serde_json::json!({
+        "id": id, "harness": "t", "project": "/src/app", "backend": "bwrap",
+        "network": "off", "gui": "none", "pid": 1, "started": 0,
+    }))
+    .unwrap()
+}
+
+#[test]
+fn a_frozen_holder_keeps_its_lease_and_the_time_it_had_left() {
+    let w = world();
+    let (a, _) = service(&w, "a", None, KvCfg::default(), None);
+    let (b, _) = service(&w, "b", None, KvCfg::default(), None);
+    let r = a.handle(&claim(Scope::Pasture, "job", 60), None);
+    assert_eq!(r.status, Status::Done, "{}", r.message);
+    let expires = r.result["expires"].as_u64().unwrap();
+    let frozen_at = expires - 50;
+    // `[suspend] leases = "keep"` is the default.
+    assert!(
+        crate::freeze::leases_frozen(&w.env, &w.root, &frozen_holder("a"), frozen_at).is_empty()
+    );
+    let st = w.open(&team());
+    let key = team().key();
+    // Long after its time to live, the lease still holds.
+    let late = expires + 3600;
+    let e = st.get(&key, "lease:job", late).unwrap().unwrap();
+    assert_eq!(e.expires, None);
+    assert!(st.is_paused(&key, "lease:job").unwrap());
+    let r = b.handle(&claim(Scope::Pasture, "job", 60), None);
+    assert_eq!(r.status, Status::Conflict);
+    assert_eq!(r.result["owner_state"], "suspended");
+    assert!(r.message.contains("suspended"), "{}", r.message);
+    // Other keys of the holder keep their time to live.
+    let mut st = w.open(&team());
+    st.put(
+        &key,
+        "note",
+        "x",
+        None,
+        Some(expires),
+        &Writer {
+            sandbox: "a",
+            harness: "t",
+        },
+        Q,
+        frozen_at,
+    )
+    .unwrap();
+    assert_eq!(crate::kv::pause_leases(&w.root, "a", frozen_at).unwrap(), 0);
+    assert!(st.get(&key, "note", late).unwrap().is_none());
+    // The thaw: the 50 seconds that it had left run from now.
+    crate::freeze::leases_thawed(&w.root, "a", late);
+    let e = st.get(&key, "lease:job", late).unwrap().unwrap();
+    assert_eq!(e.expires, Some(late + 50));
+    assert!(!st.is_paused(&key, "lease:job").unwrap());
+    assert!(st.get(&key, "lease:job", late + 50).unwrap().is_none());
+}
+
+#[test]
+fn a_paused_lease_is_released_by_its_holder_or_runs_again_when_it_ends() {
+    let w = world();
+    let (a, _) = service(&w, "a", None, KvCfg::default(), None);
+    a.handle(&claim(Scope::Pasture, "x", 60), None);
+    let now = crate::state::now();
+    assert_eq!(crate::kv::pause_leases(&w.root, "a", now).unwrap(), 1);
+    // A second freeze changes nothing: the time left stays.
+    assert_eq!(crate::kv::pause_leases(&w.root, "a", now + 30).unwrap(), 0);
+    assert_eq!(
+        crate::kv::resume_leases(&w.root, "a", now + 100).unwrap(),
+        1
+    );
+    let e = w
+        .open(&team())
+        .get(&team().key(), "lease:x", now + 100)
+        .unwrap()
+        .unwrap();
+    assert!(e.expires.unwrap() > now + 100 && e.expires.unwrap() <= now + 160);
+    let r = a.handle(&req("release", Scope::Pasture, "x"), None);
+    assert_eq!(r.status, Status::Done, "{}", r.message);
+}
+
+#[test]
+fn release_frees_the_leases_of_a_frozen_sandbox_at_once_with_an_audit_line() {
+    let w = world();
+    let cfg_dir = w.env.paddock_config();
+    std::fs::create_dir_all(&cfg_dir).unwrap();
+    std::fs::write(
+        cfg_dir.join("config.toml"),
+        "[suspend]\nleases = \"release\"\n",
+    )
+    .unwrap();
+    let (a, _) = service(&w, "a", None, KvCfg::default(), None);
+    let (b, _) = service(&w, "b", None, KvCfg::default(), None);
+    a.handle(&claim(Scope::Pasture, "job", 600), None);
+    a.handle(&put(Scope::Pasture, "plan", "secret-value"), None);
+    b.handle(&claim(Scope::Pasture, "other", 600), None);
+    let now = crate::state::now();
+    let freed = crate::freeze::leases_frozen(&w.env, &w.root, &frozen_holder("a"), now);
+    assert_eq!(freed, vec!["lease:job".to_string()]);
+    // Free for another at once; the other keys and the leases of others stay.
+    let r = b.handle(&claim(Scope::Pasture, "job", 60), None);
+    assert_eq!(r.status, Status::Done, "{}", r.message);
+    let st = w.open(&team());
+    assert!(st.get(&team().key(), "plan", now).unwrap().is_some());
+    assert!(st.get(&team().key(), "lease:other", now).unwrap().is_some());
+    let audit = std::fs::read_to_string(crate::broker::audit_file(&w.env)).unwrap();
+    let line = audit
+        .lines()
+        .find(|l| l.contains("lease released"))
+        .unwrap();
+    assert!(line.contains("lease:job"), "{line}");
+    assert!(!audit.contains("secret-value"));
+    let v: serde_json::Value = serde_json::from_str(line).unwrap();
+    assert!(
+        !v["detail"].as_str().unwrap().contains("/src/app"),
+        "{line}"
+    );
+}
