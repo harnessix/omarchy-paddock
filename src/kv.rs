@@ -1116,7 +1116,7 @@ impl Service {
                     (None, Some(x)) if x > 0.0 && x <= 1.0 => timer::More::Share(x),
                     _ => return Ok(Response::new(
                         Status::Invalid,
-                        "timer extend needs --by: a time of at most 30 days, or a share such as 5%",
+                        "timer extend needs --by: a time of at most 30 days, or a share such as 1%",
                     )),
                 };
                 // Check the kind before anyone asks the user.

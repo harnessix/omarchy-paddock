@@ -538,13 +538,13 @@ enum TimerCmd {
         #[arg(long, required_unless_present = "quota")]
         budget: Option<String>,
         /// A share of a limit window of the sandbox's account, counted from
-        /// now, for example weekly=10%. `paddock forage` shows the windows.
+        /// now, for example weekly=1%. `paddock forage` shows the windows.
         #[arg(long)]
         quota: Option<String>,
         #[arg(long)]
         hard: bool,
     },
-    /// Add time (30m) or quota (5%) to a timer of a sandbox's own scope.
+    /// Add time (30m) or quota (1%) to a timer of a sandbox's own scope.
     Extend {
         id: String,
         name: String,
