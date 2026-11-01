@@ -197,6 +197,24 @@ fn add_paused(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// Switch to WAL. When two processes create the same file at once, the
+/// switch can fail with "database is locked" at once: SQLite does not wait
+/// with the busy timeout there. So try again, for up to 10 seconds.
+fn wal(conn: &Connection) -> Result<()> {
+    let end = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        match conn.pragma_update(None, "journal_mode", "WAL") {
+            Err(e)
+                if e.sqlite_error_code() == Some(rusqlite::ErrorCode::DatabaseBusy)
+                    && std::time::Instant::now() < end =>
+            {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            r => return Ok(r?),
+        }
+    }
+}
+
 /// The keys of leases: `claim` writes them.
 const LEASE_KEYS: &str = "substr(key, 1, 6) = 'lease:'";
 
@@ -315,7 +333,7 @@ impl Store {
         let conn = Connection::open(path)
             .with_context(|| format!("cannot open the store {}", path.display()))?;
         conn.busy_timeout(std::time::Duration::from_secs(10))?;
-        conn.pragma_update(None, "journal_mode", "WAL")?;
+        wal(&conn)?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         conn.execute_batch(SCHEMA)?;
         add_paused(&conn)?;
@@ -955,5 +973,35 @@ impl Store {
         self.conn
             .execute("DELETE FROM grants WHERE sandbox = ?1", params![id])?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Several stores open one new file at the same moment, as two
+    /// sandboxes that start together open the fresh registry.
+    #[test]
+    fn stores_that_create_one_file_at_once_all_open() {
+        for round in 0..100 {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("kv.db");
+            let gate = std::sync::Arc::new(std::sync::Barrier::new(6));
+            let threads: Vec<_> = (0..6)
+                .map(|_| {
+                    let (path, gate) = (path.clone(), gate.clone());
+                    std::thread::spawn(move || {
+                        gate.wait();
+                        Store::open(&path).map(|_| ()).map_err(|e| format!("{e:#}"))
+                    })
+                })
+                .collect();
+            for t in threads {
+                if let Err(e) = t.join().unwrap() {
+                    panic!("round {round}: {e}");
+                }
+            }
+        }
     }
 }
