@@ -95,7 +95,8 @@ pub struct Credential {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_url_env: Option<String>,
     /// gateway: a known API that fills hosts, header, prefix, base_path and
-    /// base_url_env (`anthropic`, `openai`, `github`). Fields set here win.
+    /// base_url_env (`anthropic`, `openai`, `github`, `github-git`). Fields
+    /// set here win.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub preset: Option<String>,
     /// gateway: the request header that carries the value. Default:
@@ -106,6 +107,10 @@ pub struct Credential {
     /// for Authorization, nothing for other headers.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prefix: Option<String>,
+    /// gateway: send the value as HTTP Basic auth with this user name:
+    /// `Basic base64(USER:VALUE)`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub basic_user: Option<String>,
     /// gateway: a query parameter that carries the value instead of a header.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub query: Option<String>,
@@ -142,6 +147,19 @@ impl Credential {
         let Some(p) = &self.preset else {
             return Ok(c);
         };
+        if p == "github-git" {
+            if c.hosts.is_empty() {
+                c.hosts = vec!["github.com".to_string()];
+            }
+            if c.paths.is_empty() {
+                c.paths = GIT_READ_PATHS.iter().map(|p| p.to_string()).collect();
+            }
+            c.header.get_or_insert_with(|| "Authorization".to_string());
+            c.basic_user
+                .get_or_insert_with(|| "x-access-token".to_string());
+            c.prefix.get_or_insert_with(|| "Basic ".to_string());
+            return Ok(c);
+        }
         let (host, header, prefix, base_path, base_env) = match p.as_str() {
             "anthropic" => (
                 "api.anthropic.com",
@@ -164,7 +182,9 @@ impl Credential {
                 "",
                 "GITHUB_API_URL",
             ),
-            other => bail!("unknown preset '{other}': use anthropic, openai or github"),
+            other => {
+                bail!("unknown preset '{other}': use anthropic, openai, github or github-git")
+            }
         };
         if c.hosts.is_empty() {
             c.hosts = vec![host.to_string()];
@@ -179,6 +199,12 @@ impl Credential {
     /// Whether this paddock can use it: `agent` only for ssh keys.
     pub fn available(&self) -> bool {
         self.via.available() && (self.via != Via::Agent || !self.keys.is_empty())
+    }
+
+    /// git smart HTTP through the gateway (`preset = "github-git"`): git in
+    /// the sandbox reaches the host through a URL rewrite.
+    pub fn is_git(&self) -> bool {
+        self.preset.as_deref() == Some("github-git")
     }
 
     pub fn applies_to(&self, harness: &str) -> bool {
@@ -198,6 +224,27 @@ fn valid_var(n: &str) -> bool {
     !n.is_empty()
         && n.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
         && n.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// The paths of `preset = "github-git"`: fetch and clone. Push has its own
+/// path (`paddock-host git push`); add `/*/*/git-receive-pack` to allow it
+/// here too.
+pub const GIT_READ_PATHS: &[&str] = &["/*/*/info/refs", "/*/*/git-upload-pack"];
+
+/// The environment that sends git in the sandbox to the gateway for the
+/// given credentials (`(name, host)` pairs): `url.BASE/.insteadOf =
+/// https://HOST/`, through `GIT_CONFIG_COUNT`, never in a repository file.
+pub fn git_env(port: u16, routes: &[(String, String)]) -> Vec<(String, String)> {
+    let mut out = vec![("GIT_CONFIG_COUNT".to_string(), routes.len().to_string())];
+    for (i, (name, host)) in routes.iter().enumerate() {
+        let host = host.strip_suffix(":443").unwrap_or(host);
+        out.push((
+            format!("GIT_CONFIG_KEY_{i}"),
+            format!("url.http://127.0.0.1:{port}/s/{name}/.insteadOf"),
+        ));
+        out.push((format!("GIT_CONFIG_VALUE_{i}"), format!("https://{host}/")));
+    }
+    out
 }
 
 /// `[credentials.*]` of the user configuration.
@@ -248,7 +295,7 @@ pub fn parse(text: &str) -> Result<BTreeMap<String, Credential>> {
             );
         }
         if c.via == Via::Gateway {
-            if c.base_url_env.is_none() {
+            if c.base_url_env.is_none() && !c.is_git() {
                 bail!("[credentials.{name}]: via = \"gateway\" needs base_url_env, the variable that points the tool at the gateway");
             }
             if c.env.is_none() && !valid_var(name) {
@@ -275,6 +322,11 @@ pub fn parse(text: &str) -> Result<BTreeMap<String, Credential>> {
             {
                 if !p.starts_with('/') {
                     bail!("[credentials.{name}]: the path '{p}' must start with /");
+                }
+            }
+            if let Some(u) = &c.basic_user {
+                if u.is_empty() || u.contains(':') || u.chars().any(|c| c.is_control()) {
+                    bail!("[credentials.{name}]: '{u}' is not a user name for basic auth");
                 }
             }
             if let Some(h) = &c.header {
@@ -817,6 +869,55 @@ confirm = "each"
         let o = &all["OPENAI_API_KEY"];
         assert_eq!(o.hosts, ["proxy.example:8443"]);
         assert_eq!(o.base_path.as_deref(), Some("/v1"));
+    }
+
+    #[test]
+    fn the_github_git_preset_binds_git_smart_http_with_basic_auth() {
+        let all = parse("[credentials.github_git]\nvia = \"gateway\"\npreset = \"github-git\"\nfrom = \"command\"\ncommand = [\"gh\", \"auth\", \"token\"]\n").unwrap();
+        let c = &all["github_git"];
+        assert!(c.is_git());
+        assert_eq!(c.hosts, ["github.com"]);
+        assert_eq!(c.paths, ["/*/*/info/refs", "/*/*/git-upload-pack"]);
+        assert_eq!(c.header.as_deref(), Some("Authorization"));
+        assert_eq!(c.prefix.as_deref(), Some("Basic "));
+        assert_eq!(c.basic_user.as_deref(), Some("x-access-token"));
+        assert_eq!(c.base_url_env, None);
+        let r = gateway::Route::new(c, "ghp_tok".into());
+        // base64("x-access-token:ghp_tok")
+        assert_eq!(r.value, "eC1hY2Nlc3MtdG9rZW46Z2hwX3Rvaw==");
+        assert_eq!(r.prefix, "Basic ");
+        assert!(parse(
+            "[credentials.g]\nvia = \"gateway\"\npreset = \"github-git\"\nbasic_user = \"a:b\"\n"
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn the_git_rewrite_lives_in_the_environment() {
+        let env = git_env(
+            3130,
+            &[
+                ("github_git".into(), "github.com".into()),
+                ("ghe".into(), "git.example:8443".into()),
+            ],
+        );
+        let want: Vec<(String, String)> = [
+            ("GIT_CONFIG_COUNT", "2"),
+            (
+                "GIT_CONFIG_KEY_0",
+                "url.http://127.0.0.1:3130/s/github_git/.insteadOf",
+            ),
+            ("GIT_CONFIG_VALUE_0", "https://github.com/"),
+            (
+                "GIT_CONFIG_KEY_1",
+                "url.http://127.0.0.1:3130/s/ghe/.insteadOf",
+            ),
+            ("GIT_CONFIG_VALUE_1", "https://git.example:8443/"),
+        ]
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+        assert_eq!(env, want);
     }
 
     struct Answers(
