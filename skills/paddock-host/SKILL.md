@@ -20,6 +20,7 @@ When a task needs the host, use `paddock-host`. Each request goes to paddock on 
 | :--- | :--- |
 | See the real screen | `paddock-host screenshot --reason "..."` |
 | See the focused host window | `paddock-host screenshot --target window --reason "..."` |
+| See why something failed: a missing path, a refused host or address, a withheld variable | `paddock-host boundary` (the denials of the sandbox boundary, read-only) |
 | Run one command on the host | `paddock-host exec --reason "..." -- COMMAND ARG...` |
 | Run a named host tool that the user defined | `paddock-host tool NAME ARG...` (`paddock-host tool --list` shows the tools and their argument shapes) |
 | A file outside the project | `paddock-host fetch /absolute/path --reason "..."` |

@@ -476,6 +476,25 @@ paddock monitor unmute ~/src/tunnel-demo
 
 `mute` and `unmute` change only `[monitor] mute = ["/path/to/project"]` in `~/.config/paddock/config.toml` and keep the rest of the file with its comments. You can edit the list by hand too. A project `paddock.toml` can never mute itself.
 
+### Boundary log
+
+A program in a sandbox rarely says "permission denied". A path is missing, a socket is gone, or a LAN address times out, and the program falls back to its defaults without a word. paddock knows its own rules, so it writes each denial to a boundary log, `boundary.jsonl` in the run folder of the sandbox. The log is on by default.
+
+- Host requests: each `paddock-host` request that paddock refused or that the user denied, for example a `fetch` of a protected path, an `exec` in `deny` mode, a tool call that matches no shape, or a refused `borrow`. A note of the user stays out of the log.
+- Network: each target that the host proxy refused, with host and port: a private network address, a host loopback port, an address of this host, or a host outside the list in network mode `api`.
+- Environment: each variable that paddock withheld at the start (secret-looking names, cloud credentials, `paddock env hide`). The log holds the name, never the value.
+- MCP: each MCP server that does not start in the sandbox, with the reason.
+
+Each line has the time, the kind, the target, the rule and a count. The same denial within a minute raises the count of its line. The log never holds content. It goes away with the run folder when the sandbox ends.
+
+```sh
+paddock boundary ID            # the denials, by kind and target, with counts
+paddock boundary ID --follow   # and each new denial as it happens
+paddock-host boundary          # inside the sandbox: its own log, read-only
+```
+
+`paddock ps --json` shows `boundary_count` for each sandbox, and the bar panel shows the count on the row with the command that reads the log. File access that the kernel refuses inside the sandbox is not in the log: paddock does not trace the file system.
+
 ## Logins and MCP
 
 By default, a sandbox uses your existing login (auth mode `shared`). paddock copies the credential files of the harness from your home directory into the sandbox at start. If the harness refreshes a token in the sandbox, paddock writes it back when the sandbox exits. If the file also changed on the host in the meantime, the host version stays, and paddock tells you.
