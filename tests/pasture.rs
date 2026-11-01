@@ -88,3 +88,309 @@ fn list_and_remove_a_pasture() {
     let out = paddock(t.path(), &["pasture", "remove", "team", "--yes"]);
     assert!(text(&out).contains("has no data"), "{}", text(&out));
 }
+
+// ---- shared ports ------------------------------------------------------
+
+mod common;
+
+use paddock::broker::{Answer, Approver, Pending};
+use paddock::kv::{Identity, KvCfg, Service};
+use std::io::{Read as _, Write as _};
+use std::net::TcpListener;
+use std::time::{Duration, Instant};
+
+struct NoOne;
+impl Approver for NoOne {
+    fn ask(&self, _: &HostEnv, _: &Pending, _: Duration) -> Option<Answer> {
+        None
+    }
+}
+
+/// A TCP server that answers each line with "echo:" and the line.
+fn echo_server() -> u16 {
+    let l = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = l.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        for c in l.incoming().flatten() {
+            std::thread::spawn(move || {
+                let mut c = c;
+                let mut buf = [0u8; 1024];
+                while let Ok(n) = c.read(&mut buf) {
+                    if n == 0 || c.write_all(b"echo:").is_err() || c.write_all(&buf[..n]).is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+    });
+    port
+}
+
+fn until(what: &str, mut f: impl FnMut() -> bool) {
+    let start = Instant::now();
+    while !f() {
+        assert!(
+            start.elapsed() < Duration::from_secs(15),
+            "timed out: {what}"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+struct Member {
+    sock: std::path::PathBuf,
+    ground: std::path::PathBuf,
+    _served: paddock::kv::Served,
+}
+
+impl Member {
+    fn host(&self, args: &[&str]) -> Command {
+        let mut c = Command::new(env!("CARGO_BIN_EXE_paddock"));
+        c.arg("host")
+            .args(args)
+            .env("PADDOCK_KV_SOCKET", &self.sock)
+            .env("PADDOCK_PASTURE", &self.ground);
+        c
+    }
+    fn run(&self, args: &[&str]) -> std::process::Output {
+        self.host(args).output().unwrap()
+    }
+}
+
+struct Kill(std::process::Child);
+impl Drop for Kill {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// Two members in one network: the owner side of a shared port works
+/// through the socket in the pasture folder, the other member skips the
+/// port because its own 127.0.0.1 has it already, and the lease decides
+/// conflicts. The far side on 127.0.0.1 needs its own network: see the
+/// bubblewrap test below and the unit tests of the relay.
+#[test]
+fn a_member_shares_a_port_through_the_pasture_folder() {
+    let t = tempfile::tempdir().unwrap();
+    let home = t.path().join("home");
+    let ground = t.path().join("ground");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(&ground).unwrap();
+    let env = HostEnv::from_parts(home, "demo".into(), 1000, 1000, Default::default());
+    let member = |id: &str| {
+        let svc = Service::new(
+            env.clone(),
+            Identity {
+                sandbox: id.into(),
+                harness: "sh".into(),
+                project: "/src/app".into(),
+                pasture: Some("team".into()),
+                parent: None,
+                chain: vec![],
+                tree: None,
+            },
+            KvCfg::default(),
+            std::sync::Arc::new(NoOne),
+            Duration::from_secs(1),
+        );
+        let sock = t.path().join(format!("{id}.sock"));
+        let served = paddock::kv::serve(&sock, svc).unwrap();
+        Member {
+            sock,
+            ground: ground.clone(),
+            _served: served,
+        }
+    };
+    let a = member("a1");
+    let b = member("b1");
+    let port = echo_server();
+    let p = port.to_string();
+    // Ports below 1024 never.
+    assert_eq!(a.run(&["pasture", "share", "80"]).status.code(), Some(2));
+
+    let _ha = Kill(a.host(&["pasture", "serve"]).spawn().unwrap());
+    let _hb = Kill(b.host(&["pasture", "serve"]).spawn().unwrap());
+    let out = a.run(&["pasture", "share", &p]);
+    assert!(out.status.success(), "{}", text(&out));
+    let sock = ground.join(".ports").join(format!("{port}.sock"));
+    assert!(sock.exists());
+    let mut s = std::os::unix::net::UnixStream::connect(&sock).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    s.write_all(b"hi").unwrap();
+    let mut buf = [0u8; 7];
+    s.read_exact(&mut buf).unwrap();
+    assert_eq!(&buf, b"echo:hi");
+
+    // The second member is refused with the name of the owner.
+    let out = b.run(&["pasture", "share", &p]);
+    assert_eq!(out.status.code(), Some(9), "{}", text(&out));
+    assert!(text(&out).contains("sh (sandbox a1)"), "{}", text(&out));
+
+    // members: both, the port of a1, and why b1 skips it.
+    until("b1 records the skipped port", || {
+        let out = b.run(&["pasture", "members", "--json"]);
+        let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap_or_default();
+        let m = v["members"].as_array().cloned().unwrap_or_default();
+        let a1 = m.iter().find(|m| m["sandbox"] == "a1");
+        let b1 = m.iter().find(|m| m["sandbox"] == "b1");
+        a1.is_some_and(|a| a["ports"][0] == port && a["harness"] == "sh")
+            && b1.is_some_and(|b| b["you"] == true && b["skipped"][&p].is_string())
+    });
+    let out = b.run(&["pasture", "members"]);
+    assert!(
+        text(&out).contains(&format!("skips {port}")),
+        "{}",
+        text(&out)
+    );
+
+    // The host lists the port.
+    let ps = paddock::kv::host::pastures(&env, Path::new("/src/app")).unwrap();
+    assert_eq!(ps[0].ports[0].port, port);
+    assert_eq!(ps[0].ports[0].sandbox, "a1");
+
+    // b1 cannot unshare it; a1 can, and the socket goes.
+    assert_ne!(b.run(&["pasture", "unshare", &p]).status.code(), Some(0));
+    let out = a.run(&["pasture", "unshare", &p]);
+    assert!(out.status.success(), "{}", text(&out));
+    until("the socket goes", || !sock.exists());
+    assert_eq!(a.run(&["pasture", "unshare", &p]).status.code(), Some(1));
+    // Now b1 can take it.
+    let out = b.run(&["pasture", "share", &p]);
+    assert!(out.status.success(), "{}", text(&out));
+}
+
+// ---- end to end, in bubblewrap ---------------------------------------------
+
+/// Member A serves on 3000 and shares it. It writes ready:A, then waits
+/// for go:unshare and unshares.
+const OWNER: &str = r#"
+python3 - <<'PY' &
+import socket, threading
+s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(("127.0.0.1", 3000)); s.listen(8)
+def h(c):
+    d = c.recv(1024); c.sendall(b"from-a:" + d); c.close()
+while True:
+    c, _ = s.accept(); threading.Thread(target=h, args=(c,)).start()
+PY
+sleep 1
+paddock-host pasture share 3000; echo "SHARE_EXIT $?"
+paddock-host kv put ready:a yes --scope pasture >/dev/null
+paddock-host kv watch go:unshare --scope pasture --timeout 60 >/dev/null
+paddock-host pasture unshare 3000; echo "UNSHARE_EXIT $?"
+paddock-host kv put done:a yes --scope pasture >/dev/null
+paddock-host kv watch go:end --scope pasture --timeout 60 >/dev/null
+"#;
+
+/// Member B waits for ready:a, reaches 127.0.0.1:3000, tries to share it,
+/// lets A unshare, and checks that the port is gone.
+const OTHER: &str = r#"
+ask() { python3 -c '
+import socket, sys
+try:
+    c = socket.create_connection(("127.0.0.1", 3000), timeout=3); c.sendall(b"ping")
+    print(c.recv(1024).decode() or "EMPTY")
+except Exception as e:
+    print("ERR", type(e).__name__)
+'; }
+paddock-host kv watch ready:a --version 0 --scope pasture --timeout 60 >/dev/null
+for i in $(seq 1 50); do r=$(ask); case "$r" in from-a:*) break;; esac; sleep 0.2; done
+echo "REACH $r"
+paddock-host pasture share 3000 2>/tmp/err; echo "SHARE_EXIT $?"; echo "SHARE_ERR $(cat /tmp/err)"
+paddock-host pasture members > /tmp/m; echo "MEMBERS $(tr '\n' ' ' </tmp/m)"
+paddock-host kv put go:unshare yes --scope pasture >/dev/null
+paddock-host kv watch done:a --version 0 --scope pasture --timeout 60 >/dev/null
+for i in $(seq 1 50); do r=$(ask); case "$r" in from-a:*) ;; *) break;; esac; sleep 0.2; done
+echo "AFTER $r"
+paddock-host kv put go:end yes --scope pasture >/dev/null
+"#;
+
+#[test]
+fn two_members_reach_a_shared_port_in_bubblewrap() {
+    if !common::bwrap_works() {
+        eprintln!("skipped: bwrap cannot create a user namespace here");
+        return;
+    }
+    if Command::new("python3").arg("-V").output().is_err() {
+        eprintln!("skipped: no python3");
+        return;
+    }
+    let tmp = common::tempdir();
+    let root = tmp.path();
+    let cfg = root.join("cfg/paddock");
+    std::fs::create_dir_all(cfg.join("harness.d")).unwrap();
+    std::fs::create_dir_all(root.join("run")).unwrap();
+    std::fs::create_dir_all(root.join("project")).unwrap();
+    std::fs::create_dir_all(root.join("home")).unwrap();
+    std::fs::write(
+        cfg.join("config.toml"),
+        "[pastures.team]\nmembers = [\"owner\", \"other\"]\n",
+    )
+    .unwrap();
+    for (name, script) in [("owner", OWNER), ("other", OTHER)] {
+        std::fs::write(
+            cfg.join(format!("harness.d/{name}.toml")),
+            format!(
+                "name = \"{name}\"\n[locate]\ncommands = [\"sh\"]\n[launch]\nargs = [\"-c\", {}]\n",
+                serde_json::to_string(script).unwrap()
+            ),
+        )
+        .unwrap();
+    }
+    let start = |name: &str| {
+        Command::new(env!("CARGO_BIN_EXE_paddock"))
+            .env("HOME", root.join("home"))
+            .env("XDG_CONFIG_HOME", root.join("cfg"))
+            .env("XDG_DATA_HOME", root.join("data"))
+            .env("XDG_STATE_HOME", root.join("state"))
+            .env("XDG_CACHE_HOME", root.join("cache"))
+            .env("XDG_RUNTIME_DIR", root.join("run"))
+            .env_remove("DBUS_SESSION_BUS_ADDRESS")
+            .env("LANG", "C")
+            .env("LC_ALL", "C")
+            .args([
+                "run",
+                name,
+                "--backend",
+                "bwrap",
+                "--network",
+                "none",
+                "--env",
+                "clean",
+                "--pasture",
+                "team",
+                "-y",
+            ])
+            .arg(root.join("project"))
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap()
+    };
+    let a = start("owner");
+    let b = start("other");
+    let b = b.wait_with_output().unwrap();
+    let a = a.wait_with_output().unwrap();
+    let out_a = String::from_utf8_lossy(&a.stdout).into_owned();
+    let out_b = String::from_utf8_lossy(&b.stdout).into_owned();
+    let all = format!(
+        "A:\n{out_a}\n{}\nB:\n{out_b}\n{}",
+        String::from_utf8_lossy(&a.stderr),
+        String::from_utf8_lossy(&b.stderr)
+    );
+    let line = |text: &str, k: &str| -> String {
+        text.lines()
+            .find_map(|l| l.strip_prefix(&format!("{k} ")))
+            .unwrap_or_else(|| panic!("no {k} in:\n{all}"))
+            .to_string()
+    };
+    assert_eq!(line(&out_a, "SHARE_EXIT"), "0", "{all}");
+    assert_eq!(line(&out_b, "REACH"), "from-a:ping", "{all}");
+    assert_eq!(line(&out_b, "SHARE_EXIT"), "9", "{all}");
+    assert!(line(&out_b, "SHARE_ERR").contains("owner"), "{all}");
+    assert!(line(&out_b, "MEMBERS").contains("3000"), "{all}");
+    assert_eq!(line(&out_a, "UNSHARE_EXIT"), "0", "{all}");
+    assert_ne!(line(&out_b, "AFTER"), "from-a:ping", "{all}");
+}

@@ -789,6 +789,25 @@ The members of a pasture also share a folder, `/pasture` in each sandbox (`$PADD
 - `paddock pasture remove NAME --yes` deletes the data of a pasture: its paddock kv file and its folder. It refuses while a member runs.
 - `paddock ps` lists the members of one pasture together and names the pasture.
 
+Each member keeps its own network. A member can share a local port with the others:
+
+```sh
+# member A: a dev server on its own 127.0.0.1:3000
+paddock-host pasture share 3000
+# member B: the same port reaches the server of A
+curl http://127.0.0.1:3000/
+# member A
+paddock-host pasture unshare 3000
+```
+
+- A helper in each member relays the streams through a Unix socket in the shared folder (`/pasture/.ports/3000.sock`). paddock starts the helper with the sandbox. It works with every backend and needs no change to the host network.
+- The share is the lease `lease:port:3000` in the `pasture` scope. A second member that shares 3000 gets exit code 9 and the name of the owner. The helper of the owner renews the lease, so the port frees itself within 30 seconds after the owner ends.
+- Only the ports that a member names leave its sandbox. The control ports of a harness stay inside.
+- When another member already uses the port itself, it skips the port. `paddock-host pasture members` shows why, with each member, its harness and its ports.
+- Limits: TCP only, ports 1024 to 65535, at most 16 shared ports per pasture.
+- `paddock pasture list` on the host shows the shared ports and their owners.
+- Members trust each other with shared ports, as with the shared folder: every member can write `/pasture`, so a member can replace another member's socket there and receive its traffic. Put only agents that you would let edit each other's files into one pasture.
+
 The bar panel shows the shared data too. A "Shared data" row opens a list of the pastures, your `user` scope and the data of older versions, with their members and the number of keys and locks. A pasture opens to its keys, grouped by the part before the first `:`, with locks first: who wrote each key, when, and its size. A key opens to its value, shown as plain text. From there you can copy the value, delete the key or free a lock; each delete asks twice. The panel reads a value only when you open its key, and reads paddock kv only while it is open. Bind a key to `omarchy-shell harnessix.paddock.kv open` to open the shared data directly.
 
 In a spawn tree, the parent writes the tasks into the `tree` scope, each child claims one with a lease and writes its result, and the parent waits for `result:`:

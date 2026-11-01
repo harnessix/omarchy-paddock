@@ -1582,3 +1582,63 @@ fn a_quota_budget_is_counted_from_the_ledger_and_announced_once() {
         card[0].summary
     );
 }
+
+#[test]
+fn a_shared_port_has_one_owner_and_a_limit() {
+    let w = world();
+    let mk = |id: &str| {
+        in_pasture(
+            &w,
+            id,
+            &[],
+            false,
+            KvCfg::default(),
+            None,
+            Some("team".to_string()),
+            "/src/app",
+        )
+        .0
+    };
+    let a = mk("a");
+    let b = mk("b");
+    assert_eq!(
+        a.handle(&claim(Scope::Pasture, "port:3000", 30), None)
+            .status,
+        Status::Done
+    );
+    // The second member is refused with the name of the owner.
+    let r = b.handle(&claim(Scope::Pasture, "port:3000", 30), None);
+    assert_eq!(r.status, Status::Conflict);
+    assert_eq!(r.result["owner"], "a");
+    // The owner renews.
+    let r = a.handle(&claim(Scope::Pasture, "port:3000", 30), None);
+    assert_eq!(r.result["renewed"], true);
+    for bad in ["port:80", "port:70000", "port:x"] {
+        let r = b.handle(&claim(Scope::Pasture, bad, 30), None);
+        assert_eq!(r.status, Status::Invalid, "{bad}");
+    }
+    for p in 1..crate::pasture::ports::MAX_PORTS as u16 {
+        let r = b.handle(
+            &claim(Scope::Pasture, &format!("port:{}", 4000 + p), 30),
+            None,
+        );
+        assert_eq!(r.status, Status::Done, "{p}");
+    }
+    let r = b.handle(&claim(Scope::Pasture, "port:9999", 30), None);
+    assert_eq!(r.status, Status::TooLarge);
+    // The host lists the ports with their owners.
+    let p = crate::kv::host::pastures(&w.env, Path::new("/src/app")).unwrap();
+    let team = p.iter().find(|p| p.name == "team").unwrap();
+    assert_eq!(team.ports.len(), crate::pasture::ports::MAX_PORTS);
+    assert_eq!(
+        (team.ports[0].port, team.ports[0].sandbox.as_str()),
+        (3000, "a")
+    );
+    // After a release, another member can take the port.
+    a.handle(&req("release", Scope::Pasture, "port:3000"), None);
+    assert_eq!(
+        b.handle(&claim(Scope::Pasture, "port:3000", 30), None)
+            .status,
+        Status::Done
+    );
+}
