@@ -161,6 +161,7 @@ Ask the user before you run `paddock gc` with `--yes`. Show them the dry-run lis
 - `--include-app-logins` deletes the login of a desktop app. The user must log in again.
 - `--worktrees --force` deletes uncommitted changes in a worktree. Its branch and commits stay.
 - `--scratch` deletes the scratch projects of agents that started in the home folder, with their files.
+- `--dedupe` deletes nothing. It lets identical files in the sandbox homes share their data (btrfs, xfs, bcachefs), and the files keep their content.
 
 Do not delete sandbox homes, images or worktrees with `rm`, `docker rmi` or `git worktree remove`. `paddock gc` checks that no sandbox runs in them.
 

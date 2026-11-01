@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- `paddock gc --dedupe` lets identical files in the sandbox homes share their data on btrfs, xfs and bcachefs, and prints the space that came back. After each sandbox, paddock does the same for its home in the background. `[storage] dedupe = false` turns that off.
 - An approved `exec` probes bwrap once before it uses it. When bwrap is on PATH but cannot start a sandbox (for example inside another sandbox), paddock reports that no isolation is available instead of the raw bwrap error. Nothing runs without isolation.
 - `paddock timer list`, `paddock ps --json` and the panel show a timer at once after `paddock timer set`, `paddock timer extend`, `paddock timer stop` or `paddock-host timer` in a sandbox. Before, they waited up to 30 seconds.
 - The bar panel lists the credentials a sandbox uses through the ssh agent channel ("ssh agent: NAME"), and its revoke button covers them.

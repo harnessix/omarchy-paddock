@@ -21,6 +21,8 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 
+pub mod dedupe;
+
 pub const ORIGIN_FILE: &str = ".paddock-origin";
 const ORIGIN_VERSION: u32 = 1;
 /// Larger origin files are not paddock's: ignore them.
@@ -1175,6 +1177,8 @@ pub struct GcOptions {
     pub force: bool,
     /// Also scratch projects that were not used for `older_than_days`.
     pub scratch: bool,
+    /// Also share the data of identical files in the sandbox homes.
+    pub dedupe: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]

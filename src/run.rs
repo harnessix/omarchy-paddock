@@ -885,6 +885,9 @@ pub fn run(
     }
     let _ = std::fs::remove_dir_all(env.paddock_run().join(&spec.id));
     crate::recover::Session::end(env, &spec.id);
+    // Share identical file data of this home with the other homes, in the
+    // background: the exit does not wait for it.
+    crate::storage::dedupe::spawn_after_run(env, &spec.home_src);
     if !quiet {
         recovery_notice(env, &spec.id, &spec.home_src, running.started);
     }
