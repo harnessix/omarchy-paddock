@@ -224,5 +224,7 @@
   "row.gateway": "uses %1 through the gateway",
   "action.revoke": "Revoke credentials",
   "msg.revoked": "Credentials revoked. The next request with them is refused.",
-  "msg.revokeFailed": "paddock could not revoke the credentials."
+  "msg.revokeFailed": "paddock could not revoke the credentials.",
+  "row.timer": "timer %1: %2 of %3",
+  "row.timerOver": "timer %1: %2 of %3, time is up"
 }

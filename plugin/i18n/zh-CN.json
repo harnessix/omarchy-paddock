@@ -206,5 +206,7 @@
   "row.gateway": "通过网关使用：%1",
   "action.revoke": "撤销凭据",
   "msg.revoked": "凭据已撤销，之后用它的请求都会被拒绝。",
-  "msg.revokeFailed": "paddock 没能撤销凭据。"
+  "msg.revokeFailed": "paddock 没能撤销凭据。",
+  "row.timer": "计时 %1：%2 / %3",
+  "row.timerOver": "计时 %1：%2 / %3，已超时"
 }
