@@ -233,7 +233,10 @@ fn sessions_persist_and_report_project_changes() {
     // The work-tree state comes from a sandboxed git run. A host without
     // bubblewrap reports it as unknown instead of guessing.
     if c.changed_unknown {
-        assert!(env.which("bwrap").is_none());
+        if crate::testutil::bwrap_works() {
+            panic!("bwrap works, but the work-tree state is unknown");
+        }
+        eprintln!("skipped: work-tree state needs a working bwrap");
     } else {
         assert_eq!(c.changed, vec!["?? later.txt".to_string()]);
     }

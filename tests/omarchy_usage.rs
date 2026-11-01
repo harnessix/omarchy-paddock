@@ -22,11 +22,7 @@ use std::process::Command;
 
 fn tools_work() -> bool {
     let _g = EXEC.lock().unwrap_or_else(|e| e.into_inner());
-    let bwrap = Command::new("bwrap")
-        .args(["--unshare-user", "--ro-bind", "/", "/", "true"])
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
+    let bwrap = common::bwrap_works();
     let pasta = Command::new("pasta")
         .arg("--version")
         .output()

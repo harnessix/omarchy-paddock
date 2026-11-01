@@ -10,10 +10,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 fn can_run() -> bool {
-    Command::new("bwrap")
-        .args(["--unshare-user", "--ro-bind", "/", "/", "true"])
-        .status()
-        .is_ok_and(|s| s.success())
+    common::bwrap_works()
 }
 
 struct World {

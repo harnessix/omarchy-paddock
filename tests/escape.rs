@@ -5,17 +5,9 @@ mod common;
 
 use std::process::Command;
 
-fn bwrap_works() -> bool {
-    Command::new("bwrap")
-        .args(["--unshare-user", "--ro-bind", "/", "/", "true"])
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
-}
-
 #[test]
 fn bwrap_offline_escape_probe_passes() {
-    if !bwrap_works() {
+    if !common::bwrap_works() {
         eprintln!("skipped: bwrap cannot create a user namespace here");
         return;
     }

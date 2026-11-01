@@ -10,14 +10,6 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
-fn bwrap_works() -> bool {
-    Command::new("bwrap")
-        .args(["--unshare-user", "--ro-bind", "/", "/", "true"])
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
-}
-
 const TASK: &str = "write-the-note-42";
 
 struct World {
@@ -192,7 +184,7 @@ fn wait_for<T>(what: &str, secs: u64, mut f: impl FnMut() -> Option<T>) -> T {
 
 #[test]
 fn a_child_runs_in_its_own_sandbox_and_returns_results_to_the_inbox() {
-    if !bwrap_works() {
+    if !common::bwrap_works() {
         eprintln!("skipped: bwrap cannot create a user namespace here");
         return;
     }
@@ -243,7 +235,7 @@ fn a_child_runs_in_its_own_sandbox_and_returns_results_to_the_inbox() {
 
 #[test]
 fn stopping_the_parent_stops_the_child() {
-    if !bwrap_works() {
+    if !common::bwrap_works() {
         eprintln!("skipped: bwrap cannot create a user namespace here");
         return;
     }
@@ -295,7 +287,7 @@ fn device_mounts(root: &std::path::Path) -> Vec<String> {
 
 #[test]
 fn a_sigterm_to_paddock_still_runs_its_exit_steps() {
-    if !bwrap_works() {
+    if !common::bwrap_works() {
         eprintln!("skipped: bwrap cannot create a user namespace here");
         return;
     }
@@ -357,7 +349,7 @@ fn inbox_result(w: &World) -> (serde_json::Value, String) {
 
 #[test]
 fn a_reviewer_reads_the_parents_uncommitted_files_and_cannot_write() {
-    if !bwrap_works() {
+    if !common::bwrap_works() {
         eprintln!("skipped: bwrap cannot create a user namespace here");
         return;
     }
@@ -389,7 +381,7 @@ fn a_reviewer_reads_the_parents_uncommitted_files_and_cannot_write() {
 
 #[test]
 fn a_child_stops_at_its_time_limit_and_the_log_says_why() {
-    if !bwrap_works() {
+    if !common::bwrap_works() {
         eprintln!("skipped: bwrap cannot create a user namespace here");
         return;
     }
@@ -428,7 +420,7 @@ fn a_child_stops_at_its_time_limit_and_the_log_says_why() {
 /// test uses the real runtime folder, because the user manager lives there.
 #[test]
 fn a_systemd_scope_holds_the_child_and_its_limits() {
-    if !bwrap_works() {
+    if !common::bwrap_works() {
         eprintln!("skipped: bwrap cannot create a user namespace here");
         return;
     }
@@ -517,7 +509,7 @@ fn a_systemd_scope_holds_the_child_and_its_limits() {
 
 #[test]
 fn children_claim_tasks_in_the_tree_scope_and_the_parent_watch_wakes() {
-    if !bwrap_works() {
+    if !common::bwrap_works() {
         eprintln!("skipped: bwrap cannot create a user namespace here");
         return;
     }

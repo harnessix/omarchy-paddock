@@ -452,8 +452,11 @@ mod tests {
         std::fs::write(&f, "").unwrap();
         assert!(root_owned_chain(&f).is_err());
         // A root-owned system path, if this machine has one, passes.
-        if Path::new("/etc/passwd").exists() {
-            assert!(root_owned_chain(Path::new("/etc/passwd")).is_ok());
+        let passwd = Path::new("/etc/passwd");
+        if passwd.exists() && !crate::testutil::owned_by_uid0(passwd) {
+            eprintln!("skipped: /etc/passwd is not owned by uid 0 here");
+        } else if passwd.exists() {
+            assert!(root_owned_chain(passwd).is_ok());
         }
     }
 
