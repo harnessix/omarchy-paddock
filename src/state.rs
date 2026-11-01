@@ -311,6 +311,9 @@ struct AuthItem {
     rel: PathBuf,
     inside_at_start: Option<String>,
     stored_at_start: Option<String>,
+    /// A login that a keeper keeps (keeper.rs): the sandbox got it without
+    /// its refresh token, and it is never copied back.
+    kept: bool,
 }
 
 /// Credentials are copied, not bind-mounted: harnesses replace token files
@@ -407,8 +410,16 @@ impl AuthSync {
             let stored = auth_file(env, profile, mode, rel);
             let store = Store::for_file(mode, &stored);
             let rel = PathBuf::from(rel);
+            let mut kept = false;
             if let Some(bytes) = store.read(&stored)? {
-                home.write(&rel, &bytes, 0o600)
+                // A login that the keeper refreshes: the sandbox gets it
+                // without the refresh token.
+                let keep = crate::keeper::kind_for(&profile.name)
+                    .filter(|k| Path::new(k.file) == rel)
+                    .filter(|_| crate::keeper::Cfg::load(env).is_ok_and(|c| c.enabled))
+                    .and_then(|_| crate::keeper::strip(&bytes));
+                kept = keep.is_some();
+                home.write(&rel, keep.as_deref().unwrap_or(&bytes), 0o600)
                     .with_context(|| format!("credential {}", rel.display()))?;
             } else if mode.is_host_login() {
                 // The host is logged out: do not keep an older login inside.
@@ -420,6 +431,7 @@ impl AuthSync {
                 store,
                 stored,
                 rel,
+                kept,
             });
         }
         Ok(Self {
@@ -428,6 +440,19 @@ impl AuthSync {
             items,
             folders,
         })
+    }
+
+    /// The logins that a keeper keeps for this sandbox.
+    pub fn kept_logins(&self) -> Vec<HeldLogin> {
+        self.items
+            .iter()
+            .filter(|i| i.kept)
+            .map(|i| HeldLogin {
+                home: self.home.clone(),
+                rel: i.rel.clone(),
+                store: i.stored.clone(),
+            })
+            .collect()
     }
 
     /// The host logins that the sandbox got a copy of. None for an isolated
@@ -471,10 +496,16 @@ impl AuthSync {
                     store,
                     stored,
                     rel,
+                    kept: false,
                 });
             }
         }
         for it in self.items.iter().chain(added.iter()) {
+            // The keeper wrote the store; the sandbox's copy has no refresh
+            // token and must never replace it.
+            if it.kept {
+                continue;
+            }
             // A symlink or special file in place of a credential is refused:
             // reading through it would copy a host file into the store.
             let bytes = match home.read(&it.rel, crate::safefs::MAX_READ) {
@@ -690,6 +721,11 @@ pub struct Running {
     /// only stand-ins.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub gateway: Vec<String>,
+    /// Logins that a keeper keeps for this sandbox (keeper.rs): the sandbox
+    /// holds them without their refresh token, and the keeper writes the
+    /// new access token here.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub kept_logins: Vec<HeldLogin>,
 }
 
 /// A host login file and the sandbox's copy of it.

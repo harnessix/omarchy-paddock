@@ -119,6 +119,7 @@ Common tasks:
 | The user wants | Do this |
 | :--- | :--- |
 | A separate account for a harness | `paddock claude --auth isolated:work`, then log in inside the sandbox. The isolated login is its own machine: its own machine ID, kept in its login folder. Do not delete or edit `.paddock-machine-id` there: a login that sees another machine may need to sign in again. |
+| Codex says its login expired in a sandbox | paddock keeps the Codex refresh token outside the sandbox, and a keeper refreshes the login. Check `paddock doctor` and the notifications; do not copy `auth.json` by hand. `[logins] keep = false` turns the keeper off. |
 | To stop passing a variable | `paddock env hide NAME` |
 | To see which variables pass | `paddock env show` |
 | An MCP server in the sandbox | `paddock mcp claude` shows why it is off. Then ask the user before you add `[mcp] allow` |
