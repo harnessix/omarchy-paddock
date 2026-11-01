@@ -14,6 +14,7 @@
 //! `pasture` scope of paddock kv. A sandbox started without `--pasture` is a
 //! pasture of its own, so by default no two sandboxes share kv data.
 
+pub mod bridge;
 pub mod ports;
 
 use crate::env::HostEnv;
@@ -31,6 +32,8 @@ pub const SOLO_PREFIX: &str = "solo-";
 pub struct Pasture {
     /// The harnesses that can join. Empty: none can.
     pub members: Vec<String>,
+    /// Whether a member can ask another member a question (bridge.rs).
+    pub bridge: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -38,6 +41,8 @@ pub struct Pasture {
 struct RawPasture {
     #[serde(default)]
     members: Vec<String>,
+    #[serde(default)]
+    bridge: bool,
 }
 
 /// Where the shared folder of a pasture appears in each member.
@@ -87,7 +92,13 @@ pub fn parse(text: &str) -> Result<BTreeMap<String, Pasture>> {
     let mut out = BTreeMap::new();
     for (name, p) in raw {
         check_name(&name)?;
-        out.insert(name, Pasture { members: p.members });
+        out.insert(
+            name,
+            Pasture {
+                members: p.members,
+                bridge: p.bridge,
+            },
+        );
     }
     Ok(out)
 }

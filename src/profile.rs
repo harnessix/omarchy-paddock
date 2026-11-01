@@ -42,7 +42,7 @@ pub struct Profile {
 
 /// How a prompt reaches a one-shot run. Never in the arguments: the
 /// arguments of a process are visible to every local user.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, serde::Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum PromptVia {
     /// The prompt is the standard input of the harness.

@@ -244,6 +244,9 @@ pub struct Built {
     pub worktree: Option<Worktree>,
     /// The pasture it joined; None: a pasture of its own.
     pub pasture: Option<String>,
+    /// The one-shot command that answers the questions of other members
+    /// (pasture/bridge.rs). None outside a pasture, or without `[oneshot]`.
+    pub bridge: Option<crate::pasture::bridge::Command>,
     pub auth: crate::state::AuthMode,
     pub spec: SandboxSpec,
     pub profile: Profile,
@@ -778,10 +781,20 @@ pub fn build_with(env: &HostEnv, opts: &Options, harness: Harness) -> Result<Bui
         ));
         spec.set_env("PADDOCK_PASTURE", crate::pasture::MOUNT, "pasture");
         spec.set_env("PADDOCK_PASTURE_NAME", name.clone(), "pasture");
-        // The helper that relays the ports that members share.
+        // The helper that relays the ports that members share, and
+        // answers the questions of other members.
         spec.setup
             .push("paddock host pasture serve >/dev/null 2>&1 &".into());
     }
+    let bridge = match (&opts.pasture, &profile.oneshot, &opts.child) {
+        (Some(_), Some(o), None) => Some(crate::pasture::bridge::Command::of(
+            &harness.exe,
+            crate::privacy::args(&profile, privacy),
+            o,
+            &spec.home,
+        )),
+        _ => None,
+    };
 
     policy::enforce(env, &spec)?;
 
@@ -802,6 +815,7 @@ pub fn build_with(env: &HostEnv, opts: &Options, harness: Harness) -> Result<Bui
         shared_history,
         worktree,
         pasture: opts.pasture.clone(),
+        bridge,
         auth,
         spec,
         profile,

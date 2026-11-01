@@ -418,6 +418,8 @@ pub fn serve() -> i32 {
     let Some(_lock) = try_lock(&ground, &me) else {
         return 0;
     };
+    // The bridge: questions of other members, on the own kv socket.
+    std::thread::spawn(super::bridge::helper);
     let mut active: BTreeMap<u16, (Role, Listener)> = BTreeMap::new();
     let mut skipped: BTreeMap<u16, String> = BTreeMap::new();
     let mut renewed: BTreeMap<u16, Instant> = BTreeMap::new();

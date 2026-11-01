@@ -88,7 +88,7 @@ const MAX_BATCH: usize = 100;
 const BATCH_VALUES: usize = 16;
 pub const OPS: &[&str] = &[
     "get", "mget", "put", "mset", "delete", "list", "history", "watch", "claim", "release",
-    "timer", "forage",
+    "timer", "forage", "ask",
 ];
 const WRITE_OPS: &[&str] = &["put", "mset", "delete", "claim", "release", "timer"];
 
@@ -454,6 +454,9 @@ pub struct Service {
     /// One user-scope question at a time; the others wait for its answer.
     asking: Mutex<()>,
     connections: AtomicUsize,
+    /// The one-shot command that answers questions of other members of the
+    /// pasture (pasture/bridge.rs). None: this sandbox answers none.
+    bridge: Option<crate::pasture::bridge::Command>,
 }
 
 impl Service {
@@ -476,7 +479,14 @@ impl Service {
             user_denied: Mutex::new(None),
             asking: Mutex::new(()),
             connections: AtomicUsize::new(0),
+            bridge: None,
         }
+    }
+
+    /// Answer questions of other members with this one-shot command.
+    pub fn with_bridge(mut self, cmd: Option<crate::pasture::bridge::Command>) -> Self {
+        self.bridge = cmd;
+        self
     }
 
     /// Use another kv folder. Tests use it.
@@ -653,6 +663,7 @@ impl Service {
             "parent": self.id.parent,
             "started_by": self.id.chain,
             "tree_root": self.id.tree,
+            "bridge": self.id.pasture.as_deref().is_some_and(|p| !self.id.is_child() && crate::pasture::bridge::enabled(&self.env, p)),
             "scopes": {
                 "self": "read-write; this sandbox only",
                 "pasture": match (&self.id.pasture, self.id.is_child()) {
@@ -696,9 +707,9 @@ impl Service {
             resp.status,
             Status::Denied | Status::Disabled | Status::Invalid | Status::Failed
         );
-        // The user scope gate logs its own decision.
+        // The user scope gate and the bridge log their own decisions.
         let gated = scope == Scope::User && resp.status == Status::Denied;
-        if (write || failed) && !gated {
+        if (write || failed) && !gated && req.op != "ask" {
             self.audit(req, scope, "", &resp);
         }
         log::debug!(
@@ -743,6 +754,15 @@ impl Service {
                 req.op,
                 OPS.join(", ")
             ));
+        }
+        if req.op == "ask" {
+            use crate::pasture::bridge;
+            return match req.action.as_deref() {
+                None | Some("ask") => bridge::ask(&self.env, &self.id, req),
+                Some("next") => bridge::next(&self.env, &self.id, self.bridge.as_ref(), req),
+                Some("answer") => bridge::answer(&self.env, &self.id, req),
+                Some(a) => invalid(format!("unknown ask action '{a}': use ask, next or answer")),
+            };
         }
         let write = WRITE_OPS.contains(&req.op.as_str());
         let Some(ns) = self.ns(scope) else {
@@ -1379,7 +1399,9 @@ impl Service {
     fn serve_conn(&self, conn: UnixStream) -> Result<()> {
         conn.set_read_timeout(Some(Duration::from_secs(30)))?;
         // JSON can escape one byte as six.
-        let max = (self.cfg.max_value * BATCH_VALUES * 6 + 64 * 1024) as u64;
+        // A question or an answer of the bridge can be larger than a value.
+        let max = ((self.cfg.max_value * BATCH_VALUES).max(crate::pasture::bridge::MAX_ANSWER) * 6
+            + 64 * 1024) as u64;
         let mut reader = BufReader::new(conn.try_clone()?.take(max));
         let mut line = String::new();
         reader.read_line(&mut line)?;
@@ -1683,6 +1705,7 @@ pub fn start(
     pasture: Option<String>,
     approver: Arc<dyn Approver>,
     lineage: Lineage,
+    bridge: Option<crate::pasture::bridge::Command>,
 ) -> Option<Served> {
     let cfg = match KvCfg::load(env) {
         Ok(c) => c,
@@ -1708,7 +1731,8 @@ pub fn start(
     };
     watch_timers(env.clone(), id.clone(), kv_root(env), cfg.clone());
     let monitor = crate::monitor::watch(env.clone(), id.clone());
-    let svc = Service::new(env.clone(), id, cfg, approver, Duration::from_secs(wait));
+    let svc =
+        Service::new(env.clone(), id, cfg, approver, Duration::from_secs(wait)).with_bridge(bridge);
     let sock = env.paddock_run().join(&spec.id).join("kv.sock");
     match serve(&sock, svc) {
         Ok(mut s) => {

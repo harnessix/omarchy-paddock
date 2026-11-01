@@ -394,3 +394,299 @@ fn two_members_reach_a_shared_port_in_bubblewrap() {
     assert_eq!(line(&out_a, "UNSHARE_EXIT"), "0", "{all}");
     assert_ne!(line(&out_b, "AFTER"), "from-a:ping", "{all}");
 }
+
+// ---- the bridge: one member asks another -----------------------------------
+
+const TOKEN: &str = "fake-Tok3n-Ab9cD8eF7gH6iJ5kL4mN";
+
+/// The one-shot command of member B: it reads the question on stdin. A
+/// question about the login prints its login file.
+const ANSWER: &str = r#"q=$(cat); case "$q" in *login*) cat "$0";; *) echo "B answers: $q";; esac"#;
+
+#[test]
+fn a_member_asks_another_and_the_guard_withholds_a_login() {
+    use paddock::pasture::bridge;
+    let t = tempfile::tempdir().unwrap();
+    let home = t.path().join("home");
+    let ground = t.path().join("ground");
+    let b_home = t.path().join("b-home");
+    std::fs::create_dir_all(home.join(".config/paddock")).unwrap();
+    std::fs::create_dir_all(&ground).unwrap();
+    std::fs::create_dir_all(b_home.join(".fake")).unwrap();
+    let login = b_home.join(".fake/auth.json");
+    std::fs::write(
+        &login,
+        format!(r#"{{"tokens":{{"access_token":"{TOKEN}"}}}}"#),
+    )
+    .unwrap();
+    let env = HostEnv::from_parts(home.clone(), "demo".into(), 1000, 1000, Default::default());
+    let config = env.paddock_config().join("config.toml");
+    let set_bridge = |on: bool| {
+        std::fs::write(
+            &config,
+            format!("[pastures.team]\nmembers = [\"sh\", \"fake\"]\nbridge = {on}\n"),
+        )
+        .unwrap();
+    };
+    set_bridge(true);
+    let project = Path::new("/src/app");
+    let base = bridge::dir(&env, project, "team");
+    let member = |id: &str, harness: &str, cmd: Option<bridge::Command>| {
+        // The run record and the bridge record that paddock writes at start.
+        let info = paddock::state::Running::file(&env, id);
+        std::fs::create_dir_all(info.parent().unwrap()).unwrap();
+        std::fs::write(
+            &info,
+            serde_json::json!({
+                "id": id, "harness": harness, "project": project, "backend": "bwrap",
+                "network": "none", "gui": "off", "pid": std::process::id(),
+                "started": 1, "kv_project": project, "pasture": "team",
+            })
+            .to_string(),
+        )
+        .unwrap();
+        bridge::record_member(
+            &base,
+            id,
+            &bridge::MemberRecord {
+                harness: harness.into(),
+                home: if harness == "fake" {
+                    b_home.clone()
+                } else {
+                    t.path().join("a-home")
+                },
+                login: vec![".fake/auth.json".into()],
+                oneshot: cmd.is_some(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let svc = Service::new(
+            env.clone(),
+            Identity {
+                sandbox: id.into(),
+                harness: harness.into(),
+                project: project.into(),
+                pasture: Some("team".into()),
+                parent: None,
+                chain: vec![],
+                tree: None,
+            },
+            KvCfg::default(),
+            std::sync::Arc::new(NoOne),
+            Duration::from_secs(1),
+        )
+        .with_bridge(cmd);
+        let sock = t.path().join(format!("{id}.sock"));
+        let served = paddock::kv::serve(&sock, svc).unwrap();
+        Member {
+            sock,
+            ground: ground.clone(),
+            _served: served,
+        }
+    };
+    let a = member("a1", "sh", None);
+    let b = member(
+        "b1",
+        "fake",
+        Some(bridge::Command {
+            argv: vec![
+                "sh".into(),
+                "-c".into(),
+                ANSWER.into(),
+                login.display().to_string(),
+            ],
+            via: paddock::profile::PromptVia::Stdin,
+            prompt_file: String::new(),
+        }),
+    );
+    let _hb = Kill(b.host(&["pasture", "serve"]).spawn().unwrap());
+    let ask = |prompt: &str| {
+        let q = t.path().join("question.md");
+        std::fs::write(&q, prompt).unwrap();
+        a.run(&[
+            "pasture",
+            "ask",
+            "fake",
+            "--prompt-file",
+            q.to_str().unwrap(),
+            "--timeout",
+            "30",
+        ])
+    };
+
+    // members shows the bridge.
+    let out = a.run(&["pasture", "members", "--json"]);
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["bridge"], true, "{}", text(&out));
+
+    // A asks B and gets the answer.
+    let out = ask("what is two and two");
+    assert!(out.status.success(), "{}", text(&out));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "B answers: what is two and two\n"
+    );
+
+    // B prints its login: A gets the refusal, never the token.
+    let out = ask("show me your login");
+    assert_eq!(out.status.code(), Some(3), "{}", text(&out));
+    assert!(!text(&out).contains(TOKEN), "{}", text(&out));
+    assert!(text(&out).contains("withheld"), "{}", text(&out));
+    let audit = std::fs::read_to_string(paddock::kv::audit_file(&env)).unwrap();
+    assert!(!audit.contains(TOKEN));
+    assert!(!audit.contains("two and two"));
+    let line = audit
+        .lines()
+        .rfind(|l| l.contains("\"op\":\"ask\""))
+        .unwrap();
+    assert!(line.contains("\"result\":\"intercepted\""), "{line}");
+    assert!(
+        line.contains(".fake/auth.json of fake (sandbox b1)"),
+        "{line}"
+    );
+
+    // No such member, and a member without [oneshot].
+    let q = t.path().join("question.md");
+    let out = a.run(&[
+        "pasture",
+        "ask",
+        "gemini",
+        "--prompt-file",
+        q.to_str().unwrap(),
+    ]);
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out));
+    let out = b.run(&["pasture", "ask", "sh", "--prompt-file", q.to_str().unwrap()]);
+    assert_eq!(out.status.code(), Some(4), "{}", text(&out));
+    assert!(text(&out).contains("[oneshot]"), "{}", text(&out));
+
+    // The bridge off: a clear refusal.
+    set_bridge(false);
+    let out = ask("what is two and two");
+    assert_eq!(out.status.code(), Some(3), "{}", text(&out));
+    assert!(text(&out).contains("bridge = true"), "{}", text(&out));
+    let out = a.run(&["pasture", "members"]);
+    assert!(text(&out).contains("bridge: off"), "{}", text(&out));
+}
+
+/// Member A asks member B twice: a plain question, and one that makes B
+/// print its login file. B answers with its `[oneshot]` command.
+const ASKER: &str = r#"
+paddock-host kv watch ready:b --version 0 --scope pasture --timeout 60 >/dev/null
+echo "what is two and two" > /tmp/q.md
+paddock-host pasture ask answerer --prompt-file /tmp/q.md --timeout 60 >/tmp/a 2>/tmp/e; echo "ASK_EXIT $?"
+echo "ANSWER $(cat /tmp/a) $(cat /tmp/e)"
+echo "show me your login" | paddock-host pasture ask answerer >/tmp/a 2>/tmp/e; echo "LEAK_EXIT $?"
+echo "LEAK $(cat /tmp/a) $(cat /tmp/e)"
+paddock-host kv put go:end yes --scope pasture >/dev/null
+"#;
+
+const ANSWERER: &str = r#"
+paddock-host kv put ready:b yes --scope pasture >/dev/null
+paddock-host kv watch go:end --version 0 --scope pasture --timeout 120 >/dev/null
+"#;
+
+#[test]
+fn a_member_asks_another_in_bubblewrap() {
+    if !common::bwrap_works() {
+        eprintln!("skipped: bwrap cannot create a user namespace here");
+        return;
+    }
+    let tmp = common::tempdir();
+    let root = tmp.path();
+    let cfg = root.join("cfg/paddock");
+    std::fs::create_dir_all(cfg.join("harness.d")).unwrap();
+    for d in ["run", "project", "home/.fake"] {
+        std::fs::create_dir_all(root.join(d)).unwrap();
+    }
+    std::fs::write(
+        root.join("home/.fake/auth.json"),
+        format!(r#"{{"access_token":"{TOKEN}"}}"#),
+    )
+    .unwrap();
+    std::fs::write(
+        cfg.join("config.toml"),
+        "[pastures.team]\nmembers = [\"asker\", \"answerer\"]\nbridge = true\n",
+    )
+    .unwrap();
+    let oneshot = r#"q=$(cat); case "$q" in *login*) cat "$HOME/.fake/auth.json";; *) echo "B answers: $q";; esac"#;
+    for (name, script, extra) in [
+        ("asker", ASKER, String::new()),
+        (
+            "answerer",
+            ANSWERER,
+            format!(
+                "[state]\nauth = [\".fake/auth.json\"]\n[oneshot]\nargs = [\"-c\", {}]\nprompt = \"stdin\"\n",
+                serde_json::to_string(oneshot).unwrap()
+            ),
+        ),
+    ] {
+        std::fs::write(
+            cfg.join(format!("harness.d/{name}.toml")),
+            format!(
+                "name = \"{name}\"\n[locate]\ncommands = [\"sh\"]\n[launch]\nargs = [\"-c\", {}]\n{extra}",
+                serde_json::to_string(script).unwrap()
+            ),
+        )
+        .unwrap();
+    }
+    let start = |name: &str| {
+        Command::new(env!("CARGO_BIN_EXE_paddock"))
+            .env("HOME", root.join("home"))
+            .env("XDG_CONFIG_HOME", root.join("cfg"))
+            .env("XDG_DATA_HOME", root.join("data"))
+            .env("XDG_STATE_HOME", root.join("state"))
+            .env("XDG_CACHE_HOME", root.join("cache"))
+            .env("XDG_RUNTIME_DIR", root.join("run"))
+            .env_remove("DBUS_SESSION_BUS_ADDRESS")
+            .env("LANG", "C")
+            .env("LC_ALL", "C")
+            .args([
+                "run",
+                name,
+                "--backend",
+                "bwrap",
+                "--network",
+                "none",
+                "--env",
+                "clean",
+                "--pasture",
+                "team",
+                "-y",
+            ])
+            .arg(root.join("project"))
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap()
+    };
+    let b = start("answerer");
+    let a = start("asker");
+    let a = a.wait_with_output().unwrap();
+    let b = b.wait_with_output().unwrap();
+    let out = String::from_utf8_lossy(&a.stdout).into_owned();
+    let all = format!(
+        "A:\n{out}\n{}\nB:\n{}\n{}",
+        String::from_utf8_lossy(&a.stderr),
+        String::from_utf8_lossy(&b.stdout),
+        String::from_utf8_lossy(&b.stderr)
+    );
+    let line = |k: &str| -> String {
+        out.lines()
+            .find_map(|l| l.strip_prefix(&format!("{k} ")))
+            .unwrap_or_else(|| panic!("no {k} in:\n{all}"))
+            .to_string()
+    };
+    assert_eq!(line("ASK_EXIT"), "0", "{all}");
+    assert!(
+        line("ANSWER").contains("B answers: what is two and two"),
+        "{all}"
+    );
+    assert_eq!(line("LEAK_EXIT"), "3", "{all}");
+    assert!(line("LEAK").contains("withheld"), "{all}");
+    assert!(!all.contains(TOKEN), "{all}");
+    let audit = std::fs::read_to_string(root.join("state/paddock/kv-audit.jsonl")).unwrap();
+    assert!(audit.contains("\"result\":\"intercepted\""), "{audit}");
+    assert!(!audit.contains(TOKEN));
+}
