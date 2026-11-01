@@ -558,7 +558,31 @@ struct KvScope {
     tree: Option<String>,
 }
 
+/// A request of a principal (`paddock kv ... --as NAME`).
+fn kv_request(
+    op: &str,
+    key: Option<String>,
+    f: impl FnOnce(&mut paddock::kv::Request),
+) -> paddock::kv::Request {
+    let mut r = paddock::kv::Request {
+        v: paddock::kv::PROTOCOL,
+        op: op.into(),
+        key,
+        ..Default::default()
+    };
+    f(&mut r);
+    r
+}
+
 impl KvScope {
+    fn principal(&self, env: &HostEnv, who: &str, req: paddock::kv::Request) -> Result<i32> {
+        let Some(pasture) = &self.pasture else {
+            bail!("--as needs --pasture NAME");
+        };
+        let project = paddock::kv::host::project_of(self.project.as_deref())?;
+        paddock::kv::principal::cli(env, who, &project, pasture, req)
+    }
+
     fn target(&self) -> Result<paddock::kv::host::Target> {
         use paddock::kv::host::{project_of, Target};
         use paddock::kv::shard::Ns;
@@ -741,18 +765,84 @@ enum KvCmd {
         #[arg(long)]
         json: bool,
     },
-    /// Delete one key.
+    /// Delete one key. With --as: as that principal, only when the version
+    /// matches with --version.
     Delete {
         key: String,
         #[command(flatten)]
         scope: KvScope,
+        #[command(flatten)]
+        principal: KvAs,
+        #[arg(long, requires = "as_")]
+        version: Option<u64>,
     },
-    /// Free the lease lease:NAME, whatever sandbox holds it.
+    /// Free the lease lease:NAME, whatever sandbox holds it. With --as: only
+    /// a lease of that principal.
     Release {
         name: String,
         #[command(flatten)]
         scope: KvScope,
+        #[command(flatten)]
+        principal: KvAs,
     },
+    /// Write a key of a pasture as a principal of [kv.principals].
+    Put {
+        key: String,
+        /// The value (default: read from stdin).
+        value: Option<String>,
+        #[command(flatten)]
+        scope: KvScope,
+        #[command(flatten)]
+        principal: KvAsRequired,
+        /// Seconds until the key expires.
+        #[arg(long)]
+        ttl: Option<u64>,
+        /// The version the key must have (0: it must not exist).
+        #[arg(long)]
+        version: Option<u64>,
+    },
+    /// Wait for a change of a key or a prefix of a pasture, as a principal.
+    Watch {
+        key: Option<String>,
+        #[command(flatten)]
+        scope: KvScope,
+        #[command(flatten)]
+        principal: KvAsRequired,
+        #[arg(long, conflicts_with = "key", required_unless_present = "key")]
+        prefix: Option<String>,
+        /// The version the caller knows.
+        #[arg(long)]
+        version: Option<u64>,
+        /// Seconds to wait (default 60).
+        #[arg(long)]
+        timeout: Option<u64>,
+    },
+    /// Take or renew the lease lease:NAME of a pasture, as a principal.
+    Claim {
+        name: String,
+        #[command(flatten)]
+        scope: KvScope,
+        #[command(flatten)]
+        principal: KvAsRequired,
+        /// Seconds until the lease expires.
+        #[arg(long)]
+        ttl: u64,
+    },
+}
+
+/// `--as NAME`: a principal from [kv.principals] of the user configuration.
+#[derive(Args)]
+struct KvAs {
+    /// Act as this principal of [kv.principals]; needs --pasture.
+    #[arg(long = "as", id = "as_", value_name = "NAME", requires = "pasture")]
+    as_: Option<String>,
+}
+
+#[derive(Args)]
+struct KvAsRequired {
+    /// The principal of [kv.principals] to act as; needs --pasture.
+    #[arg(long = "as", id = "as_", value_name = "NAME", requires = "pasture")]
+    as_: String,
 }
 
 #[derive(Subcommand)]
@@ -2105,8 +2195,75 @@ fn real_main() -> Result<i32> {
                     json,
                 ),
                 KvCmd::Get { key, scope, json } => host::get(&env, &scope.target()?, &key, json),
-                KvCmd::Delete { key, scope } => host::delete(&env, &scope.target()?, &key),
-                KvCmd::Release { name, scope } => host::release(&env, &scope.target()?, &name),
+                KvCmd::Delete {
+                    key,
+                    scope,
+                    principal: KvAs { as_: Some(who) },
+                    version,
+                } => scope.principal(
+                    &env,
+                    &who,
+                    kv_request("delete", Some(key), |r| r.version = version),
+                ),
+                KvCmd::Delete { key, scope, .. } => host::delete(&env, &scope.target()?, &key),
+                KvCmd::Release {
+                    name,
+                    scope,
+                    principal: KvAs { as_: Some(who) },
+                } => scope.principal(&env, &who, kv_request("release", Some(name), |_| {})),
+                KvCmd::Release { name, scope, .. } => host::release(&env, &scope.target()?, &name),
+                KvCmd::Put {
+                    key,
+                    value,
+                    scope,
+                    principal,
+                    ttl,
+                    version,
+                } => {
+                    let value = match value {
+                        Some(v) => v,
+                        None => {
+                            let mut v = String::new();
+                            std::io::Read::read_to_string(&mut std::io::stdin(), &mut v)?;
+                            v
+                        }
+                    };
+                    scope.principal(
+                        &env,
+                        &principal.as_,
+                        kv_request("put", Some(key), |r| {
+                            r.value = Some(value);
+                            r.ttl = ttl;
+                            r.version = version;
+                        }),
+                    )
+                }
+                KvCmd::Watch {
+                    key,
+                    scope,
+                    principal,
+                    prefix,
+                    version,
+                    timeout,
+                } => scope.principal(
+                    &env,
+                    &principal.as_,
+                    kv_request("watch", key, |r| {
+                        r.prefix = prefix;
+                        r.version = version;
+                        r.timeout = timeout;
+                    }),
+                ),
+                KvCmd::Claim {
+                    name,
+                    scope,
+                    principal,
+                    ttl,
+                } => scope.principal(
+                    &env,
+                    &principal.as_,
+                    kv_request("claim", Some(name), |r| r.ttl = Some(ttl)),
+                ),
             }
         }
         Cmd::Du { json } => du_cmd(&env, json),
