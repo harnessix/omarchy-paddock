@@ -656,6 +656,21 @@ pub fn watch(env: HostEnv, id: Identity) -> Watch {
     Watch(Some(live))
 }
 
+/// A byte count for people: `512 B`, `151 KB`, `4.2 MB`, `5.0 GB` (1024-based).
+pub fn size(b: u64) -> String {
+    const K: f64 = 1024.0;
+    let f = b as f64;
+    if f < K {
+        format!("{b} B")
+    } else if f < K * K {
+        format!("{:.0} KB", f / K)
+    } else if f < K * K * K {
+        format!("{:.1} MB", f / (K * K))
+    } else {
+        format!("{:.1} GB", f / (K * K * K))
+    }
+}
+
 /// One alert: an audit line with numbers only, and a notification.
 fn alert(
     env: &HostEnv,
@@ -665,20 +680,19 @@ fn alert(
     median: Option<u64>,
     cfg: &MonitorCfg,
 ) {
-    let mb = |b: u64| b / (1 << 20);
     let detail = match reason {
         "factor" => format!(
-            "{} sent {} MB this hour, more than {} times its usual {} MB",
+            "{} sent {} this hour, more than {} times its usual {}",
             id.sandbox,
-            mb(hour_sent),
+            size(hour_sent),
             cfg.factor,
-            mb(median.unwrap_or(0))
+            size(median.unwrap_or(0))
         ),
         _ => format!(
-            "{} sent {} MB this hour, more than the limit of {} MB",
+            "{} sent {} this hour, more than the limit of {}",
             id.sandbox,
-            mb(hour_sent),
-            mb(cfg.upload_per_hour)
+            size(hour_sent),
+            size(cfg.upload_per_hour)
         ),
     };
     crate::broker::audit_line(
@@ -754,6 +768,14 @@ fn report(env: &HostEnv, id: &Identity, t: &Tunnel, notify: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sizes_for_people() {
+        assert_eq!(size(512), "512 B");
+        assert_eq!(size(154_786), "151 KB");
+        assert_eq!(size(5 << 30), "5.0 GB");
+        assert_eq!(size(3 << 20), "3.0 MB");
+    }
 
     fn argv(s: &str) -> Vec<String> {
         s.split_whitespace().map(String::from).collect()
