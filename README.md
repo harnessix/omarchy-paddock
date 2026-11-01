@@ -422,6 +422,27 @@ To keep the vendor defaults, set this in `~/.config/paddock/config.toml`. A proj
 telemetry = "vendor"   # default: "off"
 ```
 
+### The machine identity
+
+A sandbox does not show the identity of your machine to the programs in it. The host name is always `paddock`. What else a program can read depends on the login:
+
+| | Shared login (default) | Isolated login (`--auth isolated:NAME`) |
+| :--- | :--- | :--- |
+| `/etc/machine-id` | your machine's | an ID of this login, the same at every start |
+| Boot ID (`/proc/sys/kernel/random/boot_id`) | your machine's | derived from the login's ID: new after a reboot, different for each login |
+
+A shared login is your own login from the host, so it keeps your machine's values: a login that you made on the host keeps working. An isolated login is another machine: two isolated logins cannot be linked to each other or to your machine. paddock makes the ID at the first start and keeps it in the folder of the login (`.paddock-machine-id` in `~/.local/share/paddock/auth/HARNESS/NAME/`). It never makes a new one at each start, because a login that shows a new machine at every start looks like a login copied to many machines. When you delete the folder of the login, the ID goes with it.
+
+Hardware identity:
+
+- The MAC addresses of your network interfaces are hidden. In network modes `none` and `egress`, the sandbox has network interfaces of its own. With `--gpu`, paddock mounts `/sys/devices` for the graphics drivers, and hides the network folders and the board and firmware names (`/sys/devices/virtual/dmi`) in it. Network mode `host` shares your network stack, so the sandbox sees your interfaces and their MAC addresses there.
+- The CPU model in `/proc/cpuinfo` stays visible: programs read it to choose CPU features.
+
+Each backend has limits:
+
+- docker and podman show the machine ID as above, never the one of the image. They show your machine's boot ID, because container runtimes refuse mounts inside `/proc`. They also hide the board and firmware names.
+- srt cannot put another file at a host path. With an isolated login, a program in srt reads no machine ID at all. srt mounts `/proc` itself, so the program reads your machine's boot ID. srt also hides the MAC addresses and the board and firmware names.
+
 ## Desktop projects
 
 The sandbox has the libraries for desktop apps: the bwrap backend sees the host `/usr`, and the docker backend installs them in its image. Access to the display is the risk. A client of the host compositor can capture the screen and read the clipboard, and on wlroots compositors it can type into other windows. paddock has four display modes:
