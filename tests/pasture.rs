@@ -322,6 +322,7 @@ fn two_members_reach_a_shared_port_in_bubblewrap() {
     std::fs::create_dir_all(cfg.join("harness.d")).unwrap();
     std::fs::create_dir_all(root.join("run")).unwrap();
     std::fs::create_dir_all(root.join("project")).unwrap();
+    std::fs::create_dir_all(root.join("home")).unwrap();
     std::fs::write(
         cfg.join("config.toml"),
         "[pastures.team]\nmembers = [\"owner\", \"other\"]\n",
@@ -339,6 +340,7 @@ fn two_members_reach_a_shared_port_in_bubblewrap() {
     }
     let start = |name: &str| {
         Command::new(env!("CARGO_BIN_EXE_paddock"))
+            .env("HOME", root.join("home"))
             .env("XDG_CONFIG_HOME", root.join("cfg"))
             .env("XDG_DATA_HOME", root.join("data"))
             .env("XDG_STATE_HOME", root.join("state"))

@@ -806,6 +806,7 @@ paddock-host pasture unshare 3000
 - When another member already uses the port itself, it skips the port. `paddock-host pasture members` shows why, with each member, its harness and its ports.
 - Limits: TCP only, ports 1024 to 65535, at most 16 shared ports per pasture.
 - `paddock pasture list` on the host shows the shared ports and their owners.
+- Members trust each other with shared ports, as with the shared folder: every member can write `/pasture`, so a member can replace another member's socket there and receive its traffic. Put only agents that you would let edit each other's files into one pasture.
 
 The bar panel shows the shared data too. A "Shared data" row opens a list of the pastures, your `user` scope and the data of older versions, with their members and the number of keys and locks. A pasture opens to its keys, grouped by the part before the first `:`, with locks first: who wrote each key, when, and its size. A key opens to its value, shown as plain text. From there you can copy the value, delete the key or free a lock; each delete asks twice. The panel reads a value only when you open its key, and reads paddock kv only while it is open. Bind a key to `omarchy-shell harnessix.paddock.kv open` to open the shared data directly.
 
