@@ -16,7 +16,7 @@
 //! helper of the owner renews the lease, so the port frees itself when the
 //! owner ends. A helper (`paddock-host pasture serve`) runs in every member:
 //! paddock starts it with the sandbox. It watches `lease:port:` and starts
-//! or stops its listeners.
+//! or stops its listeners. It notes what it does in [`log_path`].
 
 use crate::kv::{Request, Response, Scope, Status, LEASE_PREFIX, PROTOCOL};
 use std::collections::BTreeMap;
@@ -394,11 +394,28 @@ pub fn make_dir(ground: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+/// The log of the helper: the private temporary folder of the sandbox.
+pub fn log_path() -> PathBuf {
+    std::env::temp_dir().join("paddock-pasture-serve.log")
+}
+
+/// Append one line to the helper log. No log when the file cannot open.
+fn note(msg: &str) {
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_path())
+    {
+        let _ = writeln!(f, "{} {msg}", crate::state::now());
+    }
+}
+
 /// The helper of one member: run until paddock kv goes away.
 pub fn serve() -> i32 {
     let (me, harness, pasture) = match whoami() {
         Ok(w) => w,
         Err(e) => {
+            note(&format!("no paddock kv, the helper ends: {e}"));
             eprintln!("paddock-host pasture serve: {e}");
             return crate::hostcli::EXIT_NO_HOST;
         }
@@ -418,6 +435,10 @@ pub fn serve() -> i32 {
     let Some(_lock) = try_lock(&ground, &me) else {
         return 0;
     };
+    note(&format!(
+        "start: sandbox {me}, pasture {}",
+        pasture.unwrap_or_default()
+    ));
     // The bridge: questions of other members, on the own kv socket.
     std::thread::spawn(super::bridge::helper);
     let mut active: BTreeMap<u16, (Role, Listener)> = BTreeMap::new();
@@ -434,7 +455,8 @@ pub fn serve() -> i32 {
                 fails = 0;
                 l
             }
-            Err(_) => {
+            Err(e) => {
+                note(&format!("cannot list the shared ports: {e}"));
                 fails += 1;
                 if fails >= 6 {
                     break;
@@ -452,6 +474,7 @@ pub fn serve() -> i32 {
             .collect();
         for p in gone {
             if let Some((_, l)) = active.remove(&p) {
+                note(&format!("stop {p}"));
                 l.stop();
             }
         }
@@ -479,6 +502,7 @@ pub fn serve() -> i32 {
             };
             match started {
                 Ok(l) => {
+                    note(&format!("{role:?} {port}"));
                     skipped.remove(&port);
                     active.insert(port, (role, l));
                 }
@@ -488,6 +512,7 @@ pub fn serve() -> i32 {
                     } else {
                         e.to_string()
                     };
+                    note(&format!("skip {port}: {why}"));
                     skipped.insert(port, why);
                 }
             }
@@ -518,9 +543,13 @@ pub fn serve() -> i32 {
                     cursor = Some(c);
                 }
             }
-            Err(_) => std::thread::sleep(Duration::from_secs(1)),
+            Err(e) => {
+                note(&format!("watch failed: {e}"));
+                std::thread::sleep(Duration::from_secs(1));
+            }
         }
     }
+    note("paddock kv went away, the helper ends");
     for (_, (_, l)) in std::mem::take(&mut active) {
         l.stop();
     }

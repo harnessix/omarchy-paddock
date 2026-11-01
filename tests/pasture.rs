@@ -262,7 +262,20 @@ fn a_member_shares_a_port_through_the_pasture_folder() {
 
 // ---- end to end, in bubblewrap ---------------------------------------------
 
-/// Member A serves on 3000 and shares it. It writes ready:A, then waits
+/// Each wait prints WAIT, the key and the exit code when it fails, and each
+/// member ends with its view of the pasture (LIST) and its helper log
+/// (HELPER), so that a failure explains itself. The keys are written once,
+/// so every watch starts at version 0: a write before the watch counts.
+const LOG: &str = r#"
+wait_for() { paddock-host kv watch "$1" --version 0 --scope pasture --timeout "${2:-12}" >/dev/null 2>/tmp/w; c=$?; [ $c = 0 ] || echo "WAIT $1 $c $(cat /tmp/w)"; }
+report() {
+  paddock-host kv list --scope pasture 2>&1 | sed 's/^/LIST /'
+  sed 's/^/HELPER /' "${TMPDIR:-/tmp}/paddock-pasture-serve.log" 2>/dev/null
+}
+paddock-host kv list --scope pasture >/dev/null 2>/tmp/k; echo "KV_EXIT $? $(cat /tmp/k)"
+"#;
+
+/// Member A serves on 3000 and shares it. It writes ready:a, then waits
 /// for go:unshare and unshares.
 const OWNER: &str = r#"
 python3 - <<'PY' &
@@ -277,10 +290,12 @@ PY
 sleep 1
 paddock-host pasture share 3000; echo "SHARE_EXIT $?"
 paddock-host kv put ready:a yes --scope pasture >/dev/null
-paddock-host kv watch go:unshare --scope pasture --timeout 60 >/dev/null
+# B asks for up to 15 seconds before it writes go:unshare.
+wait_for go:unshare 25
 paddock-host pasture unshare 3000; echo "UNSHARE_EXIT $?"
 paddock-host kv put done:a yes --scope pasture >/dev/null
-paddock-host kv watch go:end --scope pasture --timeout 60 >/dev/null
+wait_for go:end
+report
 "#;
 
 /// Member B waits for ready:a, reaches 127.0.0.1:3000, tries to share it,
@@ -289,20 +304,21 @@ const OTHER: &str = r#"
 ask() { python3 -c '
 import socket, sys
 try:
-    c = socket.create_connection(("127.0.0.1", 3000), timeout=3); c.sendall(b"ping")
+    c = socket.create_connection(("127.0.0.1", 3000), timeout=1); c.sendall(b"ping")
     print(c.recv(1024).decode() or "EMPTY")
 except Exception as e:
     print("ERR", type(e).__name__)
 '; }
-paddock-host kv watch ready:a --version 0 --scope pasture --timeout 60 >/dev/null
-for i in $(seq 1 50); do r=$(ask); case "$r" in from-a:*) break;; esac; sleep 0.2; done
+wait_for ready:a
+for i in $(seq 1 40); do r=$(ask); case "$r" in from-a:*) break;; esac; sleep 0.2; done
 echo "REACH $r"
 paddock-host pasture share 3000 2>/tmp/err; echo "SHARE_EXIT $?"; echo "SHARE_ERR $(cat /tmp/err)"
 paddock-host pasture members > /tmp/m; echo "MEMBERS $(tr '\n' ' ' </tmp/m)"
 paddock-host kv put go:unshare yes --scope pasture >/dev/null
-paddock-host kv watch done:a --version 0 --scope pasture --timeout 60 >/dev/null
-for i in $(seq 1 50); do r=$(ask); case "$r" in from-a:*) ;; *) break;; esac; sleep 0.2; done
+wait_for done:a
+for i in $(seq 1 40); do r=$(ask); case "$r" in from-a:*) ;; *) break;; esac; sleep 0.2; done
 echo "AFTER $r"
+report
 paddock-host kv put go:end yes --scope pasture >/dev/null
 "#;
 
@@ -333,14 +349,14 @@ fn two_members_reach_a_shared_port_in_bubblewrap() {
             cfg.join(format!("harness.d/{name}.toml")),
             format!(
                 "name = \"{name}\"\n[locate]\ncommands = [\"sh\"]\n[launch]\nargs = [\"-c\", {}]\n",
-                serde_json::to_string(script).unwrap()
+                serde_json::to_string(&format!("{LOG}{script}")).unwrap()
             ),
         )
         .unwrap();
     }
-    let start = |name: &str| {
-        Command::new(env!("CARGO_BIN_EXE_paddock"))
-            .env("HOME", root.join("home"))
+    let host = |args: &[&str]| {
+        let mut c = Command::new(env!("CARGO_BIN_EXE_paddock"));
+        c.env("HOME", root.join("home"))
             .env("XDG_CONFIG_HOME", root.join("cfg"))
             .env("XDG_DATA_HOME", root.join("data"))
             .env("XDG_STATE_HOME", root.join("state"))
@@ -349,43 +365,71 @@ fn two_members_reach_a_shared_port_in_bubblewrap() {
             .env_remove("DBUS_SESSION_BUS_ADDRESS")
             .env("LANG", "C")
             .env("LC_ALL", "C")
-            .args([
-                "run",
-                name,
-                "--backend",
-                "bwrap",
-                "--network",
-                "none",
-                "--env",
-                "clean",
-                "--pasture",
-                "team",
-                "-y",
-            ])
-            .arg(root.join("project"))
+            .args(args)
+            .current_dir(root.join("project"))
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-            .unwrap()
+            .stderr(std::process::Stdio::piped());
+        c
     };
-    let a = start("owner");
-    let b = start("other");
+    let start = |name: &str| {
+        let project = root.join("project");
+        host(&[
+            "run",
+            name,
+            "--backend",
+            "bwrap",
+            "--network",
+            "none",
+            "--env",
+            "clean",
+            "--pasture",
+            "team",
+            "-y",
+            project.to_str().unwrap(),
+        ])
+        .spawn()
+        .unwrap()
+    };
+    let mut a = start("owner");
+    let mut b = start("other");
+    // The scripts end within about 50 seconds; a hang ends here.
+    let deadline = Instant::now() + Duration::from_secs(90);
+    let mut killed = false;
+    while a.try_wait().unwrap().is_none() || b.try_wait().unwrap().is_none() {
+        if Instant::now() > deadline {
+            let _ = a.kill();
+            let _ = b.kill();
+            killed = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
     let b = b.wait_with_output().unwrap();
     let a = a.wait_with_output().unwrap();
+    // The host view of the pasture: which member wrote which key.
+    let list = host(&["kv", "list", "--pasture", "team"]).output().unwrap();
     let out_a = String::from_utf8_lossy(&a.stdout).into_owned();
     let out_b = String::from_utf8_lossy(&b.stdout).into_owned();
     let all = format!(
-        "A:\n{out_a}\n{}\nB:\n{out_b}\n{}",
+        "A ({}):\n{out_a}\n{}\nB ({}):\n{out_b}\n{}\nhost kv list --pasture team:\n{}",
+        a.status,
         String::from_utf8_lossy(&a.stderr),
-        String::from_utf8_lossy(&b.stderr)
+        b.status,
+        String::from_utf8_lossy(&b.stderr),
+        text(&list),
     );
+    assert!(!killed, "the members did not end in 90 seconds:\n{all}");
     let line = |text: &str, k: &str| -> String {
         text.lines()
             .find_map(|l| l.strip_prefix(&format!("{k} ")))
             .unwrap_or_else(|| panic!("no {k} in:\n{all}"))
             .to_string()
     };
+    for out in [&out_a, &out_b] {
+        assert_eq!(line(out, "KV_EXIT").trim(), "0", "{all}");
+        assert!(!out.contains("WAIT "), "{all}");
+    }
     assert_eq!(line(&out_a, "SHARE_EXIT"), "0", "{all}");
     assert_eq!(line(&out_b, "REACH"), "from-a:ping", "{all}");
     assert_eq!(line(&out_b, "SHARE_EXIT"), "9", "{all}");
