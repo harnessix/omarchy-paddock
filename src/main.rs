@@ -2653,6 +2653,7 @@ fn gc_cmd(env: &HostEnv, o: &paddock::storage::GcOptions, json: bool) -> Result<
     let mut inv = storage::scan(env, &host, false);
     let mut items = storage::plan(&inv, o, state::now());
     storage::measure_plan(&mut inv, &mut items);
+    items.extend(paddock::borrow::gc_items(env));
     match paddock::kv::gc_items(env, state::now()) {
         Ok(kv) => items.extend(kv),
         Err(e) => inv

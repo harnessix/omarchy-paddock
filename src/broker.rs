@@ -53,6 +53,14 @@ pub const CAPABILITIES: &[(&str, &str)] = &[
         "fetch",
         "copy one host file or directory into the project inbox",
     ),
+    (
+        "borrow",
+        "copy a host folder into /run/paddock/borrow to change it; the original stays as it is",
+    ),
+    (
+        "return",
+        "write the changes of a borrowed copy back to its host folder, if the folder did not change",
+    ),
     ("clipboard-read", "read the host clipboard"),
     ("clipboard-write", "set the host clipboard"),
     ("open-url", "open a URL in the host browser"),
@@ -515,6 +523,7 @@ pub fn audit_file(env: &HostEnv) -> PathBuf {
 /// - open-url: the scheme and host. Paths and queries can hold login codes.
 /// - fetch, git-push, screenshot: the paths, remote and refs, as the user saw
 ///   them. These name host locations, not private content.
+/// - borrow, return: the host folder, the size and the counts of changes.
 ///
 /// `prepared` is the detail that `prepare` worked out, for the capabilities
 /// where it is safe to keep (fetch and git-push).
@@ -565,7 +574,7 @@ pub fn audit_detail(req: &Request, project: &Path, prepared: Option<&str>) -> St
                 Err(_) => format!("open a URL ({} characters)", u.chars().count()),
             }
         }
-        "fetch" | "git-push" | "spawn" if prepared.is_some() => {
+        "fetch" | "git-push" | "spawn" | "borrow" | "return" if prepared.is_some() => {
             prepared.unwrap_or_default().to_string()
         }
         "spawn" => format!(
@@ -577,6 +586,8 @@ pub fn audit_detail(req: &Request, project: &Path, prepared: Option<&str>) -> St
             "copy {} into the sandbox",
             arg_str(req, "path").unwrap_or("")
         ),
+        "borrow" => format!("borrow {}", arg_str(req, "path").unwrap_or("")),
+        "return" => format!("return {}", arg_str(req, "name").unwrap_or("")),
         "git-push" => format!("git push {}", arg_str(req, "remote").unwrap_or("")),
         "screenshot" | "clipboard-read" => describe(req, project).1,
         other => other.to_string(),
@@ -1109,6 +1120,18 @@ fn validate(req: &Request) -> Result<()> {
             }
             // `prepare` opens the path and checks where it really leads.
         }
+        "borrow" => {
+            let p = PathBuf::from(arg_str(req, "path").context("borrow needs a path")?);
+            if !p.is_absolute() {
+                bail!("borrow needs an absolute host path");
+            }
+        }
+        "return" => {
+            let n = arg_str(req, "name").context("return needs the name of a borrowed copy")?;
+            if !crate::borrow::valid_name(n) {
+                bail!("{n} is not the name of a borrowed copy");
+            }
+        }
         "clipboard-write" => {
             arg_str(req, "text").context("clipboard-write needs text")?;
         }
@@ -1170,7 +1193,7 @@ fn validate(req: &Request) -> Result<()> {
     Ok(())
 }
 
-fn safe_name(raw: &str, fallback: &str) -> String {
+pub(crate) fn safe_name(raw: &str, fallback: &str) -> String {
     let name: String = Path::new(raw)
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
@@ -1270,6 +1293,14 @@ fn perform(env: &HostEnv, ctx: &Context, req: &Request, work: &Work) -> Result<s
         Work::Push(_) => bail!("the push runs in the executor"),
         Work::Forge(_) => bail!("gh runs in the executor"),
         Work::Fetch(f) => return fetch(env, ctx, req, f),
+        Work::Borrow(b) => {
+            // Check again after the wait, like fetch.
+            let asked = PathBuf::from(arg_str(req, "path").unwrap_or(""));
+            check_fetch(env, &asked, &b.src.real_path()?, true)?;
+            let max = crate::borrow::Cfg::load(env)?.max;
+            return crate::borrow::borrow(env, &ctx.id, b, max);
+        }
+        Work::Return(r) => return r.apply(env, &ctx.id),
         Work::Plain => {}
     }
     // Every other capability runs in the executor (Broker::run_elsewhere).
@@ -1288,7 +1319,7 @@ struct FetchPlan {
 
 /// Refuse a fetch of a protected path: the path asked for, where it really
 /// leads, or a folder that holds a protected path.
-fn check_fetch(env: &HostEnv, asked: &Path, real: &Path, dir: bool) -> Result<()> {
+pub(crate) fn check_fetch(env: &HostEnv, asked: &Path, real: &Path, dir: bool) -> Result<()> {
     let mut denied = policy::denied_paths(env);
     // Harness logins too: paddock copies them in itself, never by request.
     if let Ok(f) = crate::profile::HarnessFactory::new(env) {
@@ -1364,6 +1395,8 @@ enum Work {
     Push(git::PushPlan),
     Forge(forge::Call),
     Fetch(FetchPlan),
+    Borrow(crate::borrow::BorrowPlan),
+    Return(crate::borrow::ReturnPlan),
 }
 
 /// What the user sees and what a session grant covers.
@@ -1458,6 +1491,63 @@ fn prepare(env: &HostEnv, ctx: &Context, req: &Request) -> Result<Prepared> {
                 read_only: false,
                 audit: None,
                 work: Work::Fetch(plan),
+            })
+        }
+        "borrow" => {
+            let asked = PathBuf::from(arg_str(req, "path").unwrap_or(""));
+            let plan =
+                crate::borrow::plan_borrow(env, &asked, |a, r| check_fetch(env, a, r, true))?;
+            let real = plan.real.display().to_string();
+            let mut detail = format!(
+                "Copy the host folder {real} ({}) into {} in the sandbox. The agent changes the copy; the original stays as it is. A return asks again and shows every change.",
+                crate::storage::human(plan.bytes),
+                crate::borrow::MOUNT
+            );
+            if asked != plan.real {
+                detail.push_str(&format!(" (asked for as {})", asked.display()));
+            }
+            Ok(Prepared {
+                summary: format!("borrow {real}"),
+                audit: Some(format!("borrow {real} ({} bytes)", plan.bytes)),
+                detail,
+                keys: vec![format!("borrow\0{real}")],
+                session_allowed: true,
+                always_ask: false,
+                read_only: false,
+                work: Work::Borrow(plan),
+            })
+        }
+        "return" => {
+            let name = arg_str(req, "name").unwrap_or("");
+            let max = crate::borrow::Cfg::load(env)?.max;
+            let plan = crate::borrow::plan_return(env, &ctx.id, name, max)?;
+            if plan.changes.is_empty() {
+                bail!(
+                    "the copy {name} has no changes to return{}",
+                    if plan.changes.kept.is_empty() {
+                        String::new()
+                    } else {
+                        " (changes of git files are never returned)".into()
+                    }
+                );
+            }
+            let orig = plan.manifest.original.display().to_string();
+            Ok(Prepared {
+                summary: format!("return {name} to {orig} ({})", plan.changes.counts()),
+                detail: plan.detail(),
+                audit: Some(format!(
+                    "return {name} to {orig}: {}, {} kept, {} skipped, {} changed bytes",
+                    plan.changes.counts(),
+                    plan.changes.kept.len(),
+                    plan.changes.skipped.len(),
+                    plan.changed_bytes
+                )),
+                // Each return shows its own changes: never a session grant.
+                keys: vec![format!("return\0{orig}")],
+                session_allowed: false,
+                always_ask: false,
+                read_only: false,
+                work: Work::Return(plan),
             })
         }
         _ => {

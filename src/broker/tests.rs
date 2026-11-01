@@ -1081,3 +1081,80 @@ fn an_allowed_plain_exec_line_is_logged_for_suggest_only_when_asked() {
     assert_eq!(lines[1]["argv"], serde_json::json!(["echo", "a"]));
     assert!(lines[2].get("argv").is_none());
 }
+
+#[test]
+fn borrow_and_return_through_the_broker() {
+    let (t, b, fixed) = setup(Some(Answer::Once), HostPolicy::default());
+    let o = t.path().join("shared/lib");
+    std::fs::create_dir_all(o.join("src")).unwrap();
+    std::fs::write(o.join("src/a.rs"), "old\n").unwrap();
+    let r = b.handle(&req("borrow", serde_json::json!({ "path": o })));
+    assert_eq!(r.status, Status::Done, "{}", r.message);
+    assert_eq!(r.result["path"], "/run/paddock/borrow/lib");
+    let copy = crate::borrow::dir(&b.env, "t-1").join("lib");
+    std::fs::write(copy.join("src/a.rs"), "new\n").unwrap();
+    std::fs::write(copy.join("added"), "x").unwrap();
+    // The original does not change before the return.
+    assert_eq!(
+        std::fs::read_to_string(o.join("src/a.rs")).unwrap(),
+        "old\n"
+    );
+    let r = b.handle(&req("return", serde_json::json!({ "name": "lib" })));
+    assert_eq!(r.status, Status::Done, "{}", r.message);
+    assert_eq!(r.result["added"], 1);
+    assert_eq!(r.result["changed"], 1);
+    assert_eq!(
+        std::fs::read_to_string(o.join("src/a.rs")).unwrap(),
+        "new\n"
+    );
+    assert_eq!(std::fs::read_to_string(o.join("added")).unwrap(), "x");
+    assert_eq!(fixed.asked.load(Ordering::SeqCst), 2);
+
+    // A change to the original after the borrow: the return refuses.
+    let r = b.handle(&req("borrow", serde_json::json!({ "path": o })));
+    assert_eq!(r.status, Status::Done, "{}", r.message);
+    std::fs::write(copy.join("src/a.rs"), "agent\n").unwrap();
+    std::fs::write(o.join("src/a.rs"), "user\n").unwrap();
+    let r = b.handle(&req("return", serde_json::json!({ "name": "lib" })));
+    assert_eq!(r.status, Status::Invalid, "{}", r.message);
+    assert!(
+        r.message.contains("changed after the borrow"),
+        "{}",
+        r.message
+    );
+    assert_eq!(
+        std::fs::read_to_string(o.join("src/a.rs")).unwrap(),
+        "user\n"
+    );
+    assert_eq!(fixed.asked.load(Ordering::SeqCst), 3);
+
+    // The audit log keeps paths and counts, never content.
+    let log = std::fs::read_to_string(audit_file(&b.env)).unwrap();
+    assert!(log.contains("1 added, 1 changed, 0 deleted"), "{log}");
+    assert!(!log.contains("agent") && !log.contains("new\\n"), "{log}");
+}
+
+#[test]
+fn borrow_refuses_protected_paths_and_relative_paths() {
+    let (t, b, fixed) = setup(Some(Answer::Once), HostPolicy::default());
+    std::fs::create_dir_all(b.env.home.join(".ssh")).unwrap();
+    for p in [b.env.home.clone(), b.env.home.join(".ssh")] {
+        let r = b.handle(&req("borrow", serde_json::json!({ "path": p })));
+        assert_eq!(r.status, Status::Invalid, "{}", r.message);
+    }
+    let r = b.handle(&req("borrow", serde_json::json!({ "path": "rel/dir" })));
+    assert_eq!(r.status, Status::Invalid);
+    let r = b.handle(&req("return", serde_json::json!({ "name": "../x" })));
+    assert_eq!(r.status, Status::Invalid);
+    let r = b.handle(&req("return", serde_json::json!({ "name": "none" })));
+    assert_eq!(r.status, Status::Invalid);
+    assert_eq!(fixed.asked.load(Ordering::SeqCst), 0);
+    // A denied borrow copies nothing.
+    let (t2, b2, _) = setup(Some(Answer::Deny), HostPolicy::default());
+    let o = t2.path().join("lib");
+    std::fs::create_dir_all(&o).unwrap();
+    let r = b2.handle(&req("borrow", serde_json::json!({ "path": o })));
+    assert_eq!(r.status, Status::Denied);
+    assert!(crate::borrow::list(&b2.env, "t-1").is_empty());
+    drop(t);
+}

@@ -13,7 +13,7 @@ use std::collections::VecDeque;
 use std::ffi::{CString, OsStr, OsString};
 use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-use std::os::unix::ffi::OsStrExt;
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Component, Path, PathBuf};
 
 /// Credentials, JSON settings and similar files are small.
@@ -290,6 +290,18 @@ impl Source {
         self.kind == Kind::Dir
     }
 
+    /// A path that names the open file or folder itself, valid in this
+    /// process while the Source lives.
+    pub fn proc_path(&self) -> PathBuf {
+        PathBuf::from(fd_path(&self.fd))
+    }
+
+    /// The device and inode of the open file or folder.
+    pub fn id(&self) -> Result<(u64, u64)> {
+        let st = fstat(&self.fd)?;
+        Ok((st.st_dev, st.st_ino))
+    }
+
     /// The bytes a copy takes; it stops counting above `limit`. Symlinks,
     /// FIFOs and devices inside a folder do not count: a copy skips them.
     pub fn size(&self, limit: u64) -> Result<u64> {
@@ -514,6 +526,63 @@ impl Dir {
             bail!("{} is larger than {} bytes", what.display(), max);
         }
         read_limited(f, max, &what).map(Some)
+    }
+
+    /// Open a regular file for reading, without following a symlink. None
+    /// when it does not exist. A FIFO or a device is never opened.
+    pub fn open_read(&self, name: &OsStr) -> Result<Option<std::fs::File>> {
+        let what = self.path.join(name);
+        let fd = match openat(self.fd.as_raw_fd(), &cstr(name)?, libc::O_PATH, 0) {
+            Ok(f) => f,
+            Err(e) if e.raw_os_error() == Some(libc::ENOENT) => return Ok(None),
+            Err(e) => return Err(symlink_error(e, &what)),
+        };
+        reopen_read(&fd, &what).map(Some)
+    }
+
+    /// The target of the symlink `name`.
+    pub fn read_link(&self, name: &OsStr) -> Result<PathBuf> {
+        let n = cstr(name)?;
+        let mut buf = vec![0u8; 4096];
+        // SAFETY: readlinkat writes at most buf.len() bytes into buf.
+        let r = unsafe {
+            libc::readlinkat(
+                self.fd.as_raw_fd(),
+                n.as_ptr(),
+                buf.as_mut_ptr() as *mut libc::c_char,
+                buf.len(),
+            )
+        };
+        if r < 0 {
+            return Err(anyhow::Error::from(last_err())
+                .context(format!("cannot read {}", self.path.join(name).display())));
+        }
+        buf.truncate(r as usize);
+        Ok(PathBuf::from(OsString::from_vec(buf)))
+    }
+
+    /// Move `from`, a path that only the host can write, into this folder
+    /// as `name`. An existing entry is never replaced.
+    pub fn move_in(&self, from: &Path, name: &OsStr) -> std::io::Result<()> {
+        let (f, n) = (
+            CString::new(from.as_os_str().as_bytes()).map_err(std::io::Error::other)?,
+            CString::new(name.as_bytes()).map_err(std::io::Error::other)?,
+        );
+        // SAFETY: renameat2 with NUL-terminated names; NOREPLACE never
+        // replaces an entry that the sandbox put there.
+        let r = unsafe {
+            libc::renameat2(
+                libc::AT_FDCWD,
+                f.as_ptr(),
+                self.fd.as_raw_fd(),
+                n.as_ptr(),
+                libc::RENAME_NOREPLACE,
+            )
+        };
+        if r != 0 {
+            return Err(last_err());
+        }
+        Ok(())
     }
 
     /// What the entry `name` is, without following it. None when missing.
