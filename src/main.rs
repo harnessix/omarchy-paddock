@@ -630,6 +630,28 @@ enum PastureCmd {
         #[arg(long)]
         project: Option<PathBuf>,
     },
+    /// The workbench of a pasture: a shared terminal (tmux) that belongs to
+    /// no member. Every member and you can type into it. Allow it with
+    /// workbench = true in [pastures.NAME].
+    Workbench {
+        name: String,
+        #[arg(long)]
+        project: Option<PathBuf>,
+        /// Start it when it does not run.
+        #[arg(long, conflicts_with = "stop")]
+        start: bool,
+        /// Stop it.
+        #[arg(long)]
+        stop: bool,
+        /// Attach this terminal to it.
+        #[arg(long, conflicts_with = "stop")]
+        attach: bool,
+        #[arg(long)]
+        json: bool,
+        /// Run the workbench sandbox (paddock starts it so).
+        #[arg(long, hide = true)]
+        serve: bool,
+    },
     /// Delete the data of a pasture: its paddock kv file and its shared
     /// folder. No member may run.
     Remove {
@@ -982,6 +1004,7 @@ impl RunArgs {
             child: None,
             transparent: None,
             pasture: self.pasture.clone(),
+            workbench: false,
         })
     }
 }
@@ -2717,6 +2740,14 @@ fn pasture_cmd(env: &HostEnv, cmd: PastureCmd) -> Result<i32> {
                         "", port.port, port.harness, port.sandbox
                     );
                 }
+                match &p.workbench {
+                    Some(w) if w.running => println!(
+                        "{:<20} workbench runs: paddock pasture workbench {} --attach",
+                        "", p.name
+                    ),
+                    Some(w) if w.allowed => println!("{:<20} workbench allowed, not running", ""),
+                    _ => {}
+                }
             }
             let solo = all.iter().filter(|p| p.solo).count();
             if solo > 0 {
@@ -2737,6 +2768,19 @@ fn pasture_cmd(env: &HostEnv, cmd: PastureCmd) -> Result<i32> {
                 stop_one(env, &all, &m.id)?;
             }
             Ok(0)
+        }
+        PastureCmd::Workbench {
+            name,
+            project: p,
+            start,
+            stop,
+            attach,
+            json,
+            serve,
+        } => {
+            paddock::pasture::check_name(&name)?;
+            let project = project(p)?;
+            workbench_cmd(env, &project, &name, start, stop, attach, json, serve)
         }
         PastureCmd::Remove {
             name,
@@ -2787,6 +2831,91 @@ fn pasture_cmd(env: &HostEnv, cmd: PastureCmd) -> Result<i32> {
             Ok(0)
         }
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn workbench_cmd(
+    env: &HostEnv,
+    project: &std::path::Path,
+    name: &str,
+    start: bool,
+    stop: bool,
+    attach: bool,
+    json: bool,
+    serve: bool,
+) -> Result<i32> {
+    use paddock::pasture::workbench as wb;
+    // An invalid [pastures] is an error here, not "no workbench".
+    paddock::pasture::load(env)?;
+    if serve {
+        return wb::serve(env, project, name);
+    }
+    if stop {
+        let stopped = wb::stop(env, project, name)?;
+        if stopped {
+            wb::audit(env, project, name, "stop", "user");
+        }
+        if json {
+            println!("{}", serde_json::json!({ "stopped": stopped }));
+        } else if stopped {
+            println!("Stopped the workbench of the pasture '{name}'.");
+        } else {
+            println!("The workbench of the pasture '{name}' does not run.");
+        }
+        return Ok(0);
+    }
+    if start {
+        // The project settings need the approval of the user before a
+        // sandbox starts without a terminal.
+        let loaded = paddock::manifest::Manifest::load(env, project)?;
+        paddock::manifest::require_approval(env, &loaded, false)?;
+        if wb::start(env, project, name, "user")? == wb::Started::Now && !json && !attach {
+            println!("Started the workbench of the pasture '{name}'.");
+        }
+    }
+    let st = wb::state(env, project, name);
+    let sock = wb::socket(env, project, name);
+    if attach {
+        if !st.running {
+            bail!("the workbench of the pasture '{name}' does not run. Start it: paddock pasture workbench {name} --start --attach");
+        }
+        let Some(tmux) = env.which("tmux") else {
+            bail!("tmux is not installed on the host");
+        };
+        wb::audit(env, project, name, "join", "user");
+        // A relative socket path: the host path can be longer than a Unix
+        // socket address allows.
+        use std::os::unix::process::CommandExt as _;
+        let e = std::process::Command::new(tmux)
+            .current_dir(wb::dir(env, project, name))
+            .args(["-S", wb::SOCKET, "attach", "-t", wb::SESSION])
+            .exec();
+        bail!("cannot start tmux: {e}");
+    }
+    if json {
+        let mut v = serde_json::to_value(&st)?;
+        v["socket"] = sock.display().to_string().into();
+        println!("{}", serde_json::to_string_pretty(&v)?);
+        return Ok(0);
+    }
+    match (st.allowed, st.running) {
+        (_, true) => {
+            println!(
+                "The workbench of '{name}' runs. Every member and you can type into it, so each one sees what the others run there."
+            );
+            println!("Attach: paddock pasture workbench {name} --attach");
+            println!("   or: {}", wb::attach_command(&sock));
+            println!("Members: paddock-host pasture workbench");
+        }
+        (true, false) => println!(
+            "The workbench of '{name}' does not run. Start it: paddock pasture workbench {name} --start"
+        ),
+        (false, false) => println!(
+            "The pasture '{name}' has no workbench. Allow it in {}:\n\n[pastures.{name}]\nworkbench = true",
+            env.paddock_config().join("config.toml").display()
+        ),
+    }
+    Ok(0)
 }
 
 fn files_cmd(env: &HostEnv, id: Option<&str>, json: bool) -> Result<i32> {

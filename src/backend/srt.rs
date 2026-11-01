@@ -360,6 +360,14 @@ impl Backend for Srt {
         {
             vars.insert("PADDOCK_PASTURE".into(), s(src));
         }
+        if let Some(src) = spec
+            .mounts
+            .iter()
+            .find(|m| m.dst == Path::new(crate::pasture::workbench::MOUNT))
+            .and_then(|m| m.src.as_ref())
+        {
+            vars.insert(crate::pasture::workbench::ENV.into(), s(src));
+        }
         vars.insert("CLAUDE_CODE_TMPDIR".into(), s(&tmp));
         // Host tools appear in their own directories, not under /run/paddock/bin.
         // paddock's own wrappers in the run folder come first. Other tools,
