@@ -753,6 +753,7 @@ mod tests {
             logins,
             unit: None,
             kv_project: None,
+            pasture: None,
         }
     }
 

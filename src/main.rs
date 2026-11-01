@@ -439,13 +439,21 @@ enum EnvCmd {
     Unhide { names: Vec<String> },
 }
 
-/// Which scope a `paddock kv` command reads. Without a flag: the project
-/// of the current folder.
+/// Which scope a `paddock kv` command reads. Without a flag: the pastures
+/// of the project of the current folder.
 #[derive(Args)]
 struct KvScope {
-    /// The project scope of this folder.
+    /// The project folder (default: the current folder).
     #[arg(long, conflicts_with_all = ["user", "sandbox", "tree"])]
     project: Option<PathBuf>,
+    /// A pasture of the project: a name from [pastures] of the user
+    /// configuration, or solo-<sandbox id> for a sandbox started without one.
+    #[arg(long, conflicts_with_all = ["user", "sandbox", "tree", "legacy"])]
+    pasture: Option<String>,
+    /// The project scope that all sandboxes of the project shared in older
+    /// paddock versions. Sandboxes no longer read it.
+    #[arg(long, conflicts_with_all = ["user", "sandbox", "tree"])]
+    legacy: bool,
     /// The scope that all projects share.
     #[arg(long, conflicts_with_all = ["sandbox", "tree"])]
     user: bool,
@@ -460,14 +468,22 @@ struct KvScope {
 impl KvScope {
     fn target(&self) -> Result<paddock::kv::host::Target> {
         use paddock::kv::host::{project_of, Target};
+        use paddock::kv::shard::Ns;
         Ok(if self.user {
-            Target::User
+            Target::One(Ns::User)
         } else if let Some(id) = &self.sandbox {
-            Target::Sandbox(id.clone())
+            Target::One(Ns::Own(id.clone()))
         } else if let Some(root) = &self.tree {
-            Target::Tree(root.clone())
+            Target::One(Ns::Tree(root.clone()))
         } else {
-            Target::Project(project_of(self.project.as_deref())?)
+            let project = project_of(self.project.as_deref())?;
+            if let Some(name) = &self.pasture {
+                Target::One(Ns::pasture(&project, name)?)
+            } else if self.legacy {
+                Target::One(Ns::Legacy(project))
+            } else {
+                Target::Project(project)
+            }
         })
     }
 }
@@ -733,6 +749,11 @@ struct RunArgs {
     /// Work in a new git worktree on its own branch, and review the diff afterwards.
     #[arg(long)]
     worktree: bool,
+    /// Join this pasture of the project: [pastures.NAME] of the user
+    /// configuration. Its members share the pasture scope of paddock kv.
+    /// Without it, the sandbox shares paddock kv with no other.
+    #[arg(long, value_name = "NAME")]
+    pasture: Option<String>,
     /// Start the harness without its auto-approval flags.
     #[arg(long)]
     no_yolo: bool,
@@ -785,6 +806,7 @@ impl RunArgs {
             args: self.args.clone(),
             child: None,
             transparent: None,
+            pasture: self.pasture.clone(),
         })
     }
 }

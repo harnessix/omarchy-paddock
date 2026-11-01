@@ -568,6 +568,7 @@ fn gc_yes_removes_only_the_automatic_tier_and_spares_running_homes() {
         logins: Vec::new(),
         unit: None,
         kv_project: None,
+        pasture: None,
     }
     .register(&env)
     .unwrap();

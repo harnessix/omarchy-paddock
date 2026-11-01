@@ -1,4 +1,5 @@
-use super::store::{self, Put, Quota, Store, WriteError, Writer};
+use super::shard::{self, Ns};
+use super::store::{Put, Quota, Store, WriteError, Writer};
 use super::*;
 use crate::broker::{Answer, Approver, Pending};
 use std::collections::BTreeMap;
@@ -184,39 +185,6 @@ fn history_stays_within_the_quota() {
 }
 
 #[test]
-fn gc_finds_finished_runs_only() {
-    let (_d, mut s) = tmp_store();
-    let day = 24 * 3600;
-    let p = std::path::Path::new("/p");
-    s.register("old", "t", p, None, 0).unwrap();
-    s.finish("old", day).unwrap();
-    s.register("running", "t", p, None, 0).unwrap();
-    s.register("parent", "t", p, None, 0).unwrap();
-    s.register("child", "t", p, Some("parent"), 0).unwrap();
-    for id in ["old", "running", "parent"] {
-        let w = Writer {
-            sandbox: id,
-            harness: "t",
-        };
-        s.put(&store::ns_self(id), "k", "v", None, None, &w, Q, day)
-            .unwrap();
-    }
-    let cutoff = 40 * day;
-    let stale = s
-        .stale(cutoff, &["running".into(), "child".into()])
-        .unwrap();
-    assert_eq!(
-        stale.iter().map(|x| x.sandbox.as_str()).collect::<Vec<_>>(),
-        ["old"]
-    );
-    // Recent data stays.
-    assert!(s.stale(day, &[]).unwrap().is_empty());
-    s.remove_sandboxes(&["old".into()]).unwrap();
-    assert!(s.get(&store::ns_self("old"), "k", day).unwrap().is_none());
-    assert!(s.parent_of("child").unwrap().as_deref() == Some("parent"));
-}
-
-#[test]
 fn config_defaults_and_limits() {
     let c = KvCfg::parse("").unwrap();
     assert_eq!(c, KvCfg::default());
@@ -247,7 +215,28 @@ impl Approver for Fixed {
 struct World {
     _dir: tempfile::TempDir,
     env: HostEnv,
-    store: PathBuf,
+    /// The kv folder.
+    root: PathBuf,
+}
+
+impl World {
+    fn reg(&self) -> Store {
+        Store::open(&shard::registry(&self.root)).unwrap()
+    }
+    fn open(&self, ns: &Ns) -> Store {
+        Store::open(&ns.file(&self.root).unwrap()).unwrap()
+    }
+}
+
+/// The pasture that the sandboxes of these tests join, unless a test says
+/// otherwise.
+const TEAM: &str = "team";
+
+fn team() -> Ns {
+    Ns::Pasture {
+        project: "/src/app".into(),
+        name: TEAM.into(),
+    }
 }
 
 fn world() -> World {
@@ -255,11 +244,11 @@ fn world() -> World {
     let home = dir.path().join("home");
     std::fs::create_dir_all(&home).unwrap();
     let env = HostEnv::from_parts(home, "u".into(), 1000, 1000, BTreeMap::new());
-    let store = dir.path().join("store.db");
+    let root = kv_root(&env);
     World {
         _dir: dir,
         env,
-        store,
+        root,
     }
 }
 
@@ -284,6 +273,22 @@ fn node(
     cfg: KvCfg,
     answer: Option<Answer>,
 ) -> (Service, Arc<Fixed>) {
+    // A spawned sandbox never joins a pasture.
+    let pasture = chain.is_empty().then(|| TEAM.to_string());
+    in_pasture(w, id, chain, can_spawn, cfg, answer, pasture, "/src/app")
+}
+
+#[allow(clippy::too_many_arguments)]
+fn in_pasture(
+    w: &World,
+    id: &str,
+    chain: &[&str],
+    can_spawn: bool,
+    cfg: KvCfg,
+    answer: Option<Answer>,
+    pasture: Option<String>,
+    project: &str,
+) -> (Service, Arc<Fixed>) {
     let fixed = Arc::new(Fixed {
         answer,
         asked: Mutex::new(Vec::new()),
@@ -299,7 +304,8 @@ fn node(
             tree: lineage.tree_root(id),
             sandbox: id.into(),
             harness: "t".into(),
-            project: "/src/app".into(),
+            project: project.into(),
+            pasture: pasture.clone(),
             parent: lineage.parent.clone(),
             chain: lineage.chain.clone(),
         },
@@ -307,14 +313,14 @@ fn node(
         fixed.clone(),
         Duration::from_secs(1),
     )
-    .with_store(w.store.clone());
-    Store::open(&w.store)
-        .unwrap()
+    .with_root(w.root.clone());
+    w.reg()
         .register(
             id,
             "t",
-            Path::new("/src/app"),
+            Path::new(project),
             chain.last().copied(),
+            pasture.as_deref(),
             crate::state::now(),
         )
         .unwrap();
@@ -362,15 +368,15 @@ fn project_entries_record_the_writer() {
     let w = world();
     let (a, _) = service(&w, "a", None, KvCfg::default(), None);
     let (b, _) = service(&w, "b", None, KvCfg::default(), None);
-    a.handle(&put(Scope::Project, "note:x", "tip"), None);
-    let r = b.handle(&req("get", Scope::Project, "note:x"), None);
+    a.handle(&put(Scope::Pasture, "note:x", "tip"), None);
+    let r = b.handle(&req("get", Scope::Pasture, "note:x"), None);
     assert_eq!(r.status, Status::Done);
     assert_eq!(r.result["writer"], "a");
     assert_eq!(r.result["untrusted"], true);
     let l = b.handle(
         &Request {
             prefix: Some("note:".into()),
-            ..req("list", Scope::Project, "")
+            ..req("list", Scope::Pasture, "")
         },
         None,
     );
@@ -521,24 +527,24 @@ fn leases_belong_to_the_sandbox() {
     let r = a.handle(
         &Request {
             owner: Some("b".into()),
-            ..claim(Scope::Project, "fix", 60)
+            ..claim(Scope::Pasture, "fix", 60)
         },
         None,
     );
     assert_eq!(r.status, Status::Done);
     assert_eq!(r.result["owner"], "a");
-    let held = b.handle(&claim(Scope::Project, "fix", 60), None);
+    let held = b.handle(&claim(Scope::Pasture, "fix", 60), None);
     assert_eq!(held.status, Status::Conflict);
     assert_eq!(held.result["owner"], "a");
     // Renewal by the owner.
-    let r = a.handle(&claim(Scope::Project, "fix", 120), None);
+    let r = a.handle(&claim(Scope::Pasture, "fix", 120), None);
     assert_eq!(r.result["renewed"], true);
     // A sibling cannot release it, not even with force.
     let rel = |s: &Service, force: bool| {
         s.handle(
             &Request {
                 force: Some(force),
-                ..req("release", Scope::Project, "fix")
+                ..req("release", Scope::Pasture, "fix")
             },
             None,
         )
@@ -548,30 +554,13 @@ fn leases_belong_to_the_sandbox() {
     assert_eq!(rel(&a, false).status, Status::Done);
     assert_eq!(rel(&a, false).status, Status::NotFound);
 
-    // The parent can force the release of a child's lease. A child writes
-    // the project scope only when the user configuration allows it.
-    let (child, _) = service(
-        &w,
-        "child",
-        Some("a"),
-        KvCfg {
-            child_project_write: true,
-            ..KvCfg::default()
-        },
-        None,
-    );
-    child.handle(&claim(Scope::Project, "job", 60), None);
-    assert_eq!(rel_named(&b, "job", true).status, Status::Denied);
-    assert_eq!(rel_named(&a, "job", false).status, Status::Denied);
-    assert_eq!(rel_named(&a, "job", true).status, Status::Done);
-
     // Plain writes cannot forge a lease.
     for r in [
-        put(Scope::Project, "lease:fix", "{\"owner\":\"b\"}"),
-        req("delete", Scope::Project, "lease:fix"),
+        put(Scope::Pasture, "lease:fix", "{\"owner\":\"b\"}"),
+        req("delete", Scope::Pasture, "lease:fix"),
         Request {
             entries: Some(BTreeMap::from([("lease:x".into(), "y".into())])),
-            ..req("mset", Scope::Project, "")
+            ..req("mset", Scope::Pasture, "")
         },
     ] {
         assert_eq!(b.handle(&r, None).status, Status::Invalid);
@@ -583,29 +572,18 @@ fn leases_belong_to_the_sandbox() {
     );
 }
 
-fn rel_named(s: &Service, name: &str, force: bool) -> Response {
-    s.handle(
-        &Request {
-            force: Some(force),
-            ..req("release", Scope::Project, name)
-        },
-        None,
-    )
-}
-
 #[test]
 fn expired_leases_are_free() {
     let w = world();
     let (b, _) = service(&w, "b", None, KvCfg::default(), None);
-    let mut st = Store::open(&w.store).unwrap();
+    let mut st = w.open(&team());
     let now = crate::state::now();
     let wa = Writer {
         sandbox: "a",
         harness: "t",
     };
-    let ns = store::ns_project(Path::new("/src/app"));
     st.put(
-        &ns,
+        &team().key(),
         "lease:old",
         "{}",
         None,
@@ -615,7 +593,7 @@ fn expired_leases_are_free() {
         now - 10,
     )
     .unwrap();
-    let r = b.handle(&claim(Scope::Project, "old", 60), None);
+    let r = b.handle(&claim(Scope::Pasture, "old", 60), None);
     assert_eq!(r.status, Status::Done, "{}", r.message);
     assert_eq!(r.result["owner"], "b");
 }
@@ -705,15 +683,15 @@ fn watch_wakes_on_a_change_from_another_sandbox() {
     let b2 = b.clone();
     let t = std::thread::spawn(move || {
         std::thread::sleep(Duration::from_millis(300));
-        b2.handle(&put(Scope::Project, "result:x", "done"), None);
+        b2.handle(&put(Scope::Pasture, "result:x", "done"), None);
         std::thread::sleep(Duration::from_millis(300));
-        b2.handle(&put(Scope::Project, "result:y", "done"), None);
+        b2.handle(&put(Scope::Pasture, "result:y", "done"), None);
     });
     let start = Instant::now();
     let r = a.handle(
         &Request {
             timeout: Some(10),
-            ..req("watch", Scope::Project, "result:x")
+            ..req("watch", Scope::Pasture, "result:x")
         },
         None,
     );
@@ -727,7 +705,7 @@ fn watch_wakes_on_a_change_from_another_sandbox() {
             prefix: Some("result:".into()),
             version: Some(cursor),
             timeout: Some(10),
-            ..req("watch", Scope::Project, "")
+            ..req("watch", Scope::Pasture, "")
         },
         None,
     );
@@ -737,7 +715,7 @@ fn watch_wakes_on_a_change_from_another_sandbox() {
     let r = a.handle(
         &Request {
             timeout: Some(1),
-            ..req("watch", Scope::Project, "result:x")
+            ..req("watch", Scope::Pasture, "result:x")
         },
         None,
     );
@@ -749,7 +727,7 @@ fn watch_wakes_on_a_change_from_another_sandbox() {
         &Request {
             version: Some(0),
             timeout: Some(1),
-            ..req("watch", Scope::Project, "result:x")
+            ..req("watch", Scope::Pasture, "result:x")
         },
         None,
     );
@@ -792,24 +770,46 @@ fn disabled_store_answers_disabled() {
 #[test]
 fn gc_plan_skips_running_sandboxes() {
     let w = world();
-    let path = store_path(&w.env);
-    let mut st = Store::open(&path).unwrap();
     let old = crate::state::now() - 100 * 24 * 3600;
+    // The files were just written, so the test looks from 100 days ahead.
+    let later = crate::state::now() + 100 * 24 * 3600;
     for id in ["gone", "alive"] {
-        st.register(id, "t", Path::new("/p"), None, old).unwrap();
+        w.reg()
+            .register(id, "t", Path::new("/p"), None, None, old)
+            .unwrap();
+        w.reg().finish(id, old).unwrap();
         let wr = Writer {
             sandbox: id,
             harness: "t",
         };
-        st.put(&store::ns_self(id), "k", "v", None, None, &wr, Q, old)
-            .unwrap();
+        for ns in [
+            Ns::Own(id.into()),
+            Ns::Solo {
+                project: "/p".into(),
+                sandbox: id.into(),
+            },
+        ] {
+            w.open(&ns)
+                .put(&ns.key(), "k", "v", None, None, &wr, Q, old)
+                .unwrap();
+        }
     }
-    let plan = gc_plan(&w.env, &["alive".into()], crate::state::now()).unwrap();
+    let plan = gc_plan(&w.env, &["alive".into()], later).unwrap();
     assert_eq!(plan.stale.len(), 1);
     assert_eq!(plan.stale[0].sandbox, "gone");
-    let n = gc_apply(&w.env, &["gone".into()], crate::state::now()).unwrap();
-    assert_eq!(n, 1);
-    assert!(gc_plan(&w.env, &["alive".into()], crate::state::now())
+    assert_eq!(plan.stale[0].entries, 2);
+    // Recent files stay.
+    assert!(gc_plan(&w.env, &[], crate::state::now())
+        .unwrap()
+        .stale
+        .is_empty());
+    let n = gc_apply(&w.env, &["gone".into()], later).unwrap();
+    assert_eq!(n, 2);
+    // Its self scope and its own pasture went with its file.
+    assert!(!w.root.join("sandbox/gone.db").exists());
+    assert!(w.root.join("sandbox/alive.db").exists());
+    assert!(w.reg().times("gone").unwrap().is_none());
+    assert!(gc_plan(&w.env, &["alive".into()], later)
         .unwrap()
         .stale
         .is_empty());
@@ -950,31 +950,31 @@ fn tree_leases_work_across_siblings_and_only_ancestors_force_them() {
 }
 
 #[test]
-fn a_child_cannot_write_the_project_scope_by_default() {
+fn a_child_has_no_pasture_scope() {
     let w = world();
     let t = tree(&w, KvCfg::default());
-    t.r.handle(&put(Scope::Project, "note:x", "tip"), None);
-    // It can read what the project keeps.
-    assert_eq!(get(&t.c1, Scope::Project, "note:x").result["value"], "tip");
-    for r in [
-        put(Scope::Project, "note:x", "mine"),
-        req("delete", Scope::Project, "note:x"),
-        claim(Scope::Project, "job", 60),
-        Request {
-            entries: Some(BTreeMap::from([("k".into(), "v".into())])),
-            ..req("mset", Scope::Project, "")
-        },
-    ] {
-        assert_eq!(t.c1.handle(&r, None).status, Status::Denied);
-        assert_eq!(t.g.handle(&r, None).status, Status::Denied);
+    t.r.handle(&put(Scope::Pasture, "note:x", "tip"), None);
+    for c in [&t.c1, &t.g] {
+        assert_eq!(get(c, Scope::Pasture, "note:x").status, Status::Disabled);
+        for r in [
+            put(Scope::Pasture, "note:x", "mine"),
+            req("delete", Scope::Pasture, "note:x"),
+            claim(Scope::Pasture, "job", 60),
+            Request {
+                entries: Some(BTreeMap::from([("k".into(), "v".into())])),
+                ..req("mset", Scope::Pasture, "")
+            },
+        ] {
+            assert_eq!(c.handle(&r, None).status, Status::Disabled);
+        }
     }
-    assert_eq!(get(&t.r, Scope::Project, "note:x").result["value"], "tip");
-    // The user can allow it in the user configuration.
+    assert_eq!(get(&t.r, Scope::Pasture, "note:x").result["value"], "tip");
+    // The switch of older versions still loads, and changes nothing.
     let cfg = KvCfg::parse("[kv]\nchild_project_write = true\n").unwrap();
-    assert!(cfg.child_project_write);
     let (c, _) = node(&w, "c3", &["r"], false, cfg, None);
-    let r = c.handle(&put(Scope::Project, "note:y", "ok"), None);
-    assert_eq!(r.status, Status::Done);
+    let r = c.handle(&put(Scope::Pasture, "note:y", "ok"), None);
+    assert_eq!(r.status, Status::Disabled);
+    assert!(r.message.contains("tree"), "{}", r.message);
 }
 
 #[test]
@@ -982,22 +982,25 @@ fn the_tree_is_read_only_after_its_root_ends_and_gc_removes_it() {
     let w = world();
     let t = tree(&w, KvCfg::default());
     t.c1.handle(&put(Scope::Tree, "result:a", "done"), None);
-    Store::open(&w.store).unwrap().finish("r", 1000).unwrap();
+    w.reg().finish("r", 1000).unwrap();
     let late = t.c1.handle(&put(Scope::Tree, "result:b", "late"), None);
     assert_eq!(late.status, Status::Denied);
     // The copy stays for review.
     assert_eq!(get(&t.c1, Scope::Tree, "result:a").result["value"], "done");
-    let mut st = Store::open(&w.store).unwrap();
     // A running descendant keeps the root's data; without one it is stale.
-    let far = crate::state::now() + 10;
-    let ids = |v: Vec<store::Stale>| v.into_iter().map(|s| s.sandbox).collect::<Vec<_>>();
-    assert!(!ids(st.stale(far, &["g".into()]).unwrap()).contains(&"r".to_string()));
-    assert!(ids(st.stale(far, &[]).unwrap()).contains(&"r".to_string()));
-    st.remove_sandboxes(&["r".into()]).unwrap();
-    assert!(st
-        .get(&store::ns_tree("r"), "result:a", crate::state::now())
-        .unwrap()
-        .is_none());
+    let far = crate::state::now() + 100 * 24 * 3600;
+    let ids = |running: &[String]| {
+        gc_plan(&w.env, running, far)
+            .unwrap()
+            .stale
+            .into_iter()
+            .map(|s| s.sandbox)
+            .collect::<Vec<_>>()
+    };
+    assert!(!ids(&["g".into()]).contains(&"r".to_string()));
+    assert!(ids(&[]).contains(&"r".to_string()));
+    gc_apply(&w.env, &["r".into()], far).unwrap();
+    assert!(!w.root.join("tree/r.db").exists());
 }
 
 #[test]
@@ -1040,7 +1043,7 @@ fn a_child_inherits_the_user_scope_grant_and_never_asks_itself() {
     assert!(asked_s1.asked.lock().unwrap().is_empty());
     assert_eq!(get(&r2, Scope::User, "k").status, Status::Denied);
     // The grant ends with the root's session.
-    Store::open(&w.store).unwrap().finish("r", 1).unwrap();
+    w.reg().finish("r", 1).unwrap();
     let (c3, asked_c3) = node(&w, "c3", &["r"], false, cfg, Some(Answer::Session));
     assert_eq!(get(&c3, Scope::User, "k").status, Status::Denied);
     assert!(asked_c3.asked.lock().unwrap().is_empty());
@@ -1059,13 +1062,13 @@ fn a_prefix_watch_wakes_at_once_and_when_a_lease_runs_out() {
     let t = std::thread::spawn(move || {
         std::thread::sleep(Duration::from_millis(500));
         *wrote2.lock().unwrap() = Some(Instant::now());
-        b2.handle(&put(Scope::Project, "result:z", "done"), None);
+        b2.handle(&put(Scope::Pasture, "result:z", "done"), None);
     });
     let r = a.handle(
         &Request {
             prefix: Some("result:".into()),
             timeout: Some(10),
-            ..req("watch", Scope::Project, "")
+            ..req("watch", Scope::Pasture, "")
         },
         None,
     );
@@ -1081,7 +1084,7 @@ fn a_prefix_watch_wakes_at_once_and_when_a_lease_runs_out() {
     // A lease of another sandbox expires: a watch on lease: wakes for it.
     let claim = Request {
         ttl: Some(2),
-        ..req("claim", Scope::Project, "job")
+        ..req("claim", Scope::Pasture, "job")
     };
     assert_eq!(b.handle(&claim, None).status, Status::Done);
     let cursor = r.result["cursor"].as_u64().unwrap() + 1;
@@ -1091,7 +1094,7 @@ fn a_prefix_watch_wakes_at_once_and_when_a_lease_runs_out() {
             prefix: Some("lease:".into()),
             version: Some(cursor),
             timeout: Some(10),
-            ..req("watch", Scope::Project, "")
+            ..req("watch", Scope::Pasture, "")
         },
         None,
     );
@@ -1111,7 +1114,7 @@ fn an_expiry_between_two_watches_is_not_lost() {
     let (b, _) = service(&w, "b", None, KvCfg::default(), None);
     // The first watch ends with a cursor.
     assert_eq!(
-        b.handle(&put(Scope::Project, "lease-x", "1"), None).status,
+        b.handle(&put(Scope::Pasture, "lease-x", "1"), None).status,
         Status::Done
     );
     let r = a.handle(
@@ -1119,7 +1122,7 @@ fn an_expiry_between_two_watches_is_not_lost() {
             prefix: Some("lease:".into()),
             version: Some(0),
             timeout: Some(1),
-            ..req("watch", Scope::Project, "")
+            ..req("watch", Scope::Pasture, "")
         },
         None,
     );
@@ -1127,7 +1130,7 @@ fn an_expiry_between_two_watches_is_not_lost() {
     // While no watch runs, a lease is taken and runs out, and nobody writes.
     let claim = Request {
         ttl: Some(1),
-        ..req("claim", Scope::Project, "job")
+        ..req("claim", Scope::Pasture, "job")
     };
     assert_eq!(b.handle(&claim, None).status, Status::Done);
     std::thread::sleep(Duration::from_millis(2200));
@@ -1138,7 +1141,7 @@ fn an_expiry_between_two_watches_is_not_lost() {
             prefix: Some("lease:".into()),
             version: Some(cursor),
             timeout: Some(10),
-            ..req("watch", Scope::Project, "")
+            ..req("watch", Scope::Pasture, "")
         },
         None,
     );
@@ -1152,4 +1155,132 @@ fn an_expiry_between_two_watches_is_not_lost() {
         .collect();
     assert_eq!(ops.last(), Some(&"expire"), "{}", r.result);
     assert!(start.elapsed() < Duration::from_secs(2));
+}
+
+#[test]
+fn sandboxes_without_a_pasture_share_nothing() {
+    let w = world();
+    let solo =
+        |id: &str| in_pasture(&w, id, &[], false, KvCfg::default(), None, None, "/src/app").0;
+    let (a, b) = (solo("a"), solo("b"));
+    assert_eq!(
+        a.handle(&put(Scope::Pasture, "note:x", "a's"), None).status,
+        Status::Done
+    );
+    // The other sandbox of the same project sees nothing, through either name.
+    assert_eq!(get(&b, Scope::Pasture, "note:x").status, Status::NotFound);
+    let old_name: Request =
+        serde_json::from_str(r#"{"v":1,"op":"get","scope":"project","key":"note:x"}"#).unwrap();
+    assert_eq!(b.handle(&old_name, None).status, Status::NotFound);
+    assert_eq!(a.handle(&old_name, None).result["value"], "a's");
+    // It lives in the sandbox's own file, next to its self scope.
+    let st = w.open(&Ns::Own("a".into()));
+    let ns = Ns::Solo {
+        project: "/src/app".into(),
+        sandbox: "a".into(),
+    };
+    assert!(st
+        .get(&ns.key(), "note:x", crate::state::now())
+        .unwrap()
+        .is_some());
+    assert!(!w.root.join("pasture").exists());
+    let info = a.handle(&req("info", Scope::Own, ""), None);
+    assert!(info.result["scopes"]["pasture"]
+        .as_str()
+        .unwrap()
+        .contains("this sandbox only"));
+}
+
+#[test]
+fn members_of_one_pasture_share_it_and_no_one_else_does() {
+    let w = world();
+    let mk = |id: &str, pasture: Option<&str>, project: &str| {
+        in_pasture(
+            &w,
+            id,
+            &[],
+            false,
+            KvCfg::default(),
+            None,
+            pasture.map(str::to_string),
+            project,
+        )
+        .0
+    };
+    let a = mk("a", Some("review"), "/src/app");
+    let b = mk("b", Some("review"), "/src/app");
+    let other_pasture = mk("c", Some("build"), "/src/app");
+    let other_project = mk("d", Some("review"), "/src/other");
+    let alone = mk("e", None, "/src/app");
+    a.handle(&put(Scope::Pasture, "task:1", "todo"), None);
+    let r = get(&b, Scope::Pasture, "task:1");
+    assert_eq!(r.result["value"], "todo");
+    assert_eq!(r.result["writer"], "a");
+    assert_eq!(r.result["untrusted"], true);
+    for s in [&other_pasture, &other_project, &alone] {
+        assert_eq!(get(s, Scope::Pasture, "task:1").status, Status::NotFound);
+    }
+    // A read leaves no file behind.
+    assert_eq!(walk(&w.root.join("pasture")).len(), 1);
+    // One file per pasture; the same name in another project is another file.
+    other_pasture.handle(&put(Scope::Pasture, "k", "v"), None);
+    other_project.handle(&put(Scope::Pasture, "k", "v"), None);
+    let files: Vec<_> = walk(&w.root.join("pasture"));
+    assert_eq!(files.len(), 3, "{files:?}");
+    assert_eq!(
+        crate::kv::host::pastures(&w.env, Path::new("/src/app"))
+            .unwrap()
+            .iter()
+            .map(|p| (p.name.clone(), p.keys))
+            .collect::<Vec<_>>(),
+        [("build".to_string(), 1), ("review".to_string(), 1)]
+    );
+}
+
+fn walk(dir: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+        if e.path().is_dir() {
+            out.extend(walk(&e.path()));
+        } else if e.path().extension().is_some_and(|x| x == "db") {
+            out.push(e.path());
+        }
+    }
+    out
+}
+
+#[test]
+fn the_project_scope_of_older_versions_stays_out_of_reach() {
+    let w = world();
+    let legacy = Ns::Legacy("/src/app".into());
+    let mut st = w.open(&legacy);
+    st.put(
+        &legacy.key(),
+        "note:old",
+        "from before",
+        None,
+        None,
+        &W,
+        Q,
+        10,
+    )
+    .unwrap();
+    let (a, _) = service(&w, "a", None, KvCfg::default(), None);
+    assert_eq!(get(&a, Scope::Pasture, "note:old").status, Status::NotFound);
+    // The host still finds it, and gc removes the whole file once old.
+    assert_eq!(
+        st.get(&legacy.key(), "note:old", 11)
+            .unwrap()
+            .unwrap()
+            .value,
+        "from before"
+    );
+    let far = crate::state::now() + 100 * 24 * 3600;
+    assert!(gc_plan(&w.env, &[], far).unwrap().legacy_bytes.is_some());
+    assert!(gc_plan(&w.env, &[], crate::state::now())
+        .unwrap()
+        .legacy_bytes
+        .is_none());
+    gc_apply(&w.env, &[], far).unwrap();
+    assert!(!shard::legacy(&w.root).exists());
 }

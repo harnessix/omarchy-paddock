@@ -679,6 +679,10 @@ pub struct Running {
     /// worktree), where paddock writes the sandbox's state.
     #[serde(default)]
     pub kv_project: Option<PathBuf>,
+    /// The pasture the sandbox joined (`--pasture NAME`). None: a pasture
+    /// of its own.
+    #[serde(default)]
+    pub pasture: Option<String>,
 }
 
 /// A host login file and the sandbox's copy of it.

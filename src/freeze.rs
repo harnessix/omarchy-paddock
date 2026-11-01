@@ -177,18 +177,20 @@ fn set(env: &HostEnv, r: &Running, freeze: bool) -> Result<()> {
     Ok(())
 }
 
-/// The state of a sandbox in paddock kv, for the other agents of the
-/// project: `sandbox:<id>` = `{"state": "suspended"|"running", "since": T}`.
+/// The state of a sandbox in paddock kv, for the other members of its
+/// pasture: `sandbox:<id>` = `{"state": "suspended"|"running", "since": T}`.
+/// A sandbox without a pasture has nobody to tell.
 fn kv_state(env: &HostEnv, r: &Running, state: &str, now: u64) {
-    let Some(project) = r.kv_project.as_deref() else {
+    let (Some(project), Some(name)) = (r.kv_project.as_deref(), r.pasture.as_deref()) else {
         return;
     };
     let write = || -> Result<()> {
-        let mut st = crate::kv::store::Store::open(&crate::kv::store_path(env))?;
+        let ns = crate::kv::shard::Ns::pasture(project, name)?;
+        let mut st = crate::kv::store::Store::open(&ns.file(&crate::kv::kv_root(env))?)?;
         let cfg = crate::kv::KvCfg::load(env)?;
         let value = serde_json::json!({ "state": state, "since": now }).to_string();
         st.put(
-            &crate::kv::store::ns_project(project),
+            &ns.key(),
             &format!("sandbox:{}", r.id),
             &value,
             None,

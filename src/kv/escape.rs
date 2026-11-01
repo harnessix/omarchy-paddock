@@ -3,10 +3,11 @@
 //! another, made-up sandbox and opens a kv socket in that sandbox's run
 //! folder. The probe tries to
 //! read the canary and to claim another identity. After the run, the host
-//! checks the store: the canary is unchanged, and every entry that the
+//! checks the files: the canary is unchanged, and every entry that the
 //! probe wrote carries the probe's own sandbox id.
 
-use super::store::{self, Quota, Store, Writer};
+use super::shard::{self, Ns};
+use super::store::{Quota, Store, Writer};
 use crate::env::HostEnv;
 use anyhow::Result;
 use std::os::unix::net::UnixListener;
@@ -19,15 +20,15 @@ pub struct EscapeProbe {
     other_dir: PathBuf,
     socket: PathBuf,
     _listener: UnixListener,
-    store: PathBuf,
+    /// The kv folder.
+    root: PathBuf,
     version: u64,
 }
 
 impl EscapeProbe {
     pub fn setup(env: &HostEnv, suffix: &str) -> Result<Self> {
         let other = format!("doctor-other-{suffix}");
-        let path = super::store_path(env);
-        let mut st = Store::open(&path)?;
+        let root = super::kv_root(env);
         let w = Writer {
             sandbox: &other,
             harness: "doctor",
@@ -37,30 +38,22 @@ impl EscapeProbe {
             keys: 16,
         };
         let now = crate::state::now();
-        let version = st
-            .put(
-                &store::ns_self(&other),
-                "canary",
-                CANARY,
-                None,
-                None,
-                &w,
-                q,
-                now,
-            )
+        let own = Ns::Own(other.clone());
+        let tree = Ns::Tree(other.clone());
+        let version = Store::open(&own.file(&root)?)?
+            .put(&own.key(), "canary", CANARY, None, None, &w, q, now)
             .map_err(|e| anyhow::anyhow!("cannot write the kv canary: {e:?}"))?;
-        st.put(
-            &store::ns_tree(&other),
-            "canary",
-            CANARY,
+        Store::open(&tree.file(&root)?)?
+            .put(&tree.key(), "canary", CANARY, None, None, &w, q, now)
+            .map_err(|e| anyhow::anyhow!("cannot write the kv tree canary: {e:?}"))?;
+        Store::open(&shard::registry(&root))?.register(
+            &other,
+            "doctor",
+            Path::new("/"),
             None,
             None,
-            &w,
-            q,
             now,
-        )
-        .map_err(|e| anyhow::anyhow!("cannot write the kv tree canary: {e:?}"))?;
-        st.register(&other, "doctor", Path::new("/"), None, now)?;
+        )?;
         let other_dir = env.paddock_run().join(&other);
         crate::privfs::dir(&other_dir)?;
         let socket = other_dir.join("kv.sock");
@@ -71,7 +64,7 @@ impl EscapeProbe {
             other_dir,
             socket,
             _listener: listener,
-            store: path,
+            root,
             version,
         })
     }
@@ -95,30 +88,45 @@ impl EscapeProbe {
         project: &Path,
         asked: bool,
     ) -> Vec<(&'static str, Option<String>)> {
-        let st = match Store::open(&self.store) {
-            Ok(s) => s,
-            Err(e) => return vec![("kv-store-opens", Some(format!("{e:#}")))],
-        };
         let now = crate::state::now();
-        let other_ns = store::ns_self(&self.other);
-        let own_ns = store::ns_self(sandbox);
-        let project_ns = store::ns_project(project);
-        let canary = st.get(&other_ns, "canary", now).ok().flatten();
-        let tree_canary = st
-            .get(&store::ns_tree(&self.other), "canary", now)
+        let open = |ns: &Ns| -> Result<Store> { Store::open(&ns.file(&self.root)?) };
+        let (other_ns, tree_ns) = (Ns::Own(self.other.clone()), Ns::Tree(self.other.clone()));
+        // The probe runs without --pasture: its project scope is its own pasture.
+        let own_ns = Ns::Own(sandbox.into());
+        let pasture_ns = Ns::Solo {
+            project: project.into(),
+            sandbox: sandbox.into(),
+        };
+        let (other, tree, own, pasture) = match (
+            open(&other_ns),
+            open(&tree_ns),
+            open(&own_ns),
+            open(&pasture_ns),
+        ) {
+            (Ok(a), Ok(b), Ok(c), Ok(d)) => (a, b, c, d),
+            (Err(e), ..) | (_, Err(e), ..) | (_, _, Err(e), _) | (.., Err(e)) => {
+                return vec![("kv-store-opens", Some(format!("{e:#}")))]
+            }
+        };
+        let canary = other.get(&other_ns.key(), "canary", now).ok().flatten();
+        let tree_canary = tree.get(&tree_ns.key(), "canary", now).ok().flatten();
+        let tree_keys = tree
+            .list(&tree_ns.key(), "", 100, now)
+            .map(|(v, _)| v.len())
+            .unwrap_or(0);
+        let other_keys = other
+            .list(&other_ns.key(), "", 100, now)
+            .map(|(v, _)| v.len())
+            .unwrap_or(0);
+        let own = own.get(&own_ns.key(), "probe/identity", now).ok().flatten();
+        let note = pasture
+            .get(&pasture_ns.key(), "probe/note", now)
             .ok()
             .flatten();
-        let tree_keys = st
-            .list(&store::ns_tree(&self.other), "", 100, now)
-            .map(|(v, _)| v.len())
-            .unwrap_or(0);
-        let other_keys = st
-            .list(&other_ns, "", 100, now)
-            .map(|(v, _)| v.len())
-            .unwrap_or(0);
-        let own = st.get(&own_ns, "probe/identity", now).ok().flatten();
-        let note = st.get(&project_ns, "probe/note", now).ok().flatten();
-        let lease = st.get(&project_ns, "lease:probe", now).ok().flatten();
+        let lease = pasture
+            .get(&pasture_ns.key(), "lease:probe", now)
+            .ok()
+            .flatten();
         let check = |ok: bool, why: String| (!ok).then_some(why);
         vec![
             (
@@ -153,11 +161,11 @@ impl EscapeProbe {
                 ),
             ),
             (
-                "kv-project-entry-records-writer",
+                "kv-pasture-entry-records-writer",
                 check(
                     note.as_ref().is_some_and(|e| e.writer == sandbox),
                     format!(
-                        "the project entry is missing or has writer {:?}",
+                        "the pasture entry is missing or has writer {:?}",
                         note.map(|e| e.writer)
                     ),
                 ),
@@ -185,17 +193,19 @@ impl EscapeProbe {
 
     /// Remove what this run wrote: the canary, the probe's scopes and the
     /// fake run folder.
-    pub fn cleanup(&self, sandbox: &str, project: &Path) {
-        if let Ok(mut st) = Store::open(&self.store) {
-            for ns in [
-                store::ns_self(&self.other),
-                store::ns_tree(&self.other),
-                store::ns_self(sandbox),
-                store::ns_tree(sandbox),
-                store::ns_project(project),
-            ] {
-                let _ = st.remove_ns(&ns);
+    pub fn cleanup(&self, sandbox: &str, _project: &Path) {
+        // The probe's own pasture lives in its sandbox file.
+        for ns in [
+            Ns::Own(self.other.clone()),
+            Ns::Tree(self.other.clone()),
+            Ns::Own(sandbox.into()),
+            Ns::Tree(sandbox.into()),
+        ] {
+            if let Ok(f) = ns.file(&self.root) {
+                let _ = shard::remove_file(&f);
             }
+        }
+        if let Ok(mut st) = Store::open(&shard::registry(&self.root)) {
             let _ = st.forget_sandbox(&self.other);
             let _ = st.forget_sandbox(sandbox);
         }

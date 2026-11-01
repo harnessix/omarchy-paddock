@@ -1124,11 +1124,13 @@ impl Spawner {
             bytes: cfg.project_bytes,
             keys: cfg.max_keys,
         };
-        let ns = crate::kv::store::ns_tree(self.ceiling.root());
+        let ns = crate::kv::shard::Ns::Tree(self.ceiling.root().to_string());
         let key = format!("result:{}", s.id);
-        let r =
-            crate::kv::store::Store::open(&crate::kv::store_path(&self.env)).and_then(|mut st| {
-                st.put(&ns, &key, &value, None, None, &w, q, state::now())
+        let r = ns
+            .file(&crate::kv::kv_root(&self.env))
+            .and_then(|f| crate::kv::store::Store::open(&f))
+            .and_then(|mut st| {
+                st.put(&ns.key(), &key, &value, None, None, &w, q, state::now())
                     .map_err(|e| anyhow::anyhow!("{e:?}"))
             });
         if let Err(e) = r {

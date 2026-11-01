@@ -145,6 +145,7 @@ impl World {
             }],
             unit: None,
             kv_project: None,
+            pasture: None,
         }
         .register(&self.env())
         .unwrap();

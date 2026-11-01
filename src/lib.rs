@@ -28,6 +28,7 @@ pub mod mcp;
 pub mod mise;
 pub mod omarchy;
 pub mod omarchy_usage;
+pub mod pasture;
 pub mod policy;
 pub mod portal;
 pub mod privacy;

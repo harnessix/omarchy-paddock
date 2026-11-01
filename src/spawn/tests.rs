@@ -687,13 +687,10 @@ fn the_prompt_never_reaches_argv_or_the_audit_log_and_results_reach_the_inbox() 
     assert!(end["duration_s"].is_u64());
 
     // The parent can watch result: in the tree scope instead of polling.
-    let st = crate::kv::store::Store::open(&crate::kv::store_path(&s.env)).unwrap();
+    let ns = crate::kv::shard::Ns::Tree("p-1".into());
+    let st = crate::kv::store::Store::open(&ns.file(&crate::kv::kv_root(&s.env)).unwrap()).unwrap();
     let e = st
-        .get(
-            &crate::kv::store::ns_tree("p-1"),
-            &format!("result:{id}"),
-            crate::state::now(),
-        )
+        .get(&ns.key(), &format!("result:{id}"), crate::state::now())
         .unwrap()
         .expect("no result in the tree scope");
     assert_eq!(e.writer, crate::spawn::RESULT_WRITER);
@@ -812,6 +809,7 @@ fn ps_lists_children_under_their_parent() {
         logins: Vec::new(),
         unit: None,
         kv_project: None,
+        pasture: None,
     };
     let list = vec![
         r("a", None, 1),
