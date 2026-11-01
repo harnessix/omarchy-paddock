@@ -451,6 +451,10 @@ pub fn run(
         .then(|| crate::history::CopyBack::new(env, &built.profile, &built.auth, &spec.home_src));
     state::write_gitconfig(env, &spec.home_src, repo.as_ref())?;
     let watched = state::snapshot(&spec.watch);
+    // After paddock filled the home: its own files are not news.
+    if let Some(k) = &kv {
+        k.watch_credentials(spec.home_src.clone(), built.profile.state.auth.clone());
+    }
 
     if !quiet {
         eprintln!(
