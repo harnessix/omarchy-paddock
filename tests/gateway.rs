@@ -221,15 +221,10 @@ fn the_executor_refuses_forged_and_replayed_grants() {
             project.display().to_string(),
             "{r}"
         );
-    } else if bwrap_installed() {
-        // bwrap is there but cannot start a sandbox: the job fails in bwrap
-        // and the command never runs without isolation.
-        assert_eq!(r["ok"]["exit_code"], 1, "{r}");
-        assert_eq!(r["ok"]["stdout"], "", "{r}");
-        eprintln!("skipped: the exec run needs a working bwrap");
     } else {
-        // No way to isolate the command here: the executor still runs and
-        // says so, instead of running it without isolation.
+        // No way to isolate the command here (no bwrap, or a bwrap that
+        // cannot start a sandbox): the executor still runs and says so,
+        // instead of running it without isolation.
         assert!(
             r["error"].as_str().unwrap_or("").contains("isolation"),
             "{r}"
@@ -242,15 +237,6 @@ fn the_executor_refuses_forged_and_replayed_grants() {
     );
     let _ = daemon.kill();
     let _ = daemon.wait();
-}
-
-/// bwrap is on PATH, whether or not it can start a sandbox here.
-fn bwrap_installed() -> bool {
-    Command::new("bwrap")
-        .arg("--version")
-        .stdout(Stdio::null())
-        .status()
-        .is_ok_and(|s| s.success())
 }
 
 /// Start the executor with the folders of `w`, and wait for its socket.

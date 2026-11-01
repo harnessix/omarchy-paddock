@@ -1862,3 +1862,53 @@ fn release_frees_the_leases_of_a_frozen_sandbox_at_once_with_an_audit_line() {
         "{line}"
     );
 }
+
+#[test]
+fn the_timer_summary_is_written_at_once_after_a_change() {
+    let w = world();
+    let mut r: crate::state::Running = serde_json::from_value(serde_json::json!({
+        "id": "a", "harness": "t", "project": "/src/app", "backend": "bwrap",
+        "network": "none", "gui": "off", "pid": std::process::id(), "started": 0,
+    }))
+    .unwrap();
+    r.pasture = Some(TEAM.into());
+    r.register(&w.env).unwrap();
+    // paddock timer set: no tick ran, the summary is there.
+    crate::timer::host_set(&w.env, "a", "fix", 3600, false, None).unwrap();
+    let sum = crate::timer::read_summary(&w.env, "a");
+    assert_eq!(sum.len(), 1, "{sum:?}");
+    assert_eq!((sum[0].name.as_str(), sum[0].budget), ("fix", 3600));
+    // paddock timer extend and stop.
+    crate::timer::host_change(&w.env, "a", "fix", Some(crate::timer::More::Time(600))).unwrap();
+    assert_eq!(crate::timer::read_summary(&w.env, "a")[0].budget, 4200);
+    crate::timer::host_change(&w.env, "a", "fix", None).unwrap();
+    assert!(crate::timer::read_summary(&w.env, "a")[0].stopped);
+    // A timer op in the kv service, in the pasture scope.
+    let (a, _) = service(&w, "a", None, KvCfg::default(), None);
+    let r = a.handle(
+        &Request {
+            budget: Some(60),
+            ..timer_req("start", Scope::Pasture, "review")
+        },
+        None,
+    );
+    assert_eq!(r.status, Status::Done, "{}", r.message);
+    let sum = crate::timer::read_summary(&w.env, "a");
+    assert_eq!(sum.len(), 2, "{sum:?}");
+    // The same content as the tick writes, but for the seconds that pass.
+    let read = || {
+        let mut v: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(crate::timer::summary_file(&w.env, "a")).unwrap(),
+        )
+        .unwrap();
+        for t in v.as_array_mut().unwrap() {
+            for k in ["used", "left", "wall"] {
+                t.as_object_mut().unwrap().remove(k);
+            }
+        }
+        v
+    };
+    let before = read();
+    timer_tick(&w.env, a.identity(), &w.root, &KvCfg::default()).unwrap();
+    assert_eq!(before, read());
+}
