@@ -868,6 +868,7 @@ For `gh`, only these commands exist: `pr create`, `pr view`, `pr list`, `pr chec
 - `tea`: `pulls list`, `pulls INDEX`, `issues list`, `issues INDEX` and `releases list` read. `pulls create` and `comment INDEX TEXT` ask. paddock refuses `--login`, `--remote` and `--web`. The host picks the tea login for the host of the repository from `~/.config/tea/config.yml`: the default login for that host, or else the first one. Without `--repo`, paddock uses the first remote whose host has a tea login.
 - `glab`: `mr list`, `mr view`, `mr diff`, `issue list`, `issue view`, `ci view`, `ci list`, `ci status` and `repo view` read. `mr create`, `mr note` and `issue note` ask. paddock refuses `--web`, `--hostname`, `--push` and the flags that read a file, such as `--description-file`. `--repo` takes nested groups, for example `team/apps/web`.
 - `tea` and `glab` cannot read the body text on their standard input. Their body text goes into the arguments of the host process.
+- `tea` and `glab` take only the flags that paddock lists for them, and refuse any other flag. Their flags come from their documentation and were not checked against the real programs, and an unknown flag could read a host file into a comment.
 
 To make reads ask too, or to turn either capability off, set it in `[host]`, for example `forge = "deny"`. `forge = "allow"` also allows the write commands without a question. `git-push = "allow"` allows ordinary pushes, but force pushes, pushes to the default branch and pushes to a new remote still ask.
 

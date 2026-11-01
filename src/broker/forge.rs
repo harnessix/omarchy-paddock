@@ -68,6 +68,12 @@ pub struct Tool {
     /// The host adds its flags right after the command words, before any
     /// argument (tea stops reading flags at the first argument).
     pub flags_first: bool,
+    /// Refuse every flag that is not in `value_flags` or `bool_flags`. For
+    /// tools whose flags paddock did not check against the real program:
+    /// an unknown flag could read a host file into a comment.
+    pub only_known: bool,
+    /// Flags without a value, for `only_known`.
+    pub bool_flags: &'static [&'static str],
 }
 
 use Access::{Read, Write};
@@ -148,6 +154,8 @@ pub const GH: Tool = Tool {
     body_stdin: &["--body-file", "-"],
     needs_body: &[],
     flags_first: false,
+    only_known: false,
+    bool_flags: &[],
 };
 
 /// tea, the Gitea and Forgejo command line.
@@ -219,6 +227,8 @@ pub const TEA: Tool = Tool {
     body_stdin: &[],
     needs_body: &[("comment", "")],
     flags_first: true,
+    only_known: true,
+    bool_flags: &["--allow-maintainer-edits", "--comments"],
 };
 
 /// glab, the GitLab command line.
@@ -299,6 +309,19 @@ pub const GLAB: Tool = Tool {
     body_stdin: &[],
     needs_body: &[("mr", "note"), ("issue", "note")],
     flags_first: false,
+    only_known: true,
+    bool_flags: &[
+        "--draft",
+        "--fill",
+        "-f",
+        "--remove-source-branch",
+        "--squash-before-merge",
+        "--comments",
+        "-c",
+        "--all",
+        "--yes",
+        "-y",
+    ],
 };
 
 pub const TOOLS: &[&Tool] = &[&GH, &TEA, &GLAB];
@@ -798,6 +821,24 @@ pub fn check_with(
             && a[1..].chars().any(|c| t.denied_short.contains(c))
         {
             bail!("{a} is not allowed through paddock-host: write each flag on its own");
+        }
+        if t.only_known
+            && a.starts_with('-')
+            && a != "-"
+            && !t.value_flags.contains(&flag)
+            && !t.bool_flags.contains(&flag)
+        {
+            bail!(
+                "{flag} is not allowed through paddock-host: {} takes only the flags that paddock knows ({})",
+                t.name,
+                t.value_flags
+                    .iter()
+                    .chain(t.bool_flags.iter())
+                    .filter(|f| f.starts_with("--"))
+                    .copied()
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
         }
         if t.branch_flags
             .iter()
@@ -1328,6 +1369,46 @@ mod tests {
         let c = tea(&["pulls", "create", "--title", "--login is fixed"]).unwrap();
         assert!(c.argv.contains(&"--login is fixed".to_string()));
         assert_eq!(c.argv.iter().filter(|a| *a == "--login").count(), 1);
+    }
+
+    #[test]
+    fn tea_and_glab_take_only_known_flags() {
+        // Their flags were not checked against the real programs, so an
+        // unknown flag, which could read a host file, is refused.
+        for args in [
+            &[
+                "pulls",
+                "create",
+                "--title",
+                "t",
+                "--body-file",
+                "/etc/passwd",
+            ][..],
+            &["pulls", "list", "--some-new-flag"][..],
+            &["pulls", "list", "-x"][..],
+        ] {
+            let e = tea(args).unwrap_err();
+            assert!(
+                format!("{e:#}").contains("only the flags"),
+                "{args:?}: {e:#}"
+            );
+        }
+        for args in [
+            &["mr", "list", "--some-new-flag"][..],
+            &[
+                "mr",
+                "create",
+                "--title",
+                "t",
+                "--description-from",
+                "/etc/passwd",
+            ][..],
+        ] {
+            assert!(glab(args).is_err(), "{args:?}");
+        }
+        // Known flags still pass.
+        assert!(tea(&["pulls", "list", "--state", "open"]).is_ok());
+        assert!(glab(&["mr", "list", "--all"]).is_ok());
     }
 
     #[test]
