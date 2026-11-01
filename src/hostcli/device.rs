@@ -60,6 +60,7 @@ pub fn exit_for_errno(errno: i32) -> i32 {
         libc::ETIMEDOUT => 5,
         libc::EINVAL => 8,
         libc::EFBIG | libc::EMSGSIZE => 10,
+        libc::EDQUOT => 11,
         _ => 7,
     }
 }
@@ -74,6 +75,7 @@ pub fn describe(errno: i32) -> &'static str {
         libc::EFBIG => "the request is too large",
         libc::EMSGSIZE => "the response is too large",
         libc::EBUSY => "the device is busy; try again",
+        libc::EDQUOT => "budget used: the user raises it on the host with paddock devices budget",
         _ => "the device failed",
     }
 }

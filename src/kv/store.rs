@@ -200,7 +200,7 @@ fn add_paused(conn: &Connection) -> Result<()> {
 /// Switch to WAL. When two processes create the same file at once, the
 /// switch can fail with "database is locked" at once: SQLite does not wait
 /// with the busy timeout there. So try again, for up to 10 seconds.
-fn wal(conn: &Connection) -> Result<()> {
+pub(crate) fn wal(conn: &Connection) -> Result<()> {
     let end = std::time::Instant::now() + std::time::Duration::from_secs(10);
     loop {
         match conn.pragma_update(None, "journal_mode", "WAL") {

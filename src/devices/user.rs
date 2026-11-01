@@ -33,6 +33,7 @@
 //! The audit log keeps the device, the method and path (http) or the byte
 //! counts (command), the status and the duration. Never a body.
 
+use super::ledger::{self, Ledger, Reserve};
 use super::{Call, DevError, Device, DeviceCtx, Info, Limits};
 use crate::broker::{self, Answer};
 use anyhow::{bail, Context, Result};
@@ -63,6 +64,14 @@ pub struct UserDev {
     pub max_body: usize,
     pub timeout: u64,
     pub kind: UserKind,
+    /// The declared cost of one request, in micro units (ledger.rs). 0:
+    /// no declared cost.
+    pub cost: u64,
+    /// The response header where an http service reports the cost of
+    /// each response.
+    pub cost_header: Option<String>,
+    /// The budget per run from the table, in micro units.
+    pub budget: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -233,10 +242,19 @@ impl UserDev {
             .with_context(|| format!("{}: kind must be \"http\" or \"command\"", ctx()))?;
         let allowed: &[&str] = match kind {
             "http" => &[
-                "kind", "enabled", "target", "methods", "paths", "max_body", "timeout",
+                "kind",
+                "enabled",
+                "target",
+                "methods",
+                "paths",
+                "max_body",
+                "timeout",
+                "cost",
+                "cost_header",
+                "budget",
             ],
             "command" => &[
-                "kind", "enabled", "command", "network", "max_body", "timeout",
+                "kind", "enabled", "command", "network", "max_body", "timeout", "cost", "budget",
             ],
             other => bail!("{}: unknown kind {other:?}; use http or command", ctx()),
         };
@@ -267,6 +285,39 @@ impl UserDev {
                 .filter(|n| (1..=MAX_TIMEOUT as i64).contains(n))
                 .with_context(|| format!("{}: timeout is 1 to {MAX_TIMEOUT} seconds", ctx()))?
                 as u64,
+        };
+        let money = |k: &str| -> Result<Option<u64>> {
+            let v = match t.get(k) {
+                None => return Ok(None),
+                Some(toml::Value::Float(f)) => Some(*f),
+                Some(toml::Value::Integer(n)) => Some(*n as f64),
+                Some(_) => None,
+            };
+            v.and_then(super::ledger::amount)
+                .map(Some)
+                .with_context(|| {
+                    format!(
+                        "{}: {k} must be a number from 0 to {}, for example 0.002",
+                        ctx(),
+                        super::ledger::MAX_AMOUNT
+                    )
+                })
+        };
+        let cost = money("cost")?.unwrap_or(0);
+        let budget = money("budget")?;
+        let cost_header = match t.get("cost_header") {
+            None => None,
+            Some(v) => Some(
+                v.as_str()
+                    .filter(|h| !h.is_empty() && h.len() <= 64 && h.chars().all(token_char))
+                    .with_context(|| {
+                        format!(
+                            "{}: cost_header must be a header name like \"X-Cost\"",
+                            ctx()
+                        )
+                    })?
+                    .to_string(),
+            ),
         };
         let kind = if kind == "http" {
             let raw = t
@@ -329,7 +380,15 @@ impl UserDev {
             max_body,
             timeout,
             kind,
+            cost,
+            cost_header,
+            budget,
         })
+    }
+
+    /// True when a request of this device costs money: it needs a budget.
+    pub fn paid(&self) -> bool {
+        self.cost > 0 || self.cost_header.is_some()
     }
 }
 
@@ -341,7 +400,12 @@ pub struct Gate {
     detail: String,
     /// The session answer: allow (true) or deny (false) without a card.
     session: Mutex<Option<bool>>,
+    /// The cost of a paid device: declared cost, cost header, budget.
+    paid: Option<(u64, Option<String>, Option<u64>)>,
 }
+
+/// The ledger row of a request that a budget allowed.
+pub struct Charge(Option<i64>);
 
 impl Gate {
     pub fn new(ctx: DeviceCtx, def: &UserDev) -> Self {
@@ -350,7 +414,177 @@ impl Gate {
             name: def.name.clone(),
             detail: def.describe(),
             session: Mutex::new(None),
+            paid: def
+                .paid()
+                .then(|| (def.cost, def.cost_header.clone(), def.budget)),
         }
+    }
+
+    /// The sandbox whose budget this sandbox spends: the root of its tree.
+    fn root(&self) -> &str {
+        ledger::root_of(&self.ctx.sandbox, &self.ctx.started_by)
+    }
+
+    fn ledger(&self) -> Result<Ledger, DevError> {
+        Ledger::open(&ledger::path(&self.ctx.env)).map_err(|e| {
+            log::warn!("device {}: {e:#}", self.name);
+            DevError::Failed
+        })
+    }
+
+    /// The budget card of a paid device without a budget: the user picks
+    /// the budget of the run, or denies. None when no card is needed.
+    fn budget_card(&self, wait: Duration) -> Option<Result<(), DevError>> {
+        let (cost, header, None) = self.paid.as_ref()? else {
+            return None;
+        };
+        let l = match self.ledger() {
+            Ok(l) => l,
+            Err(e) => return Some(Err(e)),
+        };
+        if matches!(l.budget(self.root(), &self.name), Ok(Some(_))) {
+            return None;
+        }
+        let now = crate::state::now();
+        let mut cost_text = format!("Each request costs {}", ledger::money(*cost));
+        if let Some(h) = header {
+            cost_text.push_str(&format!(" or the {h} header of the response, the larger"));
+        }
+        let p = broker::Pending {
+            id: broker::new_request_id(),
+            sandbox: self.ctx.sandbox.clone(),
+            harness: self.ctx.harness.clone(),
+            project: self.ctx.project.clone(),
+            capability: broker::BUDGET_CAPABILITY.into(),
+            summary: format!("allow the paid device `{}` with a budget", self.name),
+            detail: format!(
+                "{}. {cost_text}. Pick the budget for this run: {}, or deny.",
+                self.detail,
+                ledger::CARD_CHOICES.join(", ")
+            ),
+            reason: String::new(),
+            created: now,
+            expires: now + wait.as_secs(),
+            session_allowed: false,
+            started_by: self.ctx.started_by.clone(),
+            choices: ledger::CARD_CHOICES.iter().map(|c| c.to_string()).collect(),
+        };
+        let got = self
+            .ctx
+            .approver
+            .choose(&self.ctx.env, &p, wait)
+            .and_then(|c| ledger::parse_amount(&c).ok());
+        Some(match got {
+            Some(b) if l.init_budget(self.root(), &self.name, b).is_ok() => Ok(()),
+            _ => Err(DevError::Denied),
+        })
+    }
+
+    /// Check the budget of a paid device and reserve the declared cost of
+    /// one request. A device without a cost passes with no ledger row.
+    pub fn reserve(&self) -> Result<Charge, DevError> {
+        let Some((cost, _, config)) = &self.paid else {
+            return Ok(Charge(None));
+        };
+        let mut l = self.ledger()?;
+        let root = self.root().to_string();
+        if let Some(b) = config {
+            l.init_budget(&root, &self.name, *b)
+                .map_err(|_| DevError::Failed)?;
+        }
+        let project = self.ctx.project.display().to_string();
+        let payer = ledger::Payer {
+            sandbox: &self.ctx.sandbox,
+            root: &root,
+            project: &project,
+            device: &self.name,
+        };
+        match l.reserve(&payer, *cost) {
+            Ok(Reserve::Ok(id)) => Ok(Charge(Some(id))),
+            Ok(Reserve::NoBudget) => Err(DevError::Denied),
+            Ok(Reserve::Over {
+                spent,
+                budget,
+                notify,
+            }) => {
+                if notify {
+                    self.notify_used(&root, spent, budget);
+                }
+                Err(DevError::BudgetUsed)
+            }
+            Err(e) => {
+                log::warn!("device {}: {e:#}", self.name);
+                Err(DevError::Failed)
+            }
+        }
+    }
+
+    /// Write the final cost of a request: the larger of the declared cost
+    /// and the cost header of `response`. `ran` is false when the request
+    /// never reached the service: it costs nothing.
+    pub fn settle(&self, charge: Charge, response: Option<&[u8]>, ran: bool, status: &str) {
+        let (Charge(Some(id)), Some((cost, header, _))) = (charge, &self.paid) else {
+            return;
+        };
+        let reported = match (header, response) {
+            (Some(h), Some(r)) => ledger::header_cost(r, h),
+            _ => None,
+        };
+        let total = if ran {
+            ledger::charge(*cost, reported)
+        } else {
+            0
+        };
+        if let Err(e) = self.ledger().map(|l| l.settle(id, total, status)) {
+            log::warn!("device {}: cannot write the ledger: {e:?}", self.name);
+        }
+    }
+
+    /// One notification when a request would pass the budget.
+    fn notify_used(&self, root: &str, spent: u64, budget: u64) {
+        let note = broker::notify::Note {
+            summary: format!("paddock: budget used on {}", self.name),
+            body: format!(
+                "{root} spent {} of {} on {}. Raise it with: paddock devices budget {root} {} --add 1.0",
+                ledger::money(spent),
+                ledger::money(budget),
+                self.name,
+                self.name
+            ),
+            actions: Vec::new(),
+            critical: false,
+        };
+        if let Err(e) = broker::notify::show(&self.ctx.env, &note) {
+            log::debug!("cannot show the budget notification: {e:#}");
+        }
+    }
+
+    /// What `.catalog` shows of the cost and the budget left for this run.
+    pub fn budget_details(&self, v: &mut serde_json::Value) {
+        let Some((cost, header, config)) = &self.paid else {
+            return;
+        };
+        v["cost"] = ledger::money(*cost).into();
+        if let Some(h) = header {
+            v["cost_header"] = h.clone().into();
+        }
+        let file = ledger::path(&self.ctx.env);
+        let known = file
+            .is_file()
+            .then(|| Ledger::open(&file).ok())
+            .flatten()
+            .and_then(|l| {
+                let b = l.budget(self.root(), &self.name).ok().flatten();
+                Some((b, l.spent(self.root(), &self.name).ok()?))
+            });
+        let (budget, spent) = match known {
+            Some((Some(b), s)) => (Some(b), s),
+            _ => (*config, 0),
+        };
+        v["budget_left"] = match budget {
+            Some(b) => ledger::money(b.saturating_sub(spent)).into(),
+            None => "no budget yet: the first request asks the user for one".into(),
+        };
     }
 
     /// Ask the user when no session answer exists. Requests that come
@@ -367,6 +601,13 @@ impl Gate {
         let wait = left
             .saturating_sub(Duration::from_secs(1))
             .min(Duration::from_secs(APPROVAL_WAIT));
+        if let Some(r) = self.budget_card(wait) {
+            // The budget is for the run: the device needs no other card.
+            if r.is_ok() {
+                *s = Some(true);
+            }
+            return r.map(|()| "allowed with a budget");
+        }
         let now = crate::state::now();
         let p = broker::Pending {
             id: broker::new_request_id(),
@@ -441,6 +682,9 @@ impl Device for Disabled {
     }
     fn details(&self) -> Option<serde_json::Value> {
         let mut d = self.0.details();
+        if self.0.paid() {
+            d["cost"] = ledger::money(self.0.cost).into();
+        }
         d["how_to_enable"] = format!(
             "the user sets enabled = true in [devices.{}] of ~/.config/paddock/config.toml on the host",
             self.0.name
@@ -468,7 +712,7 @@ fn http_info(def: &UserDev, methods: &[String], paths: &[String]) -> Info {
             def.max_body
         ),
         response: format!(
-            "the HTTP response as text: the status line HTTP/1.1 CODE REASON, header lines, an empty line, and the body (at most {} bytes, chunked bodies decoded). A Paddock-Status header means that paddock answered itself: disabled, refused (method or path not allowed) or unreachable. EACCES: the user declined the device. Lines end with LF.",
+            "the HTTP response as text: the status line HTTP/1.1 CODE REASON, header lines, an empty line, and the body (at most {} bytes, chunked bodies decoded). A Paddock-Status header means that paddock answered itself: disabled, refused (method or path not allowed) or unreachable. EACCES: the user declined the device. EDQUOT: the budget of a paid device is used. Lines end with LF.",
             def.max_body
         ),
         limits: def.limits(),
@@ -867,7 +1111,9 @@ impl Device for Http {
         self.def.info()
     }
     fn details(&self) -> Option<serde_json::Value> {
-        Some(self.def.details())
+        let mut v = self.def.details();
+        self.gate.budget_details(&mut v);
+        Some(v)
     }
     fn call(&self, call: &Call, request: &[u8]) -> Result<Vec<u8>, DevError> {
         let UserKind::Http {
@@ -897,21 +1143,37 @@ impl Device for Http {
                 return Err(e);
             }
         };
+        let charge = match self.gate.reserve() {
+            Ok(c) => c,
+            Err(e) => {
+                let status = match e {
+                    DevError::BudgetUsed => ledger::BUDGET_USED,
+                    DevError::Denied => "no budget",
+                    _ => "failed",
+                };
+                self.gate.audit(&detail, decision, status, start);
+                return Err(e);
+            }
+        };
         match self.send(call, *target, &req) {
             Ok(out) => {
                 let code = String::from_utf8_lossy(out.get(9..12).unwrap_or_default()).to_string();
+                self.gate.settle(charge, Some(&out), true, &code);
                 self.gate.audit(&detail, decision, &code, start);
                 Ok(out)
             }
             Err(Upstream::Unreachable(why)) => {
+                self.gate.settle(charge, None, false, "unreachable");
                 self.gate.audit(&detail, decision, "unreachable", start);
                 Ok(paddock_answer(502, "Bad Gateway", "unreachable", &why))
             }
             Err(Upstream::TooLarge) => {
+                self.gate.settle(charge, None, true, "too large");
                 self.gate.audit(&detail, decision, "too large", start);
                 Err(DevError::TooLarge)
             }
             Err(Upstream::Cancelled) => {
+                self.gate.settle(charge, None, true, "cancelled");
                 self.gate.audit(&detail, decision, "cancelled", start);
                 Err(DevError::Cancelled)
             }

@@ -37,7 +37,7 @@ pub fn info(def: &UserDev) -> Info {
             def.timeout
         ),
         response: format!(
-            "header lines, an empty line, then the standard output (at most {} bytes). Header lines: status: exit CODE, signal NUMBER, timeout, error or disabled; stderr: LINE (the first {STDERR_LINES} lines of the standard error); message: TEXT. EACCES: the user declined the device.",
+            "header lines, an empty line, then the standard output (at most {} bytes). Header lines: status: exit CODE, signal NUMBER, timeout, error or disabled; stderr: LINE (the first {STDERR_LINES} lines of the standard error); message: TEXT. EACCES: the user declined the device. EDQUOT: the budget of a paid device is used.",
             def.max_body
         ),
         limits: def.limits(),
@@ -320,7 +320,9 @@ impl Device for Command {
         info(&self.def)
     }
     fn details(&self) -> Option<serde_json::Value> {
-        Some(self.def.details())
+        let mut v = self.def.details();
+        self.gate.budget_details(&mut v);
+        Some(v)
     }
     fn call(&self, call: &Call, request: &[u8]) -> Result<Vec<u8>, DevError> {
         let start = Instant::now();
@@ -334,6 +336,23 @@ impl Device for Command {
                     &format!("{} bytes in", request.len()),
                     "denied",
                     "denied",
+                    start,
+                );
+                return Err(e);
+            }
+        };
+        let charge = match self.gate.reserve() {
+            Ok(c) => c,
+            Err(e) => {
+                let status = match e {
+                    DevError::BudgetUsed => super::ledger::BUDGET_USED,
+                    DevError::Denied => "no budget",
+                    _ => "failed",
+                };
+                self.gate.audit(
+                    &format!("{} bytes in", request.len()),
+                    decision,
+                    status,
                     start,
                 );
                 return Err(e);
@@ -356,6 +375,8 @@ impl Device for Command {
             ),
             Err(_) => (format!("{} bytes in", request.len()), "cancelled".into()),
         };
+        // A command that could not start reached no service.
+        self.gate.settle(charge, None, status != "error", &status);
         self.gate.audit(&detail, decision, &status, start);
         r.map(|o| o.response())
     }

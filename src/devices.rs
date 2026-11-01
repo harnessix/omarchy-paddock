@@ -53,6 +53,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 pub mod blocking;
 pub mod command;
+pub mod ledger;
 pub mod user;
 
 /// Where the devices appear inside the sandbox.
@@ -109,6 +110,8 @@ pub enum DevError {
     Waiting,
     /// The user declined, for example dismissed a question (EACCES).
     Denied,
+    /// The budget of a paid device is used (EDQUOT).
+    BudgetUsed,
 }
 
 impl DevError {
@@ -120,6 +123,7 @@ impl DevError {
             DevError::Cancelled => Errno::ECANCELED,
             DevError::Waiting => Errno::from_i32(crate::waiting::ERRNO_STILL_WAITING),
             DevError::Denied => Errno::EACCES,
+            DevError::BudgetUsed => Errno::EDQUOT,
         }
     }
 }
@@ -341,7 +345,7 @@ pub fn catalog_with(on: &[Arc<dyn Device>], secrets: &[String]) -> Vec<u8> {
     }
     let mut doc = serde_json::json!({
         "version": 1,
-        "protocol": "Open a device read-write, write the whole request, then read the response until end of file. One open is one request. The first read sends the request and blocks until the response is ready. Closing the file early cancels the request. A read fails with ETIMEDOUT after the deadline, EFBIG means the request is too large, EINVAL that the device rejected it. A waiting device (wait, ask) fails a read with ETIME (still waiting) when the timeout of the request passes before the event: send the same request again. EACCES means that the user declined. An http or command device of the user asks the user once per sandbox at its first request; an off one answers with a disabled status. `paddock-host device NAME` does all of this and exits with 75 for still waiting.",
+        "protocol": "Open a device read-write, write the whole request, then read the response until end of file. One open is one request. The first read sends the request and blocks until the response is ready. Closing the file early cancels the request. A read fails with ETIMEDOUT after the deadline, EFBIG means the request is too large, EINVAL that the device rejected it. A waiting device (wait, ask) fails a read with ETIME (still waiting) when the timeout of the request passes before the event: send the same request again. EACCES means that the user declined. EDQUOT means that the budget of a paid device is used: the user raises it on the host. An http or command device of the user asks the user once per sandbox at its first request; an off one answers with a disabled status. `paddock-host device NAME` does all of this and exits with 75 for still waiting.",
         "devices": devices,
     });
     if !secrets.is_empty() {

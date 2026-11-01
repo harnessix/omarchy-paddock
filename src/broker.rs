@@ -271,6 +271,9 @@ pub const ASK_CAPABILITY: &str = "ask";
 /// (`[spawn] on_timeout = "ask"`). The answer is one of its choices (more
 /// time), or deny (stop).
 pub const TIMEOUT_CAPABILITY: &str = "spawn-timeout";
+/// The capability name of the first-use card of a paid device. The answer
+/// is one of its choices (the budget of the run), or deny.
+pub const BUDGET_CAPABILITY: &str = "device-budget";
 /// The longest typed answer to a question, in characters.
 pub const MAX_REPLY: usize = 4000;
 
@@ -725,6 +728,15 @@ pub trait Approver: Send + Sync {
 
     /// The answer with the user's note on a denial. Callers that tell the
     /// agent about a denial use this one.
+    /// A card with fixed choices (`p.choices`): the chosen one, or None
+    /// for deny or no answer.
+    fn choose(&self, env: &HostEnv, p: &Pending, wait: Duration) -> Option<String> {
+        match ask_choice(env, p, wait, &|| false) {
+            crate::spawn::Choice::More(c) => Some(c),
+            _ => None,
+        }
+    }
+
     fn ask_verdict(&self, env: &HostEnv, p: &Pending, wait: Duration) -> Option<Verdict> {
         self.ask_with_source(env, p, wait)
             .map(|(answer, who)| Verdict {
