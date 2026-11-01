@@ -422,7 +422,9 @@ pub fn serve() -> i32 {
     let mut skipped: BTreeMap<u16, String> = BTreeMap::new();
     let mut renewed: BTreeMap<u16, Instant> = BTreeMap::new();
     let mut last_record: Option<(Instant, String)> = None;
-    let mut cursor: Option<u64> = None;
+    // From 0: the first watch returns at once with the cursor of now, so
+    // no change between a list and the next watch is lost.
+    let mut cursor: Option<u64> = Some(0);
     let mut fails = 0;
     loop {
         let list = match shared() {

@@ -159,7 +159,15 @@ fn share(port: u16, json: bool) -> i32 {
             );
         } else if resp.status == Status::Conflict {
             let owner = resp.result["owner"].as_str().unwrap_or("another member");
-            eprintln!("paddock-host pasture: port {port} is shared by {owner} already");
+            let harness = ports::shared()
+                .unwrap_or_default()
+                .into_iter()
+                .find(|s| s.port == port)
+                .map(|s| format!("{} ", s.harness))
+                .unwrap_or_default();
+            eprintln!(
+                "paddock-host pasture: port {port} is shared by {harness}(sandbox {owner}) already"
+            );
         } else {
             eprintln!("paddock-host pasture: share {port}: {}", resp.message);
         }
