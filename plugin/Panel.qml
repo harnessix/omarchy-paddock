@@ -349,11 +349,13 @@ Panel {
       root.refresh()
     })
   }
-  // The credentials a sandbox uses through the gateway and the ssh agent channel.
+  // The credentials a sandbox uses through the gateway, the ssh agent
+  // channel and the secret files in /dev/paddock/secret.
   function usedCredentials(s) {
     var parts = []
     if (s.gateway !== "") parts.push(strings.t("row.gateway").arg(s.gateway))
     if (s.agent !== "") parts.push(strings.t("row.agent").arg(s.agent))
+    if (s.secretFiles !== "") parts.push(strings.t("row.secretFile").arg(s.secretFiles))
     return parts.join(" · ")
   }
 
@@ -750,8 +752,12 @@ Panel {
             gateway: Array.isArray(r.gateway) ? r.gateway.slice(0, 8).map(function(c) { return root.plain(c, 64) }).join(", ") : "",
             // Credentials it uses through the ssh agent channel.
             agent: Array.isArray(r.agent) ? r.agent.slice(0, 8).map(function(c) { return root.plain(c, 64) }).join(", ") : "",
-            // paddock credentials revoke covers gateway and agent credentials.
-            revocable: (Array.isArray(r.gateway) && r.gateway.length > 0) || (Array.isArray(r.agent) && r.agent.length > 0),
+            // Credentials it reads as files in /dev/paddock/secret.
+            secretFiles: Array.isArray(r.secret_files) ? r.secret_files.slice(0, 8).map(function(c) { return root.plain(c, 64) }).join(", ") : "",
+            // paddock credentials revoke covers gateway and agent credentials
+            // and secret files.
+            revocable: (Array.isArray(r.gateway) && r.gateway.length > 0) || (Array.isArray(r.agent) && r.agent.length > 0)
+              || (Array.isArray(r.secret_files) && r.secret_files.length > 0),
             // Monitoring findings that the user did not say OK to, outside
             // muted projects (monitor.rs): "tunnel: ngrok", "+N".
             monitor: root.monitorText(r.monitor_marks),
@@ -1362,7 +1368,7 @@ Panel {
                   : modelData.timer !== null ? strings.t(modelData.timer.over ? "row.timerOver" : "row.timer")
                       .arg(modelData.timer.name).arg(root.span(modelData.timer.used)).arg(root.span(modelData.timer.budget))
                   : modelData.credentials !== "" ? strings.t("row.holdsCredentials").arg(modelData.credentials)
-                  : modelData.gateway !== "" || modelData.agent !== "" ? root.usedCredentials(modelData)
+                  : modelData.gateway !== "" || modelData.agent !== "" || modelData.secretFiles !== "" ? root.usedCredentials(modelData)
                   : (modelData.parent !== "" ? strings.t("row.startedBy").arg(modelData.parent)
                   : (modelData.auth !== "" && modelData.auth !== "shared" ? strings.t("row.auth").arg(modelData.auth)
                   : (modelData.pasture !== "" ? strings.t("row.pasture").arg(modelData.pasture) : "")))

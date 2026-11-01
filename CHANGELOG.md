@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- The bar panel lists the secret files of a sandbox ("secret file: NAME", `as = "file"` credentials), and its revoke button covers them.
 - `paddock undo --list` and `paddock undo` show the snapshot time in the local time zone. Before, they showed it in UTC.
 - New: the boundary log. paddock writes each denial of the sandbox boundary to `boundary.jsonl` in the run folder of the sandbox: refused host requests, refused network targets of the host proxy (LAN, host loopback, network mode `api`), withheld environment variables (names only) and MCP servers that do not start. The same denial within a minute raises a count. `paddock boundary ID [--json] [--follow]` shows the log by kind and target, `paddock ps --json` has `boundary_count`, the bar panel shows the count on the row, and `paddock-host boundary` reads the log inside the sandbox.
 - New: `as = "file"` for `via = "deliver"` credentials. paddock sets no variable. The sandbox reads the value at `/dev/paddock/secret/NAME`, and `.catalog` lists it by name. Each open counts as a use in the audit log and in `paddock credentials list`, and `paddock credentials revoke` ends the file at once. The paddock process now locks delivered and gateway values in RAM (`mlock`) and overwrites them with zeros after a revoke and at the end of the sandbox.
