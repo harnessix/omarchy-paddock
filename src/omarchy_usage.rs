@@ -756,6 +756,7 @@ mod tests {
             pasture: None,
             credentials: Vec::new(),
             gateway: Vec::new(),
+            kept_logins: Vec::new(),
         }
     }
 

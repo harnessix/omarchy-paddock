@@ -20,6 +20,7 @@ pub mod history;
 pub mod hostcli;
 pub mod hostgit;
 pub mod identity;
+pub mod keeper;
 pub mod keyring;
 pub mod kv;
 pub mod launchers;

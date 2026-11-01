@@ -439,6 +439,13 @@ pub fn run(
         log::warn!("{w}");
     }
     let auth = AuthSync::copy_in(env, &built.profile, &built.auth, &spec.home_src)?;
+    // The keeper refreshes the logins that the sandbox got without their
+    // refresh token (keeper.rs), as long as this process runs.
+    let kept = auth.kept_logins();
+    if let (Some(kind), Some(first)) = (crate::keeper::kind_for(&built.profile.name), kept.first())
+    {
+        crate::keeper::start(env, &built.profile.name, kind, &built.auth, &first.store);
+    }
     let history = built
         .shared_history
         .then(|| crate::history::CopyBack::new(env, &built.profile, &built.auth, &spec.home_src));
@@ -569,6 +576,7 @@ pub fn run(
         parent: built.spawn.as_ref().map(|c| c.parent.clone()),
         spawn_id: built.spawn.as_ref().map(|c| c.spawn_id.clone()),
         logins: auth.host_logins(),
+        kept_logins: kept.clone(),
         unit,
         kv_project: Some(kv_project_path),
         pasture: kv_pasture,
