@@ -19,9 +19,12 @@
 //!   where Omarchy's would. Those collectors only read a login, they never
 //!   refresh it.
 //! - The Codex collector starts `codex app-server`, which can refresh the
-//!   login. Run beside a sandbox that uses the same login, that would be a
-//!   second program that refreshes it. So nobody checks a held Codex login,
-//!   and the record keeps its last numbers, marked as paused.
+//!   login. A Codex login that a keeper keeps (keeper.rs) is checked in a
+//!   keeper sandbox, with the full login and under the keeper's refresh
+//!   lock, so it never refreshes beside the keeper; a refresh that it makes
+//!   goes back to the host and into the sandboxes. Without a keeper
+//!   (`[logins] keep = false`), nobody checks a held Codex login, and the
+//!   record keeps its last numbers, marked as paused.
 //!
 //! paddock checks only when the panel asks. It never adds a timer.
 
@@ -407,9 +410,7 @@ pub fn update(env: &HostEnv, raw: &[String]) -> Result<i32> {
         let done = if read_only {
             collect(env, agent, logins, &args.flags)
         } else {
-            Err(anyhow::anyhow!(
-                "its collector can refresh the login, so nobody checks it while a sandbox holds it"
-            ))
+            collect_kept(env, agent, logins, &args.flags)
         };
         if let Err(e) = done {
             log::debug!("{agent}: {e:#}");
@@ -496,6 +497,38 @@ fn collect(env: &HostEnv, agent: &str, logins: &[HeldLogin], flags: &[String]) -
     })();
     let _ = std::fs::remove_dir_all(&run);
     result
+}
+
+/// A login that a keeper keeps (keeper.rs): Omarchy's collector runs in a
+/// keeper sandbox with the full login, under the keeper's refresh lock, so
+/// it never refreshes beside the keeper. Without a keeper, nobody checks a
+/// login whose collector can refresh it.
+fn collect_kept(env: &HostEnv, agent: &str, logins: &[HeldLogin], flags: &[String]) -> Result<()> {
+    let profile = AGENTS
+        .iter()
+        .find(|a| a.id == agent)
+        .map(|a| a.profile)
+        .context("unknown agent")?;
+    let kept = Running::list(env)
+        .into_iter()
+        .flat_map(|r| r.kept_logins)
+        .any(|k| logins.iter().any(|l| l.store == k.store));
+    if !kept || crate::keeper::kind_for(profile).is_none() {
+        bail!("its collector can refresh the login, so nobody checks it while a sandbox holds it");
+    }
+    let collector = omarchy_path(env)
+        .join("bin")
+        .join(format!("omarchy-agent-usage-{agent}"));
+    if !crate::env::is_executable(&collector) {
+        bail!("{} is missing", collector.display());
+    }
+    let record = crate::keeper::collect_usage(env, profile, &logins[0].store, &collector, flags)?;
+    let v: serde_json::Value =
+        serde_json::from_slice(&record).context("the collector did not print JSON")?;
+    if v.get("id").and_then(|i| i.as_str()) != Some(agent) {
+        bail!("the collector printed a record for another agent");
+    }
+    write_record(env, agent, &v)
 }
 
 /// Private copies of the held logins: (copy, host file). A copy is read
