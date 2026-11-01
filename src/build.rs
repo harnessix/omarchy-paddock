@@ -409,12 +409,11 @@ pub fn build_with(env: &HostEnv, opts: &Options, harness: Harness) -> Result<Bui
     }
     // The harness's own folder: a shell in the sandbox (`paddock shell`),
     // and tools that start the harness by name, find it. The folder is
-    // already among the install mounts. It goes after paddock's own tools:
-    // a harness in /usr/bin must not put the host's `gh` before paddock's.
+    // already among the install mounts. It goes last on PATH, so it only
+    // adds the harness: a harness in /usr/bin must not put the host's `gh`
+    // before paddock's, or the host's `jq` before the project's mise tools.
     if let Some(d) = harness.exe.parent() {
-        if !spec.tool_path.iter().any(|p| p == d) {
-            spec.tool_path.push(d.to_path_buf());
-        }
+        spec.inherit_path.push(d.to_path_buf());
     }
     for d in &harness.path_dirs {
         spec.add_path(d.clone());
@@ -892,13 +891,33 @@ mod tests {
             let dirs: Vec<&str> = path.split(':').collect();
             let at = dirs.iter().position(|d| Path::new(d) == tools);
             assert!(at.is_some(), "shell={shell}: {path}");
-            // Never before paddock's own tools (gh, git).
-            let tools_at = dirs
-                .iter()
-                .position(|d| *d == crate::spec::TOOL_DIR)
-                .unwrap();
-            assert!(at.unwrap() > tools_at, "{path}");
+            // Never before paddock's own tools (gh, git) or the system tools.
+            let usr_bin = dirs.iter().position(|d| *d == "/usr/bin").unwrap();
+            assert!(at.unwrap() > usr_bin, "{path}");
         }
+        // A harness in /usr/bin changes nothing: no second /usr/bin, and
+        // the mise shims and paddock's tools stay before it.
+        let opts = Options {
+            harness: "codex".into(),
+            project: Some(proj.clone()),
+            assume_yes: true,
+            ..Default::default()
+        };
+        let before = build_with(&env, &opts, h.clone())
+            .unwrap()
+            .spec
+            .path_value();
+        let sys = Harness {
+            exe: PathBuf::from("/usr/bin/codex"),
+            ..h.clone()
+        };
+        let after = build_with(&env, &opts, sys).unwrap().spec.path_value();
+        assert_eq!(after.matches(":/usr/bin:").count(), 1, "{after}");
+        assert_eq!(
+            after,
+            before.replace(&format!(":{}", tools.display()), ""),
+            "{after}"
+        );
     }
 
     #[test]

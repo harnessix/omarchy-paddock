@@ -272,7 +272,8 @@ pub struct SandboxSpec {
     pub devices: Option<PathBuf>,
     /// Information for the user, printed at start.
     pub notices: Vec<String>,
-    /// Host PATH entries, appended after the sandbox's own entries.
+    /// Host PATH entries and the harness folder, appended after the
+    /// sandbox's own entries. An entry already on PATH is skipped.
     pub inherit_path: Vec<PathBuf>,
     /// Files generated for this run (passwd, group). Backends bind them read-only.
     pub generated: Vec<(PathBuf, PathBuf)>,
