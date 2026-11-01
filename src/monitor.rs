@@ -19,6 +19,11 @@
 //! It keeps numbers only: totals in the run folder, and the sent bytes per
 //! hour of each harness and project in `~/.local/state/paddock/monitor/`.
 //!
+//! The panel marks a sandbox with findings until the user says OK
+//! (`paddock monitor ack`, a `monitor-ack.json` next to `monitor.json`).
+//! `[monitor] mute` in the user configuration lists projects with no
+//! notification and no mark: the audit lines stay.
+//!
 //! It also looks for new credential files in the sandbox home (`~/.ssh/`,
 //! `~/.netrc`, token files and the like) every few minutes and once at the
 //! end. It records paths and sizes, never content. A change to a login file
@@ -237,6 +242,211 @@ pub fn read_credential_files(env: &HostEnv, sandbox: &str) -> Vec<CredFile> {
     load_record(&seen_file(env, sandbox)).credential_files
 }
 
+/// One finding of a sandbox, for the panel and `paddock monitor list`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Finding {
+    /// `tunnel`, `upload` or `credential_file`.
+    pub kind: &'static str,
+    /// The tool, the bytes of the hour (`6.2 GB`), or the path (`~/.netrc`).
+    pub detail: String,
+    /// The user said OK to it (`paddock monitor ack`).
+    pub acked: bool,
+}
+
+impl Finding {
+    /// One line for people, the same words as the panel.
+    pub fn text(&self) -> String {
+        match self.kind {
+            "tunnel" => format!("tunnel: {}", self.detail),
+            "upload" => format!("upload: {} this hour", self.detail),
+            _ => format!("new credential file: {}", self.detail),
+        }
+    }
+}
+
+/// The file with what the user said OK to, next to `monitor.json`. Only
+/// `paddock monitor ack` writes it, so the watch never overwrites it.
+pub fn ack_file(env: &HostEnv, sandbox: &str) -> PathBuf {
+    env.paddock_run().join(sandbox).join("monitor-ack.json")
+}
+
+/// The findings that the user said OK to.
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct Ack {
+    #[serde(default)]
+    tunnels: BTreeSet<String>,
+    #[serde(default)]
+    alerts: BTreeSet<String>,
+    #[serde(default)]
+    credential_files: BTreeSet<String>,
+}
+
+fn load_ack(file: &Path) -> Ack {
+    std::fs::read_to_string(file)
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or_default()
+}
+
+fn findings_of(rec: &Record, ack: &Ack) -> Vec<Finding> {
+    let mut out: Vec<Finding> = rec
+        .tunnels
+        .iter()
+        .map(|t| Finding {
+            kind: "tunnel",
+            detail: t.clone(),
+            acked: ack.tunnels.contains(t),
+        })
+        .collect();
+    if !rec.alerts.is_empty() {
+        let sent = if rec.alert_sent > 0 {
+            rec.alert_sent
+        } else {
+            rec.traffic.as_ref().map_or(0, |t| t.hour_sent)
+        };
+        out.push(Finding {
+            kind: "upload",
+            detail: size(sent),
+            acked: rec.alerts.iter().all(|a| ack.alerts.contains(a)),
+        });
+    }
+    out.extend(rec.credential_files.iter().map(|f| Finding {
+        kind: "credential_file",
+        detail: format!("~/{}", f.path),
+        acked: ack.credential_files.contains(&f.path),
+    }));
+    out
+}
+
+/// All findings of a sandbox, with the ones the user said OK to.
+pub fn findings(env: &HostEnv, sandbox: &str) -> Vec<Finding> {
+    findings_of(
+        &load_record(&seen_file(env, sandbox)),
+        &load_ack(&ack_file(env, sandbox)),
+    )
+}
+
+/// The findings that make a mark in the panel: not said OK to, and not in
+/// a muted project.
+pub fn marks(env: &HostEnv, sandbox: &str, project: &Path) -> Vec<Finding> {
+    if is_muted(&load_mute(env), project) {
+        return Vec::new();
+    }
+    findings(env, sandbox)
+        .into_iter()
+        .filter(|f| !f.acked)
+        .collect()
+}
+
+/// Say OK to the current findings of a sandbox: the panel mark goes away
+/// until a new finding comes. The audit log keeps them. It returns how
+/// many findings it acknowledged.
+pub fn ack(env: &HostEnv, sandbox: &str) -> std::io::Result<usize> {
+    let rec = load_record(&seen_file(env, sandbox));
+    let ack = Ack {
+        tunnels: rec.tunnels.clone(),
+        alerts: rec.alerts.clone(),
+        credential_files: rec
+            .credential_files
+            .iter()
+            .map(|f| f.path.clone())
+            .collect(),
+    };
+    let count = findings_of(&rec, &ack).len();
+    let file = ack_file(env, sandbox);
+    if let Some(d) = file.parent() {
+        crate::privfs::dir(d)?;
+    }
+    crate::privfs::write_atomic(&file, serde_json::to_string(&ack).unwrap_or_default())?;
+    Ok(count)
+}
+
+/// The muted projects: `[monitor] mute` of the user configuration. Only
+/// absolute paths count. A project `paddock.toml` never comes here.
+pub fn load_mute(env: &HostEnv) -> Vec<PathBuf> {
+    parse_mute(
+        &std::fs::read_to_string(env.paddock_config().join("config.toml")).unwrap_or_default(),
+    )
+}
+
+fn parse_mute(text: &str) -> Vec<PathBuf> {
+    let v = toml::from_str::<toml::Value>(text).ok();
+    let Some(list) = v
+        .as_ref()
+        .and_then(|v| v.get("monitor")?.get("mute")?.as_array())
+    else {
+        return Vec::new();
+    };
+    list.iter()
+        .filter_map(|p| p.as_str())
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+        .collect()
+}
+
+/// A project is muted when it is a muted path or a folder in one.
+pub fn is_muted(mute: &[PathBuf], project: &Path) -> bool {
+    mute.iter().any(|m| project.starts_with(m))
+}
+
+/// Whether a finding of a sandbox in `project` shows a notification now:
+/// `[monitor] notify` and no mute. It reads the configuration each time,
+/// so a mute counts at once.
+fn notify_now(env: &HostEnv, project: &Path, notify: bool) -> bool {
+    notify && !is_muted(&load_mute(env), project)
+}
+
+/// Add (`mute = true`) or remove a project in `[monitor] mute` of the user
+/// configuration, and keep the rest of the file with its comments. It
+/// returns the new list.
+pub fn edit_mute(env: &HostEnv, path: &Path, mute: bool) -> anyhow::Result<Vec<String>> {
+    use anyhow::Context;
+    let file = env.paddock_config().join("config.toml");
+    let text = std::fs::read_to_string(&file).unwrap_or_default();
+    let new = edit_mute_text(&text, path, mute)
+        .with_context(|| format!("cannot change {}", file.display()))?;
+    crate::privfs::dir(file.parent().context("no configuration folder")?)?;
+    crate::privfs::write_atomic(&file, new.0)?;
+    Ok(new.1)
+}
+
+fn edit_mute_text(text: &str, path: &Path, mute: bool) -> anyhow::Result<(String, Vec<String>)> {
+    use anyhow::{bail, Context};
+    if !path.is_absolute() {
+        bail!("{} is not an absolute path", path.display());
+    }
+    let path = path
+        .to_str()
+        .context("the path is not valid UTF-8")?
+        .trim_end_matches('/');
+    let path = if path.is_empty() { "/" } else { path };
+    let mut doc: toml_edit::DocumentMut = text.parse().context("the file is not valid TOML")?;
+    let table = doc.entry("monitor").or_insert(toml_edit::table());
+    let table = table
+        .as_table_mut()
+        .context("[monitor] in the configuration is not a table")?;
+    let arr = table
+        .entry("mute")
+        .or_insert(toml_edit::value(toml_edit::Array::new()));
+    let arr = arr
+        .as_array_mut()
+        .context("[monitor] mute is not an array")?;
+    let has = arr
+        .iter()
+        .any(|v| v.as_str().map(|s| s.trim_end_matches('/')) == Some(path));
+    if mute && !has {
+        arr.push(path);
+    }
+    if !mute {
+        arr.retain(|v| v.as_str().map(|s| s.trim_end_matches('/')) != Some(path));
+    }
+    let list = arr
+        .iter()
+        .filter_map(|v| v.as_str().map(str::to_string))
+        .collect();
+    Ok((doc.to_string(), list))
+}
+
 #[cfg(test)]
 fn load_seen(file: &Path) -> BTreeSet<String> {
     load_record(file).tunnels
@@ -256,6 +466,12 @@ struct Record {
     /// Changes to the harness's own login files: token refreshes.
     #[serde(default, skip_serializing_if = "is_zero")]
     login_refreshes: u64,
+    /// The hour (since 1970) of the last upload alert, and the bytes that
+    /// the sandbox sent in that hour, so that the panel does not count.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    alert_hour: u64,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    alert_sent: u64,
 }
 
 fn is_zero(n: &u64) -> bool {
@@ -302,13 +518,25 @@ impl Seen {
         out
     }
 
-    /// The alert reasons that are new for this sandbox. It records them.
-    pub fn fresh_alerts(&mut self, reasons: Vec<&'static str>) -> Vec<&'static str> {
+    /// The alert reasons that are new for this sandbox. It records them,
+    /// with the hour and its sent bytes. While that hour lasts, the bytes
+    /// follow the count.
+    pub fn fresh_alerts(
+        &mut self,
+        reasons: Vec<&'static str>,
+        hour: u64,
+        hour_sent: u64,
+    ) -> Vec<&'static str> {
         let out: Vec<_> = reasons
             .into_iter()
             .filter(|r| self.rec.alerts.insert(r.to_string()))
             .collect();
+        let follow = self.rec.alert_hour == hour && self.rec.alert_sent < hour_sent;
         if !out.is_empty() {
+            self.rec.alert_hour = hour;
+        }
+        if !out.is_empty() || follow {
+            self.rec.alert_sent = hour_sent;
             self.save();
         }
         out
@@ -739,13 +967,15 @@ impl Live {
         let (rx, tx) = self.counter.step(reading);
         let t = self.seen.rec.traffic.get_or_insert_with(Traffic::default);
         let ended = t.add(crate::state::now(), rx, tx);
-        let hour_sent = t.hour_sent;
+        let (hour, hour_sent) = (t.hour, t.hour_sent);
         if let Some((h, b)) = ended {
             self.flush(h, b);
         }
         self.seen.save();
         let base = Baseline::load(&self.base_file);
-        let new = self.seen.fresh_alerts(reasons(hour_sent, cfg, &base));
+        let new = self
+            .seen
+            .fresh_alerts(reasons(hour_sent, cfg, &base), hour, hour_sent);
         (new, hour_sent, base.median())
     }
 
@@ -965,7 +1195,7 @@ fn alert(
             "decision": "reported",
         }),
     );
-    if cfg.notify {
+    if notify_now(env, &id.project, cfg.notify) {
         let _ = crate::broker::notify::show(
             env,
             &crate::broker::notify::Note {
@@ -1008,7 +1238,7 @@ fn report_creds(env: &HostEnv, id: &Identity, files: &[CredFile], notify: bool) 
             }),
         );
     }
-    if notify {
+    if notify_now(env, &id.project, notify) {
         let mut names: Vec<String> = files
             .iter()
             .take(3)
@@ -1054,7 +1284,7 @@ fn report(env: &HostEnv, id: &Identity, t: &Tunnel, notify: bool) {
             "decision": "reported",
         }),
     );
-    if notify {
+    if notify_now(env, &id.project, notify) {
         let _ = crate::broker::notify::show(
             env,
             &crate::broker::notify::Note {
@@ -1292,18 +1522,18 @@ Inter-|   Receive                                                |  Transmit
         let tmp = tempfile::tempdir().unwrap();
         let file = tmp.path().join("monitor.json");
         let mut seen = Seen::open(file.clone());
-        assert_eq!(seen.fresh_alerts(vec!["factor"]), ["factor"]);
-        assert!(seen.fresh_alerts(vec!["factor"]).is_empty());
+        assert_eq!(seen.fresh_alerts(vec!["factor"], 7, 100), ["factor"]);
+        assert!(seen.fresh_alerts(vec!["factor"], 7, 100).is_empty());
         assert_eq!(
-            seen.fresh_alerts(vec!["factor", "upload_per_hour"]),
+            seen.fresh_alerts(vec!["factor", "upload_per_hour"], 7, 100),
             ["upload_per_hour"]
         );
         let mut again = Seen::open(file);
         assert!(again
-            .fresh_alerts(vec!["upload_per_hour", "factor"])
+            .fresh_alerts(vec!["upload_per_hour", "factor"], 7, 100)
             .is_empty());
         let mut other = Seen::open(tmp.path().join("other.json"));
-        assert_eq!(other.fresh_alerts(vec!["factor"]), ["factor"]);
+        assert_eq!(other.fresh_alerts(vec!["factor"], 7, 100), ["factor"]);
     }
 
     #[test]
@@ -1325,10 +1555,13 @@ Inter-|   Receive                                                |  Transmit
         assert_eq!((new, sent), (vec!["upload_per_hour"], 2000));
         let (new, _, _) = live.count((500, 3000), &cfg);
         assert!(new.is_empty());
-        let t = load_record(&tmp.path().join("run/monitor.json"))
-            .traffic
-            .unwrap();
+        let rec = load_record(&tmp.path().join("run/monitor.json"));
+        let t = rec.traffic.unwrap();
         assert_eq!((t.sent, t.received), (3000, 500));
+        // The alert flag and the bytes of its hour, for the panel.
+        assert!(rec.alerts.contains("upload_per_hour"));
+        assert_eq!(rec.alert_sent, 3000);
+        assert_eq!(rec.alert_hour, t.hour);
         live.finish();
         live.finish();
         let b = Baseline::load(&live.base_file);
@@ -1504,5 +1737,135 @@ Inter-|   Receive                                                |  Transmit
         assert_eq!(line["path"], ".ssh/id_ed25519");
         assert_eq!(line["size"], secret.len());
         assert!(!log.contains(secret));
+    }
+
+    #[test]
+    fn the_alert_keeps_the_bytes_of_its_hour() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("monitor.json");
+        let mut seen = Seen::open(file.clone());
+        assert_eq!(
+            seen.fresh_alerts(vec!["upload_per_hour"], 10, 6 << 30),
+            ["upload_per_hour"]
+        );
+        // Later in the same hour the bytes follow.
+        assert!(seen
+            .fresh_alerts(vec!["upload_per_hour"], 10, 7 << 30)
+            .is_empty());
+        // The next hour does not change them.
+        seen.fresh_alerts(vec![], 11, 1 << 30);
+        let text = std::fs::read_to_string(&file).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(v["alerts"], serde_json::json!(["upload_per_hour"]));
+        assert_eq!(v["alert_sent"], 7u64 << 30);
+        assert_eq!(v["alert_hour"], 10);
+    }
+
+    fn test_env(tmp: &Path) -> HostEnv {
+        let mut vars = BTreeMap::new();
+        vars.insert(
+            "XDG_RUNTIME_DIR".to_string(),
+            tmp.join("run").display().to_string(),
+        );
+        HostEnv::from_parts(tmp.join("home"), "demo".into(), 1000, 1000, vars)
+    }
+
+    #[test]
+    fn ack_clears_the_mark_until_a_new_finding() {
+        let tmp = tempfile::tempdir().unwrap();
+        let env = test_env(tmp.path());
+        let project = Path::new("/work/app");
+        let mut seen = Seen::open(seen_file(&env, "s1"));
+        seen.fresh(vec![tunnel_in(&argv("ngrok http 80")).unwrap()]);
+        seen.fresh_alerts(vec!["upload_per_hour"], 3, 6 << 30);
+        seen.fresh_creds(
+            vec![CredFile {
+                path: ".ssh/id_ed25519".into(),
+                size: 400,
+            }],
+            0,
+        );
+        let m = marks(&env, "s1", project);
+        let texts: Vec<String> = m.iter().map(Finding::text).collect();
+        assert_eq!(
+            texts,
+            [
+                "tunnel: ngrok",
+                "upload: 6.0 GB this hour",
+                "new credential file: ~/.ssh/id_ed25519"
+            ]
+        );
+        assert_eq!(ack(&env, "s1").unwrap(), 3);
+        assert!(marks(&env, "s1", project).is_empty());
+        // The findings stay, marked as acknowledged.
+        assert!(findings(&env, "s1").iter().all(|f| f.acked));
+        // A new finding marks the sandbox again, alone.
+        seen.fresh(vec![tunnel_in(&argv("cloudflared tunnel run")).unwrap()]);
+        let m = marks(&env, "s1", project);
+        assert_eq!(m.len(), 1);
+        assert_eq!(m[0].text(), "tunnel: cloudflared");
+        // Another sandbox has its own acknowledgement.
+        let mut other = Seen::open(seen_file(&env, "s2"));
+        other.fresh(vec![tunnel_in(&argv("ngrok http 80")).unwrap()]);
+        assert_eq!(marks(&env, "s2", project).len(), 1);
+    }
+
+    #[test]
+    fn mute_matches_the_project_and_its_folders() {
+        let mute =
+            parse_mute("[monitor]\nmute = [\"/work/noisy\", \"relative/path\", \"/srv/x/\"]\n");
+        assert_eq!(
+            mute,
+            [PathBuf::from("/work/noisy"), PathBuf::from("/srv/x/")]
+        );
+        assert!(is_muted(&mute, Path::new("/work/noisy")));
+        assert!(is_muted(&mute, Path::new("/work/noisy/sub/dir")));
+        assert!(is_muted(&mute, Path::new("/srv/x")));
+        assert!(!is_muted(&mute, Path::new("/work/noisy2")));
+        assert!(!is_muted(&mute, Path::new("/work")));
+        assert!(!is_muted(&mute, Path::new("/elsewhere/relative/path")));
+        assert!(parse_mute("").is_empty());
+        assert!(parse_mute("[monitor]\nmute = \"/work\"\n").is_empty());
+    }
+
+    #[test]
+    fn a_muted_project_has_no_mark() {
+        let tmp = tempfile::tempdir().unwrap();
+        let env = test_env(tmp.path());
+        let mut seen = Seen::open(seen_file(&env, "s1"));
+        seen.fresh(vec![tunnel_in(&argv("ngrok http 80")).unwrap()]);
+        let project = Path::new("/work/noisy/app");
+        assert_eq!(marks(&env, "s1", project).len(), 1);
+        edit_mute(&env, Path::new("/work/noisy"), true).unwrap();
+        assert!(marks(&env, "s1", project).is_empty());
+        assert!(!notify_now(&env, project, true));
+        assert!(notify_now(&env, Path::new("/work/other"), true));
+        // The findings stay for the list.
+        assert_eq!(findings(&env, "s1").len(), 1);
+        edit_mute(&env, Path::new("/work/noisy/"), false).unwrap();
+        assert_eq!(marks(&env, "s1", project).len(), 1);
+    }
+
+    #[test]
+    fn mute_edits_keep_the_rest_of_the_file() {
+        let text =
+            "# my settings\n[monitor]\n# quiet here\nnotify = true\n\n[env]\nhide = [\"A\"]\n";
+        let (out, list) = edit_mute_text(text, Path::new("/work/a/"), true).unwrap();
+        assert_eq!(list, ["/work/a"]);
+        assert!(out.contains("# my settings"));
+        assert!(out.contains("# quiet here"));
+        assert!(out.contains("hide = [\"A\"]"));
+        assert_eq!(parse_mute(&out), [PathBuf::from("/work/a")]);
+        // Twice is once.
+        let (out, list) = edit_mute_text(&out, Path::new("/work/a"), true).unwrap();
+        assert_eq!(list, ["/work/a"]);
+        let (out, list) = edit_mute_text(&out, Path::new("/work/b"), true).unwrap();
+        assert_eq!(list, ["/work/a", "/work/b"]);
+        let (out, list) = edit_mute_text(&out, Path::new("/work/a"), false).unwrap();
+        assert_eq!(list, ["/work/b"]);
+        assert!(out.contains("# quiet here"));
+        assert!(edit_mute_text("", Path::new("rel"), true).is_err());
+        assert!(edit_mute_text("[monitor]\nmute = 3\n", Path::new("/a"), true).is_err());
+        assert!(edit_mute_text("not toml [", Path::new("/a"), true).is_err());
     }
 }

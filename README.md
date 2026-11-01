@@ -380,6 +380,22 @@ A key or a token that a sandbox plants in its home can keep access later. paddoc
 - In `~/.config/paddock/config.toml`, `[monitor] credentials = false` turns the check off, and `[monitor] notify = false` keeps the audit lines without a notification.
 - It works with every backend, as long as paddock kv runs.
 
+#### Findings in the panel, OK and mute
+
+The bar panel marks a sandbox with findings: its row gets a line in the urgent color, such as `tunnel: ngrok`, `upload: 6.2 GB this hour` or `new credential file: ~/.ssh/id_ed25519`, and `+N` for more. A frozen sandbox and warnings come first, timers after.
+
+- The OK action on the row (or `paddock monitor ack ID`) clears the mark of that sandbox until a new finding. paddock writes the acknowledgement into the run folder. The audit log keeps the findings.
+- `paddock monitor list` prints the findings of the running sandboxes, and `--json` prints them as JSON. `paddock ps --json` shows the marked ones in `monitor_marks`.
+- `monitor.json` in the run folder flags upload alerts in `alerts` (`upload_per_hour`, `factor`) and keeps the bytes of the alert's hour in `alert_sent`.
+- A project that is noisy on purpose gets no notification and no mark when you mute it. The audit lines stay. A muted path covers its folders too.
+
+```sh
+paddock monitor mute ~/src/tunnel-demo     # adds it to [monitor] mute
+paddock monitor unmute ~/src/tunnel-demo
+```
+
+`mute` and `unmute` change only `[monitor] mute = ["/path/to/project"]` in `~/.config/paddock/config.toml` and keep the rest of the file with its comments. You can edit the list by hand too. A project `paddock.toml` can never mute itself.
+
 ## Logins and MCP
 
 By default, a sandbox uses your existing login (auth mode `shared`). paddock copies the credential files of the harness from your home directory into the sandbox at start. If the harness refreshes a token in the sandbox, paddock writes it back when the sandbox exits. If the file also changed on the host in the meantime, the host version stays, and paddock tells you.

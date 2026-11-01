@@ -231,5 +231,12 @@
   "row.timerOver": "timer %1: %2 of %3, time is up",
   "row.quota": "timer %1: %2% of %3% of %4",
   "row.quotaOver": "timer %1: %2% of %3% of %4, quota used up",
+  "row.monitorTunnel": "tunnel: %1",
+  "row.monitorUpload": "upload: %1 this hour",
+  "row.monitorCredential": "new credential file: %1",
+  "row.monitorMore": "%1 +%2",
+  "action.ack": "OK, clear the mark",
+  "msg.acked": "The mark is cleared. The audit log keeps the findings.",
+  "msg.ackFailed": "paddock could not clear the mark.",
   "forage.overgrazing": "%1 %2: %3% used, runs out in %4 at this rate, resets in %5"
 }
