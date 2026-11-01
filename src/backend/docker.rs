@@ -416,6 +416,42 @@ impl Backend for Docker {
             mount_arg("bind", Some(&group_f), Path::new("/etc/group"), true)?,
             mount_arg("bind", Some(&spec.home_src), &spec.home, false)?,
         ];
+        // The machine ID (identity.rs): an isolated login's own, or the
+        // host's for a host login, as with bwrap. Not the image's: a login
+        // made on the host would see another machine. The boot ID stays the
+        // host's, because container runtimes refuse mounts inside /proc.
+        let machine_id_f = run_dir.join("machine-id");
+        let mut identity_files = Vec::new();
+        if let Some(id) = &spec.identity.machine_id {
+            identity_files.push((machine_id_f.clone(), id.clone(), 0o444));
+            mounts.push(mount_arg(
+                "bind",
+                Some(&machine_id_f),
+                Path::new("/etc/machine-id"),
+                true,
+            )?);
+        } else if Path::new("/etc/machine-id").is_file() {
+            mounts.push(mount_arg(
+                "bind",
+                Some(Path::new("/etc/machine-id")),
+                Path::new("/etc/machine-id"),
+                true,
+            )?);
+        }
+        // The board and firmware names of the host. The serials in there
+        // are readable by root only, and the container never runs as root;
+        // the names alone help to tell machines apart. podman copies the
+        // folder into a new tmpfs unless told not to, and fails on the
+        // serials.
+        // Machines without DMI (many ARM boards) have no such folder, and
+        // a mount point cannot be made in sysfs.
+        if Path::new("/sys/devices/virtual/dmi").is_dir() {
+            let mut dmi = mount_arg("tmpfs", None, Path::new("/sys/devices/virtual/dmi"), true)?;
+            if self.cli == "podman" {
+                dmi.push_str(",notmpcopyup");
+            }
+            mounts.push(dmi);
+        }
         for m in spec.ordered_mounts() {
             mounts.push(match m.kind {
                 MountKind::Ro => mount_arg("bind", m.src.as_deref(), &m.dst, true)?,
@@ -587,12 +623,16 @@ impl Backend for Docker {
             program: exe,
             args: a,
             env: host_env,
-            files: vec![
-                (passwd_f, passwd, 0o644),
-                (group_f, group, 0o644),
-                (env_f, env_text, 0o600),
-                (empty_f, String::new(), 0o444),
-            ],
+            files: [
+                vec![
+                    (passwd_f, passwd, 0o644),
+                    (group_f, group, 0o644),
+                    (env_f, env_text, 0o600),
+                    (empty_f, String::new(), 0o444),
+                ],
+                identity_files,
+            ]
+            .concat(),
         })
     }
 }

@@ -396,6 +396,9 @@ pub fn build_with(env: &HostEnv, opts: &Options, harness: Harness) -> Result<Bui
     );
     spec.network = opts.network.or(m.network.mode).unwrap_or_default();
     spec.publish = m.network.publish.clone();
+    // An isolated login is another machine; a host login keeps the host's
+    // identity.
+    spec.identity = crate::identity::for_login(env, &profile.name, &auth)?;
 
     spec.add_mount(Mount::same(&project, true, "project"));
 
