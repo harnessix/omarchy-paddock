@@ -233,7 +233,9 @@ pub struct Pending {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub started_by: Vec<String>,
     /// For a question (`/dev/paddock/ask`): short answers that the card
-    /// offers as buttons. The user can always type another answer.
+    /// offers as buttons. The user can always type another answer. For a
+    /// card of paddock itself (`spawn-timeout`): the only answers, besides
+    /// deny.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub choices: Vec<String>,
 }
@@ -242,6 +244,10 @@ pub struct Pending {
 /// approval card. It is not a host capability: the answer is text for the
 /// agent, and nothing runs on the host.
 pub const ASK_CAPABILITY: &str = "ask";
+/// The capability name of the card for a spawned child at its time limit
+/// (`[spawn] on_timeout = "ask"`). The answer is one of its choices (more
+/// time), or deny (stop).
+pub const TIMEOUT_CAPABILITY: &str = "spawn-timeout";
 /// The longest typed answer to a question, in characters.
 pub const MAX_REPLY: usize = 4000;
 
@@ -406,6 +412,12 @@ pub fn answer_with_note(env: &HostEnv, id: &str, a: Answer, note: Option<&str>) 
     if p.capability == ASK_CAPABILITY && a == Answer::DenySession {
         bail!("{id} is a question: dismiss it with deny");
     }
+    if p.capability != ASK_CAPABILITY && !p.choices.is_empty() && a != Answer::Deny {
+        bail!(
+            "{id} offers choices: answer it with --text {}, or deny",
+            p.choices.join("|")
+        );
+    }
     if a == Answer::Session && !p.session_allowed {
         bail!("this request can only be allowed once");
     }
@@ -439,6 +451,20 @@ pub fn answer_reply(env: &HostEnv, id: &str, text: &str) -> Result<()> {
         bail!("no pending request {id}");
     }
     let p: Pending = serde_json::from_str(&std::fs::read_to_string(&pending)?)?;
+    // A card of paddock itself with fixed choices: only those.
+    if p.capability != ASK_CAPABILITY && !p.choices.is_empty() {
+        if !p.choices.iter().any(|c| c == text.trim()) {
+            bail!(
+                "{id} takes one of these answers: {}, or deny",
+                p.choices.join(", ")
+            );
+        }
+        crate::privfs::write(
+            &dir.join(format!("{id}.answer")),
+            serde_json::json!({ "reply": text.trim() }).to_string(),
+        )?;
+        return Ok(());
+    }
     if p.capability != ASK_CAPABILITY {
         bail!("{id} is a host request, not a question: answer it with once, session or deny");
     }
@@ -726,6 +752,85 @@ impl Approver for HostApprover {
         let _ = std::fs::remove_file(&pending);
         let _ = std::fs::remove_file(&answer_file);
         got
+    }
+}
+
+/// Put a card with fixed choices up (`TIMEOUT_CAPABILITY`) and wait for
+/// the answer: one of `p.choices`, or deny. Stop waiting after `wait` or
+/// when `cancelled` turns true.
+pub fn ask_choice(
+    env: &HostEnv,
+    p: &Pending,
+    wait: Duration,
+    cancelled: &dyn Fn() -> bool,
+) -> crate::spawn::Choice {
+    use crate::spawn::Choice;
+    let p = &p.cleaned();
+    let answer_file = approvals_dir(env).join(format!("{}.answer", p.id));
+    let Ok(pending) = write_pending(env, p) else {
+        return Choice::NoAnswer;
+    };
+    let shown = notify_choices(env, p);
+    let start = Instant::now();
+    let mut got = Choice::NoAnswer;
+    while start.elapsed() < wait && !cancelled() {
+        if let Ok(t) = std::fs::read_to_string(&answer_file) {
+            let reply = serde_json::from_str::<serde_json::Value>(&t)
+                .ok()
+                .and_then(|v| v["reply"].as_str().map(str::to_string));
+            got = match reply {
+                Some(r) if p.choices.contains(&r) => Choice::More(r),
+                _ => Choice::Stop,
+            };
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    if let Some(h) = shown {
+        h.close();
+    }
+    let _ = std::fs::remove_file(&pending);
+    let _ = std::fs::remove_file(&answer_file);
+    got
+}
+
+/// The notification for a card with fixed choices, when the bar does not
+/// run: one button per choice, and Stop.
+fn notify_choices(env: &HostEnv, p: &Pending) -> Option<notify::Handle> {
+    if approval_ui_active(env) {
+        return None;
+    }
+    let mut actions: Vec<(String, String)> = p
+        .choices
+        .iter()
+        .enumerate()
+        .map(|(i, c)| (format!("choice:{i}"), format!("+{c}")))
+        .collect();
+    actions.push(("deny".into(), "Stop".into()));
+    let note = notify::Note {
+        summary: format!("paddock: {}", p.summary),
+        body: p.detail.clone(),
+        actions,
+        critical: true,
+    };
+    let (env2, id, choices) = (env.clone(), p.id.clone(), p.choices.clone());
+    let on_action = move |key: &str| {
+        if let Some(c) = key
+            .strip_prefix("choice:")
+            .and_then(|i| i.parse::<usize>().ok())
+            .and_then(|i| choices.get(i))
+        {
+            let _ = answer_reply(&env2, &id, c);
+        } else if key == "deny" {
+            let _ = answer(&env2, &id, Answer::Deny);
+        }
+    };
+    match notify::ask(env, &note, on_action) {
+        Ok(h) => Some(h),
+        Err(e) => {
+            log::debug!("cannot show the card as a notification: {e:#}");
+            None
+        }
     }
 }
 

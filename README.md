@@ -726,6 +726,8 @@ A role is a fixed set of limits. The agent names a role. It cannot combine its o
 
 `--timeout`, `--mem` and `--cpus` can only lower the limits in your configuration. If the host has `systemd-run --user`, paddock starts the child's host process in a systemd scope with `MemoryMax`, `CPUQuota` and `RuntimeMaxSec`, so the limits cover the child sandbox and everything in it. paddock itself stops the child at the timeout, so the child can still save its login. The scope's runtime limit is a backstop one minute later. Without `systemd-run`, paddock enforces the timeout and refuses `--mem` and `--cpus`. The audit log says why a child stopped.
 
+With `on_timeout = "ask"`, paddock does not stop a child at its time limit. It freezes the child (see `paddock freeze`, and `[suspend] leases` holds for its leases) and asks you on an approval card: more time (15m, 30m or 1h) or Stop. The card names the parent, the child, the harness, the role and the time used. In a terminal: `paddock approvals answer ID --text 30m`, or `deny` to stop. The time on the card does not count against the child. More time thaws the child and moves its limit. Stop, or no answer within the approval wait, stops the child as at any time limit. The audit log records each decision. In this mode the scope gets no `RuntimeMaxSec`: systemd counts frozen time too, so the backstop would kill a child that waits on the card. paddock's own timer stops the child, and the child ends with its parent's paddock as always.
+
 Spawn is off until you turn it on. Only `~/.config/paddock/config.toml` can turn it on. A project `paddock.toml` cannot.
 
 ```toml
@@ -739,6 +741,7 @@ max_depth = 1            # 1: a child cannot start children of its own
 timeout = 1800           # seconds that one child may run in total
 # max_mem = "4G"         # the most memory of one child; no limit by default
 # max_cpus = 2           # the most CPUs of one child; no limit by default
+# on_timeout = "ask"    # stop (default) | ask: freeze the child at its time limit and ask
 ```
 
 These rules always hold:

@@ -73,9 +73,13 @@ Item {
     return parts.length ? parts[parts.length - 1] : ""
   }
   function isQuestion(r) { return r && r.capability === "ask" }
+  // A card of paddock itself with fixed answers, such as more time for a
+  // spawned child at its time limit.
+  function hasChoices(r) { return r && !isQuestion(r) && (r.choices || []).length > 0 }
   function answersFor(r) {
-    // A question: dismiss, or one of the agent's short answers.
-    if (isQuestion(r)) return ["deny"].concat((r.choices || []).map(function(c) { return "reply:" + c }))
+    // A question: dismiss, or one of the agent's short answers. A card with
+    // fixed answers: deny (stop), or one of them.
+    if (isQuestion(r) || hasChoices(r)) return ["deny"].concat((r.choices || []).map(function(c) { return "reply:" + c }))
     var list = ["deny", "once"]
     if (r && r.sessionAllowed) list.push("session")
     if (r && r.sessionAllowed) list.push("deny-session")
@@ -83,8 +87,10 @@ Item {
   }
   function isDenial(decision) { return decision === "deny" || decision === "deny-session" }
   function answerLabel(r, decision) {
+    if (decision.indexOf("reply:") === 0 && hasChoices(r)) return strings.t("popup.answer.more").arg(decision.slice(6))
     if (decision.indexOf("reply:") === 0) return decision.slice(6)
     if (isQuestion(r) && decision === "deny") return strings.t("popup.answer.dismiss")
+    if (hasChoices(r) && decision === "deny") return strings.t("popup.answer.stop")
     return strings.t("popup.answer." + decision)
   }
   // The first http(s) link in a request's detail.
@@ -113,7 +119,7 @@ Item {
   }
   function glyph(c) {
     return ({ "screenshot": "󰹑", "exec": "󰆍", "fetch": "󰉋", "clipboard-read": "󰅇",
-              "clipboard-write": "󰅌", "open-url": "󰌹", "notify": "󰂞", "spawn": "󰚩", "ask": "󰘥" })[c] || "󰀦"
+              "clipboard-write": "󰅌", "open-url": "󰌹", "notify": "󰂞", "spawn": "󰚩", "spawn-timeout": "󰔟", "ask": "󰘥" })[c] || "󰀦"
   }
 
   function answer(r, decision) {
@@ -538,7 +544,7 @@ Item {
               // a click.
               Rectangle {
                 Layout.fillWidth: true
-                visible: !root.isQuestion(card.modelData) && !card.result
+                visible: !root.isQuestion(card.modelData) && !root.hasChoices(card.modelData) && !card.result
                 radius: Style.cornerRadius
                 color: Qt.alpha(Commons.Color.foreground, 0.06)
                 border.width: 1

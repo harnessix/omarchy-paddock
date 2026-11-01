@@ -1129,3 +1129,292 @@ fn from_head_commits_the_parents_files_without_touching_its_checkout() {
     git(&repo, &["config", "core.fsmonitor", "/bin/false"]);
     assert!(snapshot_commit(&repo, &index, "x").is_err());
 }
+
+/// Freeze, thaw and the card without a real freezer: it records the calls
+/// and gives one fixed answer after `delay`.
+struct FakeSeam {
+    calls: Mutex<Vec<String>>,
+    cards: Mutex<Vec<Pending>>,
+    answer: Choice,
+    delay: Duration,
+}
+
+impl FakeSeam {
+    fn new(answer: Choice, delay: Duration) -> Arc<Self> {
+        Arc::new(Self {
+            calls: Mutex::new(vec![]),
+            cards: Mutex::new(vec![]),
+            answer,
+            delay,
+        })
+    }
+    fn calls(&self) -> Vec<String> {
+        self.calls.lock().unwrap().clone()
+    }
+}
+
+impl TimeoutSeam for FakeSeam {
+    fn freeze(&self, sandbox: &str) -> Result<()> {
+        self.calls.lock().unwrap().push(format!("freeze {sandbox}"));
+        Ok(())
+    }
+    fn thaw(&self, sandbox: &str) -> Result<()> {
+        self.calls.lock().unwrap().push(format!("thaw {sandbox}"));
+        Ok(())
+    }
+    fn ask(&self, card: &Pending, wait: Duration, _: &dyn Fn() -> bool) -> Choice {
+        assert_eq!(wait, Duration::from_secs(7));
+        self.calls.lock().unwrap().push("ask".into());
+        self.cards.lock().unwrap().push(card.clone());
+        std::thread::sleep(self.delay);
+        self.answer.clone()
+    }
+}
+
+/// A child program that runs `secs` seconds and then writes a result.
+fn child_that_runs(secs: &str) -> Vec<OsString> {
+    let script = format!(
+        "sleep {secs}; printf '{{\"exit_code\":0,\"branch\":\"b\",\"base\":\"\",\"commits\":0,\"stat\":\"\",\"output\":\"\",\"output_truncated\":false,\"started\":0,\"ended\":0}}' > \"$(dirname \"$1\")/result.json\""
+    );
+    ["sh", "-c", &script, "job"]
+        .iter()
+        .map(OsString::from)
+        .collect()
+}
+
+fn limit_spawner(
+    s: &Setup,
+    mode: OnTimeout,
+    seam: Arc<FakeSeam>,
+    program: Vec<OsString>,
+) -> Arc<Spawner> {
+    let mut c = cfg(&["codex"], 2);
+    c.on_timeout = mode;
+    let mut sp = Spawner::with_program(
+        &s.env,
+        c,
+        ceiling("p-1", 0, &s.project),
+        &s.project,
+        program,
+    );
+    sp.seam = seam;
+    sp.approval_wait = Duration::from_secs(7);
+    Arc::new(sp)
+}
+
+fn run_with_limit(sp: &Arc<Spawner>, timeout: u64) -> Status {
+    let o = StartOpts {
+        limits: Limits {
+            timeout,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let st = sp.start("codex", SECRET_TASK.as_bytes(), o).unwrap();
+    let done = sp.wait(&st.id, Duration::from_secs(40)).unwrap();
+    assert!(!done.state.active(), "{done:?}");
+    done
+}
+
+fn audit_decisions(env: &HostEnv) -> Vec<String> {
+    std::fs::read_to_string(crate::broker::audit_file(env))
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .filter(|v| v["used_s"].is_u64())
+        .map(|v| v["decision"].as_str().unwrap_or("").to_string())
+        .collect()
+}
+
+#[test]
+fn on_timeout_is_read_from_the_user_configuration() {
+    let doc = |t: &str| toml::from_str::<toml::Value>(t).unwrap();
+    assert_eq!(SpawnCfg::default().on_timeout, OnTimeout::Stop);
+    let c = SpawnCfg::from_doc(&doc("[spawn]\non_timeout = \"ask\"")).unwrap();
+    assert_eq!(c.on_timeout, OnTimeout::Ask);
+    assert!(SpawnCfg::from_doc(&doc("[spawn]\non_timeout = \"wait\"")).is_err());
+}
+
+#[test]
+fn ask_freezes_the_child_and_more_time_thaws_and_extends_it() {
+    let s = setup();
+    let seam = FakeSeam::new(Choice::More("30m".into()), Duration::from_secs(1));
+    let sp = limit_spawner(&s, OnTimeout::Ask, seam.clone(), child_that_runs("3"));
+    let done = run_with_limit(&sp, 1);
+    assert_eq!(done.state, State::Exited, "{done:?}");
+    assert_eq!(done.limits.timeout, 1 + 1800);
+    assert!(done.frozen_s >= 1, "{done:?}");
+    let sb = &done.sandbox;
+    assert_eq!(
+        seam.calls(),
+        [format!("freeze {sb}"), "ask".into(), format!("thaw {sb}")]
+    );
+    let card = seam.cards.lock().unwrap()[0].clone();
+    assert_eq!(card.capability, crate::broker::TIMEOUT_CAPABILITY);
+    assert_eq!(card.choices, ["15m", "30m", "1h"]);
+    assert_eq!(card.started_by, ["p-1"]);
+    for want in [
+        "Parent: p-1 (claude)",
+        sb.as_str(),
+        "(codex)",
+        "implementer",
+        "Time used: ",
+    ] {
+        assert!(
+            card.detail.contains(want),
+            "{want} missing in {}",
+            card.detail
+        );
+    }
+    assert!(!card.detail.contains("TASK-TEXT"));
+    assert_eq!(audit_decisions(&s.env), ["more time: 30m"]);
+}
+
+#[test]
+fn stop_or_no_answer_stops_the_child_and_thaws_it_to_end() {
+    for (answer, decision) in [
+        (Choice::Stop, "stop"),
+        (Choice::NoAnswer, "no answer: stop"),
+        // An answer that is not on the card stops it too.
+        (Choice::More("5h".into()), "no answer: stop"),
+    ] {
+        let s = setup();
+        let seam = FakeSeam::new(answer, Duration::ZERO);
+        let sp = limit_spawner(&s, OnTimeout::Ask, seam.clone(), child_that_runs("30"));
+        let done = run_with_limit(&sp, 1);
+        assert_eq!(done.state, State::TimedOut, "{done:?}");
+        assert_eq!(done.limits.timeout, 1);
+        let sb = &done.sandbox;
+        assert_eq!(
+            seam.calls(),
+            [format!("freeze {sb}"), "ask".into(), format!("thaw {sb}")]
+        );
+        assert_eq!(audit_decisions(&s.env), [decision]);
+    }
+}
+
+#[test]
+fn stop_mode_stops_at_the_limit_without_a_card() {
+    let s = setup();
+    let seam = FakeSeam::new(Choice::More("30m".into()), Duration::ZERO);
+    let sp = limit_spawner(&s, OnTimeout::Stop, seam.clone(), child_that_runs("30"));
+    let done = run_with_limit(&sp, 1);
+    assert_eq!(done.state, State::TimedOut);
+    assert!(
+        done.message.contains("time limit of 1 seconds"),
+        "{}",
+        done.message
+    );
+    assert!(seam.calls().is_empty());
+    assert!(audit_decisions(&s.env).is_empty());
+}
+
+#[test]
+fn the_frozen_time_does_not_count_against_the_limit() {
+    // Limit 1 s, 2 s more at the card, which waits 2 s. The child runs 4 s.
+    // Without the frozen time, it used about 2 s of its 3 s at its end, so
+    // there is one card only. With the frozen time counted, a second card
+    // would come at once.
+    let s = setup();
+    let seam = FakeSeam::new(Choice::More("2s".into()), Duration::from_secs(2));
+    let mut sp = Arc::try_unwrap(limit_spawner(
+        &s,
+        OnTimeout::Ask,
+        seam.clone(),
+        child_that_runs("4"),
+    ))
+    .ok()
+    .unwrap();
+    sp.more_time = vec![("2s".into(), 2)];
+    let sp = Arc::new(sp);
+    let done = run_with_limit(&sp, 1);
+    assert_eq!(done.state, State::Exited, "{done:?}");
+    assert_eq!(seam.calls().iter().filter(|c| *c == "ask").count(), 1);
+    assert_eq!(done.limits.timeout, 3);
+    assert!(done.frozen_s >= 2);
+}
+
+#[test]
+fn ask_mode_leaves_out_the_scope_runtime_limit() {
+    let s = setup();
+    let seam = FakeSeam::new(Choice::Stop, Duration::ZERO);
+    let sp = limit_spawner(&s, OnTimeout::Ask, seam, vec!["/usr/bin/paddock".into()]);
+    let log = std::fs::File::create(s.project.join("log")).unwrap();
+    let limits = Limits {
+        timeout: 600,
+        mem: Some(1 << 30),
+        cpu_percent: None,
+    };
+    let cmd = sp
+        .command(
+            &s.project.join("job.json"),
+            log,
+            limits,
+            Some(Path::new("/usr/bin/systemd-run")),
+            "paddock-spawn-x",
+        )
+        .unwrap();
+    let args: Vec<String> = cmd
+        .get_args()
+        .map(|a| a.to_string_lossy().into_owned())
+        .collect();
+    assert!(
+        args.iter().all(|a| !a.starts_with("RuntimeMaxSec")),
+        "{args:?}"
+    );
+    assert!(args.iter().any(|a| a == "MemoryMax=1073741824"));
+}
+
+#[test]
+fn a_card_with_choices_takes_only_its_choices() {
+    let s = setup();
+    let p = Pending {
+        id: "lim-1".into(),
+        sandbox: "codex-spawn-1".into(),
+        harness: "codex".into(),
+        project: s.project.clone(),
+        capability: crate::broker::TIMEOUT_CAPABILITY.into(),
+        summary: "s".into(),
+        detail: "d".into(),
+        reason: String::new(),
+        created: state::now(),
+        expires: state::now() + 60,
+        session_allowed: false,
+        started_by: vec!["p-1".into()],
+        choices: vec!["15m".into(), "30m".into()],
+    };
+    let (p_again, p_last) = (p.clone(), p.clone());
+    crate::broker::write_pending(&s.env, &p).unwrap();
+    assert!(crate::broker::answer_reply(&s.env, "lim-1", "2h").is_err());
+    assert!(crate::broker::answer(&s.env, "lim-1", Answer::Once).is_err());
+    let s2 = s.env.clone();
+    let t = std::thread::spawn(move || {
+        crate::broker::ask_choice(&s2, &p, Duration::from_secs(10), &|| false)
+    });
+    std::thread::sleep(Duration::from_millis(300));
+    crate::broker::answer_reply(&s.env, "lim-1", "30m").unwrap();
+    assert_eq!(t.join().unwrap(), Choice::More("30m".into()));
+    assert!(crate::broker::pending(&s.env).is_empty());
+    // Deny stops the child.
+    let s2 = s.env.clone();
+    let p2 = Pending {
+        id: "lim-2".into(),
+        ..p_again
+    };
+    let t = std::thread::spawn(move || {
+        crate::broker::ask_choice(&s2, &p2, Duration::from_secs(10), &|| false)
+    });
+    std::thread::sleep(Duration::from_millis(300));
+    crate::broker::answer(&s.env, "lim-2", Answer::Deny).unwrap();
+    assert_eq!(t.join().unwrap(), Choice::Stop);
+    // Without an answer, the card goes away after the wait.
+    let p3 = Pending {
+        id: "lim-3".into(),
+        ..p_last
+    };
+    assert_eq!(
+        crate::broker::ask_choice(&s.env, &p3, Duration::from_millis(300), &|| false),
+        Choice::NoAnswer
+    );
+    assert!(crate::broker::pending(&s.env).is_empty());
+}

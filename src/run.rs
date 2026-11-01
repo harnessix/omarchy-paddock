@@ -954,7 +954,12 @@ fn start_broker(
             ceiling.devices =
                 crate::devices::names_for(env, built.test_devices, built.device_ceiling.as_deref());
             match crate::spawn::Spawner::new(env, cfg, ceiling, &built.spec.project) {
-                Ok(s) => Some(std::sync::Arc::new(s)),
+                Ok(mut s) => {
+                    // The card at a child's time limit waits as long as
+                    // any other approval.
+                    s.approval_wait = std::time::Duration::from_secs(policy.wait);
+                    Some(std::sync::Arc::new(s))
+                }
                 Err(e) => {
                     log::warn!("spawn is off for this run: {e:#}");
                     None
