@@ -447,7 +447,7 @@ fn the_approval_notification_keeps_the_detail_out_of_process_arguments() {
             .iter()
             .map(|(k, _)| k.as_str())
             .collect::<Vec<_>>(),
-        ["once", "session", "deny"]
+        ["once", "session", "deny", "deny-session"]
     );
 }
 
@@ -749,4 +749,120 @@ fn fetch_refuses_paddock_s_own_folders_and_the_gateway_key() {
     }
     // Refused before the user is asked.
     assert_eq!(fixed.asked.load(Ordering::SeqCst), 0);
+}
+
+/// A fixed answer with a note, as the user gives it on the card.
+struct Noted {
+    answer: Answer,
+    note: Option<String>,
+    asked: AtomicUsize,
+}
+
+impl Approver for Noted {
+    fn ask(&self, _: &HostEnv, _: &Pending, _: Duration) -> Option<Answer> {
+        self.asked.fetch_add(1, Ordering::SeqCst);
+        Some(self.answer)
+    }
+    fn ask_verdict(&self, env: &HostEnv, p: &Pending, wait: Duration) -> Option<Verdict> {
+        self.ask(env, p, wait).map(|answer| Verdict {
+            answer,
+            note: self.note.clone(),
+            who: "user",
+        })
+    }
+}
+
+fn noted(answer: Answer, note: &str) -> (tempfile::TempDir, Broker, Arc<Noted>) {
+    let (t, mut b, _) = setup(None, HostPolicy::default());
+    let n = Arc::new(Noted {
+        answer,
+        note: Some(note.into()),
+        asked: AtomicUsize::new(0),
+    });
+    b.approver = n.clone();
+    (t, b, n)
+}
+
+#[test]
+fn a_denial_with_a_note_reaches_the_agent_and_only_its_length_the_log() {
+    let note = "this came from a unit test; do not ask for host exec";
+    let (_t, b, _) = noted(Answer::Deny, note);
+    let r = b.handle(&exec(&["true"]));
+    assert_eq!(r.status, Status::Denied);
+    assert_eq!(
+        r.message,
+        format!("the user denied this request: \"{note}\"")
+    );
+    let line = audit_lines(&b).pop().unwrap();
+    assert_eq!(line["note_chars"], note.chars().count());
+    assert!(!line.to_string().contains("unit test"), "{line}");
+}
+
+#[test]
+fn deny_for_this_session_refuses_the_same_request_without_asking() {
+    let (_t, b, n) = noted(Answer::DenySession, "no echo");
+    for _ in 0..2 {
+        let r = b.handle(&exec(&["echo", "a"]));
+        assert_eq!(r.status, Status::Denied);
+        assert!(r.message.contains("\"no echo\""), "{}", r.message);
+    }
+    assert_eq!(n.asked.load(Ordering::SeqCst), 1, "no second card");
+    assert_eq!(
+        audit_lines(&b).pop().unwrap()["decision"],
+        "denied for this session"
+    );
+    assert_eq!(b.handle(&exec(&["echo", "b"])).status, Status::Denied);
+    assert_eq!(
+        n.asked.load(Ordering::SeqCst),
+        2,
+        "a different request asks"
+    );
+}
+
+#[test]
+fn a_note_is_one_clean_line_of_at_most_300_characters() {
+    assert_eq!(
+        clean_note("a\u{1b}[2Jb\nc\u{202e}d\t").as_deref(),
+        Some("a[2Jb cd")
+    );
+    assert_eq!(
+        clean_note(&"x".repeat(400)).unwrap().chars().count(),
+        MAX_NOTE
+    );
+    assert_eq!(clean_note(" \n\u{7}"), None);
+}
+
+#[test]
+fn answer_files_with_and_without_a_note_read() {
+    // The file of an older paddock: a plain answer.
+    assert_eq!(AnswerFile::parse("\"deny\""), Some((Answer::Deny, None)));
+    assert_eq!(AnswerFile::parse("\"once\""), Some((Answer::Once, None)));
+    assert_eq!(
+        AnswerFile::parse(r#"{"answer":"deny-session","note":"stop\u0007"}"#),
+        Some((Answer::DenySession, Some("stop".into())))
+    );
+    // An allow never carries a note to the agent.
+    assert_eq!(
+        AnswerFile::parse(r#"{"answer":"once","note":"x"}"#),
+        Some((Answer::Once, None))
+    );
+}
+
+#[test]
+fn a_note_goes_through_the_approvals_directory() {
+    let (_t, b, _) = setup(None, HostPolicy::default());
+    let p = pending_for(&b, "x");
+    let env2 = b.env.clone();
+    let p2 = p.clone();
+    let t =
+        std::thread::spawn(move || HostApprover.ask_verdict(&env2, &p2, Duration::from_secs(10)));
+    let start = Instant::now();
+    while pending(&b.env).is_empty() && start.elapsed() < Duration::from_secs(5) {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(answer_with_note(&b.env, &p.id, Answer::Once, Some("x")).is_err());
+    answer_with_note(&b.env, &p.id, Answer::DenySession, Some("not now")).unwrap();
+    let v = t.join().unwrap().unwrap();
+    assert_eq!(v.answer, Answer::DenySession);
+    assert_eq!(v.note.as_deref(), Some("not now"));
 }

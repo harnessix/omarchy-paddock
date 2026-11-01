@@ -1,7 +1,7 @@
 use super::shard::{self, Ns};
 use super::store::{Put, Quota, Store, WriteError, Writer};
 use super::*;
-use crate::broker::{Answer, Approver, Pending};
+use crate::broker::{Answer, Approver, Pending, Verdict};
 use std::collections::BTreeMap;
 use std::sync::Mutex;
 
@@ -202,6 +202,8 @@ fn config_defaults_and_limits() {
 /// The answer source of the tests: a fixed answer, and a count.
 struct Fixed {
     answer: Option<Answer>,
+    /// The user's note on a denial.
+    note: Mutex<Option<String>>,
     asked: Mutex<Vec<Pending>>,
 }
 
@@ -209,6 +211,13 @@ impl Approver for Fixed {
     fn ask(&self, _: &HostEnv, p: &Pending, _: Duration) -> Option<Answer> {
         self.asked.lock().unwrap().push(p.clone());
         self.answer
+    }
+    fn ask_verdict(&self, env: &HostEnv, p: &Pending, wait: Duration) -> Option<Verdict> {
+        self.ask(env, p, wait).map(|answer| Verdict {
+            answer,
+            note: self.note.lock().unwrap().clone(),
+            who: "user",
+        })
     }
 }
 
@@ -291,6 +300,7 @@ fn in_pasture(
 ) -> (Service, Arc<Fixed>) {
     let fixed = Arc::new(Fixed {
         answer,
+        note: Mutex::new(None),
         asked: Mutex::new(Vec::new()),
     });
     let lineage = Lineage {
@@ -445,6 +455,30 @@ fn the_socket_is_the_identity() {
     assert_eq!(r.result["value"], "from a");
     let info = send(&sb, r#"{"v":1,"op":"info"}"#);
     assert_eq!(info.result["sandbox"], "b");
+}
+
+#[test]
+fn user_scope_denied_for_the_session_asks_no_more() {
+    let w = world();
+    let (a, asked) = service(&w, "a", None, KvCfg::default(), Some(Answer::DenySession));
+    *asked.note.lock().unwrap() = Some("use the project scope".into());
+    for _ in 0..2 {
+        let r = a.handle(&req("get", Scope::User, "k"), None);
+        assert_eq!(r.status, Status::Denied);
+        assert!(
+            r.message.contains("\"use the project scope\""),
+            "{}",
+            r.message
+        );
+    }
+    assert_eq!(asked.asked.lock().unwrap().len(), 1);
+    // Another sandbox asks on its own.
+    let (b, asked) = service(&w, "b", None, KvCfg::default(), Some(Answer::Once));
+    assert_eq!(
+        b.handle(&req("get", Scope::User, "k"), None).status,
+        Status::NotFound
+    );
+    assert_eq!(asked.asked.lock().unwrap().len(), 1);
 }
 
 #[test]
@@ -1388,8 +1422,16 @@ fn a_timer_counts_and_only_its_owner_changes_it() {
     assert_eq!(card[0].capability, "timer");
     assert_eq!(card[0].reason, "the tests need longer");
     drop(card);
-    let (c, _) = service(&w, "c", None, KvCfg::default(), Some(Answer::Deny));
+    let (c, cfix) = service(&w, "c", None, KvCfg::default(), Some(Answer::Deny));
     assert_eq!(c.handle(&ext(600), None).status, Status::Denied);
+    // A note of the user reaches the agent with the denial.
+    *cfix.note.lock().unwrap() = Some("finish what you have".into());
+    let r = c.handle(&ext(600), None);
+    assert_eq!(r.status, Status::Denied);
+    assert_eq!(
+        r.message,
+        "the user denied this request: \"finish what you have\""
+    );
     assert_eq!(
         a.handle(&timer_req("stop", Scope::Pasture, "fix"), None)
             .result["stopped"],
