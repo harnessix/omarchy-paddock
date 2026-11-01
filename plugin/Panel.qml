@@ -389,7 +389,8 @@ Panel {
   function monitorText(marks) {
     if (!Array.isArray(marks) || !marks.length) return ""
     var m = marks[0] || {}
-    var key = m.kind === "tunnel" ? "row.monitorTunnel" : (m.kind === "upload" ? "row.monitorUpload" : "row.monitorCredential")
+    var keys = { tunnel: "row.monitorTunnel", upload: "row.monitorUpload", new_host: "row.monitorNewHost", new_hosts: "row.monitorNewHosts" }
+    var key = keys[m.kind] || "row.monitorCredential"
     var text = strings.t(key).arg(root.plain(m.detail, 96))
     return marks.length > 1 ? strings.t("row.monitorMore").arg(text).arg(Commons.I18n.formatNumber(marks.length - 1)) : text
   }

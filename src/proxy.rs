@@ -197,6 +197,21 @@ pub struct HostProxy {
     /// Gets each refused target ("host:port") and the rule, for the boundary
     /// log of the sandbox.
     pub boundary: Option<Boundary>,
+    /// Gets the host of each connection that the proxy opens, for the
+    /// egress monitor. Never a path or content.
+    pub egress: Option<Egress>,
+}
+
+/// The sink of the egress monitor: the target host of an open connection.
+#[derive(Clone)]
+pub struct Egress(pub EgressFn);
+
+pub type EgressFn = Arc<dyn Fn(&str) + Send + Sync>;
+
+impl std::fmt::Debug for Egress {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Egress")
+    }
 }
 
 /// The sink of the boundary log: target and rule, never content.
@@ -218,6 +233,13 @@ impl HostProxy {
             (b.0)(&authority(host, port), rule);
         }
     }
+
+    /// Note a host that the proxy connected.
+    fn reached(&self, host: &str) {
+        if let Some(e) = &self.egress {
+            (e.0)(host);
+        }
+    }
 }
 
 impl Default for HostProxy {
@@ -234,6 +256,7 @@ impl Default for HostProxy {
             #[cfg(test)]
             tls: None,
             boundary: None,
+            egress: None,
         }
     }
 }
@@ -734,6 +757,7 @@ fn handle(cfg: &HostProxy, mut client: UnixStream) -> Result<()> {
             },
             None => rest,
         };
+        cfg.reached(&host);
         if !rest.is_empty() {
             up.write_all(&rest)?;
         }
@@ -803,6 +827,7 @@ fn handle(cfg: &HostProxy, mut client: UnixStream) -> Result<()> {
             return Err(e);
         }
     };
+    cfg.reached(&host);
     let mut out = line.into_bytes();
     for h in req.headers.iter() {
         if HOP.contains(&h.name.to_ascii_lowercase().as_str()) {
