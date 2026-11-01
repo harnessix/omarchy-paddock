@@ -227,5 +227,7 @@
   "msg.revokeFailed": "paddock could not revoke the credentials.",
   "row.timer": "timer %1: %2 of %3",
   "row.timerOver": "timer %1: %2 of %3, time is up",
+  "row.quota": "timer %1: %2% of %3% of %4",
+  "row.quotaOver": "timer %1: %2% of %3% of %4, quota used up",
   "forage.overgrazing": "%1 %2: %3% used, runs out in %4 at this rate, resets in %5"
 }

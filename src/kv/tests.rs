@@ -1456,3 +1456,87 @@ fn forage_shows_the_accounts_that_the_sandbox_can_use() {
     assert_eq!(ws.len(), 1);
     assert_eq!(ws[0]["used"], 0.4);
 }
+
+#[test]
+fn a_quota_budget_is_counted_from_the_ledger_and_announced_once() {
+    let w = world();
+    let dir = w.env.state_dir.join("omarchy/agents/usage");
+    std::fs::create_dir_all(&dir).unwrap();
+    let usage = |at: u64, pct: f64| {
+        std::fs::write(
+            dir.join("t.json"),
+            serde_json::json!({"limitsFetchedAt": at * 1000, "limits": [
+                {"label": "Session (5-hour)", "percent": 0.1, "resetsAt": "2030-01-01T00:00:00Z"},
+                {"label": "Weekly (7-day)", "percent": pct, "resetsAt": "2030-01-05T00:00:00Z"}]})
+            .to_string(),
+        )
+        .unwrap();
+    };
+    let (a, _) = service(&w, "a", None, KvCfg::default(), None);
+    let (b, asked) = service(&w, "b", None, KvCfg::default(), Some(Answer::Once));
+    let start = |name: &str, window: &str| Request {
+        window: Some(window.into()),
+        share: Some(0.10),
+        ..timer_req("start", Scope::Pasture, name)
+    };
+    // No numbers for the account: refused, with a hint.
+    let r = a.handle(&start("q", "weekly"), None);
+    assert_eq!(r.status, Status::Invalid);
+    assert!(r.message.contains("paddock forage"), "{}", r.message);
+    let now = crate::state::now();
+    usage(now, 0.40);
+    let r = a.handle(&start("q", "monthly"), None);
+    assert_eq!(r.status, Status::Invalid);
+    assert!(r.message.contains("Weekly (7-day)"), "{}", r.message);
+    let r = a.handle(&start("q", "weekly"), None);
+    assert_eq!(r.status, Status::Done, "{}", r.message);
+    assert_eq!(r.result["budget"], 0);
+    assert_eq!(r.result["quota"]["window"], "Weekly (7-day)");
+    assert_eq!(r.result["quota"]["used"], 0.0);
+    assert_eq!(r.result["over"], false);
+    // The account uses 6%: still within the budget.
+    usage(now + 60, 0.46);
+    let id = a.identity().clone();
+    timer_tick(&w.env, &id, &w.root, &KvCfg::default()).unwrap();
+    let s = a.handle(&timer_req("status", Scope::Pasture, "q"), None);
+    let used = s.result["quota"]["used"].as_f64().unwrap();
+    assert!((used - 0.06).abs() < 1e-9, "{}", s.result);
+    assert_eq!(s.result["over"], false);
+    // 11%: over; the watch says so once.
+    usage(now + 120, 0.51);
+    timer_tick(&w.env, &id, &w.root, &KvCfg::default()).unwrap();
+    timer_tick(&w.env, &id, &w.root, &KvCfg::default()).unwrap();
+    let sum = crate::timer::read_summary(&w.env, "a");
+    assert!(
+        sum[0].over && sum[0].quota.as_ref().unwrap().over,
+        "{sum:?}"
+    );
+    let log = std::fs::read_to_string(crate::broker::audit_file(&w.env)).unwrap();
+    assert_eq!(
+        log.matches("quota budget, 10% of t Weekly (7-day)").count(),
+        1,
+        "{log}"
+    );
+    // Time cannot be added to a quota-only timer; quota can, and someone
+    // else asks the user.
+    let more = |by: Option<u64>, share: Option<f64>| Request {
+        by,
+        share,
+        ..timer_req("extend", Scope::Pasture, "q")
+    };
+    assert_eq!(
+        a.handle(&more(Some(600), None), None).status,
+        Status::Invalid
+    );
+    let r = b.handle(&more(None, Some(0.05)), None);
+    assert_eq!(r.status, Status::Done, "{}", r.message);
+    assert!((r.result["quota"]["share"].as_f64().unwrap() - 0.15).abs() < 1e-9);
+    assert_eq!(r.result["over"], false);
+    let card = asked.asked.lock().unwrap();
+    assert_eq!(card.len(), 1);
+    assert!(
+        card[0].summary.contains("5% more quota"),
+        "{}",
+        card[0].summary
+    );
+}

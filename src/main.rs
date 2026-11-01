@@ -530,17 +530,21 @@ enum TimerCmd {
         json: bool,
     },
     /// Give a running sandbox a timer that you own. --hard freezes the
-    /// sandbox when the time is up.
+    /// sandbox when the time or the quota budget is used up.
     Set {
         id: String,
         name: String,
         /// For example 2h, 30m, 1h30m.
+        #[arg(long, required_unless_present = "quota")]
+        budget: Option<String>,
+        /// A share of a limit window of the sandbox's account, counted from
+        /// now, for example weekly=10%. `paddock forage` shows the windows.
         #[arg(long)]
-        budget: String,
+        quota: Option<String>,
         #[arg(long)]
         hard: bool,
     },
-    /// Add time to a timer of a sandbox's own scope.
+    /// Add time (30m) or quota (5%) to a timer of a sandbox's own scope.
     Extend {
         id: String,
         name: String,
@@ -1911,14 +1915,15 @@ fn real_main() -> Result<i32> {
             use paddock::timer;
             let show = |s: &timer::Status| {
                 format!(
-                    "{}: used {} of {}, {}{}",
+                    "{}: used {}, {}{}",
                     s.name,
-                    timer::format_duration(s.used),
-                    timer::format_duration(s.budget),
+                    timer::describe(s),
                     if s.over {
                         "over".to_string()
-                    } else {
+                    } else if s.budget > 0 {
                         format!("{} left", timer::format_duration(s.left))
+                    } else {
+                        "within budget".to_string()
                     },
                     if s.hard { " (hard)" } else { "" }
                 )
@@ -1958,15 +1963,19 @@ fn real_main() -> Result<i32> {
                     id,
                     name,
                     budget,
+                    quota,
                     hard,
                 } => {
-                    let s =
-                        timer::host_set(&env, &id, &name, timer::parse_duration(&budget)?, hard)?;
+                    let budget = match budget {
+                        Some(b) => timer::parse_duration(&b)?,
+                        None => 0,
+                    };
+                    let quota = quota.as_deref().map(timer::parse_quota).transpose()?;
+                    let s = timer::host_set(&env, &id, &name, budget, hard, quota)?;
                     println!("{id}  {}", show(&s));
                 }
                 TimerCmd::Extend { id, name, by } => {
-                    let s =
-                        timer::host_change(&env, &id, &name, Some(timer::parse_duration(&by)?))?;
+                    let s = timer::host_change(&env, &id, &name, Some(timer::parse_more(&by)?))?;
                     println!("{id}  {}", show(&s));
                 }
                 TimerCmd::Stop { id, name } => {
