@@ -1213,3 +1213,135 @@ fn a_user_denial_writes_the_boundary_log_without_the_note() {
     assert_eq!(lines.len(), 1);
     assert_eq!(lines[0].rule, "denied");
 }
+
+/// A broker with fake `tea` and `glab` on the host's PATH, and a project
+/// with remotes on codeberg.org and a self-hosted GitLab. The fakes print
+/// their arguments, one per line, and their environment.
+fn forge_setup(answer: Option<Answer>) -> (tempfile::TempDir, Broker, Arc<Fixed>) {
+    use std::os::unix::fs::PermissionsExt;
+    let (tmp, mut b, fixed, _) = setup_repo(answer, HostPolicy::default());
+    let bin = tmp.path().join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    for tool in ["tea", "glab"] {
+        let script = bin.join(tool);
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\necho \"tool:{tool}\"\nfor a in \"$@\"; do echo \"arg:$a\"; done\necho \"stdin:$(cat)\"\nenv | sort\n"
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    b.env.path = vec![bin, "/usr/bin".into(), "/bin".into()];
+    let tea_cfg = b.env.config_dir.join("tea");
+    std::fs::create_dir_all(&tea_cfg).unwrap();
+    std::fs::write(
+        tea_cfg.join("config.yml"),
+        "logins:\n- name: cb\n  url: https://codeberg.org\n  token: host-token\n  default: true\n",
+    )
+    .unwrap();
+    let p = b.ctx.project.clone();
+    git_in(
+        &p,
+        &[
+            "remote",
+            "add",
+            "forgejo",
+            "https://codeberg.org/demo/tool.git",
+        ],
+    );
+    git_in(
+        &p,
+        &[
+            "remote",
+            "add",
+            "lab",
+            "git@gitlab.example.org:team/apps/web.git",
+        ],
+    );
+    b.ctx.repo = git::Repo::snapshot(&p);
+    (tmp, b, fixed)
+}
+
+fn forge_req(tool: &str, argv: &[&str]) -> Request {
+    req(
+        "forge",
+        serde_json::json!({
+            "tool": tool,
+            "argv": argv,
+            "branch": "fix",
+            // A sandbox cannot hand the tool variables: this is ignored.
+            "env": { "GITEA_TOKEN": SECRET, "GITLAB_TOKEN": SECRET },
+        }),
+    )
+}
+
+/// The arguments and the environment that a fake forge tool printed.
+fn fake_output(r: &Response) -> (Vec<String>, String) {
+    let out = r.result["stdout"].as_str().unwrap_or("").to_string();
+    assert!(!out.contains(SECRET), "{out}");
+    for line in out
+        .lines()
+        .filter(|l| l.contains('=') && !l.starts_with("arg:"))
+    {
+        let k = line.split('=').next().unwrap();
+        assert!(
+            !k.contains("TOKEN"),
+            "a token variable reached the tool: {line}"
+        );
+    }
+    let args = out
+        .lines()
+        .filter_map(|l| l.strip_prefix("arg:"))
+        .map(String::from)
+        .collect();
+    (args, out)
+}
+
+#[test]
+fn tea_runs_exactly_the_checked_arguments_with_the_host_login() {
+    let (_t, b, fixed) = forge_setup(Some(Answer::Once));
+    let r = b.handle(&forge_req("tea", &["pulls", "list", "-r", "demo/tool"]));
+    assert_eq!(r.status, Status::Done, "{}", r.message);
+    let (args, out) = fake_output(&r);
+    assert!(out.starts_with("tool:tea\n"), "{out}");
+    assert_eq!(
+        args,
+        ["pulls", "list", "--repo", "demo/tool", "--login", "cb"]
+    );
+    assert_eq!(fixed.asked.load(Ordering::SeqCst), 0, "a read asks nobody");
+    let r = b.handle(&forge_req("tea", &["comment", "4", "Done", "here"]));
+    assert_eq!(r.status, Status::Done, "{}", r.message);
+    let (args, _) = fake_output(&r);
+    assert_eq!(
+        args,
+        [
+            "comment",
+            "--repo",
+            "demo/tool",
+            "--login",
+            "cb",
+            "4",
+            "Done here"
+        ]
+    );
+    assert_eq!(fixed.asked.load(Ordering::SeqCst), 1, "a write asks");
+    // The body stays out of the audit log.
+    let lines = audit_lines(&b);
+    assert!(
+        !lines.iter().any(|l| l.to_string().contains("Done here")),
+        "{lines:?}"
+    );
+    // A login, another repository or a host without a tea login: refused
+    // before anything runs.
+    for argv in [
+        &["pulls", "list", "--login", "other"][..],
+        &["pulls", "list", "--repo", "other/tool"],
+        &["pulls", "list", "--repo", "github.com/demo/app"],
+    ] {
+        let r = b.handle(&forge_req("tea", argv));
+        assert_eq!(r.status, Status::Invalid, "{argv:?}: {}", r.message);
+    }
+    assert_eq!(fixed.asked.load(Ordering::SeqCst), 1);
+}

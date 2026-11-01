@@ -1139,6 +1139,21 @@ fn start_broker(
     let gh = run_dir.join("gh");
     gui::write_file(&gh, "#!/bin/sh\nexec paddock host gh \"$@\"\n", 0o755)?;
     built.spec.add_tool("gh", gh, "gh through the host");
+    // tea and glab only when the user has them: without them the sandbox
+    // sees "not found", as before.
+    for tool in ["tea", "glab"] {
+        if env.which(tool).is_some() {
+            let w = run_dir.join(tool);
+            gui::write_file(
+                &w,
+                &format!("#!/bin/sh\nexec paddock host {tool} \"$@\"\n"),
+                0o755,
+            )?;
+            built
+                .spec
+                .add_tool(tool, w, &format!("{tool} through the host"));
+        }
+    }
     Ok((repo, spawner, Some(broker)))
 }
 
