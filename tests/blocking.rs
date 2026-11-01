@@ -8,14 +8,6 @@ mod common;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
-fn bwrap_works() -> bool {
-    Command::new("bwrap")
-        .args(["--unshare-user", "--ro-bind", "/", "/", "true"])
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
-}
-
 fn fuse_works() -> bool {
     std::fs::OpenOptions::new()
         .read(true)
@@ -110,7 +102,7 @@ fn run(w: &World, name: &str) -> std::process::Child {
 }
 
 fn can_run() -> bool {
-    if !bwrap_works() {
+    if !common::bwrap_works() {
         eprintln!("skipped: bwrap cannot create a user namespace here");
         return false;
     }

@@ -10,14 +10,6 @@ use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-fn bwrap_works() -> bool {
-    Command::new("bwrap")
-        .args(["--unshare-user", "--ro-bind", "/", "/", "true"])
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
-}
-
 fn fuse_works() -> bool {
     std::fs::OpenOptions::new()
         .read(true)
@@ -91,7 +83,7 @@ fn pending(w: &World) -> Vec<serde_json::Value> {
 
 #[test]
 fn a_host_request_goes_through_the_gateway_and_attaches_when_sent_again() {
-    if !bwrap_works() || !fuse_works() {
+    if !common::bwrap_works() || !fuse_works() {
         eprintln!("skipped: bwrap or FUSE does not work here");
         return;
     }
@@ -185,19 +177,8 @@ fn the_executor_refuses_forged_and_replayed_grants() {
         1000,
         vars.clone(),
     );
-    let mut daemon = Command::new(env!("CARGO_BIN_EXE_paddock"))
-        .args(["gatewayd", "--idle", "5"])
-        .envs(&vars)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .unwrap();
+    let mut daemon = executor(&w, &vars);
     let sock = paddock::gatewayd::socket_path(&env);
-    let start = Instant::now();
-    while !sock.exists() && start.elapsed() < Duration::from_secs(10) {
-        std::thread::sleep(Duration::from_millis(50));
-    }
     let ask = |job: &paddock::gateway::Job| -> serde_json::Value {
         let mut s = std::os::unix::net::UnixStream::connect(&sock).unwrap();
         writeln!(s, "{}", serde_json::to_string(job).unwrap()).unwrap();
@@ -234,12 +215,18 @@ fn the_executor_refuses_forged_and_replayed_grants() {
     let good =
         paddock::gateway::sign(&key, "s1", &project, &req, path, serde_json::Value::Null).unwrap();
     let r = ask(&good);
-    if bwrap_works() {
+    if common::bwrap_works() {
         assert_eq!(
             r["ok"]["stdout"].as_str().unwrap_or("").trim(),
             project.display().to_string(),
             "{r}"
         );
+    } else if bwrap_installed() {
+        // bwrap is there but cannot start a sandbox: the job fails in bwrap
+        // and the command never runs without isolation.
+        assert_eq!(r["ok"]["exit_code"], 1, "{r}");
+        assert_eq!(r["ok"]["stdout"], "", "{r}");
+        eprintln!("skipped: the exec run needs a working bwrap");
     } else {
         // No way to isolate the command here: the executor still runs and
         // says so, instead of running it without isolation.
@@ -257,6 +244,15 @@ fn the_executor_refuses_forged_and_replayed_grants() {
     let _ = daemon.wait();
 }
 
+/// bwrap is on PATH, whether or not it can start a sandbox here.
+fn bwrap_installed() -> bool {
+    Command::new("bwrap")
+        .arg("--version")
+        .stdout(Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
+}
+
 /// Start the executor with the folders of `w`, and wait for its socket.
 fn executor(w: &World, vars: &std::collections::BTreeMap<String, String>) -> std::process::Child {
     let env = paddock::env::HostEnv::from_parts(
@@ -269,6 +265,9 @@ fn executor(w: &World, vars: &std::collections::BTreeMap<String, String>) -> std
     let child = Command::new(env!("CARGO_BIN_EXE_paddock"))
         .args(["gatewayd", "--idle", "5"])
         .envs(vars)
+        // The executor runs on the host only. When the tests themselves run
+        // in a paddock sandbox, it must not see that sandbox's mark.
+        .env_remove("PADDOCK")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -345,7 +344,7 @@ fn exec_vars(w: &World) -> std::collections::BTreeMap<String, String> {
 
 #[test]
 fn an_approved_exec_runs_isolated() {
-    if !bwrap_works() {
+    if !common::bwrap_works() {
         eprintln!("skipped: bwrap does not work here");
         return;
     }
@@ -411,7 +410,7 @@ fn an_approved_exec_runs_isolated() {
 /// home folder stays unchanged.
 #[test]
 fn an_approved_push_runs_in_the_executor() {
-    if !bwrap_works() {
+    if !common::bwrap_works() {
         eprintln!("skipped: bwrap does not work here");
         return;
     }
@@ -513,7 +512,7 @@ fn an_approved_push_runs_in_the_executor() {
 /// a home folder that it cannot change.
 #[test]
 fn an_approved_gh_call_runs_in_the_executor() {
-    if !bwrap_works() {
+    if !common::bwrap_works() {
         eprintln!("skipped: bwrap does not work here");
         return;
     }

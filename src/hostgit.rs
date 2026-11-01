@@ -753,6 +753,13 @@ mod tests {
             assert!(l.status(&env, "all").unwrap().is_none());
             return;
         }
+        if !crate::testutil::bwrap_works() {
+            // A bwrap that cannot start gives no status, as a missing one.
+            assert!(l.status(&env, "all").unwrap().is_none());
+            assert!(!canary.exists(), "the planted fsmonitor reached the host");
+            eprintln!("skipped: needs a working bwrap");
+            return;
+        }
         let lines = l.status(&env, "all").unwrap().unwrap();
         assert!(lines.iter().any(|l| l.contains("new.txt")), "{lines:?}");
         assert!(!canary.exists(), "the planted fsmonitor reached the host");

@@ -70,3 +70,31 @@ fn mounts_under(dir: &Path) -> Vec<String> {
         .filter(|mp| mp.starts_with(&prefix))
         .collect()
 }
+
+/// bubblewrap is on PATH and can start a sandbox with a user namespace. It
+/// cannot when the tests themselves run in a sandbox that allows no nested
+/// namespace.
+#[allow(dead_code)]
+pub fn bwrap_works() -> bool {
+    std::process::Command::new("bwrap")
+        .args(["--unshare-user", "--ro-bind", "/", "/", "true"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
+}
+
+/// A systemd user instance runs, and the session bus is known.
+#[allow(dead_code)]
+pub fn systemd_user() -> bool {
+    std::env::var("DBUS_SESSION_BUS_ADDRESS").is_ok()
+        && std::process::Command::new("systemctl")
+            .args(["--user", "is-system-running"])
+            .output()
+            .is_ok_and(|o| {
+                matches!(
+                    String::from_utf8_lossy(&o.stdout).trim(),
+                    "running" | "degraded"
+                )
+            })
+}

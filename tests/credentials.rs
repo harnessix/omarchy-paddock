@@ -13,10 +13,7 @@ use std::time::{Duration, Instant};
 const SECRET: &str = "s3cret-value-for-the-test";
 
 fn can_run() -> bool {
-    Command::new("bwrap")
-        .args(["--unshare-user", "--ro-bind", "/", "/", "true"])
-        .status()
-        .is_ok_and(|s| s.success())
+    common::bwrap_works()
 }
 
 struct World {

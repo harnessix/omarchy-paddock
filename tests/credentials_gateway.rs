@@ -17,10 +17,7 @@ use std::time::{Duration, Instant};
 const SECRET: &str = "ghp_REAL0123456789abcdefghijklmnopqrstu";
 
 fn can_run() -> bool {
-    let bwrap = Command::new("bwrap")
-        .args(["--unshare-user", "--ro-bind", "/", "/", "true"])
-        .status()
-        .is_ok_and(|s| s.success());
+    let bwrap = common::bwrap_works();
     let curl = Command::new("curl").arg("--version").output().is_ok();
     bwrap && curl
 }
