@@ -87,6 +87,8 @@
   "popup.answer.deny": "No",
   "popup.answer.once": "Yes, once",
   "popup.answer.session": "Yes, for this session",
+  "popup.answer.deny-session": "No, for this session",
+  "popup.note.placeholder": "Note for the agent (optional, goes with No)",
   "popup.keysHint": "Click to answer",
   "popup.ask.exec": "Allow %1 in %2 to run this command on your computer?",
   "popup.ask.screenshot": "Allow %1 in %2 to take a screenshot of your screen?",

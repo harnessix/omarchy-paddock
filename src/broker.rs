@@ -251,6 +251,72 @@ pub enum Answer {
     Once,
     Session,
     Deny,
+    /// Deny this request and every same request of this sandbox for the
+    /// rest of its session, without a new card.
+    #[serde(rename = "deny-session")]
+    DenySession,
+}
+
+impl Answer {
+    pub fn denies(self) -> bool {
+        matches!(self, Self::Deny | Self::DenySession)
+    }
+}
+
+/// The longest note for the agent on a denial, in characters.
+pub const MAX_NOTE: usize = 300;
+
+/// The note of a denial, made safe: one line, no control or invisible
+/// characters, at most `MAX_NOTE` characters. None when nothing is left.
+pub fn clean_note(s: &str) -> Option<String> {
+    let line: String = s
+        .chars()
+        .map(|c| if c.is_whitespace() { ' ' } else { c })
+        .collect();
+    let t: String = clean_text(&line).trim().chars().take(MAX_NOTE).collect();
+    let t = t.trim_end().to_string();
+    (!t.is_empty()).then_some(t)
+}
+
+/// The message of a denial for the agent: the user's note when there is
+/// one, else `plain`.
+pub fn denied_message(plain: &str, note: Option<&str>) -> String {
+    match note {
+        Some(n) => format!("the user denied this request: \"{n}\""),
+        None => plain.to_string(),
+    }
+}
+
+/// An answer with the user's note on a denial, and who gave it ("user" or
+/// "agent").
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Verdict {
+    pub answer: Answer,
+    pub note: Option<String>,
+    pub who: &'static str,
+}
+
+/// The answer file: a plain answer (`"deny"`), or an answer with a note.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+enum AnswerFile {
+    Plain(Answer),
+    Noted {
+        answer: Answer,
+        #[serde(default)]
+        note: String,
+    },
+}
+
+impl AnswerFile {
+    fn parse(text: &str) -> Option<(Answer, Option<String>)> {
+        match serde_json::from_str::<AnswerFile>(text).ok()? {
+            AnswerFile::Plain(a) => Some((a, None)),
+            AnswerFile::Noted { answer, note } => {
+                Some((answer, clean_note(&note).filter(|_| answer.denies())))
+            }
+        }
+    }
 }
 
 impl std::str::FromStr for Answer {
@@ -260,7 +326,8 @@ impl std::str::FromStr for Answer {
             "once" => Ok(Self::Once),
             "session" => Ok(Self::Session),
             "deny" => Ok(Self::Deny),
-            _ => bail!("answer must be once, session or deny"),
+            "deny-session" => Ok(Self::DenySession),
+            _ => bail!("answer must be once, session, deny or deny-session"),
         }
     }
 }
@@ -318,6 +385,12 @@ pub fn pending(env: &HostEnv) -> Vec<Pending> {
 /// Record the user's answer. Only the host can call this: the approvals
 /// directory is not mounted in any sandbox.
 pub fn answer(env: &HostEnv, id: &str, a: Answer) -> Result<()> {
+    answer_with_note(env, id, a, None)
+}
+
+/// Record the user's answer with a note for the agent. Only a denial
+/// carries a note.
+pub fn answer_with_note(env: &HostEnv, id: &str, a: Answer, note: Option<&str>) -> Result<()> {
     if id.is_empty() || !id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
         bail!("invalid request id");
     }
@@ -330,12 +403,25 @@ pub fn answer(env: &HostEnv, id: &str, a: Answer) -> Result<()> {
     if p.capability == ASK_CAPABILITY && a != Answer::Deny {
         bail!("{id} is a question: answer it with --text TEXT, or dismiss it with deny");
     }
+    if p.capability == ASK_CAPABILITY && a == Answer::DenySession {
+        bail!("{id} is a question: dismiss it with deny");
+    }
     if a == Answer::Session && !p.session_allowed {
         bail!("this request can only be allowed once");
     }
+    if a == Answer::DenySession && !p.session_allowed {
+        bail!("this request has no session answer: deny it with deny");
+    }
+    if note.is_some() && !a.denies() {
+        bail!("only a denial carries a note");
+    }
+    let file = match note.and_then(clean_note) {
+        Some(note) => AnswerFile::Noted { answer: a, note },
+        None => AnswerFile::Plain(a),
+    };
     crate::privfs::write(
         &dir.join(format!("{id}.answer")),
-        serde_json::to_string(&a)?,
+        serde_json::to_string(&file)?,
     )?;
     Ok(())
 }
@@ -450,6 +536,7 @@ pub fn audit_detail(req: &Request, project: &Path, prepared: Option<&str>) -> St
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn audit(
     env: &HostEnv,
     ctx: &Context,
@@ -458,7 +545,13 @@ fn audit(
     request: Option<&str>,
     decision: &str,
     resp: &Response,
+    note: Option<&str>,
 ) {
+    // The note of a denial goes to the agent only: the log keeps its length.
+    let message = match note {
+        Some(_) => "the user denied the request with a note",
+        None => resp.message.as_str(),
+    };
     let line = serde_json::json!({
         "time": state::now(),
         "sandbox": ctx.id,
@@ -470,9 +563,12 @@ fn audit(
         "reason": req.reason.chars().take(500).collect::<String>(),
         "decision": decision,
         "status": resp.status,
-        "message": resp.message,
+        "message": message,
     });
     let mut line = line;
+    if let Some(n) = note {
+        line["note_chars"] = n.chars().count().into();
+    }
     if let Some(parent) = ctx.chain.last() {
         line["parent"] = parent.clone().into();
         line["chain"] = serde_json::json!(ctx.chain);
@@ -524,6 +620,17 @@ pub trait Approver: Send + Sync {
         wait: Duration,
     ) -> Option<(Answer, &'static str)> {
         self.ask(env, p, wait).map(|a| (a, "user"))
+    }
+
+    /// The answer with the user's note on a denial. Callers that tell the
+    /// agent about a denial use this one.
+    fn ask_verdict(&self, env: &HostEnv, p: &Pending, wait: Duration) -> Option<Verdict> {
+        self.ask_with_source(env, p, wait)
+            .map(|(answer, who)| Verdict {
+                answer,
+                note: None,
+                who,
+            })
     }
 }
 
@@ -580,6 +687,19 @@ pub fn write_pending(env: &HostEnv, p: &Pending) -> std::io::Result<PathBuf> {
 
 impl Approver for HostApprover {
     fn ask(&self, env: &HostEnv, p: &Pending, wait: Duration) -> Option<Answer> {
+        self.ask_verdict(env, p, wait).map(|v| v.answer)
+    }
+
+    fn ask_with_source(
+        &self,
+        env: &HostEnv,
+        p: &Pending,
+        wait: Duration,
+    ) -> Option<(Answer, &'static str)> {
+        self.ask_verdict(env, p, wait).map(|v| (v.answer, v.who))
+    }
+
+    fn ask_verdict(&self, env: &HostEnv, p: &Pending, wait: Duration) -> Option<Verdict> {
         let p = &p.cleaned();
         let answer_file = approvals_dir(env).join(format!("{}.answer", p.id));
         let Ok(pending) = write_pending(env, p) else {
@@ -590,7 +710,11 @@ impl Approver for HostApprover {
         let mut got = None;
         while start.elapsed() < wait {
             if let Ok(t) = std::fs::read_to_string(&answer_file) {
-                got = serde_json::from_str(&t).ok();
+                got = AnswerFile::parse(&t).map(|(answer, note)| Verdict {
+                    answer,
+                    note,
+                    who: "user",
+                });
                 break;
             }
             std::thread::sleep(Duration::from_millis(200));
@@ -630,6 +754,9 @@ pub fn approval_note(p: &Pending) -> notify::Note {
         actions.push(("session".into(), "Allow for this session".into()));
     }
     actions.push(("deny".into(), "Deny".into()));
+    if p.session_allowed {
+        actions.push(("deny-session".into(), "Deny for this session".into()));
+    }
     notify::Note {
         summary: format!("paddock: {} asks for {}", p.harness, p.capability),
         body: {
@@ -1194,6 +1321,8 @@ pub struct Broker {
     /// executor (`paddock gatewayd`). The tests run it in this process.
     pub dispatch: Option<Arc<dyn crate::gatewayd::Dispatch>>,
     grants: Mutex<Vec<String>>,
+    /// "Deny for this session": the keys of the request and the user's note.
+    denials: Mutex<Vec<(String, Option<String>)>>,
 }
 
 impl Broker {
@@ -1211,6 +1340,7 @@ impl Broker {
             spawner: None,
             dispatch: None,
             grants: Mutex::new(Vec::new()),
+            denials: Mutex::new(Vec::new()),
         }
     }
 
@@ -1521,6 +1651,7 @@ impl Broker {
             None,
             "refused: reviewer",
             &r,
+            None,
         );
         r
     }
@@ -1635,6 +1766,7 @@ impl Broker {
                 None,
                 "invalid",
                 &r,
+                None,
             );
             r
         };
@@ -1668,6 +1800,7 @@ impl Broker {
                 None,
                 "disabled",
                 &r,
+                None,
             );
             return r;
         }
@@ -1683,6 +1816,7 @@ impl Broker {
                         None,
                         "refused",
                         &r,
+                        None,
                     );
                     return r;
                 }
@@ -1700,11 +1834,29 @@ impl Broker {
             let g = self.grants.lock().unwrap();
             prep.session_allowed && prep.keys.iter().all(|k| g.contains(k))
         };
+        // The same keys as a session grant. A request without keys is
+        // never the same request.
+        let session_denied = || -> Option<Option<String>> {
+            if !prep.session_allowed || prep.keys.is_empty() {
+                return None;
+            }
+            let d = self.denials.lock().unwrap();
+            let note = |k: &String| d.iter().find(|(x, _)| x == k).map(|(_, n)| n.clone());
+            prep.keys
+                .iter()
+                .map(note)
+                .collect::<Option<Vec<_>>>()
+                .map(|n| n.into_iter().flatten().next())
+        };
         let mut request_id: Option<String> = None;
+        let mut note: Option<String> = None;
         let (decision, allowed) = if mode == Mode::Allow && !prep.always_ask {
             ("allowed by configuration", Some(true))
         } else if prep.read_only {
             ("allowed: read-only", Some(true))
+        } else if let Some(n) = session_denied() {
+            note = n;
+            ("denied for this session", Some(false))
         } else if granted() {
             ("allowed for this session", Some(true))
         } else {
@@ -1724,11 +1876,11 @@ impl Broker {
                 choices: Vec::new(),
                 started_by: self.ctx.chain.clone(),
             };
-            match self.approver.ask_with_source(
-                &self.env,
-                &p,
-                Duration::from_secs(self.policy.wait),
-            ) {
+            let verdict =
+                self.approver
+                    .ask_verdict(&self.env, &p, Duration::from_secs(self.policy.wait));
+            note = verdict.as_ref().and_then(|v| v.note.clone());
+            match verdict.map(|v| (v.answer, v.who)) {
                 Some((Answer::Once, "agent")) => ("allowed once by the agent approver", Some(true)),
                 Some((Answer::Once, _)) => ("allowed once", Some(true)),
                 // A grant this request cannot have counts as once.
@@ -1749,6 +1901,22 @@ impl Broker {
                 }
                 Some((Answer::Deny, "agent")) => ("denied by the agent approver", Some(false)),
                 Some((Answer::Deny, _)) => ("denied", Some(false)),
+                // A request without a session answer: a plain denial.
+                Some((Answer::DenySession, _)) if !prep.session_allowed || prep.keys.is_empty() => {
+                    ("denied", Some(false))
+                }
+                Some((Answer::DenySession, who)) => {
+                    let mut d = self.denials.lock().unwrap();
+                    for k in &prep.keys {
+                        d.retain(|(x, _)| x != k);
+                        d.push((k.clone(), note.clone()));
+                    }
+                    if who == "agent" {
+                        ("denied for this session by the agent approver", Some(false))
+                    } else {
+                        ("denied for this session", Some(false))
+                    }
+                }
                 None => ("timed out", None),
             }
         };
@@ -1757,7 +1925,10 @@ impl Broker {
                 Status::Timeout,
                 format!("nobody answered within {} seconds", self.policy.wait),
             ),
-            (_, Some(false)) => Response::new(Status::Denied, "the user denied the request"),
+            (_, Some(false)) => Response::new(
+                Status::Denied,
+                denied_message("the user denied the request", note.as_deref()),
+            ),
             _ if matches!(prep.work, Work::Spawn { .. } | Work::SpawnControl) => {
                 self.perform_spawn(req, &prep.work)
             }
@@ -1813,6 +1984,7 @@ impl Broker {
             request_id.as_deref(),
             decision,
             &resp,
+            note.as_deref(),
         );
         log::info!(
             "sandbox {}: {} request {}: {:?}",

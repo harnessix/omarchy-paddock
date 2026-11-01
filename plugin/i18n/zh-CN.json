@@ -79,6 +79,8 @@
   "popup.answer.deny": "否",
   "popup.answer.once": "是，仅此一次",
   "popup.answer.session": "是，本会话内",
+  "popup.answer.deny-session": "否，本会话内",
+  "popup.note.placeholder": "给智能体的备注（可选，随“否”一起发送）",
   "popup.keysHint": "点击答复",
   "popup.ask.exec": "允许 %2 中的 %1 在你的电脑上运行这条命令吗？",
   "popup.ask.screenshot": "允许 %2 中的 %1 截取你的屏幕吗？",

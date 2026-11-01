@@ -648,16 +648,19 @@ enum KvCmd {
 
 #[derive(Subcommand)]
 enum ApprovalsCmd {
-    /// Answer one request: once, session (same request again in this sandbox), or deny.
-    /// Answer a question from /dev/paddock/ask with --text TEXT, or dismiss it with deny.
+    /// Answer one request: once, session (same request again in this sandbox),
+    /// deny, or deny-session (same request again in this sandbox is denied
+    /// without a card). Answer a question from /dev/paddock/ask with --text
+    /// TEXT, or dismiss it with deny.
     Answer {
         id: String,
         #[arg(required_unless_present = "text")]
         answer: Option<String>,
-        /// The answer to a question (/dev/paddock/ask). It goes to the agent.
-        /// `-` reads it from standard input, so it never shows in the process
-        /// list or the shell history; prefer that for anything private.
-        #[arg(long, conflicts_with = "answer", allow_hyphen_values = true)]
+        /// The answer to a question (/dev/paddock/ask), or with deny and
+        /// deny-session a note for the agent (one line, at most 300
+        /// characters). It goes to the agent. `-` reads it from standard
+        /// input, so it never shows in the process list or the shell history.
+        #[arg(long, allow_hyphen_values = true)]
         text: Option<String>,
     },
 }
@@ -828,9 +831,20 @@ one with --text: the text goes to the agent, and nothing runs on the host.
 --text - reads the answer from standard input, so it never shows in the
 process list or the shell history. deny dismisses it.
 
+A denial can carry a note for the agent: deny --text TEXT (or --text -). The
+agent gets it in the answer, so it knows why and does not ask again. The note
+is one line of at most 300 characters. The audit log keeps only its length.
+
+deny-session denies the request and every same request of that sandbox for
+the rest of its session, at once and without a new card, with the same note.
+\"The same request\" is what \"session\" (allow for this session) covers. It
+never covers a child or a parent sandbox.
+
 Examples:
   paddock approvals
   paddock approvals answer r-1793321234-1a2b3c4d once
+  paddock approvals answer r-1793321234-1a2b3c4d deny --text \"do not ask for host exec\"
+  paddock approvals answer r-1793321234-1a2b3c4d deny-session --text -
   paddock approvals answer r-1793321234-9f8e7d6c --text -
   paddock approvals --json";
 
@@ -1149,7 +1163,33 @@ fn real_main() -> Result<i32> {
             use paddock::broker;
             if let Some(ApprovalsCmd::Answer { id, answer, text }) = cmd {
                 match (answer, text) {
-                    (_, Some(t)) => {
+                    (Some(a), Some(t)) => {
+                        let a: broker::Answer = a.parse()?;
+                        if !a.denies() {
+                            bail!("--text goes with deny or deny-session, or alone for a question");
+                        }
+                        let t = if t == "-" {
+                            let mut s = String::new();
+                            std::io::Read::read_to_string(
+                                &mut std::io::Read::take(std::io::stdin(), 64 * 1024),
+                                &mut s,
+                            )?;
+                            s
+                        } else {
+                            t
+                        };
+                        let note = broker::clean_note(&t);
+                        broker::answer_with_note(&env, &id, a, note.as_deref())?;
+                        match note {
+                            Some(n) => println!(
+                                "Answered {id}: {} with a note of {} characters.",
+                                serde_json::to_value(a)?.as_str().unwrap_or("deny"),
+                                n.chars().count()
+                            ),
+                            None => println!("Answered {id}: deny"),
+                        }
+                    }
+                    (None, Some(t)) => {
                         let t = if t == "-" {
                             let mut s = String::new();
                             std::io::Read::read_to_string(
@@ -1207,9 +1247,14 @@ fn real_main() -> Result<i32> {
                         continue;
                     }
                     println!(
-                        "    answer: paddock approvals answer {} once|{}deny\n",
+                        "    answer: paddock approvals answer {} once|{}deny{}  [--text NOTE]\n",
                         p.id,
-                        if p.session_allowed { "session|" } else { "" }
+                        if p.session_allowed { "session|" } else { "" },
+                        if p.session_allowed {
+                            "|deny-session"
+                        } else {
+                            ""
+                        }
                     );
                 }
             }
