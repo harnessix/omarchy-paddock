@@ -350,7 +350,7 @@ pub fn enforce(env: &HostEnv, spec: &SandboxSpec) -> Result<()> {
     }
 
     for (k, v) in &spec.env {
-        let explicit = ["profile", "manifest", "host env", "network"]
+        let explicit = ["profile", "manifest", "host env", "network", "credentials"]
             .iter()
             .any(|o| v.origin.starts_with(o));
         if looks_secret(k) && !explicit {

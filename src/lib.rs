@@ -6,6 +6,7 @@ pub mod approver;
 pub mod backend;
 pub mod broker;
 pub mod build;
+pub mod credentials;
 pub mod detect;
 pub mod devices;
 pub mod doctor;

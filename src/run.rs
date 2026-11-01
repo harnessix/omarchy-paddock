@@ -118,6 +118,60 @@ fn help_text(exe: &Path, args: &[String]) -> Result<String> {
     Ok(text)
 }
 
+/// Ask for the registered `deliver` credentials and add the ones that the
+/// user allowed twice. Returns their names, for `paddock ps` and the panel.
+fn deliver_credentials(env: &HostEnv, built: &mut Built, quiet: bool) -> Result<Vec<String>> {
+    let say = |m: &str| {
+        if !quiet {
+            eprintln!("paddock: {m}");
+        }
+    };
+    let plan = match crate::credentials::plan(env, &built.spec.harness, built.spawn.is_some()) {
+        Ok(p) => p,
+        Err(e) => {
+            say(&format!("no credentials are delivered: {e:#}"));
+            return Ok(Vec::new());
+        }
+    };
+    for n in &plan.notices {
+        say(n);
+    }
+    if plan.deliver.is_empty() {
+        return Ok(Vec::new());
+    }
+    let approver: std::sync::Arc<dyn crate::broker::Approver> = built
+        .approver
+        .clone()
+        .unwrap_or_else(|| std::sync::Arc::new(crate::broker::HostApprover));
+    let wait = crate::broker::HostPolicy::load(env)
+        .map(|p| p.wait)
+        .unwrap_or(120);
+    say("waiting for your answer on the approval card before the harness starts (credentials)");
+    if !crate::credentials::ask(
+        env,
+        &built.spec,
+        approver.as_ref(),
+        Duration::from_secs(wait),
+        &plan,
+    ) {
+        say("the sandbox starts without the credentials");
+        return Ok(Vec::new());
+    }
+    let (values, notices) = crate::credentials::read(env, &plan);
+    for n in &notices {
+        say(n);
+    }
+    let mut names = Vec::new();
+    for (name, var, value) in values {
+        built
+            .spec
+            .set_secret_env(&var, value, &format!("credentials: deliver {name}"));
+        crate::credentials::audit(env, &built.spec, &name, "delivered");
+        names.push(name);
+    }
+    Ok(names)
+}
+
 pub struct Outcome {
     pub code: i32,
     pub stdout: Option<String>,
@@ -252,6 +306,10 @@ pub fn run(
             eprintln!("paddock: warning: provisioning failed; the harness starts anyway");
         }
     }
+    // Registered credentials (credentials.rs): after the install steps,
+    // which never get them, and before the harness starts, which waits for
+    // the user's two answers.
+    let delivered = deliver_credentials(env, &mut built, quiet)?;
     let launch = backend.render(env, &built.spec, interactive)?;
     write_files(&launch)?;
 
@@ -402,6 +460,7 @@ pub fn run(
         unit,
         kv_project: Some(kv_project_path),
         pasture: kv_pasture,
+        credentials: delivered,
     };
     running.register(env)?;
     // Kept after exit, so `paddock files` can list what the sandbox left.

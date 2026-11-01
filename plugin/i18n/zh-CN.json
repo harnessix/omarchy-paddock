@@ -200,5 +200,7 @@
   "keys.kvKeys": "↵ 打开键或分组 · Del 删除或释放 · Esc 返回",
   "keys.kvKey": "C 复制 · Del 删除或释放 · Esc 返回",
   "keys.kvRow": "↵ 或 K 查看共享数据",
-  "row.pasture": "牧场 %1"
+  "row.pasture": "牧场 %1",
+  "row.holdsCredentials": "持有真值：%1",
+  "popup.ask.credentials": "把这些凭据交给 %2 中的 %1 吗？agent 能读到它们。"
 }

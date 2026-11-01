@@ -754,6 +754,7 @@ mod tests {
             unit: None,
             kv_project: None,
             pasture: None,
+            credentials: Vec::new(),
         }
     }
 

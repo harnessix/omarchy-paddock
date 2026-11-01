@@ -298,6 +298,12 @@ enum Cmd {
         #[command(subcommand)]
         cmd: PastureCmd,
     },
+    /// The credentials registered in [credentials] of the user
+    /// configuration, and how often each was delivered. Never a value.
+    Credentials {
+        #[command(subcommand)]
+        cmd: CredentialsCmd,
+    },
     /// Read what agents wrote to paddock kv, and free their leases.
     Kv {
         #[command(subcommand)]
@@ -492,6 +498,15 @@ impl KvScope {
             }
         })
     }
+}
+
+#[derive(Subcommand)]
+enum CredentialsCmd {
+    /// List the registered credentials.
+    List {
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1790,6 +1805,50 @@ fn real_main() -> Result<i32> {
         } => recover_cmd(&env, &id, paths, all, to.as_deref(), keep),
         Cmd::Discard { id, paths, all } => discard_cmd(&env, &id, paths, all),
         Cmd::Pasture { cmd } => pasture_cmd(&env, cmd),
+        Cmd::Credentials {
+            cmd: CredentialsCmd::List { json },
+        } => {
+            let rows = paddock::credentials::rows(&env)?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "api_version": "paddock.credentials/v1", "credentials": rows,
+                    }))?
+                );
+                return Ok(0);
+            }
+            if rows.is_empty() {
+                println!(
+                    "No credentials are registered. Add [credentials.NAME] to {}.",
+                    env.paddock_config().join("config.toml").display()
+                );
+            }
+            for r in &rows {
+                println!(
+                    "{:<24} {:<9} {:<28} {}{}",
+                    r.name,
+                    r.via,
+                    r.source,
+                    if !r.available {
+                        "not available yet".to_string()
+                    } else if !r.ready {
+                        "source missing".to_string()
+                    } else {
+                        "ready".to_string()
+                    },
+                    match r.last_delivered {
+                        Some(t) => format!(
+                            ", delivered {} times, last {}",
+                            r.delivered,
+                            paddock::storage::date(t)
+                        ),
+                        None => String::new(),
+                    }
+                );
+            }
+            Ok(0)
+        }
         Cmd::Stop { id } => {
             let all = Running::list(&env);
             stop_one(&env, &all, &id)

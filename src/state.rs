@@ -683,6 +683,9 @@ pub struct Running {
     /// of its own.
     #[serde(default)]
     pub pasture: Option<String>,
+    /// The credentials whose values the sandbox holds (`deliver`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub credentials: Vec<String>,
 }
 
 /// A host login file and the sandbox's copy of it.
