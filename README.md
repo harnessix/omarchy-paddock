@@ -652,13 +652,36 @@ With `confirm = "each"`, the approval card asks for every signature and shows th
 
 What it protects: the private key never enters the sandbox, so the agent cannot copy it, and the sandbox cannot add, remove or use other keys. What it does not protect: while the run is allowed, the sandbox can ask for signatures with the named keys, for example to push or to log in to a server that trusts them. Use `confirm = "each"` to see each one, and revoke the credential to end it.
 
+`via = "agent"` with `kind = "docker"` gives docker in the sandbox the login of listed registries, one request at a time:
+
+```toml
+[credentials.registry]
+via = "agent"
+kind = "docker"
+registries = ["ghcr.io", "registry.example.com"]
+```
+
+The sandbox gets `DOCKER_CONFIG=/run/paddock/docker`, whose `config.json` sends only these registries to the helper `docker-credential-paddock`. The host takes the login from your own docker configuration (`credHelpers`, then `credsStore`, then `auths`) and refuses any registry that is not listed. The helper refuses `store`, `erase` and `list`. What it protects: the sandbox never sees your docker configuration or the logins of other registries, each use is asked once per run, audited and can be revoked. What it does not protect: the login of a listed registry reaches the sandbox's docker client for that request.
+
+`via = "agent"` with `kind = "aws"` gives the sandbox short-lived credentials of one profile of your `~/.aws/config`:
+
+```toml
+[credentials.aws-dev]
+via = "agent"
+kind = "aws"
+profile = "dev"
+duration = 900                    # seconds, 900 to 3600
+```
+
+The sandbox gets its own `AWS_CONFIG_FILE`, whose profile `dev` runs `paddock-host credential aws aws-dev` as its `credential_process`, and an empty shared credentials file. The host runs `aws sts get-session-token` for the profile and returns only the temporary keys with their expiry. A profile that gives temporary credentials already (single sign-on, an assumed role) passes them on as they are, and `duration` does not apply to them. What it protects: the long-lived keys of the profile never leave your computer, and each set expires. What it does not protect: until it expires, a set works like any AWS credential of that profile.
+
 For every way:
 
 - When a sandbox starts, the approval card asks twice: first whether to give the credentials, then to confirm. The harness starts only after the second answer. With "No" at either step, or no answer, the sandbox starts without them.
 - paddock reads the value only after both answers. A command runs on the host. paddock never writes the value to disk.
 - A registered credential never passes in any other way: not with the inherited environment, not as a harness login variable, not through `[env] pass`. To keep a harness login key such as `ANTHROPIC_API_KEY` on the host, register it with its preset.
 - A sandbox that another one started gets no credentials. A project `paddock.toml` cannot register one.
-- `paddock credentials revoke ID [NAME]` stops a sandbox from using a gateway credential, the ssh agent channel or a secret file at once. The sandbox keeps running. The bar panel has a button for it. A value delivered as a variable cannot be revoked: stop the sandbox.
+- `paddock credentials revoke ID [NAME]` stops a sandbox from using a gateway credential, an agent channel (ssh, docker or AWS) or a secret file at once. The sandbox keeps running. The bar panel has a button for it. A value delivered as a variable cannot be revoked: stop the sandbox.
 - The paddock process locks delivered and gateway values in RAM, so they never go to swap. It overwrites them with zeros after a revoke and when the sandbox ends.
 - The bar panel marks a sandbox that holds a delivered value, and names the gateway credentials that it uses.
 - `paddock credentials list` shows the registered credentials, whether their source is there, how often each was delivered, how many requests went through the gateway, how many ssh signatures were allowed, and how often each secret file was opened. The audit log (`paddock log`) records each question, answer, request (method, host, path without its query) and revocation by name, never a value.
