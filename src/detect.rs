@@ -303,6 +303,35 @@ impl Detector for Cache {
     }
 }
 
+/// Share `.npm` for a harness that is an npm package (Claude Code, codex,
+/// gemini and copilot install through npm), also in a project without a
+/// `package.json`. Such a harness fills its home's npm cache through `npx`
+/// (MCP servers) and its update checks, the same downloads in every home.
+/// npm checks each entry of `_cacache` against its sha512 integrity hash,
+/// so one shared copy is as safe as a copy per project, the same reason
+/// [`Cache::node`] shares it. pnpm, bun and yarn stay for `package.json`.
+pub fn npm_harness(
+    env: &HostEnv,
+    harness: &crate::profile::Harness,
+    spec: &mut SandboxSpec,
+) -> Result<()> {
+    let npm = |p: &Path| p.components().any(|c| c.as_os_str() == "node_modules");
+    if !npm(&harness.exe) && !harness.install_mounts.iter().any(|p| npm(p)) {
+        return Ok(());
+    }
+    let dst = spec.home.join(".npm");
+    if spec.mounts.iter().any(|m| m.dst == dst) {
+        return Ok(());
+    }
+    spec.add_mount(cache_mount(
+        env,
+        "npm",
+        dst,
+        "detector node: npm cache of an npm harness",
+    )?);
+    Ok(())
+}
+
 /// The host's rustup toolchains, for a Rust project: `~/.rustup` and the
 /// proxies in `~/.cargo/bin`, read-only. Not the rest of `~/.cargo`, which
 /// holds `credentials.toml`. Read-only, so a project's `rust-toolchain.toml`

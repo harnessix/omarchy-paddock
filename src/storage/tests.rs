@@ -58,6 +58,7 @@ fn host<'a>(c: &'a dyn Containers, profiles: &[(&str, bool)]) -> Host<'a> {
         containers: c,
         current_tags: ["paddock-base:current".to_string()].into(),
         profiles: Some(profiles.iter().map(|(n, a)| (n.to_string(), *a)).collect()),
+        scratch: BTreeMap::new(),
     }
 }
 
@@ -153,6 +154,7 @@ fn home(path: &str, harness: &str) -> Home {
         profile: true,
         running: false,
         loses: String::new(),
+        caches: vec![],
     }
 }
 
@@ -170,6 +172,8 @@ fn inventory(homes: Vec<Home>) -> Inventory {
         build_cache: vec![],
         scratch: vec![],
         snapshots: vec![],
+        tmpfs_caches: true,
+        classes: vec![],
     }
 }
 
@@ -857,4 +861,76 @@ fn gc_removes_snapshots_of_gone_projects_and_old_ones_with_the_flag() {
     let items = plan(&inv, &o, now);
     assert!(find(&items, "snapshot old").unwrap().selected());
     assert!(find(&items, "undo trash").unwrap().selected());
+}
+
+#[test]
+fn gc_clears_pure_caches_in_the_automatic_tier_and_never_a_login() {
+    let (_t, env) = setup();
+    let project = env.home.join("src/app");
+    std::fs::create_dir_all(&project).unwrap();
+    let h = make_home(&env, "fake", &project, false);
+    let keep = [
+        ".config/App/Local Storage/leveldb/x",
+        ".config/App/Cookies",
+        ".fake/auth.json",
+        ".fake/sessions/s.jsonl",
+        ".npm/_cacache/x",
+        ".codex/packages/runtime.bin",
+    ];
+    let clear = [
+        ".config/App/Cache/data_0",
+        ".config/App/GPUCache/data_1",
+        ".cache/mesa_shader_cache/index",
+        ".fake/cache/blob",
+    ];
+    for f in keep.iter().chain(&clear) {
+        std::fs::create_dir_all(h.join(f).parent().unwrap()).unwrap();
+        std::fs::write(h.join(f), "x").unwrap();
+    }
+    // A symlink that the sandbox planted: gc never follows it.
+    let outside = env.home.join("outside/Cache");
+    std::fs::create_dir_all(&outside).unwrap();
+    std::fs::write(outside.join("keep"), "x").unwrap();
+    symlink(env.home.join("outside"), h.join(".config/Linked")).unwrap();
+
+    let fake: crate::profile::Profile = toml::from_str(
+        "name = \"fake\"\n[state]\nauth = [\".fake/auth.json\"]\nscratch = [\".fake/cache\"]\n",
+    )
+    .unwrap();
+    let c = FakeContainers::default();
+    let mut hst = host(&c, &[("fake", false)]);
+    hst.scratch
+        .insert("fake".into(), caches::scratch(Some(&fake)).0);
+    let mut inv = scan(&env, &hst, true);
+    let scratch = inv
+        .classes
+        .iter()
+        .find(|c| c.class == caches::Class::Scratch)
+        .unwrap();
+    assert_eq!(scratch.folders, 4, "{:?}", inv.classes);
+    assert!(render_du(&env, &inv, state::now()).contains("pure caches"));
+
+    // Off in the user configuration: no item.
+    inv.tmpfs_caches = false;
+    assert!(find(&plan(&inv, &opts(), state::now()), "pure caches").is_none());
+    inv.tmpfs_caches = true;
+    let items = plan(&inv, &opts(), state::now());
+    let item = find(&items, "pure caches").unwrap();
+    assert_eq!(item.tier, Tier::Auto);
+    assert!(item.selected());
+    let removed = apply(&env, &c, &items);
+    assert!(removed.iter().all(|r| r.error.is_none()), "{removed:?}");
+    for f in clear {
+        assert!(!h.join(f).exists(), "{f}");
+    }
+    for f in keep {
+        assert!(h.join(f).exists(), "{f}");
+    }
+    assert!(outside.join("keep").exists());
+
+    // A running sandbox keeps its caches.
+    std::fs::create_dir_all(h.join(".cache/fontconfig")).unwrap();
+    let mut inv = scan(&env, &hst, false);
+    inv.homes[0].running = true;
+    assert!(find(&plan(&inv, &opts(), state::now()), "pure caches").is_none());
 }

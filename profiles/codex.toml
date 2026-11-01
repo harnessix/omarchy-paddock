@@ -25,6 +25,8 @@ import_ro = [".codex/AGENTS.md", ".codex/prompts", ".agents/skills"]
 # the sandbox are not copied back, and the host copy replaces them each start.
 seed = [".codex/config.toml"]
 env_pass = ["OPENAI_API_KEY", "OPENAI_BASE_URL", "CODEX_API_KEY"]
+# Pure caches: a tmpfs in the sandbox, and paddock gc clears old ones.
+scratch = [".codex/cache"]
 
 # Omarchy's account switch: CODEX_HOME replaces ~/.codex.
 [state.account]
