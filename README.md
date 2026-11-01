@@ -478,7 +478,7 @@ pass = ["MY_TOOL_TOKEN"]
 
 ### Credentials
 
-A variable in `[env] pass` reaches the sandbox at every start, without a question. For a credential that you want to control, register it in `~/.config/paddock/config.toml`. There are two ways to give it to a sandbox.
+A variable in `[env] pass` reaches the sandbox at every start, without a question. For a credential that you want to control, register it in `~/.config/paddock/config.toml`. There are three ways to give it to a sandbox.
 
 `via = "gateway"` keeps the value on the host. The sandbox gets a stand-in with the same start and length, and a base URL that points at a local gateway. For each request, paddock removes every credential that the sandbox sent, adds the real one, and sends the request over HTTPS to the host that you bound it to: from your computer, through your proxy settings, with your system's certificates. No TLS is decrypted and no certificate authority is made. Answers stream back as they come, so model APIs work.
 
@@ -509,15 +509,28 @@ command = ["secret-tool", "lookup", "service", "mydb"]
 harnesses = ["claude"]              # optional: only these harnesses
 ```
 
-For both ways:
+`via = "agent"` with `keys` gives the sandbox your ssh keys through your ssh agent. The private keys stay in the ssh agent on your computer (`SSH_AUTH_SOCK` where paddock started). The sandbox gets its own agent socket, and `SSH_AUTH_SOCK` in the sandbox points at it. paddock answers on that socket: a list of keys shows only the keys that you name, and a signature passes only for them. Every other request (add or remove keys, lock, unlock, extensions) fails and never reaches your agent. A message over 256 KiB, or a malformed one, fails too.
+
+```toml
+[credentials.ssh]
+via = "agent"
+keys = ["~/.ssh/id_ed25519.pub"]   # the public keys; only these keys
+confirm = "each"                   # each: a card for every signature; session: once on the start card
+```
+
+With `confirm = "each"`, the approval card asks for every signature and shows the key's fingerprint and comment, never the data to sign. The audit log records each signature with the sandbox, the credential name, the key fingerprint and the answer. When your agent is not there, or does not hold a key, paddock says so at start, and the sandbox starts without the socket.
+
+What it protects: the private key never enters the sandbox, so the agent cannot copy it, and the sandbox cannot add, remove or use other keys. What it does not protect: while the run is allowed, the sandbox can ask for signatures with the named keys, for example to push or to log in to a server that trusts them. Use `confirm = "each"` to see each one, and revoke the credential to end it.
+
+For every way:
 
 - When a sandbox starts, the approval card asks twice: first whether to give the credentials, then to confirm. The harness starts only after the second answer. With "No" at either step, or no answer, the sandbox starts without them.
 - paddock reads the value only after both answers. A command runs on the host. paddock never writes the value to disk.
 - A registered credential never passes in any other way: not with the inherited environment, not as a harness login variable, not through `[env] pass`. To keep a harness login key such as `ANTHROPIC_API_KEY` on the host, register it with its preset.
 - A sandbox that another one started gets no credentials. A project `paddock.toml` cannot register one.
-- `paddock credentials revoke ID [NAME]` stops a sandbox from using a gateway credential at once; the sandbox keeps running. The bar panel has a button for it. A delivered value cannot be revoked: stop the sandbox.
+- `paddock credentials revoke ID [NAME]` stops a sandbox from using a gateway credential or the ssh agent channel at once; the sandbox keeps running. The bar panel has a button for it. A delivered value cannot be revoked: stop the sandbox.
 - The bar panel marks a sandbox that holds a delivered value, and names the gateway credentials that it uses.
-- `paddock credentials list` shows the registered credentials, whether their source is there, how often each was delivered, and how many requests went through the gateway. The audit log (`paddock log`) records each question, answer, request (method, host, path without its query) and revocation by name, never a value.
+- `paddock credentials list` shows the registered credentials, whether their source is there, how often each was delivered, how many requests went through the gateway, and how many ssh signatures were allowed. The audit log (`paddock log`) records each question, answer, request (method, host, path without its query) and revocation by name, never a value.
 
 ## Privacy defaults
 

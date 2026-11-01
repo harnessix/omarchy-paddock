@@ -721,6 +721,9 @@ pub struct Running {
     /// only stand-ins.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub gateway: Vec<String>,
+    /// The credentials that the sandbox uses through the ssh agent channel.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub agent: Vec<String>,
     /// Logins that a keeper keeps for this sandbox (keeper.rs): the sandbox
     /// holds them without their refresh token, and the keeper writes the
     /// new access token here.

@@ -535,6 +535,14 @@ impl Backend for Docker {
                 true,
             )?);
         }
+        if let Some(sock) = &spec.ssh_agent_socket {
+            mounts.push(mount_arg(
+                "bind",
+                Some(sock),
+                Path::new(crate::credentials::sshagent::SOCKET_IN_SANDBOX),
+                true,
+            )?);
+        }
         // An empty folder now. paddock mounts the devices on it after the
         // container started, and slave propagation carries that mount in
         // (devices.rs explains why).
@@ -574,6 +582,12 @@ impl Backend for Docker {
             vars.insert(
                 "PADDOCK_KV_SOCKET".into(),
                 crate::kv::SOCKET_IN_SANDBOX.into(),
+            );
+        }
+        if spec.ssh_agent_socket.is_some() {
+            vars.insert(
+                "SSH_AUTH_SOCK".into(),
+                crate::credentials::sshagent::SOCKET_IN_SANDBOX.into(),
             );
         }
         if spec.devices.is_some() {

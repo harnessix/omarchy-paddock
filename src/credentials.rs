@@ -12,8 +12,9 @@
 //!   the value on the host.
 //! - `intercept`: TLS interception for tools that can do neither.
 //!
-//! Only `deliver` is built so far; the others are accepted in the
-//! configuration and named as not available. A project `paddock.toml` can
+//! `deliver`, `gateway` and `agent` for ssh (with `keys`, sshagent.rs) are
+//! built. The others are accepted in the configuration and named as not
+//! available. A project `paddock.toml` can
 //! never define a credential, and `from = "command"` runs on the host, like
 //! `[exec]`. Values are read when they are needed, never written to disk.
 
@@ -43,9 +44,10 @@ impl Via {
             Via::Intercept => "intercept",
         }
     }
-    /// Whether this paddock can use the credential this way.
+    /// Whether this paddock can use a credential this way. `agent` needs
+    /// `keys` as well (Credential::available).
     pub fn available(self) -> bool {
-        matches!(self, Via::Deliver | Via::Gateway)
+        matches!(self, Via::Deliver | Via::Gateway | Via::Agent)
     }
 }
 
@@ -174,6 +176,11 @@ impl Credential {
         Ok(c)
     }
 
+    /// Whether this paddock can use it: `agent` only for ssh keys.
+    pub fn available(&self) -> bool {
+        self.via.available() && (self.via != Via::Agent || !self.keys.is_empty())
+    }
+
     pub fn applies_to(&self, harness: &str) -> bool {
         self.harnesses.is_empty() || self.harnesses.iter().any(|h| h == harness)
     }
@@ -224,6 +231,9 @@ pub fn parse(text: &str) -> Result<BTreeMap<String, Credential>> {
             if !valid_var(v) {
                 bail!("[credentials.{name}]: '{v}' is not an environment variable name");
             }
+        }
+        if !c.keys.is_empty() && c.via != Via::Agent {
+            bail!("[credentials.{name}]: keys are only for via = \"agent\"");
         }
         if c.via == Via::Deliver && c.env.is_none() && !valid_var(name) {
             bail!("[credentials.{name}]: name the variable for the sandbox with env = \"...\"");
@@ -290,6 +300,9 @@ pub fn load(env: &HostEnv) -> Result<BTreeMap<String, Credential>> {
 /// Whether the source of a credential is there, without reading a value
 /// from a command: an env source must be set, a command must exist.
 pub fn source_ready(env: &HostEnv, name: &str, c: &Credential) -> bool {
+    if c.via == Via::Agent {
+        return !c.keys.is_empty() && c.keys.iter().all(|k| sshagent::key_path(env, k).is_file());
+    }
     match c.from {
         Source::Env => env.var(c.host_var(name)).is_some_and(|v| !v.is_empty()),
         Source::Command => c
@@ -303,7 +316,7 @@ pub fn source_ready(env: &HostEnv, name: &str, c: &Credential) -> bool {
 /// pass with the inherited environment.
 pub fn host_vars(all: &BTreeMap<String, Credential>) -> Vec<String> {
     all.iter()
-        .filter(|(_, c)| c.from == Source::Env)
+        .filter(|(_, c)| c.from == Source::Env && c.via != Via::Agent)
         .map(|(n, c)| c.host_var(n).to_string())
         .collect()
 }
@@ -317,7 +330,8 @@ const COMMAND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 /// The credentials of a run: what to deliver, and what to say about the rest.
 #[derive(Debug, Default)]
 pub struct Plan {
-    /// `deliver` credentials whose source is there, by name.
+    /// The credentials whose source is there, by name: `deliver`,
+    /// `gateway`, and `agent` whose keys the host agent holds.
     pub deliver: Vec<(String, Credential)>,
     pub notices: Vec<String>,
 }
@@ -330,17 +344,34 @@ pub fn plan(env: &HostEnv, harness: &str, spawned: bool) -> Result<Plan> {
         if !c.applies_to(harness) {
             continue;
         }
-        if !c.via.available() {
-            p.notices.push(format!(
-                "credential {name}: via = \"{}\" is not available in this paddock yet; the sandbox does not get it",
-                c.via.name()
-            ));
+        if !c.available() {
+            p.notices.push(if c.via == Via::Agent {
+                format!("credential {name}: via = \"agent\" needs keys, the public ssh keys that the sandbox may use; the sandbox does not get it")
+            } else {
+                format!(
+                    "credential {name}: via = \"{}\" is not available in this paddock yet; the sandbox does not get it",
+                    c.via.name()
+                )
+            });
             continue;
         }
         if spawned {
             p.notices.push(format!(
                 "credential {name}: a sandbox started by another one gets no credentials"
             ));
+            continue;
+        }
+        if c.via == Via::Agent {
+            let ready = sshagent::load_keys(env, &[(name.clone(), c.clone())]).and_then(|keys| {
+                sshagent::check_host(env.var("SSH_AUTH_SOCK").map(std::path::Path::new), &keys)
+            });
+            if let Err(e) = ready {
+                p.notices.push(format!(
+                    "credential {name}: {e:#}; the sandbox starts without the ssh agent socket"
+                ));
+                continue;
+            }
+            p.deliver.push((name, c));
             continue;
         }
         if !source_ready(env, &name, &c) {
@@ -367,6 +398,15 @@ fn describe(name: &str, c: &Credential) -> String {
         Source::Command => format!("from the command `{}`", c.command.join(" ")),
     };
     match c.via {
+        Via::Agent => format!(
+            "{name}: the ssh keys {} in your ssh agent. The private keys stay on the host: the sandbox gets an agent socket that lists only these keys and signs only with them{}",
+            c.keys.join(", "),
+            if c.confirm == Confirm::Each {
+                ", and you allow each signature"
+            } else {
+                ", without a question for each signature during this run"
+            }
+        ),
         Via::Gateway => format!(
             "{name}: {from}. It stays on the host: the sandbox gets a stand-in, and paddock adds the real value to requests for {}{}",
             c.hosts.join(", "),
@@ -451,6 +491,11 @@ pub fn read(env: &HostEnv, plan: &Plan) -> (Vec<(String, String, String)>, Vec<S
     let mut out = Vec::new();
     let mut notices = Vec::new();
     for (name, c) in &plan.deliver {
+        if c.via == Via::Agent {
+            // No value: the host agent keeps the keys.
+            out.push((name.clone(), String::new(), String::new()));
+            continue;
+        }
         let value = match c.from {
             Source::Env => env
                 .var(c.host_var(name))
@@ -545,7 +590,8 @@ pub struct Row {
     pub harnesses: Vec<String>,
     pub delivered: u64,
     pub last_delivered: Option<u64>,
-    /// Requests that the gateway forwarded with it.
+    /// Requests that the gateway forwarded with it, or signatures that the
+    /// ssh agent channel allowed.
     pub used: u64,
 }
 
@@ -575,6 +621,16 @@ pub fn rows(env: &HostEnv) -> Result<Vec<Row>> {
                 }
                 continue;
             }
+            if v["decision"] == "allowed" {
+                if let Some(name) = v["detail"]
+                    .as_str()
+                    .and_then(|d| d.strip_prefix("agent "))
+                    .and_then(|d| d.split(' ').next())
+                {
+                    *forwarded.entry(name.to_string()).or_default() += 1;
+                }
+                continue;
+            }
             if v["decision"] != "delivered" {
                 continue;
             }
@@ -595,10 +651,11 @@ pub fn rows(env: &HostEnv) -> Result<Vec<Row>> {
             Row {
                 name: name.clone(),
                 via: c.via.name(),
-                available: c.via.available(),
-                source: match c.from {
-                    Source::Env => format!("env {}", c.host_var(name)),
-                    Source::Command => format!("command {}", c.command[0]),
+                available: c.available(),
+                source: match (c.via, c.from) {
+                    (Via::Agent, _) => format!("ssh agent, keys {}", c.keys.join(" ")),
+                    (_, Source::Env) => format!("env {}", c.host_var(name)),
+                    (_, Source::Command) => format!("command {}", c.command[0]),
                 },
                 ready: source_ready(env, name, c),
                 harnesses: c.harnesses.clone(),
@@ -643,20 +700,24 @@ pub fn revoked_file(env: &HostEnv, sandbox: &str) -> std::path::PathBuf {
 }
 
 /// Revoke a credential (or all, with None) of a running sandbox. The next
-/// request through the gateway gets 403; the sandbox keeps running.
+/// request through the gateway gets 403, and the ssh agent channel signs
+/// no more; the sandbox keeps running.
 pub fn revoke(env: &HostEnv, sandbox: &str, name: Option<&str>) -> Result<Vec<String>> {
     let r = crate::state::Running::list(env)
         .into_iter()
         .find(|r| r.id == sandbox)
         .with_context(|| format!("no running sandbox with id {sandbox}"))?;
+    let held: Vec<String> = r.gateway.iter().chain(&r.agent).cloned().collect();
     let names: Vec<String> = match name {
-        Some(n) if r.gateway.iter().any(|g| g == n) => vec![n.to_string()],
+        Some(n) if held.iter().any(|g| g == n) => vec![n.to_string()],
         Some(n) if r.credentials.iter().any(|c| c == n) => bail!(
             "{n} was delivered: its value is in the sandbox and cannot be taken back. Stop the sandbox to end it: paddock stop {sandbox}"
         ),
         Some(n) => bail!("sandbox {sandbox} does not use the credential {n}"),
-        None if r.gateway.is_empty() => bail!("sandbox {sandbox} uses no credential through the gateway"),
-        None => r.gateway.clone(),
+        None if held.is_empty() => {
+            bail!("sandbox {sandbox} uses no credential through the gateway or the ssh agent channel")
+        }
+        None => held,
     };
     let mut f = crate::privfs::append(&revoked_file(env, sandbox))?;
     use std::io::Write as _;
@@ -672,7 +733,7 @@ pub fn revoke(env: &HostEnv, sandbox: &str, name: Option<&str>) -> Result<Vec<St
                 "harness": r.harness,
                 "project": r.project,
                 "capability": CAPABILITY,
-                "detail": format!("gateway {n}"),
+                "detail": if r.agent.contains(n) { format!("agent {n}") } else { format!("gateway {n}") },
                 "decision": "revoked by the user",
             }),
         );
@@ -715,7 +776,10 @@ confirm = "each"
         assert_eq!(all["DB_PASSWORD"].sandbox_var("DB_PASSWORD"), "DB_PASSWORD");
         assert_eq!(all["ssh"].confirm, Confirm::Each);
         assert!(Via::Deliver.available() && Via::Gateway.available());
-        assert!(!Via::Agent.available() && !Via::Intercept.available());
+        assert!(all["ssh"].available() && !Via::Intercept.available());
+        let bare = parse("[credentials.git]\nvia = \"agent\"\n").unwrap();
+        assert!(!bare["git"].available());
+        assert!(parse("[credentials.x]\nvia = \"deliver\"\nkeys = [\"k.pub\"]\n").is_err());
         assert!(parse("").unwrap().is_empty());
     }
 
@@ -894,6 +958,67 @@ via = "deliver"
                 && log.contains("timed out")
         );
         assert!(!log.contains("s3cret"));
+    }
+
+    #[test]
+    fn an_agent_credential_without_a_host_agent_gets_a_notice_and_counts_signatures() {
+        let (_t, env) = world(
+            "[credentials.ssh]\nvia = \"agent\"\nkeys = [\"~/.ssh/id_test.pub\"]\n",
+            &[],
+        );
+        // The key file is missing.
+        let p = plan(&env, "claude", false).unwrap();
+        assert!(p.deliver.is_empty());
+        assert!(
+            p.notices[0].contains("cannot read the key"),
+            "{:?}",
+            p.notices
+        );
+        // The key is there, the host agent is not.
+        use base64::Engine as _;
+        let mut blob = Vec::new();
+        for part in [&b"ssh-ed25519"[..], &[1u8; 32][..]] {
+            blob.extend_from_slice(&(part.len() as u32).to_be_bytes());
+            blob.extend_from_slice(part);
+        }
+        std::fs::create_dir_all(env.home.join(".ssh")).unwrap();
+        std::fs::write(
+            env.home.join(".ssh/id_test.pub"),
+            format!(
+                "ssh-ed25519 {} test\n",
+                base64::engine::general_purpose::STANDARD.encode(&blob)
+            ),
+        )
+        .unwrap();
+        let p = plan(&env, "claude", false).unwrap();
+        assert!(p.deliver.is_empty());
+        assert!(
+            p.notices[0].contains("SSH_AUTH_SOCK")
+                && p.notices[0].contains("without the ssh agent socket"),
+            "{:?}",
+            p.notices
+        );
+        // Allowed signatures count as uses.
+        let s = spec(&env);
+        let k = sshagent::Key {
+            name: "ssh".into(),
+            fingerprint: sshagent::fingerprint(&blob),
+            blob,
+            comment: "test".into(),
+            confirm: Confirm::Each,
+        };
+        sshagent::audit(&env, &s, &k, "allowed");
+        sshagent::audit(&env, &s, &k, "denied by the user");
+        let r = rows(&env).unwrap();
+        assert_eq!(
+            (r[0].via, r[0].available, r[0].ready, r[0].used),
+            ("agent", true, true, 1)
+        );
+        assert!(r[0].source.contains("ssh agent"));
+        assert!(host_vars(
+            &parse("[credentials.ssh]\nvia = \"agent\"\nkeys = [\"k.pub\"]\n").unwrap()
+        )
+        .is_empty());
     }
 
     #[test]

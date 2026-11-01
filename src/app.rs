@@ -691,6 +691,7 @@ fn run_flatpak(
         pasture: None,
         credentials: Vec::new(),
         gateway: Vec::new(),
+        agent: Vec::new(),
         kept_logins: Vec::new(),
     };
     if let Err(e) = running.register(env) {

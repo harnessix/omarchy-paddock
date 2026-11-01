@@ -202,6 +202,13 @@ impl Backend for Bwrap {
                 crate::kv::SOCKET_IN_SANDBOX.into(),
             ]);
         }
+        if let Some(sock) = &spec.ssh_agent_socket {
+            a.extend([
+                "--ro-bind".into(),
+                p(sock),
+                crate::credentials::sshagent::SOCKET_IN_SANDBOX.into(),
+            ]);
+        }
         // Read-write: a request is a write to a device file.
         if let Some(dir) = &spec.devices {
             a.extend([
@@ -263,6 +270,12 @@ impl Backend for Bwrap {
             env_map.insert(
                 "PADDOCK_KV_SOCKET".into(),
                 crate::kv::SOCKET_IN_SANDBOX.into(),
+            );
+        }
+        if spec.ssh_agent_socket.is_some() {
+            env_map.insert(
+                "SSH_AUTH_SOCK".into(),
+                crate::credentials::sshagent::SOCKET_IN_SANDBOX.into(),
             );
         }
         if spec.devices.is_some() {

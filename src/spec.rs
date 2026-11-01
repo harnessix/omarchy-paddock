@@ -263,6 +263,11 @@ pub struct SandboxSpec {
     /// The key-value socket of this sandbox on the host (kv.rs). Backends
     /// make it reachable inside and set PADDOCK_KV_SOCKET.
     pub kv_socket: Option<PathBuf>,
+    /// The filtering ssh agent socket of this sandbox on the host
+    /// (credentials/sshagent.rs). Backends make it reachable inside and set
+    /// SSH_AUTH_SOCK.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ssh_agent_socket: Option<PathBuf>,
     /// The machine ID and boot ID that the sandbox sees instead of the
     /// host's (identity.rs). Empty: the host's. Left out of `explain`.
     #[serde(skip)]
@@ -325,6 +330,7 @@ impl SandboxSpec {
             bus_socket: None,
             host_socket: None,
             kv_socket: None,
+            ssh_agent_socket: None,
             identity: Default::default(),
             devices: None,
             notices: Vec::new(),

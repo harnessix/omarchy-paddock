@@ -123,6 +123,7 @@ fn help_text(exe: &Path, args: &[String]) -> Result<String> {
 struct RunCredentials {
     delivered: Vec<String>,
     gateway: Vec<String>,
+    agent: Vec<String>,
 }
 
 /// Ask for the registered credentials and set up the ones that the user
@@ -189,11 +190,14 @@ fn setup_credentials(
     }
     let mut out = RunCredentials::default();
     let mut routes = std::collections::BTreeMap::new();
+    let mut agents = Vec::new();
     for (name, var, value) in values {
         let Some((_, c)) = plan.deliver.iter().find(|(n, _)| *n == name) else {
             continue;
         };
-        if c.via == Via::Gateway {
+        if c.via == Via::Agent {
+            agents.push((name, c.clone()));
+        } else if c.via == Via::Gateway {
             let mark = gateway::new_mark();
             built.spec.set_env(
                 &var,
@@ -223,6 +227,14 @@ fn setup_credentials(
                 .set_secret_env(&var, value, &format!("credentials: deliver {name}"));
             crate::credentials::audit(env, &built.spec, &name, "delivered");
             out.delivered.push(name);
+        }
+    }
+    if !agents.is_empty() {
+        match start_ssh_agent(env, built, &approver, Duration::from_secs(wait), &agents) {
+            Ok(()) => out.agent = agents.into_iter().map(|(n, _)| n).collect(),
+            Err(e) => say(&format!(
+                "the sandbox starts without the ssh agent socket: {e:#}"
+            )),
         }
     }
     if !routes.is_empty() {
@@ -282,6 +294,43 @@ fn setup_credentials(
         );
     }
     Ok(out)
+}
+
+/// The filtering ssh agent of the run (credentials/sshagent.rs), alive as
+/// long as this process. SSH_AUTH_SOCK in the sandbox points at it.
+fn start_ssh_agent(
+    env: &HostEnv,
+    built: &mut Built,
+    approver: &std::sync::Arc<dyn crate::broker::Approver>,
+    wait: Duration,
+    agents: &[(String, crate::credentials::Credential)],
+) -> Result<()> {
+    use crate::credentials::sshagent;
+    let upstream = env
+        .var("SSH_AUTH_SOCK")
+        .map(std::path::PathBuf::from)
+        .context("SSH_AUTH_SOCK is not set where paddock started")?;
+    let keys = sshagent::load_keys(env, agents)?;
+    sshagent::check_host(Some(&upstream), &keys)?;
+    let run_dir = env.paddock_run().join(&built.spec.id);
+    crate::privfs::dir(&run_dir)?;
+    let sock = run_dir.join("ssh-agent.sock");
+    let (e1, spec) = (env.clone(), built.spec.clone());
+    sshagent::Proxy::new(
+        keys,
+        upstream,
+        crate::credentials::revoked_file(env, &built.spec.id),
+        sshagent::approver_ask(env.clone(), built.spec.clone(), approver.clone(), wait),
+        std::sync::Arc::new(move |k: &sshagent::Key, result: &str| {
+            sshagent::audit(&e1, &spec, k, result);
+        }),
+    )
+    .serve(&sock)?;
+    for (name, _) in agents {
+        crate::credentials::audit(env, &built.spec, name, "ssh agent ready");
+    }
+    built.spec.ssh_agent_socket = Some(sock);
+    Ok(())
 }
 
 pub struct Outcome {
@@ -586,6 +635,7 @@ pub fn run(
         pasture: kv_pasture,
         credentials: creds.delivered,
         gateway: creds.gateway,
+        agent: creds.agent,
     };
     running.register(env)?;
     // Kept after exit, so `paddock files` can list what the sandbox left.

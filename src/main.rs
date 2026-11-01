@@ -608,8 +608,9 @@ enum CredentialsCmd {
         #[arg(long)]
         json: bool,
     },
-    /// Stop a running sandbox from using a credential through the gateway.
-    /// Without NAME: every one. Its next request gets 403; it keeps running.
+    /// Stop a running sandbox from using a credential through the gateway or
+    /// the ssh agent channel.
+    /// Without NAME: every one. Its next request fails; it keeps running.
     Revoke { id: String, name: Option<String> },
 }
 
@@ -2107,7 +2108,7 @@ fn real_main() -> Result<i32> {
         } => {
             let names = paddock::credentials::revoke(&env, &id, name.as_deref())?;
             println!(
-                "Revoked for {id}: {}. Its next request with them gets 403.",
+                "Revoked for {id}: {}. Its next request with them gets 403, and the ssh agent channel signs no more.",
                 names.join(", ")
             );
             Ok(0)
@@ -2154,7 +2155,11 @@ fn real_main() -> Result<i32> {
                     },
                 );
                 if r.used > 0 {
-                    println!("{:<24} {} requests through the gateway", "", r.used);
+                    if r.via == "agent" {
+                        println!("{:<24} {} ssh signatures allowed", "", r.used);
+                    } else {
+                        println!("{:<24} {} requests through the gateway", "", r.used);
+                    }
                 }
             }
             Ok(0)
