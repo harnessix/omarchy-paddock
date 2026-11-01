@@ -690,3 +690,199 @@ fn a_member_asks_another_in_bubblewrap() {
     assert!(audit.contains("\"result\":\"intercepted\""), "{audit}");
     assert!(!audit.contains(TOKEN));
 }
+
+// ---- the workbench ---------------------------------------------------------
+
+#[test]
+fn the_workbench_needs_the_configuration() {
+    let t = tempfile::tempdir().unwrap();
+    for d in ["home/.config/paddock", "project", "run"] {
+        std::fs::create_dir_all(t.path().join(d)).unwrap();
+    }
+    let out = paddock(t.path(), &["pasture", "workbench", "team"]);
+    assert!(out.status.success(), "{}", text(&out));
+    assert!(text(&out).contains("workbench = true"), "{}", text(&out));
+    let out = paddock(t.path(), &["pasture", "workbench", "team", "--start"]);
+    assert!(!out.status.success(), "{}", text(&out));
+    assert!(text(&out).contains("workbench = true"), "{}", text(&out));
+    std::fs::write(
+        t.path().join("home/.config/paddock/config.toml"),
+        "[pastures.team]\nmembers = [\"sh\"]\nworkbench = true\n",
+    )
+    .unwrap();
+    let out = paddock(t.path(), &["pasture", "workbench", "team", "--json"]);
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["allowed"], true);
+    assert_eq!(v["running"], false);
+    let out = paddock(t.path(), &["pasture", "workbench", "team", "--attach"]);
+    assert!(text(&out).contains("--start"), "{}", text(&out));
+    let out = paddock(t.path(), &["pasture", "workbench", "team", "--stop"]);
+    assert!(text(&out).contains("does not run"), "{}", text(&out));
+    // workbench is no member name.
+    std::fs::write(
+        t.path().join("home/.config/paddock/config.toml"),
+        "[pastures.team]\nmembers = [\"workbench\"]\n",
+    )
+    .unwrap();
+    let out = paddock(t.path(), &["pasture", "workbench", "team"]);
+    assert!(!out.status.success(), "{}", text(&out));
+}
+
+/// A member types into the workbench through its read-only socket folder.
+const POKER: &str = r#"
+S=/run/paddock/workbench/tmux
+for i in $(seq 1 100); do [ -S "$S" ] && break; sleep 0.1; done
+tmux -S "$S" send-keys -t workbench 'echo hi > /pasture/hi' Enter; echo "SEND_EXIT $?"
+for i in $(seq 1 100); do [ -s /pasture/hi ] && break; sleep 0.1; done
+echo "SEEN $(cat /pasture/hi 2>/dev/null)"
+echo "HOME_FILES $(find "$HOME" -name 'tmux*' -o -name 'workbench*' | tr '\n' ' ')"
+touch /run/paddock/workbench/x 2>/dev/null; echo "RO_EXIT $?"
+paddock-host pasture workbench --print >/tmp/o 2>&1; echo "JOIN_EXIT $?"
+echo "JOIN $(head -n 1 /tmp/o)"
+paddock-host pasture members > /tmp/m; echo "MEMBERS $(tr '\n' ' ' </tmp/m)"
+"#;
+
+#[test]
+fn a_member_types_into_the_workbench_in_bubblewrap() {
+    if !common::bwrap_works() {
+        eprintln!("skipped: bwrap cannot create a user namespace here");
+        return;
+    }
+    if Command::new("tmux").arg("-V").output().is_err() {
+        eprintln!("skipped: no tmux");
+        return;
+    }
+    let tmp = common::tempdir();
+    let root = tmp.path();
+    let cfg = root.join("cfg/paddock");
+    std::fs::create_dir_all(cfg.join("harness.d")).unwrap();
+    for d in ["run", "project", "home"] {
+        std::fs::create_dir_all(root.join(d)).unwrap();
+    }
+    std::fs::write(
+        cfg.join("config.toml"),
+        "backend = \"bwrap\"\n[pastures.team]\nmembers = [\"poker\"]\nworkbench = true\n",
+    )
+    .unwrap();
+    std::fs::write(
+        cfg.join("harness.d/poker.toml"),
+        format!(
+            "name = \"poker\"\n[locate]\ncommands = [\"sh\"]\n[launch]\nargs = [\"-c\", {}]\n",
+            serde_json::to_string(POKER).unwrap()
+        ),
+    )
+    .unwrap();
+    let project = root.join("project").canonicalize().unwrap();
+    let cmd = |args: &[&str]| {
+        let mut c = Command::new(env!("CARGO_BIN_EXE_paddock"));
+        c.env("HOME", root.join("home"))
+            .env("XDG_CONFIG_HOME", root.join("cfg"))
+            .env("XDG_DATA_HOME", root.join("data"))
+            .env("XDG_STATE_HOME", root.join("state"))
+            .env("XDG_CACHE_HOME", root.join("cache"))
+            .env("XDG_RUNTIME_DIR", root.join("run"))
+            .env_remove("DBUS_SESSION_BUS_ADDRESS")
+            .env("LANG", "C")
+            .env("LC_ALL", "C")
+            .current_dir(&project)
+            .args(args)
+            .stdin(std::process::Stdio::null());
+        c
+    };
+    let env = HostEnv::from_parts(
+        root.join("home"),
+        "demo".into(),
+        1000,
+        1000,
+        [
+            ("XDG_DATA_HOME", root.join("data")),
+            ("XDG_STATE_HOME", root.join("state")),
+            ("XDG_CONFIG_HOME", root.join("cfg")),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.display().to_string()))
+        .collect(),
+    );
+    let sock = paddock::pasture::workbench::socket(&env, &project, "team");
+    let ground = paddock::pasture::ground(&env, &project, "team");
+
+    let out = cmd(&["pasture", "workbench", "team", "--start"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", text(&out));
+    assert!(sock.exists(), "{}", sock.display());
+    let out = cmd(&["pasture", "list", "--json"]).output().unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["pastures"][0]["workbench"]["running"], true, "{v}");
+
+    let member = cmd(&[
+        "run",
+        "poker",
+        "--backend",
+        "bwrap",
+        "--network",
+        "none",
+        "--env",
+        "clean",
+        "--pasture",
+        "team",
+        "-y",
+    ])
+    .output()
+    .unwrap();
+    let out = String::from_utf8_lossy(&member.stdout).into_owned();
+    let all = format!("{out}\n{}", String::from_utf8_lossy(&member.stderr));
+    let line = |k: &str| -> String {
+        out.lines()
+            .find_map(|l| l.strip_prefix(&format!("{k} ")))
+            .unwrap_or_else(|| panic!("no {k} in:\n{all}"))
+            .trim()
+            .to_string()
+    };
+    assert_eq!(line("SEND_EXIT"), "0", "{all}");
+    assert_eq!(line("SEEN"), "hi", "{all}");
+    assert_eq!(std::fs::read_to_string(ground.join("hi")).unwrap(), "hi\n");
+    assert!(
+        out.lines().any(|l| l.trim() == "HOME_FILES"),
+        "the member home has workbench files:\n{all}"
+    );
+    assert_ne!(line("RO_EXIT"), "0", "{all}");
+    assert_eq!(line("JOIN_EXIT"), "0", "{all}");
+    assert!(
+        line("JOIN").contains("tmux -S /run/paddock/workbench/tmux attach"),
+        "{all}"
+    );
+    assert!(line("MEMBERS").contains("workbench: runs"), "{all}");
+
+    // The last member ended: the workbench stops, and its socket goes.
+    until("the workbench stops after the last member", || {
+        !sock.exists()
+    });
+
+    // Started again, then stopped by the user.
+    let out = cmd(&["pasture", "workbench", "team", "--start"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", text(&out));
+    assert!(sock.exists());
+    let out = cmd(&["pasture", "workbench", "team", "--stop"])
+        .output()
+        .unwrap();
+    assert!(text(&out).contains("Stopped"), "{}", text(&out));
+    until("the socket goes", || !sock.exists());
+
+    let audit = std::fs::read_to_string(root.join("state/paddock/kv-audit.jsonl")).unwrap();
+    let events: Vec<&str> = audit
+        .lines()
+        .filter(|l| l.contains("\"op\":\"workbench\""))
+        .collect();
+    assert!(
+        events
+            .iter()
+            .any(|l| l.contains("\"event\":\"join\"") && l.contains("poker (sandbox")),
+        "{audit}"
+    );
+    assert!(events.iter().any(|l| l.contains("\"event\":\"start\"")));
+    assert!(events.iter().any(|l| l.contains("\"event\":\"stop\"")));
+    assert!(!audit.contains("echo hi"));
+}

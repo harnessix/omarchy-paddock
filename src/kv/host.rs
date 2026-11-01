@@ -77,6 +77,9 @@ pub struct PastureInfo {
     pub leases: u64,
     /// The ports that members share (`paddock-host pasture share`).
     pub ports: Vec<crate::pasture::ports::Shared>,
+    /// The workbench of a configured pasture (pasture/workbench.rs).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workbench: Option<crate::pasture::workbench::State>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -159,9 +162,11 @@ pub fn pastures(env: &HostEnv, project: &Path) -> Result<Vec<PastureInfo>> {
         let members: Vec<Member> = records
             .iter()
             .filter(|r| r.pasture.as_deref() == Some(name.as_str()))
+            .filter(|r| r.harness != crate::pasture::workbench::NAME)
             .map(member)
             .collect();
-        if keys == 0 && !members.iter().any(|m| m.running) {
+        let workbench = crate::pasture::workbench::state(env, project, &name);
+        if keys == 0 && !members.iter().any(|m| m.running) && !workbench.running {
             continue;
         }
         out.push(PastureInfo {
@@ -172,6 +177,7 @@ pub fn pastures(env: &HostEnv, project: &Path) -> Result<Vec<PastureInfo>> {
             bytes,
             leases,
             ports,
+            workbench: Some(workbench),
         });
     }
     // A spawned sandbox has no pasture, so it is left out.
@@ -196,6 +202,7 @@ pub fn pastures(env: &HostEnv, project: &Path) -> Result<Vec<PastureInfo>> {
             bytes,
             leases,
             ports,
+            workbench: None,
         });
     }
     Ok(out)

@@ -45,6 +45,9 @@ pub struct Options {
     /// Join this pasture of the project (`--pasture NAME`). None: the
     /// sandbox is a pasture of its own.
     pub pasture: Option<String>,
+    /// The workbench of the pasture (pasture/workbench.rs): its socket
+    /// folder is writable.
+    pub workbench: bool,
 }
 
 /// A worktree that paddock created for one run.
@@ -781,6 +784,22 @@ pub fn build_with(env: &HostEnv, opts: &Options, harness: Harness) -> Result<Bui
         ));
         spec.set_env("PADDOCK_PASTURE", crate::pasture::MOUNT, "pasture");
         spec.set_env("PADDOCK_PASTURE_NAME", name.clone(), "pasture");
+        // The socket folder of the workbench, from the start, so that a
+        // member can join a workbench that starts later. Read-only for
+        // members: a client can connect to a socket on a read-only mount.
+        let bench = crate::pasture::workbench::dir(env, &kv_project, name);
+        crate::privfs::dir(&bench)?;
+        spec.add_mount(Mount::bind(
+            &bench,
+            crate::pasture::workbench::MOUNT,
+            opts.workbench,
+            &format!("pasture {name} workbench"),
+        ));
+        spec.set_env(
+            crate::pasture::workbench::ENV,
+            crate::pasture::workbench::MOUNT,
+            "pasture",
+        );
         // The helper that relays the ports that members share, and
         // answers the questions of other members.
         spec.setup
@@ -981,6 +1000,22 @@ mod tests {
         );
         assert_eq!(b.spec.env["PADDOCK_PASTURE"].value, "/pasture");
         assert_eq!(b.spec.env["PADDOCK_PASTURE_NAME"].value, "team");
+        // The workbench folder: read-only for a member.
+        let w = b
+            .spec
+            .mounts
+            .iter()
+            .find(|m| m.dst == Path::new("/run/paddock/workbench"))
+            .expect("no workbench mount");
+        assert_eq!(w.kind, crate::spec::MountKind::Ro);
+        assert_eq!(
+            w.src.as_deref(),
+            Some(crate::pasture::workbench::dir(&env, &b.home_key, "team").as_path())
+        );
+        assert_eq!(
+            b.spec.env["PADDOCK_WORKBENCH"].value,
+            "/run/paddock/workbench"
+        );
         // The admission check of `build` comes before this: a configured
         // member only.
         assert!(build(&env, &opts).is_err());

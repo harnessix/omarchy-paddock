@@ -464,6 +464,20 @@ impl<'a> HarnessFactory<'a> {
         })
     }
 
+    /// A harness for a profile that paddock builds itself, such as the
+    /// workbench of a pasture.
+    pub fn adopt(&self, profile: Profile, source: &str) -> Result<Harness> {
+        let exe = self.locate(&profile)?;
+        let (install_mounts, path_dirs) = runtime_closure(self.env, &exe)?;
+        Ok(Harness {
+            profile,
+            exe,
+            install_mounts,
+            path_dirs,
+            source: source.into(),
+        })
+    }
+
     fn locate(&self, p: &Profile) -> Result<PathBuf> {
         let mut tried = Vec::new();
         if let (Some(tool), Some(mise)) = (&p.locate.mise, self.env.which("mise")) {

@@ -409,14 +409,14 @@ pub struct Response {
 }
 
 impl Response {
-    fn new(status: Status, message: impl Into<String>) -> Self {
+    pub(crate) fn new(status: Status, message: impl Into<String>) -> Self {
         Self {
             status,
             message: message.into(),
             result: serde_json::Value::Null,
         }
     }
-    fn done(result: serde_json::Value) -> Self {
+    pub(crate) fn done(result: serde_json::Value) -> Self {
         Self {
             status: Status::Done,
             message: String::new(),
@@ -680,6 +680,10 @@ impl Service {
             "tree_root": self.id.tree,
             "rations": self.rations(),
             "bridge": self.id.pasture.as_deref().is_some_and(|p| !self.id.is_child() && crate::pasture::bridge::enabled(&self.env, p)),
+            "workbench": match (&self.id.pasture, self.id.is_child()) {
+                (Some(p), false) => serde_json::to_value(crate::pasture::workbench::state(&self.env, &self.id.project, p)).unwrap_or_default(),
+                _ => serde_json::Value::Null,
+            },
             "scopes": {
                 "self": "read-write; this sandbox only",
                 "pasture": match (&self.id.pasture, self.id.is_child()) {
@@ -725,7 +729,7 @@ impl Service {
         );
         // The user scope gate and the bridge log their own decisions.
         let gated = scope == Scope::User && resp.status == Status::Denied;
-        if (write || failed) && !gated && req.op != "ask" {
+        if (write || failed) && !gated && req.op != "ask" && req.op != "workbench" {
             self.audit(req, scope, "", &resp);
         }
         log::debug!(
@@ -763,6 +767,9 @@ impl Service {
         }
         if req.op == "info" {
             return Response::done(self.info());
+        }
+        if req.op == "workbench" {
+            return crate::pasture::workbench::join(&self.env, &self.id);
         }
         if !OPS.contains(&req.op.as_str()) {
             return invalid(format!(

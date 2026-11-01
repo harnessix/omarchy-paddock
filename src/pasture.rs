@@ -14,11 +14,15 @@
 //! `pasture` scope of paddock kv. A sandbox started without `--pasture` is a
 //! pasture of its own, so by default no two sandboxes share kv data.
 //!
+//! `workbench = true` in `[pastures.NAME]` allows a shared terminal that
+//! belongs to no member (workbench.rs).
+//!
 //! `[pastures.NAME.rations]` gives a member a ration: a timer named
 //! `ration` that the user owns, set when the member starts (timer.rs).
 
 pub mod bridge;
 pub mod ports;
+pub mod workbench;
 
 use crate::env::HostEnv;
 use anyhow::{bail, Context as _, Result};
@@ -39,6 +43,8 @@ pub struct Pasture {
     pub bridge: bool,
     /// The ration of each member harness that has one.
     pub rations: BTreeMap<String, Ration>,
+    /// Whether the pasture can have a workbench (workbench.rs).
+    pub workbench: bool,
 }
 
 /// What a member can graze: the budgets of its `ration` timer.
@@ -65,6 +71,8 @@ struct RawPasture {
     bridge: bool,
     #[serde(default)]
     rations: BTreeMap<String, RawRation>,
+    #[serde(default)]
+    workbench: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -154,6 +162,12 @@ pub fn parse(text: &str) -> Result<BTreeMap<String, Pasture>> {
             .clone()
             .try_into()
             .with_context(|| format!("[pastures.{name}] is invalid"))?;
+        if p.members.iter().any(|m| m == workbench::NAME) {
+            bail!(
+                "[pastures.{name}]: '{}' is the shared terminal of a pasture, not a member: set workbench = true",
+                workbench::NAME
+            );
+        }
         let mut rations = BTreeMap::new();
         for (member, r) in p.rations {
             let ration = ration_of(name, &member, &p.members, r)?;
@@ -165,6 +179,7 @@ pub fn parse(text: &str) -> Result<BTreeMap<String, Pasture>> {
                 members: p.members,
                 bridge: p.bridge,
                 rations,
+                workbench: p.workbench,
             },
         );
     }
@@ -316,6 +331,19 @@ mod tests {
         assert!(parse("[pastures.Bad]\nmembers = []\n").is_err());
         assert!(parse("[pastures.x]\nother = 1\n").is_err());
         assert!(parse("").unwrap().is_empty());
+        assert!(!p["review"].workbench);
+    }
+
+    #[test]
+    fn parses_the_workbench() {
+        let p = parse("[pastures.review]\nmembers = [\"claude\"]\nworkbench = true\n").unwrap();
+        assert!(p["review"].workbench);
+        assert!(parse("[pastures.review]\nworkbench = \"yes\"\n").is_err());
+        let e = format!(
+            "{:#}",
+            parse("[pastures.review]\nmembers = [\"workbench\"]\n").unwrap_err()
+        );
+        assert!(e.contains("workbench = true"), "{e}");
     }
 
     #[test]

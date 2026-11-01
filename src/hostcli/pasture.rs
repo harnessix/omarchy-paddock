@@ -13,6 +13,7 @@ USAGE
   paddock-host pasture unshare PORT [--json]
   paddock-host pasture members [--json]
   paddock-host pasture ask MEMBER [--prompt-file FILE] [--timeout SECONDS] [--json]
+  paddock-host pasture workbench [--print] [--json]
 
 Each member of a pasture is its own sandbox with its own network. share PORT
 puts a TCP port of this sandbox "on the ground": a server that listens on
@@ -41,6 +42,14 @@ member. Nothing else leaves this sandbox: only the ports that you name.
                  longer one). When an answer holds a piece of a login secret
                  of a member, paddock withholds it and says so. A member
                  that used up its ration answers no questions (exit 3).
+  workbench      Join the workbench: one tmux session that belongs to no
+                 member, with the project, /pasture and the shared ports,
+                 but no login and an empty home. The first member that
+                 asks starts it. In a terminal this attaches to it;
+                 --print, or no terminal, prints the tmux command instead.
+                 Every member and the user can type into it, so each one
+                 sees what the others run there. Off until the user sets
+                 workbench = true in [pastures.NAME].
 
 When a member already has its own server on PORT, it skips that port and
 members shows why. Limits: TCP only, ports 1024 to 65535, at most 16 shared
@@ -61,6 +70,7 @@ EXAMPLES
   paddock-host pasture members
   curl http://127.0.0.1:3000/      (in another member)
   paddock-host pasture ask codex --prompt-file question.md --timeout 300
+  paddock-host pasture workbench
 "#;
 
 fn usage(msg: &str) -> i32 {
@@ -110,6 +120,8 @@ pub fn main(args: &[String]) -> i32 {
             Err(e) => usage(&e),
         },
         ["members"] => members(json),
+        ["workbench"] => workbench(json, false),
+        ["workbench", "--print"] => workbench(json, true),
         [cmd, ..] if matches!(*cmd, "share" | "unshare") => usage(&format!("{cmd} needs one PORT")),
         [cmd, ..] => usage(&format!("unknown pasture command '{cmd}'")),
     }
@@ -346,17 +358,87 @@ fn ask(args: &[String]) -> i32 {
     resp.status.exit_code()
 }
 
-/// Whether the bridge of this pasture is on, and the rations of its
-/// members by sandbox id, from paddock kv.
-fn info() -> (bool, serde_json::Value) {
+/// `workbench`: start or find the workbench, then attach or print how.
+fn workbench(json: bool, print: bool) -> i32 {
+    use crate::pasture::workbench as wb;
+    use std::io::IsTerminal as _;
+    if let Err(code) = member() {
+        return code;
+    }
+    let resp = match super::kv::send(&crate::kv::Request {
+        v: crate::kv::PROTOCOL,
+        op: "workbench".into(),
+        ..Default::default()
+    }) {
+        Ok(r) => r,
+        Err(e) => return no_host(&e),
+    };
+    let sock = wb::socket_in_sandbox(std::env::var(wb::ENV).ok().as_deref());
+    let tmux = which("tmux");
+    if json {
+        let mut v = serde_json::to_value(&resp).unwrap_or_default();
+        if resp.status == Status::Done {
+            v["result"]["socket"] = sock.display().to_string().into();
+            v["result"]["attach"] = wb::attach_command(&sock).into();
+            v["result"]["tmux"] = tmux.is_some().into();
+        }
+        println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default());
+        return resp.status.exit_code();
+    }
+    if resp.status != Status::Done {
+        eprintln!("paddock-host pasture: workbench: {}", resp.message);
+        return resp.status.exit_code();
+    }
+    if !sock.exists() {
+        eprintln!(
+            "paddock-host pasture: the workbench runs, but {} is not in this sandbox. The user restarts this member to see it.",
+            sock.display()
+        );
+        return super::EXIT_NO_HOST;
+    }
+    let cmd = wb::attach_command(&sock);
+    let Some(tmux) = tmux else {
+        println!("The workbench runs. tmux is not in this sandbox, so you cannot attach from here. With tmux: {cmd}");
+        return 0;
+    };
+    if print || !(std::io::stdin().is_terminal() && std::io::stdout().is_terminal()) {
+        println!("{cmd}");
+        eprintln!("Every member and the user can type into the workbench, so each one sees what the others run there.");
+        return 0;
+    }
+    use std::os::unix::process::CommandExt as _;
+    let e = std::process::Command::new(tmux)
+        .arg("-S")
+        .arg(&sock)
+        .args(["attach", "-t", wb::SESSION])
+        .exec();
+    eprintln!("paddock-host pasture: cannot start tmux: {e}");
+    super::EXIT_NO_HOST
+}
+
+fn which(cmd: &str) -> Option<std::path::PathBuf> {
+    std::env::var_os("PATH").and_then(|p| {
+        std::env::split_paths(&p)
+            .map(|d| d.join(cmd))
+            .find(|f| crate::env::is_executable(f))
+    })
+}
+
+/// Whether the bridge of this pasture is on, the rations of its members
+/// by sandbox id, and the workbench, from paddock kv.
+fn info() -> (bool, serde_json::Value, serde_json::Value) {
     let r = super::kv::send(&crate::kv::Request {
         v: crate::kv::PROTOCOL,
         op: "info".into(),
         ..Default::default()
     });
     match r {
-        Ok(r) => (r.result["bridge"] == true, r.result["rations"].clone()),
-        Err(_) => (false, serde_json::Value::Null),
+        Ok(r) => (
+            r.result["bridge"] == true,
+            r.result["rations"].clone(),
+            r.result["workbench"].clone(),
+        ),
+        Err(_) => (false, serde_json::Value::Null, serde_json::Value::Null),
     }
 }
 
@@ -365,7 +447,7 @@ fn members(json: bool) -> i32 {
         Ok(m) => m,
         Err(code) => return code,
     };
-    let (bridge, rations) = info();
+    let (bridge, rations, bench) = info();
     let shared = match ports::shared() {
         Ok(s) => s,
         Err(e) => return no_host(&e),
@@ -375,7 +457,11 @@ fn members(json: bool) -> i32 {
         Err(e) => return no_host(&e),
     };
     // Every member with a record, plus owners of ports without one.
-    let mut rows: Vec<(String, String, serde_json::Value)> = records;
+    // The workbench is no member: it has a line of its own.
+    let mut rows: Vec<(String, String, serde_json::Value)> = records
+        .into_iter()
+        .filter(|(_, h, _)| h != crate::pasture::workbench::NAME)
+        .collect();
     for s in &shared {
         if !rows.iter().any(|(id, _, _)| *id == s.sandbox) {
             rows.push((
@@ -405,8 +491,10 @@ fn members(json: bool) -> i32 {
             .collect();
         println!(
             "{}",
-            serde_json::to_string_pretty(&serde_json::json!({ "members": list, "bridge": bridge }))
-                .unwrap_or_default()
+            serde_json::to_string_pretty(
+                &serde_json::json!({ "members": list, "bridge": bridge, "workbench": bench })
+            )
+            .unwrap_or_default()
         );
         return 0;
     }
@@ -416,6 +504,14 @@ fn members(json: bool) -> i32 {
             "on: members can ask each other (paddock-host pasture ask MEMBER)"
         } else {
             "off"
+        }
+    );
+    println!(
+        "workbench: {}",
+        match (bench["allowed"] == true, bench["running"] == true) {
+            (_, true) => "runs: join it with paddock-host pasture workbench",
+            (true, false) => "allowed, not running: paddock-host pasture workbench starts it",
+            (false, false) => "off",
         }
     );
     for (id, harness, skipped) in &rows {
