@@ -807,6 +807,17 @@ pub fn build_with(env: &HostEnv, opts: &Options, harness: Harness) -> Result<Bui
         crate::spawn::make_read_only(&mut spec, &[project.clone(), home_key.clone()]);
     }
 
+    // The borrow folder: empty at the start. `paddock-host borrow` copies
+    // host folders into it, and the sandbox end removes what is left.
+    let borrow = crate::borrow::dir(env, &id);
+    crate::privfs::dir(&borrow)?;
+    spec.add_mount(Mount::bind(
+        &borrow,
+        crate::borrow::MOUNT,
+        true,
+        "borrow folder",
+    ));
+
     // The shared folder of the pasture. paddock sets the variables last,
     // so that nothing from the host or the project replaces them.
     if let Some(name) = &opts.pasture {

@@ -528,6 +528,8 @@ pub fn removable_roots(env: &HostEnv) -> Vec<PathBuf> {
         keyring_root(env),
         sessions_root(env),
         scratch_root(env),
+        crate::borrow::root(env),
+        crate::borrow::meta_root(env),
     ]
 }
 
@@ -1919,6 +1921,10 @@ pub fn render_du(env: &HostEnv, inv: &Inventory, now: u64) -> String {
         "Keyring passwords: {} ({orphan} without a home)\n",
         inv.keyrings.len()
     ));
+    if let Some(l) = crate::borrow::du_line(env) {
+        t.push_str(&l);
+        t.push('\n');
+    }
     for n in &inv.notes {
         t.push_str(&format!("note: {n}\n"));
     }

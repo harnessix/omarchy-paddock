@@ -31,6 +31,8 @@ USAGE
   paddock-host exec [--timeout SECONDS] [--reason TEXT] -- COMMAND [ARG...]
   paddock-host tool --list | tool [--timeout SECONDS] [--reason TEXT] NAME [ARG...]
   paddock-host fetch HOST_PATH [--reason TEXT]
+  paddock-host borrow HOST_FOLDER [--reason TEXT]
+  paddock-host return NAME [--reason TEXT]
   paddock-host clipboard get [--reason TEXT]
   paddock-host clipboard set TEXT [--reason TEXT]
   paddock-host open URL [--reason TEXT]
@@ -117,6 +119,8 @@ EXAMPLES
   paddock-host screenshot --target window --out settings.png
   paddock-host exec --reason "restart the dev database" -- systemctl --user restart postgres
   paddock-host fetch /etc/hosts --reason "compare host name resolution"
+  paddock-host borrow /srv/shared-lib --reason "fix the parser bug there"
+  paddock-host return shared-lib --reason "the parser fix, tests pass"
   paddock-host open https://example.com/docs
   paddock-host notify "Build finished" "All 214 tests passed"
   git push -u origin fix-login
@@ -184,6 +188,24 @@ snapshot. Symbolic links inside a directory are skipped. The limit is 64 MiB.
 Protected paths (~/.ssh, ~/.gnupg, cloud credentials, browser profiles and the
 other paths that paddock never mounts) are refused even if the user would
 allow them."#
+        }
+        "borrow" | "return" => {
+            r#"paddock-host borrow and return: change a host folder outside the project.
+
+  paddock-host borrow HOST_FOLDER   copy the folder to /run/paddock/borrow/NAME
+  paddock-host return NAME          write the changes of the copy back
+
+HOST_FOLDER must be absolute, and its last part is no symlink. borrow prints
+the path of the copy. Change the copy as you like. The original does not
+change. return shows the user every added, changed and deleted file, and
+writes them back on approval. It refuses when the original changed after the
+borrow: borrow it again and redo the changes. A return never writes git
+config, hooks or pointer files, gives new files no execute bit, and refuses
+symlinks that point outside the folder. After a return the copy is gone.
+Copies that are not returned are deleted when the sandbox ends.
+Protected paths (~/.ssh, cloud credentials, browser profiles and the others
+that fetch refuses) and folders that hold one are refused. Without reflinks
+the limit is [borrow] max of the user configuration (default 1G)."#
         }
         "clipboard-read" | "clipboard" => {
             r#"paddock-host clipboard: read or set the host clipboard.
@@ -556,6 +578,30 @@ pub fn main(args: &[String]) -> i32 {
                 a.insert("path".into(), serde_json::json!(path));
                 (req("fetch", p.reason, a), p.json)
             }
+            "borrow" => {
+                let p = parse(rest, &[])?;
+                let [path] = p.rest.as_slice() else {
+                    return Err("borrow needs exactly one host folder".into());
+                };
+                let mut a = BTreeMap::new();
+                a.insert("path".into(), serde_json::json!(path));
+                (req("borrow", p.reason, a), p.json)
+            }
+            "return" => {
+                let p = parse(rest, &[])?;
+                let [name] = p.rest.as_slice() else {
+                    return Err("return needs the name that borrow printed".into());
+                };
+                // The path of the copy works too.
+                let name = name
+                    .trim_end_matches('/')
+                    .rsplit('/')
+                    .next()
+                    .unwrap_or_default();
+                let mut a = BTreeMap::new();
+                a.insert("name".into(), serde_json::json!(name));
+                (req("return", p.reason, a), p.json)
+            }
             "clipboard" => {
                 let p = parse(rest, &[])?;
                 match p.rest.as_slice() {
@@ -778,6 +824,14 @@ fn print_human(req: &Request, resp: &Response) {
             eprint!("{}", r["stderr"].as_str().unwrap_or(""));
         }
         "clipboard-read" => print!("{}", r["text"].as_str().unwrap_or("")),
+        "return" => println!(
+            "returned {} to {}: {} added, {} changed, {} deleted",
+            r["name"].as_str().unwrap_or(""),
+            r["original"].as_str().unwrap_or(""),
+            r["added"],
+            r["changed"],
+            r["deleted"]
+        ),
         "spawn" => match req.args.get("action").and_then(|a| a.as_str()) {
             Some("start") => {
                 // Only the id on stdout, so `id=$(paddock-host spawn ...)` works.

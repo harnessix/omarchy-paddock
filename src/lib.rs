@@ -4,6 +4,7 @@
 pub mod app;
 pub mod approver;
 pub mod backend;
+pub mod borrow;
 pub mod broker;
 pub mod build;
 pub mod credentials;

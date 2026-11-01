@@ -884,6 +884,7 @@ pub fn run(
         crate::pasture::bridge::forget_member(base, &spec.id);
     }
     let _ = std::fs::remove_dir_all(env.paddock_run().join(&spec.id));
+    crate::borrow::end(env, &spec.id);
     crate::recover::Session::end(env, &spec.id);
     // Share identical file data of this home with the other homes, in the
     // background: the exit does not wait for it.
