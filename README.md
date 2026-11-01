@@ -831,6 +831,24 @@ paddock-host pasture ask codex --prompt-file question.md --timeout 300
 - The guard finds a login only as plain text. An answer that encodes it, for example in base64 or with other characters between its parts, passes. The guard stops an accident or a simple trick, not a member that works hard to leak. Put only members that you trust with each other's answers into one pasture with the bridge on.
 - With the srt backend, a member can read the bridge folder outside the sandboxes. It holds the pending questions and hashes of 16-character pieces of the delivered credentials, never their values.
 
+Members of one pasture often use one account, so they eat from the same limits. Give each member a ration:
+
+```toml
+[pastures.review]
+members = ["claude", "codex"]
+
+[pastures.review.rations]
+claude = { quota = "weekly=1%", budget = "2h" }
+codex  = { quota = "weekly=2%", hard = true }
+```
+
+- When a member starts, paddock sets a timer named `ration` in its own scope, as `paddock timer set` does. You own it, so the member asks you on the approval card for more.
+- `quota` is a share of a limit window of the account, counted from the start. `budget` is a time. A ration needs one of them, or both. `hard = true` freezes the member when the ration is used up. Without it, the member gets a notice.
+- When paddock has no usage numbers for the account, the ration counts only the time, and paddock says so at the start.
+- `paddock pasture list` and `paddock-host pasture members` show each ration and how much of it is used.
+- A member that used up its ration answers no bridge questions. The asker gets a refusal and exit code 3.
+- Each key of `rations` names a member of `members`. A wrong key, quota or duration stops the start with an error that names the pasture.
+
 The bar panel shows the shared data too. A "Shared data" row opens a list of the pastures, your `user` scope and the data of older versions, with their members and the number of keys and locks. A pasture opens to its keys, grouped by the part before the first `:`, with locks first: who wrote each key, when, and its size. A key opens to its value, shown as plain text. From there you can copy the value, delete the key or free a lock; each delete asks twice. The panel reads a value only when you open its key, and reads paddock kv only while it is open. Bind a key to `omarchy-shell harnessix.paddock.kv open` to open the shared data directly.
 
 In a spawn tree, the parent writes the tasks into the `tree` scope, each child claims one with a lease and writes its result, and the parent waits for `result:`:

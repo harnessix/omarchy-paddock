@@ -1642,3 +1642,103 @@ fn a_shared_port_has_one_owner_and_a_limit() {
         Status::Done
     );
 }
+
+#[test]
+fn a_ration_is_a_user_timer_and_stops_bridge_questions_when_used_up() {
+    let w = world();
+    std::fs::create_dir_all(w.env.paddock_config()).unwrap();
+    std::fs::write(
+        w.env.paddock_config().join("config.toml"),
+        "[pastures.team]\nmembers = [\"t\"]\nbridge = true\n[pastures.team.rations]\nt = { quota = \"weekly=1%\", budget = \"2h\" }\n",
+    )
+    .unwrap();
+    let dir = w.env.state_dir.join("omarchy/agents/usage");
+    std::fs::create_dir_all(&dir).unwrap();
+    let usage = |at: u64, pct: f64| {
+        std::fs::write(
+            dir.join("t.json"),
+            serde_json::json!({"limitsFetchedAt": at * 1000, "limits": [
+                {"label": "Weekly (7-day)", "percent": pct, "resetsAt": "2030-01-05T00:00:00Z"}]})
+            .to_string(),
+        )
+        .unwrap();
+    };
+    let now = crate::state::now();
+    usage(now, 0.40);
+    let (a, _) = service(&w, "a", None, KvCfg::default(), Some(Answer::Deny));
+    let (b, _) = service(&w, "b", None, KvCfg::default(), None);
+    for id in ["a", "b"] {
+        let mut r: crate::state::Running = serde_json::from_value(serde_json::json!({
+            "id": id, "harness": "t", "project": "/src/app", "backend": "bwrap",
+            "network": "none", "gui": "off", "pid": std::process::id(), "started": now,
+        }))
+        .unwrap();
+        r.kv_project = Some("/src/app".into());
+        r.pasture = Some(TEAM.into());
+        r.register(&w.env).unwrap();
+    }
+    // What the start of a member does.
+    let ration = crate::pasture::load(&w.env).unwrap()[TEAM].rations["t"].clone();
+    let notes = crate::pasture::apply_ration(&w.env, "a", "t", &ration).unwrap();
+    assert!(notes[0].contains("ration of t"), "{notes:?}");
+    let s = a.handle(&timer_req("status", Scope::Own, "ration"), None);
+    assert_eq!(s.status, Status::Done, "{}", s.message);
+    assert_eq!(s.result["owner"], "user");
+    assert_eq!(s.result["budget"], 7200);
+    assert_eq!(s.result["hard"], false);
+    assert_eq!(s.result["quota"]["window"], "Weekly (7-day)");
+    // The member cannot stop it, and the user denies more.
+    assert_eq!(
+        a.handle(&timer_req("stop", Scope::Own, "ration"), None)
+            .status,
+        Status::Denied
+    );
+    let more = Request {
+        by: Some(600),
+        reason: Some("more".into()),
+        ..timer_req("extend", Scope::Own, "ration")
+    };
+    assert_eq!(a.handle(&more, None).status, Status::Denied);
+    let u = crate::pasture::ration_use(&w.env, "a").unwrap();
+    assert!(!u.over && u.used.contains("of 2h"), "{u:?}");
+    // The account eats 2% of the week: over, so a question to it is refused.
+    usage(now + 60, 0.42);
+    crate::forage::record(&w.env, "t").unwrap();
+    assert!(crate::pasture::ration_use(&w.env, "a").unwrap().over);
+    let info = b.handle(&req("info", Scope::Own, ""), None);
+    assert_eq!(info.result["rations"]["a"]["over"], true, "{}", info.result);
+    let ask = Request {
+        v: PROTOCOL,
+        op: "ask".into(),
+        key: Some("a".into()),
+        value: Some("are you there?".into()),
+        timeout: Some(5),
+        ..Default::default()
+    };
+    let r = b.handle(&ask, None);
+    assert_eq!(r.status, Status::Denied, "{}", r.message);
+    assert_eq!(r.status.exit_code(), 3);
+    assert!(r.message.contains("ration"), "{}", r.message);
+}
+
+#[test]
+fn a_ration_without_usage_numbers_keeps_its_time() {
+    let w = world();
+    let mut r: crate::state::Running = serde_json::from_value(serde_json::json!({
+        "id": "a", "harness": "t", "project": "/src/app", "backend": "bwrap",
+        "network": "none", "gui": "off", "pid": std::process::id(), "started": 0,
+    }))
+    .unwrap();
+    r.pasture = Some(TEAM.into());
+    r.register(&w.env).unwrap();
+    let ration = crate::pasture::Ration {
+        budget: 3600,
+        quota: Some(("weekly".into(), 0.02)),
+        hard: true,
+    };
+    let notes = crate::pasture::apply_ration(&w.env, "a", "t", &ration).unwrap();
+    assert!(notes[0].contains("no usage numbers"), "{notes:?}");
+    let s = crate::pasture::ration_status(&w.env, "a").unwrap();
+    assert_eq!((s.owner.as_str(), s.budget, s.hard), ("user", 3600, true));
+    assert!(s.quota.is_none());
+}

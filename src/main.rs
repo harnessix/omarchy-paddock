@@ -2698,6 +2698,19 @@ fn pasture_cmd(env: &HostEnv, cmd: PastureCmd) -> Result<i32> {
                         format!("running: {}", running.join(", "))
                     }
                 );
+                for m in &p.members {
+                    if let Some(r) = &m.ration {
+                        println!(
+                            "{:<20} ration of {} ({}): {}{}{}",
+                            "",
+                            m.harness,
+                            m.sandbox,
+                            r.used,
+                            if r.hard { ", hard" } else { "" },
+                            if r.over { ", over" } else { "" }
+                        );
+                    }
+                }
                 for port in &p.ports {
                     println!(
                         "{:<20} port {} shared by {} ({})",

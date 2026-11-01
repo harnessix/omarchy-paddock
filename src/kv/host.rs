@@ -86,6 +86,9 @@ pub struct Member {
     pub running: bool,
     /// Since when it is frozen (`paddock freeze`).
     pub frozen_since: Option<u64>,
+    /// Its `ration` timer, when the pasture gives it one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ration: Option<crate::pasture::RationUse>,
 }
 
 /// The pastures of a project that hold keys or have a running member.
@@ -107,6 +110,10 @@ pub fn pastures(env: &HostEnv, project: &Path) -> Result<Vec<PastureInfo>> {
         harness: r.harness.clone(),
         running: r.ended.is_none() && running.contains(&r.id),
         frozen_since: crate::freeze::frozen(env, &r.id).map(|(since, _)| since),
+        ration: r
+            .pasture
+            .as_ref()
+            .and_then(|_| crate::pasture::ration_use(env, &r.id)),
     };
     type Counts = (u64, u64, u64, Vec<crate::pasture::ports::Shared>);
     let count = |ns: &Ns| -> Result<Counts> {

@@ -13,6 +13,9 @@
 //! in two projects is two pastures. The members of one pasture share the
 //! `pasture` scope of paddock kv. A sandbox started without `--pasture` is a
 //! pasture of its own, so by default no two sandboxes share kv data.
+//!
+//! `[pastures.NAME.rations]` gives a member a ration: a timer named
+//! `ration` that the user owns, set when the member starts (timer.rs).
 
 pub mod bridge;
 pub mod ports;
@@ -34,7 +37,24 @@ pub struct Pasture {
     pub members: Vec<String>,
     /// Whether a member can ask another member a question (bridge.rs).
     pub bridge: bool,
+    /// The ration of each member harness that has one.
+    pub rations: BTreeMap<String, Ration>,
 }
+
+/// What a member can graze: the budgets of its `ration` timer.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Ration {
+    /// Seconds; 0: no time budget.
+    pub budget: u64,
+    /// A window and a share of it, as `timer::parse_quota` gives them.
+    pub quota: Option<(String, f64)>,
+    pub hard: bool,
+}
+
+impl Eq for Ration {}
+
+/// The name of the timer that holds a ration.
+pub const RATION: &str = "ration";
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -43,6 +63,44 @@ struct RawPasture {
     members: Vec<String>,
     #[serde(default)]
     bridge: bool,
+    #[serde(default)]
+    rations: BTreeMap<String, RawRation>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawRation {
+    quota: Option<String>,
+    budget: Option<String>,
+    #[serde(default)]
+    hard: bool,
+}
+
+fn ration_of(pasture: &str, member: &str, members: &[String], r: RawRation) -> Result<Ration> {
+    let at = format!("[pastures.{pasture}.rations] {member}");
+    if !members.iter().any(|m| m == member) {
+        bail!("{at}: {member} is not in members of [pastures.{pasture}]");
+    }
+    let budget = match &r.budget {
+        Some(b) => {
+            let s = crate::timer::parse_duration(b).with_context(|| at.clone())?;
+            crate::timer::check_budget(s).with_context(|| at.clone())?;
+            s
+        }
+        None => 0,
+    };
+    let quota = match &r.quota {
+        Some(q) => Some(crate::timer::parse_quota(q).with_context(|| at.clone())?),
+        None => None,
+    };
+    if budget == 0 && quota.is_none() {
+        bail!("{at}: a ration needs a quota (for example \"weekly=1%\"), a budget (for example \"2h\"), or both");
+    }
+    Ok(Ration {
+        budget,
+        quota,
+        hard: r.hard,
+    })
 }
 
 /// Where the shared folder of a pasture appears in each member.
@@ -88,15 +146,25 @@ pub fn parse(text: &str) -> Result<BTreeMap<String, Pasture>> {
     let Some(t) = v.get("pastures") else {
         return Ok(BTreeMap::new());
     };
-    let raw: BTreeMap<String, RawPasture> = t.clone().try_into()?;
+    let tbl = t.as_table().context("[pastures] is not a table")?;
     let mut out = BTreeMap::new();
-    for (name, p) in raw {
-        check_name(&name)?;
+    for (name, v) in tbl {
+        check_name(name)?;
+        let p: RawPasture = v
+            .clone()
+            .try_into()
+            .with_context(|| format!("[pastures.{name}] is invalid"))?;
+        let mut rations = BTreeMap::new();
+        for (member, r) in p.rations {
+            let ration = ration_of(name, &member, &p.members, r)?;
+            rations.insert(member, ration);
+        }
         out.insert(
-            name,
+            name.clone(),
             Pasture {
                 members: p.members,
                 bridge: p.bridge,
+                rations,
             },
         );
     }
@@ -130,6 +198,67 @@ pub fn admit(env: &HostEnv, name: &str, harness: &str) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// Set the ration of a member that just started: the timer `ration` in
+/// its own scope, owned by the user. Without usage numbers for the account
+/// the quota part is left out. Returns the notices for the user.
+pub fn apply_ration(env: &HostEnv, id: &str, harness: &str, r: &Ration) -> Result<Vec<String>> {
+    let mut notes = Vec::new();
+    let agent = crate::forage::agent_of(harness);
+    let quota = match &r.quota {
+        Some(q) if crate::forage::windows(env, &agent).is_empty() => {
+            notes.push(format!(
+                "paddock has no usage numbers for {agent}, so the ration of {harness} counts no quota ({}={:.0}%)",
+                q.0,
+                q.1 * 100.0
+            ));
+            None
+        }
+        q => q.clone(),
+    };
+    if r.budget == 0 && quota.is_none() {
+        return Ok(notes);
+    }
+    let s = crate::timer::host_set(env, id, RATION, r.budget, r.hard, quota)?;
+    notes.push(format!(
+        "ration of {harness}: {}{}",
+        crate::timer::describe(&s),
+        if r.hard { ", hard" } else { "" }
+    ));
+    Ok(notes)
+}
+
+/// The status of the `ration` timer of a sandbox, if it has one.
+pub fn ration_status(env: &HostEnv, sandbox: &str) -> Option<crate::timer::Status> {
+    let (file, ns) = crate::timer::self_file(env, sandbox).ok()?;
+    if !file.is_file() {
+        return None;
+    }
+    let st = crate::kv::store::Store::open(&file).ok()?;
+    let now = crate::state::now();
+    let e = st
+        .get(&ns, &format!("{}{RATION}", crate::timer::PREFIX), now)
+        .ok()??;
+    let t: crate::timer::Timer = serde_json::from_str(&e.value).ok()?;
+    Some(t.status_in(env, now))
+}
+
+/// A ration as `pasture list` and `pasture members` show it.
+#[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
+pub struct RationUse {
+    /// "10m of 2h, 0% of 1% of claude Weekly".
+    pub used: String,
+    pub over: bool,
+    pub hard: bool,
+}
+
+pub fn ration_use(env: &HostEnv, sandbox: &str) -> Option<RationUse> {
+    ration_status(env, sandbox).map(|s| RationUse {
+        used: crate::timer::describe(&s),
+        over: s.over,
+        hard: s.hard,
+    })
 }
 
 #[cfg(test)]
@@ -187,5 +316,56 @@ mod tests {
         assert!(parse("[pastures.Bad]\nmembers = []\n").is_err());
         assert!(parse("[pastures.x]\nother = 1\n").is_err());
         assert!(parse("").unwrap().is_empty());
+    }
+
+    #[test]
+    fn parses_and_checks_rations() {
+        let p = parse(
+            r#"[pastures.review]
+members = ["claude", "codex"]
+[pastures.review.rations]
+claude = { quota = "weekly=1%", budget = "2h" }
+codex  = { quota = "weekly=2%", hard = true }
+"#,
+        )
+        .unwrap();
+        let r = &p["review"].rations;
+        assert_eq!(
+            r["claude"],
+            Ration {
+                budget: 7200,
+                quota: Some(("weekly".into(), 0.01)),
+                hard: false
+            }
+        );
+        assert_eq!(r["codex"].budget, 0);
+        assert!(r["codex"].hard);
+        let err = |rations: &str| {
+            format!(
+                "{:#}",
+                parse(&format!(
+                    "[pastures.review]\nmembers = [\"claude\"]\n[pastures.review.rations]\n{rations}\n"
+                ))
+                .unwrap_err()
+            )
+        };
+        let e = err("codex = { budget = \"2h\" }");
+        assert!(
+            e.contains("[pastures.review.rations]") && e.contains("not in members"),
+            "{e}"
+        );
+        let e = err("claude = { quota = \"weekly\" }");
+        assert!(e.contains("[pastures.review.rations] claude"), "{e}");
+        let e = err("claude = { budget = \"2x\" }");
+        assert!(e.contains("[pastures.review.rations] claude"), "{e}");
+        let e = err("claude = { budget = \"40d\" }");
+        assert!(e.contains("30 days"), "{e}");
+        let e = err("claude = { hard = true }");
+        assert!(e.contains("needs a quota"), "{e}");
+        let e = err("claude = { budget = \"2h\", other = 1 }");
+        assert!(
+            e.contains("[pastures.review]") && e.contains("other"),
+            "{e}"
+        );
     }
 }
