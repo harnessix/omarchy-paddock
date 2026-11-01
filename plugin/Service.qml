@@ -22,6 +22,11 @@ import qs.Ui
 // A question from /dev/paddock/ask is a card too. Its answer is text for the
 // agent: a choice button, or a typed answer. The text field takes the
 // keyboard only after a click on it; Escape gives it back.
+//
+// A host request card has a one-line note field for the agent. The note goes
+// with "No" or "No, for this session", on standard input, never as an
+// argument. "No, for this session" denies the same request of that sandbox
+// at once until it ends.
 Item {
   id: root
   property var shell: null
@@ -38,6 +43,8 @@ Item {
   property int choice: 0
   // The question whose answer field has the keyboard, or "".
   property string typingId: ""
+  // Notes for the agent on a denial, by request id.
+  property var notes: ({})
   property real now: Date.now() / 1000
 
   readonly property var visibleRequests: requests.slice(0, 3)
@@ -71,8 +78,10 @@ Item {
     if (isQuestion(r)) return ["deny"].concat((r.choices || []).map(function(c) { return "reply:" + c }))
     var list = ["deny", "once"]
     if (r && r.sessionAllowed) list.push("session")
+    if (r && r.sessionAllowed) list.push("deny-session")
     return list
   }
+  function isDenial(decision) { return decision === "deny" || decision === "deny-session" }
   function answerLabel(r, decision) {
     if (decision.indexOf("reply:") === 0) return decision.slice(6)
     if (isQuestion(r) && decision === "deny") return strings.t("popup.answer.dismiss")
@@ -110,9 +119,20 @@ Item {
   function answer(r, decision) {
     if (decision.indexOf("reply:") === 0) return answerText(r, decision.slice(6))
     if (root.settled[r.id]) return
+    var note = isDenial(decision) && !isQuestion(r) ? String(root.notes[r.id] || "").trim() : ""
     var s = Object.assign({}, root.settled)
     s[r.id] = { state: "sending", decision: decision }
     root.settled = s
+    if (note !== "") {
+      // The note goes on standard input, like the answer to a question.
+      if (root.typingId === r.id) root.typingId = ""
+      textProc.pending = { id: r.id, decision: decision }
+      textProc.text = note.slice(0, 300)
+      textProc.stdinEnabled = true
+      textProc.command = ["sh", "-c", root.launcher, "paddock", "approvals", "answer", r.id, decision, "--text", "-"]
+      textProc.running = true
+      return
+    }
     answerProc.pending = { id: r.id, decision: decision }
     answerProc.command = ["sh", "-c", root.launcher, "paddock", "approvals", "answer", r.id, decision]
     answerProc.running = true
@@ -134,7 +154,7 @@ Item {
   }
   function finish(id, ok, decision) {
     var s = Object.assign({}, root.settled)
-    s[id] = { state: ok ? (decision === "deny" ? "denied" : (decision === "reply" ? "answered" : "allowed")) : "gone", decision: decision }
+    s[id] = { state: ok ? (isDenial(decision) ? "denied" : (decision === "reply" ? "answered" : "allowed")) : "gone", decision: decision }
     root.settled = s
     root.keyboardMode = false
     if (root.typingId === id) root.typingId = ""
@@ -188,8 +208,10 @@ Item {
       var keep = []
       for (var i = 0; i < root.requests.length; i++) if (ids.indexOf(root.requests[i].id) < 0) keep.push(root.requests[i])
       var s = Object.assign({}, root.settled)
-      for (var j = 0; j < ids.length; j++) delete s[ids[j]]
+      var n = Object.assign({}, root.notes)
+      for (var j = 0; j < ids.length; j++) { delete s[ids[j]]; delete n[ids[j]] }
       root.settled = s
+      root.notes = n
       root.requests = keep
       ids = []
     }
@@ -511,6 +533,57 @@ Item {
                 }
               }
 
+              // A host request: an optional note for the agent. It goes
+              // with either "No". The field takes the keyboard only after
+              // a click.
+              Rectangle {
+                Layout.fillWidth: true
+                visible: !root.isQuestion(card.modelData) && !card.result
+                radius: Style.cornerRadius
+                color: Qt.alpha(Commons.Color.foreground, 0.06)
+                border.width: 1
+                border.color: noteInput.activeFocus ? Commons.Color.accent : Qt.alpha(Commons.Color.foreground, 0.18)
+                implicitHeight: noteInput.implicitHeight + Style.space(14)
+                Text {
+                  anchors.fill: parent
+                  anchors.margins: Style.space(7)
+                  visible: noteInput.text === ""
+                  textFormat: Text.PlainText
+                  color: Qt.alpha(Commons.Color.foreground, 0.45)
+                  font.family: Style.font.family
+                  font.pixelSize: Style.font.caption
+                  text: strings.t("popup.note.placeholder")
+                }
+                TextInput {
+                  id: noteInput
+                  anchors.fill: parent
+                  anchors.margins: Style.space(7)
+                  color: Commons.Color.foreground
+                  font.family: Style.font.family
+                  font.pixelSize: Style.font.caption
+                  clip: true
+                  maximumLength: 300
+                  selectByMouse: true
+                  focus: root.typingId === card.modelData.id
+                  onActiveFocusChanged: if (activeFocus) root.typingId = card.modelData.id
+                  onTextChanged: {
+                    var n = Object.assign({}, root.notes)
+                    n[card.modelData.id] = text
+                    root.notes = n
+                  }
+                  // Enter alone never answers: it gives the keyboard back.
+                  Keys.onReturnPressed: { root.typingId = ""; focus = false }
+                  Keys.onEnterPressed: { root.typingId = ""; focus = false }
+                  Keys.onEscapePressed: { root.typingId = ""; focus = false }
+                }
+                MouseArea {
+                  anchors.fill: parent
+                  visible: root.typingId !== card.modelData.id
+                  cursorShape: Qt.IBeamCursor
+                  onClicked: { root.keyboardMode = false; root.typingId = card.modelData.id; noteInput.forceActiveFocus() }
+                }
+              }
+
               // Answers: equal weight, "No" first.
               RowLayout {
                 visible: !card.result
@@ -529,7 +602,7 @@ Item {
                 }
                 Item { Layout.fillWidth: true }
                 Text {
-                  visible: card.index === 0 && !root.keyboardMode
+                  visible: card.index === 0 && !root.keyboardMode && root.answersFor(card.modelData).length < 4
                   textFormat: Text.PlainText
                   color: Qt.alpha(Commons.Color.foreground, 0.45)
                   font.family: Style.font.family

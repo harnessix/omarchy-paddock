@@ -448,6 +448,9 @@ pub struct Service {
     /// The folder of the kv files (shard.rs).
     root: PathBuf,
     user_granted: AtomicBool,
+    /// "Deny for this session" of the user scope, with the user's note.
+    /// Only this sandbox: its children ask on their own.
+    user_denied: Mutex<Option<Option<String>>>,
     /// One user-scope question at a time; the others wait for its answer.
     asking: Mutex<()>,
     connections: AtomicUsize,
@@ -470,6 +473,7 @@ impl Service {
             wait,
             root,
             user_granted: AtomicBool::new(false),
+            user_denied: Mutex::new(None),
             asking: Mutex::new(()),
             connections: AtomicUsize::new(0),
         }
@@ -556,6 +560,14 @@ impl Service {
                 "a sandbox started by spawn cannot ask for the user scope; use it in the root sandbox first, or set [kv] user = \"allow\" in the user configuration",
             ));
         }
+        if let Some(note) = self.user_denied.lock().unwrap().clone() {
+            let resp = Response::new(
+                Status::Denied,
+                crate::broker::denied_message("the user denied the user scope", note.as_deref()),
+            );
+            self.audit(req, Scope::User, "denied for this session", &resp);
+            return Some(resp);
+        }
         let started = crate::spawn::chain_text(&self.id.chain);
         let p = Pending {
             id: request_id(),
@@ -576,7 +588,15 @@ impl Service {
             choices: Vec::new(),
             started_by: self.id.chain.clone(),
         };
-        let (decision, resp) = match self.approver.ask(&self.env, &p, self.wait) {
+        let verdict = self.approver.ask_verdict(&self.env, &p, self.wait);
+        let note = verdict.as_ref().and_then(|v| v.note.clone());
+        let denied = || {
+            Some(Response::new(
+                Status::Denied,
+                crate::broker::denied_message("the user denied the user scope", note.as_deref()),
+            ))
+        };
+        let (decision, resp) = match verdict.map(|v| v.answer) {
             Some(Answer::Once) => ("allowed once", None),
             Some(Answer::Session) => {
                 self.user_granted.store(true, Ordering::SeqCst);
@@ -589,13 +609,11 @@ impl Service {
                 }
                 ("allowed for this session", None)
             }
-            Some(Answer::Deny) => (
-                "denied",
-                Some(Response::new(
-                    Status::Denied,
-                    "the user denied the user scope",
-                )),
-            ),
+            Some(Answer::Deny) => ("denied", denied()),
+            Some(Answer::DenySession) => {
+                *self.user_denied.lock().unwrap() = Some(note.clone());
+                ("denied for this session", denied())
+            }
             None => (
                 "timed out",
                 Some(Response::new(
@@ -1161,14 +1179,17 @@ impl Service {
                         choices: Vec::new(),
                         started_by: self.id.chain.clone(),
                     };
-                    match self.approver.ask(&self.env, &p, self.wait) {
-                        Some(Answer::Once | Answer::Session) => "user".to_string(),
-                        Some(Answer::Deny) => {
+                    match self.approver.ask_verdict(&self.env, &p, self.wait) {
+                        Some(v) if v.answer.denies() => {
                             return Ok(Response::new(
                                 Status::Denied,
-                                "the user did not give more time",
+                                crate::broker::denied_message(
+                                    "the user did not give more time",
+                                    v.note.as_deref(),
+                                ),
                             ))
                         }
+                        Some(_) => "user".to_string(),
                         None => {
                             return Ok(Response::new(
                                 Status::Timeout,

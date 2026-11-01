@@ -430,7 +430,7 @@ pub fn ask(
     for (step, p) in [("allowed", &first), ("confirmed", &second)] {
         let answer = approver.ask(env, p, wait);
         let decision = match answer {
-            Some(crate::broker::Answer::Deny) => "denied",
+            Some(a) if a.denies() => "denied",
             None => "timed out",
             Some(_) => step,
         };
