@@ -640,6 +640,7 @@ Sometimes the agent needs one thing from your computer: a screenshot of the real
 | :--- | :--- | :--- |
 | `screenshot` | Captures the screen, one output or the focused window | ask |
 | `exec` | Runs one command in the project folder, without a shell, isolated (see below) | ask, and never allow |
+| `tool` | Runs a named host tool of `[host.tools]` with allowed arguments only (see [Named host tools](#named-host-tools)) | the mode of each tool |
 | `fetch` | Copies one host file or folder into the project, at most 64 MiB | ask |
 | `clipboard-read`, `clipboard-write` | Reads or sets the host clipboard | ask |
 | `open-url` | Opens an http or https link in your browser, for example a harness login page | ask |
@@ -693,6 +694,36 @@ clipboard-read = "deny"
 wait = 60              # seconds to wait for an answer
 ```
 
+### Named host tools
+
+`exec` asks for every new command line. For a command that you run often, define a named tool in `~/.config/paddock/config.toml`. The command is fixed, and the sandbox can only add arguments that match a shape that you wrote:
+
+```toml
+[host.tools.omarchy-restart-shell]
+command = ["omarchy", "restart", "shell"]   # fixed: no shape, so no arguments
+mode = "allow"
+
+[host.tools.compose]
+command = ["docker", "compose"]
+args = ["up -d", "down", "ps", "logs *"]    # the allowed argument shapes
+cwd = "project"                              # project (default) or home
+mode = "ask"                                 # allow | ask (default) | deny
+```
+
+In the sandbox, `paddock-host tool compose up -d` runs it, and `paddock-host tool --list` shows each tool with its mode and shapes.
+
+- paddock compares the arguments with each shape word by word. `*` matches exactly one word that does not start with `-`. `**`, only as the last word, matches the rest of the words (none or more), none of them starting with `-`. A tool without `args` takes no arguments.
+- Arguments that match no shape are refused at once. Nobody gets a card for them.
+- `allow` runs the tool without a card. `ask` shows a card with the tool name and the exact arguments, and "Allow for this session" covers only the same tool with the same arguments. `deny` refuses. `[host] tool = "deny"` turns off every tool.
+- The tool runs in the executor, isolated like `exec`, with the same `[exec]` limits and the same clean environment. The sandbox environment never reaches it. The executor reads `[host.tools]` again and checks the arguments once more before it runs the command. The program is found on the host `PATH`. With `cwd = "home"`, the tool runs in your home folder, which it sees read-only unless `[exec] home = "full"`.
+- Only the user configuration defines tools. paddock ignores `[host.tools]` in a project `paddock.toml` and logs a warning.
+- The audit log records the tool name, the arguments, the decision and the exit code.
+
+`paddock tools suggest` reads the audit log and prints a ready `[host.tools.NAME]` block for each `exec` command line that you allowed at least 3 times. It never changes your configuration. For this, the audit log keeps the command line of an allowed `exec` when every word is plain: no spaces, quotes or `=`, no flag that names a token, password, secret, key or login, and no long run of mixed letters and digits like a key. Other command lines stay out of the log, as before.
+
+> [!WARNING]
+> A `docker` or `podman` tool runs containers on the host as you. A container can mount any host folder, so on most systems this is the same as root. The shapes limit the words, not what a compose file in the project does: the agent writes that file. Use the docker backend or a VM for container work instead. Treat a container tool as the host itself.
+
 ### Push and pull requests
 
 The sandbox has no SSH key, no git credential helper and no `gh` login. paddock also drops `GH_TOKEN`, `GITHUB_TOKEN`, `GITLAB_TOKEN` and similar variables from the inherited environment. The agent still runs plain `git push` and `gh pr create`. The host does the work with your own credentials, and the token never enters the sandbox.
@@ -711,7 +742,7 @@ For `gh`, only these commands exist: `pr create`, `pr view`, `pr list`, `pr chec
 
 To make reads ask too, or to turn either capability off, set it in `[host]`, for example `forge = "deny"`. `forge = "allow"` also allows the write commands without a question. `git-push = "allow"` allows ordinary pushes, but force pushes, pushes to the default branch and pushes to a new remote still ask.
 
-`paddock log` shows every request with its decision and result. The log is `~/.local/state/paddock/host-audit.jsonl`. It does not keep text that can be private. For `clipboard-write`, it keeps only the length of the text. For `exec`, it keeps the program and the number of arguments, because arguments can hold tokens. For `forge`, it keeps the command without the body text. For `notify`, it keeps the lengths of the title and the body. For `open-url`, it keeps the scheme and the host. paddock makes its folders readable only by you (mode 0700) and its files too (mode 0600), and tightens older ones that other users can read. Request text never goes into the arguments of a host process, which other users can see: notifications go over the desktop bus, and `gh` reads the body on its standard input. To teach agents the client, run `paddock skill install`: it copies a short skill into the skill folders of your harnesses. Inside a sandbox, `paddock-host --help` is the full reference.
+`paddock log` shows every request with its decision and result. The log is `~/.local/state/paddock/host-audit.jsonl`. It does not keep text that can be private. For `clipboard-write`, it keeps only the length of the text. For `exec`, it keeps the program and the number of arguments, because arguments can hold tokens. Only an allowed command line of plain words stays whole, for `paddock tools suggest` (see [Named host tools](#named-host-tools)). For `forge`, it keeps the command without the body text. For `notify`, it keeps the lengths of the title and the body. For `open-url`, it keeps the scheme and the host. paddock makes its folders readable only by you (mode 0700) and its files too (mode 0600), and tightens older ones that other users can read. Request text never goes into the arguments of a host process, which other users can see: notifications go over the desktop bus, and `gh` reads the body on its standard input. To teach agents the client, run `paddock skill install`: it copies a short skill into the skill folders of your harnesses. Inside a sandbox, `paddock-host --help` is the full reference.
 
 ### Spawn other agents
 

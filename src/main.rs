@@ -382,6 +382,11 @@ enum Cmd {
         #[arg(long)]
         background: bool,
     },
+    /// Named host tools ([host.tools]): suggest blocks from the audit log.
+    Tools {
+        #[command(subcommand)]
+        cmd: ToolsCmd,
+    },
     /// The executor of approved host requests: let systemd start it on the
     /// first request (socket activation), or turn that off again.
     Gateway {
@@ -417,6 +422,13 @@ enum Cmd {
     },
     #[command(external_subcommand)]
     External(Vec<String>),
+}
+
+#[derive(Subcommand)]
+enum ToolsCmd {
+    /// Print a [host.tools.NAME] block for each exec command line that you
+    /// allowed at least 3 times. It never changes the configuration.
+    Suggest,
 }
 
 #[derive(Subcommand)]
@@ -1540,6 +1552,24 @@ fn real_main() -> Result<i32> {
             Ok(0)
         }
         Cmd::Pick { harness } => pick(&env, &harness),
+        Cmd::Tools {
+            cmd: ToolsCmd::Suggest,
+        } => {
+            let log =
+                std::fs::read_to_string(paddock::broker::audit_file(&env)).unwrap_or_default();
+            let known = paddock::hosttools::load(&env)?;
+            let out = paddock::hosttools::suggest(&log, &known);
+            if out.is_empty() {
+                println!(
+                    "No suggestion: no exec command line was allowed {} times or more.",
+                    paddock::hosttools::SUGGEST_MIN
+                );
+            } else {
+                println!("# Copy the blocks that you want into your paddock config.toml.\n# Add args = [...] for the argument shapes. mode = \"allow\" runs without a card.\n");
+                print!("{out}");
+            }
+            Ok(0)
+        }
         Cmd::Gateway { cmd } => {
             use paddock::gatewayd;
             match cmd {

@@ -506,6 +506,10 @@ pub fn audit_file(env: &HostEnv) -> PathBuf {
 /// - clipboard-write: the length of the text, never the text.
 /// - exec: the program and the number of arguments. Arguments can hold
 ///   tokens or passwords (`curl -H "Authorization: ..."`), so they stay out.
+///   An allowed command line of plain words (`hosttools::loggable_argv`)
+///   goes into `argv`, for `paddock tools suggest`.
+/// - tool: the tool name and the arguments, which match a shape that the
+///   user wrote.
 /// - forge: the command line without the body text, and the body length.
 /// - notify: the lengths of the title and the body.
 /// - open-url: the scheme and host. Paths and queries can hold login codes.
