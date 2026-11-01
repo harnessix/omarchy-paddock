@@ -651,6 +651,7 @@ pub fn build_with(env: &HostEnv, opts: &Options, harness: Harness) -> Result<Bui
         let mut c = vec![harness.exe.display().to_string()];
         // The privacy flags are global options: before a subcommand.
         c.extend(crate::privacy::args(&profile, privacy));
+        c.extend(crate::hostcli::status::harness_args(env, &profile.name));
         c.extend(o.render(&spec.home.join(crate::spawn::PROMPT_IN_HOME)));
         c
     } else if let Some(t) = opts.transparent.as_ref().filter(|t| !t.shell.is_empty()) {
@@ -666,6 +667,10 @@ pub fn build_with(env: &HostEnv, opts: &Options, harness: Harness) -> Result<Bui
             c.extend(profile.launch.yolo_args.iter().cloned());
         }
         c.extend(crate::privacy::args(&profile, privacy));
+        // Timers and limits in the agent's context (hostcli/status.rs).
+        if opts.transparent.is_none() {
+            c.extend(crate::hostcli::status::harness_args(env, &profile.name));
+        }
         // Transparent: the command already has the arguments it needs.
         if opts.transparent.is_none() {
             c.extend(profile.launch.args.iter().cloned());

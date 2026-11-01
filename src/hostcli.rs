@@ -11,6 +11,7 @@ pub mod device;
 pub mod forage;
 mod git;
 pub mod kv;
+pub mod status;
 pub mod timer;
 
 pub const EXIT_USAGE: i32 = 2;
@@ -41,6 +42,7 @@ USAGE
   paddock-host kv COMMAND [ARG...]              (key-value store, see `paddock-host kv --help`)
   paddock-host timer COMMAND [ARG...]           (task timers, see `paddock-host timer --help`)
   paddock-host forage [--refresh] [--json]      (limits left and how fast they go)
+  paddock-host status                           (your timers and limits in a few lines)
   paddock-host device NAME [REQUEST]            (a device in /dev/paddock, see `paddock-host device --help`)
   paddock-host help [CAPABILITY]
 
@@ -399,6 +401,7 @@ pub fn main(args: &[String]) -> i32 {
         "kv" => return kv::main(rest),
         "timer" => return timer::main(rest),
         "forage" => return forage::main(rest),
+        "status" => return status::main(rest),
         "device" => return device::main(rest),
         "forge" if rest.first().is_some_and(|t| t == "gh") => return git::gh_main(&rest[1..]),
         _ => {}
