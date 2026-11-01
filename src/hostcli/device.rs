@@ -60,6 +60,7 @@ pub fn exit_for_errno(errno: i32) -> i32 {
         libc::ETIMEDOUT => 5,
         libc::EINVAL => 8,
         libc::EFBIG | libc::EMSGSIZE => 10,
+        libc::EDQUOT => 11,
         _ => 7,
     }
 }
@@ -74,6 +75,7 @@ pub fn describe(errno: i32) -> &'static str {
         libc::EFBIG => "the request is too large",
         libc::EMSGSIZE => "the response is too large",
         libc::EBUSY => "the device is busy; try again",
+        libc::EDQUOT => "budget used: the user raises it on the host with paddock devices budget",
         _ => "the device failed",
     }
 }
@@ -265,6 +267,7 @@ mod tests {
         assert_eq!(exit_for_errno(libc::ETIMEDOUT), 5);
         assert_eq!(exit_for_errno(libc::EINVAL), 8);
         assert_eq!(exit_for_errno(libc::EMSGSIZE), 10);
+        assert_eq!(exit_for_errno(libc::EDQUOT), 11);
         assert_eq!(exit_for_errno(libc::EIO), 7);
         // The same code as a kv watch or a spawn wait that timed out.
         assert_eq!(

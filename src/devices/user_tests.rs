@@ -16,6 +16,13 @@ impl Approver for Fixed {
         self.1.fetch_add(1, Ordering::SeqCst);
         Some(self.0)
     }
+    /// The budget card of a paid device: a budget of 1, or deny.
+    fn choose(&self, _: &HostEnv, p: &Pending, _: Duration) -> Option<String> {
+        assert_eq!(p.capability, crate::broker::BUDGET_CAPABILITY);
+        assert_eq!(p.choices, ["0.10", "1", "5"]);
+        self.1.fetch_add(1, Ordering::SeqCst);
+        (!self.0.denies()).then(|| "1".to_string())
+    }
 }
 
 pub fn ctx(dir: &std::path::Path, answer: Answer) -> (DeviceCtx, Arc<Fixed>) {
@@ -552,4 +559,103 @@ fn an_http_device_answers_through_the_mount() {
     assert!(ask("off", b"x").starts_with("status: disabled\n"));
     let cat = std::fs::read_to_string(root.join(".catalog")).unwrap();
     assert!(cat.contains("\"/dev/paddock/svc\"") && cat.contains("\"/dev/paddock/off\""));
+}
+
+#[test]
+fn cost_cost_header_and_budget_parse() {
+    let cfg = DevicesCfg::parse(
+        "[devices.search]\nkind = \"http\"\ntarget = \"127.0.0.1:9\"\ncost = 0.002\ncost_header = \"X-Cost\"\nbudget = 1\n\n[devices.run]\nkind = \"command\"\ncommand = [\"true\"]\ncost = 2\n\n[devices.free]\nkind = \"command\"\ncommand = [\"true\"]\n",
+    )
+    .unwrap();
+    let get = |n: &str| cfg.user.iter().find(|d| d.name == n).unwrap();
+    let s = get("search");
+    assert_eq!((s.cost, s.budget), (2_000, Some(1_000_000)));
+    assert_eq!(s.cost_header.as_deref(), Some("X-Cost"));
+    assert!(s.paid());
+    assert_eq!((get("run").cost, get("run").budget), (2_000_000, None));
+    assert!(get("run").paid());
+    assert!(!get("free").paid());
+    for bad in [
+        "kind = \"http\"\ntarget = \"127.0.0.1:9\"\ncost = -1",
+        "kind = \"http\"\ntarget = \"127.0.0.1:9\"\ncost = \"cheap\"",
+        "kind = \"http\"\ntarget = \"127.0.0.1:9\"\nbudget = 1e9",
+        "kind = \"http\"\ntarget = \"127.0.0.1:9\"\ncost_header = \"X Cost\"",
+        "kind = \"command\"\ncommand = [\"true\"]\ncost_header = \"X-Cost\"",
+    ] {
+        assert!(
+            DevicesCfg::parse(&format!("[devices.d]\n{bad}\n")).is_err(),
+            "{bad}"
+        );
+    }
+}
+
+fn paid_dev(target: SocketAddr, extra: &str) -> UserDev {
+    let text = format!(
+        "[devices.search]\nkind = \"http\"\nenabled = true\ntarget = \"{target}\"\nmethods = [\"GET\"]\npaths = [\"/\"]\ntimeout = 5\ncost = 0.002\ncost_header = \"X-Cost\"\n{extra}"
+    );
+    DevicesCfg::parse(&text).unwrap().user.remove(0)
+}
+
+#[test]
+fn a_paid_device_stops_at_its_budget_until_the_user_raises_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, seen, _l) = server(b"HTTP/1.1 200 OK\r\nX-Cost: 0.4\r\nContent-Length: 2\r\n\r\nok");
+    let (ctx, fixed) = ctx(dir.path(), Answer::Session);
+    let env = ctx.env.clone();
+    let dev = Http::new(paid_dev(addr, "budget = 1.0\n"), ctx);
+    let call = || Call::for_test("box1", Duration::from_secs(10));
+    let req = b"GET /q HTTP/1.1\n\n";
+    // 0.4 each, the larger of the header and the declared 0.002: the third
+    // request starts at 0.8 and passes, the fourth finds 1.2 spent.
+    for _ in 0..3 {
+        let out = dev.call(&call(), req).unwrap();
+        assert!(String::from_utf8_lossy(&out).ends_with("ok"));
+    }
+    assert_eq!(dev.call(&call(), req), Err(DevError::BudgetUsed));
+    assert_eq!(DevError::BudgetUsed.errno(), fuser::Errno::EDQUOT);
+    assert_eq!(seen.lock().unwrap().len(), 3);
+    let catalog = String::from_utf8(catalog(&[Arc::new(Http::new(
+        paid_dev(addr, "budget = 1.0\n"),
+        dev.gate.ctx.clone(),
+    )) as Arc<dyn Device>]))
+    .unwrap();
+    assert!(catalog.contains("\"cost\": \"0.002\""), "{catalog}");
+    assert!(catalog.contains("\"budget_left\": \"0.00\""), "{catalog}");
+    // paddock devices budget box1 search --add 1.0
+    let (root, budget) = ledger::raise(&env, "box1", "search", ledger::UNIT).unwrap();
+    assert_eq!((root.as_str(), budget), ("box1", 2 * ledger::UNIT));
+    assert!(dev.call(&call(), req).is_ok());
+    assert_eq!(seen.lock().unwrap().len(), 4);
+    // One card, at the first request.
+    assert_eq!(fixed.1.load(Ordering::SeqCst), 1);
+    let l = Ledger::open(&ledger::path(&env)).unwrap();
+    let sums = l.sums(None, 0).unwrap();
+    assert_eq!(sums.len(), 1);
+    assert_eq!((sums[0].requests, sums[0].spent), (5, 1_600_000));
+}
+
+#[test]
+fn a_paid_device_without_a_budget_asks_for_one_and_a_child_spends_the_root() {
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, seen, _l) = server(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+    let (denied, _) = ctx(dir.path(), Answer::Deny);
+    let dev = Http::new(paid_dev(addr, ""), denied);
+    let call = |sb: &str| Call::for_test(sb, Duration::from_secs(10));
+    // Deny on the budget card: no budget, no request.
+    let req = b"GET /q HTTP/1.1\n\n";
+    assert_eq!(dev.call(&call("box1"), req), Err(DevError::Denied));
+    assert!(seen.lock().unwrap().is_empty());
+    let (mut child, fixed) = ctx(dir.path(), Answer::Once);
+    child.sandbox = "kid".into();
+    child.started_by = vec!["box1".into()];
+    let env = child.env.clone();
+    let dev = Http::new(paid_dev(addr, ""), child);
+    // The card sets the budget of the root (1): the child spends it.
+    assert!(dev.call(&call("kid"), req).is_ok());
+    assert!(dev.call(&call("kid"), req).is_ok());
+    assert_eq!(fixed.1.load(Ordering::SeqCst), 1);
+    let l = Ledger::open(&ledger::path(&env)).unwrap();
+    assert_eq!(l.budget("box1", "search").unwrap(), Some(ledger::UNIT));
+    assert_eq!(l.budget("kid", "search").unwrap(), None);
+    assert_eq!(l.spent("box1", "search").unwrap(), 4_000);
 }

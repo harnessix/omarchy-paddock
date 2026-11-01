@@ -851,6 +851,11 @@ Panel {
             monitor: root.monitorText(r.monitor_marks),
             // Denials in the boundary log (paddock boundary ID).
             boundaryCount: Math.max(0, Math.floor(Number(r.boundary_count || 0))),
+            // What paid devices of its run spent (devices/ledger.rs).
+            spent: Array.isArray(r.spent) ? r.spent.slice(0, 4).map(function(x) {
+              x = x || {}
+              return strings.t("row.spent").arg(root.plain(x.spent, 16)).arg(root.plain(x.budget, 16)).arg(root.plain(x.device, 32))
+            }).join(" · ") : "",
             parentHarness: "",
             depth: 0,
             children: 0
@@ -1498,9 +1503,9 @@ Panel {
                   : (modelData.pasture !== "" ? strings.t("row.pasture").arg(modelData.pasture) : "")))
                 caption2Color: modelData.warning !== "" || (modelData.frozenSince === 0 && (modelData.monitor !== "" || modelData.credentials !== "" || (modelData.timer !== null && modelData.timer.over))) ? root.urgent : root.dim
                 // Text only: reading the log is a command, the row runs nothing new.
-                caption3: modelData.boundaryCount > 0
+                caption3: [modelData.boundaryCount > 0
                   ? strings.tn("row.boundary", modelData.boundaryCount).arg(Commons.I18n.formatNumber(modelData.boundaryCount)).arg(modelData.id)
-                  : ""
+                  : "", modelData.spent].filter(function(t) { return t !== "" }).join(" · ")
                 showActions: true
                 onActivated: root.goToTerminal(modelData)
 

@@ -367,6 +367,11 @@ enum Cmd {
         #[command(subcommand)]
         cmd: CredentialsCmd,
     },
+    /// The ledger and the budgets of paid devices.
+    Devices {
+        #[command(subcommand)]
+        cmd: DevicesCmd,
+    },
     /// Read what agents wrote to paddock kv, and free their leases.
     Kv {
         #[command(subcommand)]
@@ -606,6 +611,30 @@ impl KvScope {
             }
         })
     }
+}
+
+#[derive(Subcommand)]
+enum DevicesCmd {
+    /// Raise the budget of a paid device for a run (a sandbox and the
+    /// sandboxes it started).
+    Budget {
+        id: String,
+        device: String,
+        /// The amount to add, for example 1.0.
+        #[arg(long)]
+        add: String,
+    },
+    /// What paid devices spent, by sandbox and device.
+    Ledger {
+        #[arg(long)]
+        json: bool,
+        /// Only requests of this project folder.
+        #[arg(long)]
+        project: Option<PathBuf>,
+        /// Only requests of this recent time, for example 7d or 12h.
+        #[arg(long)]
+        since: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -2086,6 +2115,20 @@ fn real_main() -> Result<i32> {
                                 paddock::boundary::count(&env, &r.id).into(),
                             );
                         }
+                        let spent = paddock::devices::ledger::spent_of(&env, &r.id);
+                        if let (Some(o), false) = (v.as_object_mut(), spent.is_empty()) {
+                            let rows: Vec<serde_json::Value> = spent
+                                .iter()
+                                .map(|s| {
+                                    serde_json::json!({
+                                        "device": s.device,
+                                        "spent": paddock::devices::ledger::money(s.spent),
+                                        "budget": paddock::devices::ledger::money(s.budget),
+                                    })
+                                })
+                                .collect();
+                            o.insert("spent".into(), rows.into());
+                        }
                         let tunnels = paddock::monitor::read_seen(&env, &r.id);
                         if let (Some(o), false) = (v.as_object_mut(), tunnels.is_empty()) {
                             o.insert("tunnels".into(), tunnels.into());
@@ -2342,6 +2385,32 @@ fn real_main() -> Result<i32> {
             Ok(0)
         }
         Cmd::Monitor { cmd } => monitor_cmd(&env, cmd),
+        Cmd::Devices { cmd } => {
+            use paddock::devices::ledger;
+            match cmd {
+                DevicesCmd::Budget { id, device, add } => {
+                    let add = ledger::parse_amount(&add)?;
+                    let (root, budget) = ledger::raise(&env, &id, &device, add)?;
+                    println!(
+                        "The budget of {device} for {root} is now {}. The next request can pass.",
+                        ledger::money(budget)
+                    );
+                    Ok(0)
+                }
+                DevicesCmd::Ledger {
+                    json,
+                    project,
+                    since,
+                } => {
+                    let project = project
+                        .map(|p| paddock::kv::host::project_of(Some(&p)))
+                        .transpose()?;
+                    let since = since.map(|s| ledger::parse_since(&s)).transpose()?;
+                    print!("{}", ledger::report(&env, project.as_deref(), since, json)?);
+                    Ok(0)
+                }
+            }
+        }
         Cmd::Timer { cmd } => {
             use paddock::timer;
             let show = |s: &timer::Status| {

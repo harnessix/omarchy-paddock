@@ -1286,6 +1286,27 @@ paddock-host device ollama "GET /api/tags"
 printf '{"a":1}' | paddock-host device jq -
 ```
 
+#### Paid devices: budgets and the ledger
+
+Some services cost money per request, for example a paid search API behind an `http` device. paddock never spends money without a budget.
+
+```toml
+[devices.search]
+kind = "http"
+enabled = true
+target = "127.0.0.1:8090"
+cost = 0.002            # per request, in a currency unit you pick
+cost_header = "X-Cost"  # http only: the service reports the cost of each response
+budget = 1.0            # per run
+```
+
+- A device with `cost` or `cost_header` is paid. paddock does not convert currencies. With `cost_header`, a request costs the larger of `cost` and the header value. paddock ignores a header that is not a number.
+- A paid device needs a budget before its first request. Without `budget` in its table, the first-use card asks for one: 0.10, 1 or 5, or deny. No budget, no request.
+- The budget is per run: a sandbox and the sandboxes it started. A spawned child spends the budget of the root sandbox, never a budget of its own.
+- A request that would pass the budget fails with `EDQUOT` (`paddock-host device` says "budget used" and exits with 11). You get one notification with the command to raise it: `paddock devices budget ID DEVICE --add 1.0`. The next request can pass.
+- The ledger `~/.local/state/paddock/devices/ledger.db` records the time, the sandbox, the project, the device, the cost and the status of each request. Never a body. `paddock devices ledger [--json] [--project PATH] [--since 7d]` sums it by sandbox and device.
+- `.catalog` shows the cost of each device and the budget left for this sandbox. The bar panel row shows the spent amount, for example "spent 0.42 of 1.00 on search".
+
 The mount needs FUSE: `/dev/fuse` and `fusermount3` (package `fuse3`). `paddock doctor` checks both. The bwrap backend binds the mount at the start. docker and podman bind an empty folder and paddock mounts the file system on it after the container starts. The container waits up to five seconds for it before the harness starts. This needs a shared mount for the paddock run folder, which is the systemd default. srt cannot place a mount at `/dev/paddock`: there, the devices are at the path in `$PADDOCK_DEVICES`. When FUSE is missing, the sandbox starts without devices, and `paddock doctor` says why.
 
 Programs must read the response with `read`. `cat` from coreutils, `dd`, shells, Python and Rust do that. busybox `cat` uses `sendfile` and sees an empty file: use `dd` there. Requests and responses never go into logs or process arguments. The log records the device name, the sizes and the result.
