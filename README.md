@@ -828,6 +828,8 @@ paddock-host pasture ask codex --prompt-file question.md --timeout 300
 - Limits: one question at a time per member, questions and answers up to 256 KiB (the end of a longer answer), and a timeout of 300 seconds by default, at most `[spawn] timeout`. A member that is busy or frozen answers with exit code 9, one that ended with exit code 1.
 - The audit log `kv-audit.jsonl` records who asked whom, the sizes, the time and the result. It never records the question or the answer.
 - Only the user configuration turns the bridge on. A project `paddock.toml` cannot.
+- The guard finds a login only as plain text. An answer that encodes it, for example in base64 or with other characters between its parts, passes. The guard stops an accident or a simple trick, not a member that works hard to leak. Put only members that you trust with each other's answers into one pasture with the bridge on.
+- With the srt backend, a member can read the bridge folder outside the sandboxes. It holds the pending questions and hashes of 16-character pieces of the delivered credentials, never their values.
 
 The bar panel shows the shared data too. A "Shared data" row opens a list of the pastures, your `user` scope and the data of older versions, with their members and the number of keys and locks. A pasture opens to its keys, grouped by the part before the first `:`, with locks first: who wrote each key, when, and its size. A key opens to its value, shown as plain text. From there you can copy the value, delete the key or free a lock; each delete asks twice. The panel reads a value only when you open its key, and reads paddock kv only while it is open. Bind a key to `omarchy-shell harnessix.paddock.kv open` to open the shared data directly.
 
