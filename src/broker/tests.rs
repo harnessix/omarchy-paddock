@@ -1345,3 +1345,41 @@ fn tea_runs_exactly_the_checked_arguments_with_the_host_login() {
     }
     assert_eq!(fixed.asked.load(Ordering::SeqCst), 1);
 }
+
+#[test]
+fn glab_runs_exactly_the_checked_arguments_on_a_self_hosted_gitlab() {
+    let (_t, b, fixed) = forge_setup(Some(Answer::Once));
+    let web = "https://gitlab.example.org/team/apps/web";
+    let r = b.handle(&forge_req("glab", &["mr", "view", "-R", "team/apps/web"]));
+    assert_eq!(r.status, Status::Done, "{}", r.message);
+    let (args, out) = fake_output(&r);
+    assert!(out.starts_with("tool:glab\n"), "{out}");
+    assert_eq!(args, ["mr", "view", "fix", "--repo", web]);
+    assert_eq!(fixed.asked.load(Ordering::SeqCst), 0, "a read asks nobody");
+    let r = b.handle(&forge_req(
+        "glab",
+        &["mr", "note", "2", "-R", web, "-m", "Looks good"],
+    ));
+    assert_eq!(r.status, Status::Done, "{}", r.message);
+    let (args, _) = fake_output(&r);
+    assert_eq!(
+        args,
+        ["mr", "note", "2", "--repo", web, "--message=Looks good"]
+    );
+    assert_eq!(fixed.asked.load(Ordering::SeqCst), 1, "a write asks");
+    let lines = audit_lines(&b);
+    assert!(
+        !lines.iter().any(|l| l.to_string().contains("Looks good")),
+        "{lines:?}"
+    );
+    for argv in [
+        &["mr", "list", "--hostname", "evil.example"][..],
+        &["mr", "list", "-R", "team/apps/other"],
+        &["mr", "view", "1", "--web"],
+        &["mr", "merge", "1"],
+    ] {
+        let r = b.handle(&forge_req("glab", argv));
+        assert_eq!(r.status, Status::Invalid, "{argv:?}: {}", r.message);
+    }
+    assert_eq!(fixed.asked.load(Ordering::SeqCst), 1);
+}

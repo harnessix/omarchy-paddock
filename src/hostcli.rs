@@ -283,6 +283,17 @@ tea (Gitea and Forgejo) works the same way when the user has it on the host:
     for the repository's host.
   - pulls create gets --head with the sandbox's branch.
 
+glab (GitLab) works the same way when the user has it on the host:
+
+  read (no question):  mr list|view|diff, issue list|view, ci view|list|status,
+                       repo view
+  write (asks first):  mr create, mr note, issue note
+
+  - --web, --hostname and the file flags are refused. Pass the text with
+    --description or --message.
+  - mr view, mr diff, mr note, ci view and ci status get the sandbox's branch,
+    mr create gets --source-branch.
+
 Extra options: --paddock-reason TEXT, --paddock-timeout SECONDS (default 120,
 1800 for watch), --paddock-json. The exit code is the tool's own."#
         }

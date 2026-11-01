@@ -221,7 +221,87 @@ pub const TEA: Tool = Tool {
     flags_first: true,
 };
 
-pub const TOOLS: &[&Tool] = &[&GH, &TEA];
+/// glab, the GitLab command line.
+pub const GLAB: Tool = Tool {
+    name: "glab",
+    commands: &[
+        ("mr", "list", Read),
+        ("mr", "view", Read),
+        ("mr", "create", Write),
+        ("mr", "diff", Read),
+        ("mr", "note", Write),
+        ("issue", "list", Read),
+        ("issue", "view", Read),
+        ("issue", "note", Write),
+        ("ci", "view", Read),
+        ("ci", "list", Read),
+        ("ci", "status", Read),
+        ("repo", "view", Read),
+    ],
+    repo_flags: ("-R", "--repo"),
+    repo_form: RepoForm::Url,
+    login_flag: None,
+    denied_flags: &[
+        "-w",
+        "--web",
+        "--hostname",
+        "--description-file",
+        "--notes-file",
+        "--template-file",
+        "--editor",
+        "--push",
+        "--create-source-branch",
+    ],
+    denied_short: "w",
+    value_flags: &[
+        "--title",
+        "-t",
+        "--assignee",
+        "-a",
+        "--reviewer",
+        "--label",
+        "--milestone",
+        "-m",
+        "--source-branch",
+        "-s",
+        "--target-branch",
+        "-b",
+        "--branch",
+        "--author",
+        "--per-page",
+        "-P",
+        "--page",
+        "-p",
+        "--output",
+        "-F",
+        "--status",
+        "--sort",
+        "--order",
+        "--pipeline-id",
+    ],
+    branch_default: &[
+        ("mr", "view"),
+        ("mr", "diff"),
+        ("mr", "note"),
+        ("ci", "view"),
+    ],
+    branch_flags: &[
+        (("mr", "create"), "--source-branch", "-s"),
+        (("ci", "status"), "--branch", "-b"),
+    ],
+    repo_positional: &[("repo", "view")],
+    body_flags: &[
+        (("mr", "create"), "--description", "-d"),
+        (("mr", "note"), "--message", "-m"),
+        (("issue", "note"), "--message", "-m"),
+    ],
+    body_args: &[],
+    body_stdin: &[],
+    needs_body: &[("mr", "note"), ("issue", "note")],
+    flags_first: false,
+};
+
+pub const TOOLS: &[&Tool] = &[&GH, &TEA, &GLAB];
 
 pub fn tool(name: &str) -> Option<&'static Tool> {
     TOOLS.iter().copied().find(|t| t.name == name)
@@ -1318,5 +1398,170 @@ mod tests {
         );
         assert_eq!(tea_login_in(cfg, "github.com"), None);
         assert_eq!(tea_login_in("preferences:\n  x: 1\n", "codeberg.org"), None);
+    }
+
+    fn glab(args: &[&str]) -> Result<Call> {
+        let remotes = vec![
+            Remote {
+                name: "origin".into(),
+                url: "git@gitlab.example.org:team/apps/web.git".into(),
+                push_url: None,
+                gh_resolved: None,
+            },
+            Remote {
+                name: "mirror".into(),
+                url: "https://gitlab.com/demo/app".into(),
+                push_url: None,
+                gh_resolved: None,
+            },
+        ];
+        let a: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+        check(&GLAB, &a, Some("fix-login"), &remotes)
+    }
+
+    const WEB: &str = "https://gitlab.example.org/team/apps/web";
+
+    #[test]
+    fn glab_runs_its_allowlist() {
+        let c = glab(&["mr", "list"]).unwrap();
+        assert_eq!(c.access, Access::Read);
+        assert_eq!(c.argv, ["mr", "list", "--repo", WEB]);
+        let c = glab(&["mr", "create", "--title", "Fix", "-d", "Text"]).unwrap();
+        assert_eq!(c.access, Access::Write);
+        assert_eq!(
+            c.argv,
+            [
+                "mr",
+                "create",
+                "--title",
+                "Fix",
+                "--source-branch",
+                "fix-login",
+                "--repo",
+                WEB,
+                "--description=Text"
+            ]
+        );
+        let c = glab(&["mr", "note", "3", "-m", "-1 from me"]).unwrap();
+        assert_eq!(
+            c.argv,
+            ["mr", "note", "3", "--repo", WEB, "--message=-1 from me"]
+        );
+        assert_eq!(
+            glab(&["issue", "note", "5", "--message=ok"])
+                .unwrap()
+                .access,
+            Access::Write
+        );
+        let c = glab(&["repo", "view", "-R", "gitlab.com/demo/app"]).unwrap();
+        assert_eq!(c.argv, ["repo", "view", "https://gitlab.com/demo/app"]);
+        for ok in [
+            &["issue", "list", "--label", "bug"][..],
+            &["issue", "view", "7"],
+            &["ci", "list", "--status", "failed"],
+            &["mr", "diff", "3"],
+            &[
+                "mr",
+                "view",
+                "https://gitlab.example.org/team/apps/web/-/merge_requests/1",
+            ],
+        ] {
+            assert_eq!(glab(ok).unwrap().access, Access::Read, "{ok:?}");
+        }
+        for bad in [
+            &["mr", "merge", "3"][..],
+            &["mr", "approve", "3"],
+            &["mr", "checkout", "3"],
+            &["mr", "update", "3"],
+            &["ci", "run"],
+            &["ci", "retry", "4"],
+            &["ci", "delete", "4"],
+            &["api", "projects"],
+            &["auth", "status"],
+            &["variable", "list"],
+            &["release", "create", "v1"],
+            &["mr"],
+            &["mr", "note", "3"],
+            &["issue", "note", "3"],
+        ] {
+            assert!(glab(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn glab_refuses_browsers_files_and_other_hosts() {
+        for bad in [
+            &["mr", "view", "3", "--web"][..],
+            &["mr", "view", "3", "-w"],
+            &["mr", "view", "3", "-cw"],
+            &["ci", "view", "-w"],
+            &["mr", "list", "--hostname", "evil.example"],
+            &["mr", "list", "--hostname=evil.example"],
+            &["mr", "create", "--description-file", "/etc/passwd"],
+            &["mr", "create", "--title", "x", "--push"],
+            &["mr", "create", "--title", "x", "-d", "-"],
+        ] {
+            assert!(glab(bad).is_err(), "{bad:?}");
+        }
+        assert!(glab(&["mr", "create", "--title", "--web is fixed"]).is_ok());
+    }
+
+    #[test]
+    fn glab_names_only_project_repositories() {
+        for bad in [
+            &["mr", "list", "-R", "team/apps/other"][..],
+            &["mr", "list", "-Rteam/other"],
+            &["mr", "list", "--repo=https://gitlab.example.org/team/apps"],
+            &["mr", "list", "--repo", "gitlab.com/team/apps/web"],
+            &[
+                "mr",
+                "view",
+                "https://gitlab.example.org/team/apps/website/-/merge_requests/1",
+            ],
+            &[
+                "mr",
+                "view",
+                "https://gitlab.com/other/app/-/merge_requests/1",
+            ],
+            &["repo", "view", "team/apps/web"],
+        ] {
+            assert!(glab(bad).is_err(), "{bad:?}");
+        }
+        for ok in ["team/apps/web", "gitlab.example.org/team/apps/web", WEB] {
+            assert_eq!(
+                glab(&["mr", "list", "-R", ok]).unwrap().repo.owner,
+                "team/apps"
+            );
+        }
+    }
+
+    #[test]
+    fn glab_defaults_to_the_current_branch() {
+        let c = glab(&["mr", "view"]).unwrap();
+        assert_eq!(c.argv, ["mr", "view", "fix-login", "--repo", WEB]);
+        let c = glab(&["ci", "view"]).unwrap();
+        assert_eq!(c.argv, ["ci", "view", "fix-login", "--repo", WEB]);
+        let c = glab(&["ci", "status"]).unwrap();
+        assert_eq!(
+            c.argv,
+            ["ci", "status", "--branch", "fix-login", "--repo", WEB]
+        );
+        let c = glab(&["ci", "status", "-b", "main"]).unwrap();
+        assert_eq!(c.argv, ["ci", "status", "-b", "main", "--repo", WEB]);
+        let c = glab(&["mr", "create", "-s", "other", "--title", "x"]).unwrap();
+        assert_eq!(c.argv.iter().filter(|a| a.contains("source")).count(), 0);
+        // The body never shows in the audit line.
+        let (rest, body) = split_body(
+            &GLAB,
+            &[
+                "mr".into(),
+                "note".into(),
+                "3".into(),
+                "-m".into(),
+                "secret".into(),
+            ],
+        );
+        assert_eq!(rest, ["mr", "note", "3"]);
+        assert_eq!(body.as_deref(), Some("secret"));
     }
 }
