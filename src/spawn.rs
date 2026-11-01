@@ -382,9 +382,20 @@ impl SpawnCfg {
 pub fn network_rank(n: Network) -> u8 {
     match n {
         Network::None => 0,
-        Network::Allowlist => 1,
-        Network::Egress => 2,
-        Network::Host => 3,
+        Network::Api => 1,
+        Network::Allowlist => 2,
+        Network::Egress => 3,
+        Network::Host => 4,
+    }
+}
+
+/// The network mode of a child. A reviewer needs only its model: with a
+/// parent in `egress` or `host`, it gets `api`. Otherwise, and for an
+/// implementer, the child keeps the parent's mode.
+pub fn child_network(role: Role, parent: Network) -> Network {
+    match (role, parent) {
+        (Role::Reviewer, Network::Egress | Network::Host) => Network::Api,
+        _ => parent,
     }
 }
 
@@ -543,8 +554,11 @@ impl Ceiling {
                 no(format!("host port {p}"))?;
             }
         }
+        // A parent with a list can pass on only its own domains. A parent
+        // with open egress has more than any list.
+        let listed = matches!(self.network, Network::Allowlist | Network::Api);
         let endpoints: BTreeSet<&String> = built.profile.network.endpoints.iter().collect();
-        for d in &s.allow_domains {
+        for d in s.allow_domains.iter().filter(|_| listed) {
             if !self.allow_domains.contains(d) && !endpoints.contains(d) {
                 no(format!("the domain {d}"))?;
             }
@@ -1667,10 +1681,7 @@ fn run_child(env: &HostEnv, job: &Job, prompt: Vec<u8>, result: &mut ChildResult
         harness: job.harness.clone(),
         project: Some(c.repo.clone()),
         backend: Some(c.backend.clone()),
-        // TODO: a reviewer gets network mode "api" (only the model API
-        // hosts of its profile) once that mode exists. Until then it keeps
-        // the parent's mode, which `Ceiling::check` caps.
-        network: Some(c.network),
+        network: Some(child_network(job.role, c.network)),
         gui: Some(GuiMode::Off),
         // Both roles get a clean environment: only the allowlist and the
         // harness's own variables pass.

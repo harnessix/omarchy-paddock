@@ -925,7 +925,8 @@ struct RunArgs {
     /// auto, bwrap, docker or podman.
     #[arg(long, short)]
     backend: Option<String>,
-    /// none, egress or host.
+    /// none, api, egress or host. api: only the model API hosts of the
+    /// profile and the domains of --allow, over HTTPS through the paddock proxy.
     #[arg(long, short)]
     network: Option<Network>,
     /// off, headless, window or host.
@@ -940,7 +941,8 @@ struct RunArgs {
     /// shared (default) reuses your login; isolated or isolated:NAME uses a separate one.
     #[arg(long)]
     auth: Option<String>,
-    /// A domain the sandbox can reach in network mode allowlist (repeatable).
+    /// A domain the sandbox can reach in network modes api and allowlist
+    /// (repeatable). HOST, HOST:PORT, or *.DOMAIN for its subdomains.
     #[arg(long)]
     allow: Vec<String>,
     /// Work in a new git worktree on its own branch, and review the diff afterwards.
@@ -1069,6 +1071,15 @@ fn explain(env: &HostEnv, a: &RunArgs, json: bool) -> Result<()> {
             format!(", publish {:?}", s.publish)
         }
     );
+    if matches!(s.network, Network::Api | Network::Allowlist) {
+        if s.allow_domains.is_empty() {
+            println!("          no allowed hosts: every connection fails");
+        }
+        for d in &s.allow_domains {
+            let from = s.allow_origins.get(d).map(String::as_str).unwrap_or("");
+            println!("  allow  {d}\n         {from}");
+        }
+    }
     println!(
         "display   {:?}  ({}){}",
         s.gui.mode,

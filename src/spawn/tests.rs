@@ -1418,3 +1418,48 @@ fn a_card_with_choices_takes_only_its_choices() {
     );
     assert!(crate::broker::pending(&s.env).is_empty());
 }
+
+#[test]
+fn a_reviewer_gets_network_mode_api_under_an_egress_parent() {
+    assert_eq!(child_network(Role::Reviewer, Network::Egress), Network::Api);
+    assert_eq!(child_network(Role::Reviewer, Network::Host), Network::Api);
+    assert_eq!(child_network(Role::Reviewer, Network::None), Network::None);
+    assert_eq!(child_network(Role::Reviewer, Network::Api), Network::Api);
+    assert_eq!(
+        child_network(Role::Reviewer, Network::Allowlist),
+        Network::Allowlist
+    );
+    assert_eq!(
+        child_network(Role::Implementer, Network::Egress),
+        Network::Egress
+    );
+    assert!(network_rank(Network::Api) < network_rank(Network::Egress));
+    assert!(network_rank(Network::None) < network_rank(Network::Api));
+}
+
+#[test]
+fn an_api_child_fits_under_an_egress_parent_but_not_the_reverse() {
+    let tmp = tempfile::tempdir().unwrap();
+    let env = env_in(tmp.path());
+    let project = tmp.path().join("app");
+    std::fs::create_dir_all(&project).unwrap();
+    let mut parent = parent_built(&env, &project);
+    parent.spec.network = Network::Egress;
+    let c = Ceiling::of(&parent, "bwrap", &modes(&[]));
+    let mut child = parent_built(&env, &project);
+    child.spec.network = Network::Api;
+    child.spec.allow_domains = vec!["docs.example.com".into()];
+    c.check(&child, "bwrap").unwrap();
+
+    // A parent in api passes on only its own hosts.
+    let mut parent = parent_built(&env, &project);
+    parent.spec.network = Network::Api;
+    parent.spec.allow_domains = vec!["api.example.com".into()];
+    let c = Ceiling::of(&parent, "bwrap", &modes(&[]));
+    let e = c.check(&child, "bwrap").unwrap_err().to_string();
+    assert!(e.contains("docs.example.com"), "{e}");
+    child.spec.network = Network::Egress;
+    child.spec.allow_domains.clear();
+    let e = c.check(&child, "bwrap").unwrap_err().to_string();
+    assert!(e.contains("network"), "{e}");
+}

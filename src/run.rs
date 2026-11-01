@@ -314,6 +314,65 @@ fn setup_credentials(
     Ok(out)
 }
 
+/// Network mode `api` on bwrap, docker and podman: the sandbox has no
+/// network. The paddock proxy (proxy.rs) on a Unix socket lets through TLS to
+/// the allowed hosts, and `paddock relay` offers it on 127.0.0.1:3131 in the
+/// sandbox. srt enforces the list with its own proxy.
+fn start_api_proxy(env: &HostEnv, built: &mut Built, backend: &str) -> Result<()> {
+    if built.spec.network != crate::spec::Network::Api || backend == "srt" {
+        return Ok(());
+    }
+    use crate::proxy::{allow, API_PORT, API_SOCKET_IN_SANDBOX};
+    let run_dir = env.paddock_run().join(&built.spec.id);
+    crate::privfs::dir(&run_dir)?;
+    let sock = run_dir.join("api-proxy.sock");
+    let (list, _) = allow::Allowlist::parse(&built.spec.allow_domains);
+    let (e1, spec) = (env.clone(), built.spec.clone());
+    let refusals = allow::Refusals::new(std::sync::Arc::new(move |host: &str, why: &str| {
+        crate::broker::audit_line(
+            &e1,
+            &serde_json::json!({
+                "time": crate::state::now(),
+                "sandbox": spec.id,
+                "harness": spec.harness,
+                "project": spec.project,
+                "capability": "network",
+                "detail": format!("api: {host}: {why}"),
+                "decision": "refused",
+            }),
+        );
+    }));
+    let mut cfg = crate::proxy::HostProxy::from_vars(|k| env.var(k).map(str::to_string));
+    cfg.allow_lan = built.spec.lan;
+    cfg.api = Some(allow::ApiPolicy {
+        list,
+        refusals: Some(refusals),
+    });
+    for w in cfg.cleartext_warnings() {
+        log::warn!("{w}");
+    }
+    crate::proxy::serve(&sock, cfg)?;
+    built.spec.add_mount(crate::spec::Mount::bind(
+        &sock,
+        API_SOCKET_IN_SANDBOX,
+        false,
+        "network: api proxy",
+    ));
+    let me = std::env::current_exe()
+        .and_then(std::fs::canonicalize)
+        .context("cannot find the paddock executable")?;
+    built
+        .spec
+        .add_tool("paddock", me, "network: api proxy relay");
+    built.spec.setup.insert(
+        0,
+        format!(
+            "paddock relay --listen 127.0.0.1:{API_PORT} --socket {API_SOCKET_IN_SANDBOX} --ready-file /tmp/.paddock-api >/dev/null 2>&1 &\ni=0; while [ ! -e /tmp/.paddock-api ] && [ $i -lt 100 ]; do sleep 0.05; i=$((i+1)); done"
+        ),
+    );
+    Ok(())
+}
+
 /// The filtering ssh agent of the run (credentials/sshagent.rs), alive as
 /// long as this process. SSH_AUTH_SOCK in the sandbox points at it.
 fn start_ssh_agent(
@@ -490,6 +549,7 @@ pub fn run(
     // which never get them, and before the harness starts, which waits for
     // the user's two answers.
     let creds = setup_credentials(env, &mut built, backend.name(), quiet)?;
+    start_api_proxy(env, &mut built, backend.name())?;
     let launch = backend.render(env, &built.spec, interactive)?;
     write_files(&launch)?;
 

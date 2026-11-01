@@ -80,6 +80,9 @@ pub enum Network {
     Host,
     /// Only the listed domains (srt backend).
     Allowlist,
+    /// No network, only the host proxy, which lets through TLS to the model
+    /// API hosts of the profile and the domains of `--allow`.
+    Api,
 }
 
 impl std::str::FromStr for Network {
@@ -90,7 +93,10 @@ impl std::str::FromStr for Network {
             "egress" => Ok(Self::Egress),
             "host" => Ok(Self::Host),
             "allowlist" => Ok(Self::Allowlist),
-            _ => anyhow::bail!("unknown network mode '{s}': use none, egress, allowlist or host"),
+            "api" => Ok(Self::Api),
+            _ => anyhow::bail!(
+                "unknown network mode '{s}': use none, api, egress, allowlist or host"
+            ),
         }
     }
 }
@@ -231,8 +237,10 @@ pub struct SandboxSpec {
     /// that a manifest allows (for example a local MCP server). All other host
     /// loopback ports stay unreachable.
     pub host_ports: Vec<(u16, String)>,
-    /// Domains reachable in network mode `allowlist`.
+    /// Domains reachable in network modes `allowlist` and `api`.
     pub allow_domains: Vec<String>,
+    /// Where each entry of `allow_domains` comes from, for `paddock explain`.
+    pub allow_origins: BTreeMap<String, String>,
     /// Private and link-local networks are reachable (network.lan).
     pub lan: bool,
     /// A private keyring starts with the command (keyring.rs).
@@ -316,6 +324,7 @@ impl SandboxSpec {
             publish: Vec::new(),
             host_ports: Vec::new(),
             allow_domains: Vec::new(),
+            allow_origins: BTreeMap::new(),
             lan: false,
             keyring: false,
             private_bus: false,

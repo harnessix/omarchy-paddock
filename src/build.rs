@@ -502,7 +502,7 @@ pub fn build_with(env: &HostEnv, opts: &Options, harness: Harness) -> Result<Bui
     // The host proxy, in every env mode: sandbox traffic must leave the way host
     // traffic does. A proxy on the host loopback is the one loopback port the
     // sandbox can reach.
-    if spec.network != Network::None {
+    if !matches!(spec.network, Network::None | Network::Api) {
         for k in crate::proxy::PROXY_VARS {
             if let Some(v) = env.var(k).filter(|v| !v.is_empty()) {
                 spec.set_secret_env(k, v, "network: host proxy");
@@ -612,7 +612,7 @@ pub fn build_with(env: &HostEnv, opts: &Options, harness: Harness) -> Result<Bui
     }
     spec.setup.extend(m.setup.run.iter().cloned());
     spec.lan = m.network.lan == Some(true);
-    if spec.network != Network::None {
+    if !matches!(spec.network, Network::None | Network::Api) {
         for p in &m.network.host_ports {
             spec.add_host_port(*p, "manifest network.host_ports");
         }
@@ -624,7 +624,7 @@ pub fn build_with(env: &HostEnv, opts: &Options, harness: Harness) -> Result<Bui
         &format!("{porigin} state.settings"),
         &mut spec,
     )?;
-    if spec.network != Network::None {
+    if !matches!(spec.network, Network::None | Network::Api) {
         for p in &profile.network.publish {
             if !spec.publish.contains(p) {
                 spec.publish.push(*p);
@@ -638,13 +638,53 @@ pub fn build_with(env: &HostEnv, opts: &Options, harness: Harness) -> Result<Bui
     // telemetry back on. Only the user configuration can ([privacy]).
     let privacy = crate::privacy::mode(&m);
     crate::privacy::apply(&profile, privacy, &mut spec)?;
-    if spec.network == Network::Allowlist {
-        let mut d: Vec<String> = profile.network.endpoints.clone();
-        d.extend(m.network.allow.iter().cloned());
-        d.extend(opts.allow_domains.iter().cloned());
-        d.sort();
-        d.dedup();
-        spec.allow_domains = d;
+    if matches!(spec.network, Network::Allowlist | Network::Api) {
+        let sources = [
+            (
+                profile.network.endpoints.clone(),
+                format!("{porigin} [network] endpoints"),
+            ),
+            (m.network.allow.clone(), "[network] allow".to_string()),
+            (opts.allow_domains.clone(), "--allow".to_string()),
+        ];
+        for (items, origin) in sources {
+            for d in items {
+                spec.allow_origins
+                    .entry(d)
+                    .or_insert_with(|| origin.clone());
+            }
+        }
+        spec.allow_domains = spec.allow_origins.keys().cloned().collect();
+        if spec.network == Network::Api {
+            let (_, bad) = crate::proxy::allow::Allowlist::parse(&spec.allow_domains);
+            if !bad.is_empty() {
+                spec.warnings.push(format!(
+                    "network mode api ignores these entries: {} (use host names, not IP addresses)",
+                    bad.join(", ")
+                ));
+            }
+        }
+    }
+
+    // Last, so no host or project variable replaces them.
+    if spec.network == Network::Api {
+        // Network mode api: the sandbox has no network, only the paddock
+        // proxy through a local relay (run.rs). The proxy on the host uses
+        // the host proxy variables.
+        let url = format!("http://127.0.0.1:{}", crate::proxy::API_PORT);
+        for k in [
+            "HTTPS_PROXY",
+            "https_proxy",
+            "HTTP_PROXY",
+            "http_proxy",
+            "ALL_PROXY",
+            "all_proxy",
+        ] {
+            spec.set_env(k, url.clone(), "network: api proxy");
+        }
+        for k in ["NO_PROXY", "no_proxy"] {
+            spec.set_env(k, "127.0.0.1,localhost", "network: api proxy");
+        }
     }
 
     // The command.

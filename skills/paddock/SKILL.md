@@ -125,6 +125,7 @@ Common tasks:
 | An MCP server in the sandbox | `paddock mcp claude` shows why it is off. Then ask the user before you add `[mcp] allow` |
 | A desktop project with a visible window | `paddock claude --gui window` |
 | No network | `paddock claude --network none` |
+| Only the model API | `paddock claude --network api` (add hosts with `--allow`) |
 | Agents in the sandbox to know `paddock-host` | `paddock skill install` |
 | To see what telemetry paddock turns off, and where to turn off training | `paddock doctor` (section "Privacy") |
 

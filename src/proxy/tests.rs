@@ -667,3 +667,156 @@ fn unknown_proxy_scheme_never_goes_direct() {
         .to_string();
     assert!(e.starts_with("refused") && e.contains("socks4"), "{e}");
 }
+
+// Network mode api against a local TLS server. The server records every
+// byte it receives, so a test can check that a refused hello never left.
+
+struct TlsEcho {
+    port: u16,
+    raw: Arc<Mutex<Vec<u8>>>,
+}
+
+fn tls_echo(ck: &rcgen::CertifiedKey<rcgen::KeyPair>) -> TlsEcho {
+    use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(ck.signing_key.serialize_der()));
+    let scfg = Arc::new(
+        rustls::ServerConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(vec![ck.cert.der().clone()], key)
+            .unwrap(),
+    );
+    let l = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = l.local_addr().unwrap().port();
+    let raw = Arc::new(Mutex::new(Vec::new()));
+    let raw2 = raw.clone();
+    std::thread::spawn(move || {
+        for c in l.incoming().flatten() {
+            let (scfg, raw) = (scfg.clone(), raw2.clone());
+            std::thread::spawn(move || {
+                let conn = rustls::ServerConnection::new(scfg).unwrap();
+                let mut s = rustls::StreamOwned::new(conn, Recording { inner: c, raw });
+                let mut buf = [0u8; 1024];
+                while let Ok(n @ 1..) = s.read(&mut buf) {
+                    if s.write_all(&buf[..n]).is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+    });
+    TlsEcho { port, raw }
+}
+
+fn api_proxy(
+    entries: &[String],
+    port: u16,
+) -> (tempfile::TempDir, PathBuf, Arc<Mutex<Vec<String>>>) {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let s2 = seen.clone();
+    let (list, bad) = allow::Allowlist::parse(entries);
+    assert!(bad.is_empty());
+    let (dir, sock) = start(HostProxy {
+        // The test-only override: the local server is on the host loopback,
+        // which network mode api never reaches otherwise.
+        allow_loopback: vec![port],
+        api: Some(allow::ApiPolicy {
+            list,
+            refusals: Some(allow::Refusals::new(Arc::new(move |h: &str, why: &str| {
+                s2.lock().unwrap().push(format!("{h}: {why}"));
+            }))),
+        }),
+        ..HostProxy::default()
+    });
+    (dir, sock, seen)
+}
+
+fn tls_through(
+    sock: &Path,
+    target: &str,
+    name: &str,
+    cfg: Arc<rustls::ClientConfig>,
+) -> std::io::Result<Vec<u8>> {
+    let (code, s) = connect(sock, target);
+    assert_eq!(code, 200);
+    let name = rustls::pki_types::ServerName::try_from(name.to_string()).unwrap();
+    let conn = rustls::ClientConnection::new(cfg, name).unwrap();
+    let mut t = rustls::StreamOwned::new(conn, s);
+    t.write_all(b"hello")?;
+    let mut buf = [0u8; 5];
+    t.read_exact(&mut buf)?;
+    Ok(buf.to_vec())
+}
+
+use std::path::PathBuf;
+
+#[test]
+fn api_mode_lets_an_allowed_name_through() {
+    let ck = self_signed();
+    let srv = tls_echo(&ck);
+    let (_d, sock, seen) = api_proxy(&[format!("localhost:{}", srv.port)], srv.port);
+    let got = tls_through(
+        &sock,
+        &format!("localhost:{}", srv.port),
+        "localhost",
+        trusting(&ck),
+    )
+    .unwrap();
+    assert_eq!(got, b"hello");
+    assert!(seen.lock().unwrap().is_empty());
+}
+
+#[test]
+fn api_mode_refuses_a_different_or_missing_server_name() {
+    let ck = self_signed();
+    let srv = tls_echo(&ck);
+    let (_d, sock, seen) = api_proxy(&[format!("localhost:{}", srv.port)], srv.port);
+    let target = format!("localhost:{}", srv.port);
+    assert!(tls_through(&sock, &target, "other.example.com", trusting(&ck)).is_err());
+    let mut no_sni = (*trusting(&ck)).clone();
+    no_sni.enable_sni = false;
+    assert!(tls_through(&sock, &target, "localhost", Arc::new(no_sni)).is_err());
+    std::thread::sleep(Duration::from_millis(100));
+    assert!(
+        srv.raw.lock().unwrap().is_empty(),
+        "no byte reached the server"
+    );
+    let seen = seen.lock().unwrap();
+    assert_eq!(seen.len(), 1, "one line per host and minute: {seen:?}");
+    assert!(
+        seen[0].starts_with("localhost: the TLS server name differs"),
+        "{seen:?}"
+    );
+}
+
+#[test]
+fn api_mode_refuses_other_hosts_ports_ip_literals_and_plain_http() {
+    let ck = self_signed();
+    let srv = tls_echo(&ck);
+    let (_d, sock, seen) = api_proxy(&[format!("localhost:{}", srv.port)], srv.port);
+    assert_eq!(connect(&sock, "elsewhere.example.com:443").0, 403);
+    assert_eq!(connect(&sock, "localhost:443").0, 403);
+    assert_eq!(connect(&sock, &format!("127.0.0.1:{}", srv.port)).0, 403);
+    let (code, _) = request(
+        &sock,
+        &format!(
+            "GET http://localhost:{}/ HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            srv.port
+        ),
+    );
+    assert_eq!(code, 403);
+    let seen = seen.lock().unwrap();
+    assert!(
+        seen.iter()
+            .any(|l| l == "elsewhere.example.com: not on the list"),
+        "{seen:?}"
+    );
+    assert!(
+        seen.iter()
+            .any(|l| l.starts_with("127.0.0.1: an IP address")),
+        "{seen:?}"
+    );
+    assert!(srv.raw.lock().unwrap().is_empty());
+}

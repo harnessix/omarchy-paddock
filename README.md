@@ -312,6 +312,7 @@ paddock never removes the home or worktree of a running sandbox. It deletes only
 | :--- | :--- |
 | `egress` (default) | Internet access that leaves the same way as host traffic. Host services and the LAN are not reachable. |
 | `none` | No network. |
+| `api` | Only HTTPS to the model API hosts of the harness profile and the domains of `--allow`. Meant for reviewers and agents that need only their model. |
 | `host` | The host network namespace. Host-local services are reachable. Needs approval in `paddock.toml`. |
 
 Many users depend on a system proxy or a TUN device for a stable exit address, and an account can be flagged when that address changes. So paddock never gives a sandbox a bridged network.
@@ -330,6 +331,20 @@ On the docker and podman backends, the container has no network interface. Its o
 A host proxy URL that starts with `https://` means TLS to the proxy itself. The paddock proxy then opens a TLS connection to that proxy and checks its certificate against the system trust store. A private CA that you installed system-wide works, and so do `SSL_CERT_FILE` and `SSL_CERT_DIR`. The request and the user name and password from the URL go only inside TLS. If the TLS connection fails, for example because of a certificate error, the request fails. paddock never falls back to plain TCP. A URL that starts with `http://` or `socks5://` sends the user name and password in cleartext, because those protocols do that, for host programs too. paddock allows this, but it logs a warning when the proxy is not on the host loopback. Use an `https://` proxy URL to protect them.
 
 Who talks to the host proxy depends on the backend. On docker and podman, the paddock proxy described above does. On bwrap, the sandbox gets the host proxy variables, and the harness in the sandbox connects to the proxy itself, through pasta. The harness then handles `https://` proxy URLs and certificates the way it does on the host. On srt, the srt proxy on the host handles the traffic, and the paddock proxy is not used.
+
+### Network mode `api`
+
+In mode `api`, the sandbox has no network at all. Its only way out is the paddock proxy on the host, which a relay in the sandbox offers on `127.0.0.1:3131`. paddock sets `HTTPS_PROXY`, `HTTP_PROXY`, `ALL_PROXY` and their lowercase forms to it, and `NO_PROXY=127.0.0.1,localhost`. A program must honor these variables to reach anything. A program that ignores them gets no network, so the rule holds either way. The credential gateway on `127.0.0.1:3130` works as before.
+
+The proxy lets a connection through only when all of these hold:
+
+- It is a `CONNECT` to a host on the list, on port 443. The list holds the `[network] endpoints` of the harness profile, the `[network] allow` entries, and each `--allow`. An entry `HOST:PORT` allows that port instead. An entry `*.example.com` allows the subdomains of `example.com`, not `example.com` itself.
+- The host is a name. IP addresses are refused.
+- The TLS ClientHello names the same host (SNI). The proxy checks this before any byte goes to the host.
+
+Plain HTTP requests are refused. The proxy connects like a host program, through the host proxy variables or directly, and it still refuses the host itself and the LAN. The audit log (`paddock log`, capability `network`) records each refused host and the reason, at most once per host and minute, never content. `paddock explain HARNESS --network api` lists the allowed hosts and where each one comes from, and `paddock ps --json` shows the mode.
+
+On docker and podman, the container gets the same proxy and the same rules. On srt, mode `api` uses the srt proxy with the same list (`allow_domains`). srt does not check the TLS server name.
 
 `paddock doctor --escape --network egress --online` checks all of this: DNS and HTTPS work, and the host loopback, the other host addresses, and direct connections that bypass the proxy do not.
 
@@ -722,7 +737,7 @@ A role is a fixed set of limits. The agent names a role. It cannot combine its o
 | `implementer` (the default) | its own writable worktree | clean | as the parent allows |
 | `reviewer` | read-only | clean | refused |
 
-"Clean" means that only the allowlist and the harness's own variables (for example `OPENAI_API_KEY` for codex) pass. A reviewer keeps the network mode of the parent for now.
+"Clean" means that only the allowlist and the harness's own variables (for example `OPENAI_API_KEY` for codex) pass. A reviewer gets network mode `api` when the parent has `egress` or `host`, so it reaches only its model API. Otherwise it keeps the network mode of the parent.
 
 `--timeout`, `--mem` and `--cpus` can only lower the limits in your configuration. If the host has `systemd-run --user`, paddock starts the child's host process in a systemd scope with `MemoryMax`, `CPUQuota` and `RuntimeMaxSec`, so the limits cover the child sandbox and everything in it. paddock itself stops the child at the timeout, so the child can still save its login. The scope's runtime limit is a backstop one minute later. Without `systemd-run`, paddock enforces the timeout and refuses `--mem` and `--cpus`. The audit log says why a child stopped.
 
@@ -746,7 +761,7 @@ timeout = 1800           # seconds that one child may run in total
 
 These rules always hold:
 
-- A child never gets more than its parent. It gets the same backend, network mode, LAN setting and approved mounts, and the same project. Its environment is clean. It gets no display. Its host capability modes are at most those of the parent. Its `/dev/paddock` has at most the devices of the parent. In paddock kv it writes only its own scope and the `tree` scope. paddock uses the settings that the parent had when it started, so a change to `paddock.toml` during the run does not reach the child.
+- A child never gets more than its parent. It gets the same backend, network mode (or `api` for a reviewer), LAN setting and approved mounts, and the same project. Its environment is clean. It gets no display. Its host capability modes are at most those of the parent. Its `/dev/paddock` has at most the devices of the parent. In paddock kv it writes only its own scope and the `tree` scope. paddock uses the settings that the parent had when it started, so a change to `paddock.toml` during the run does not reach the child.
 - No credentials move between sandboxes. The child uses its own login of its harness, in its own sandbox home. The parent never sees it. The parent gets only the results.
 - The first spawn of each harness in a session asks you. The card shows the harness, the role, the login it uses, the limits and the task. "Allow for this session" covers only that harness in that role.
 - Requests from a child, for example `git-push` or `exec`, show "Started by sandbox X" on the card. An "Allow for this session" or "No for this session" answer for the parent does not apply to the child, and an answer for the child does not apply to the parent. Otherwise a sandbox could avoid a question by giving the work to a child.
