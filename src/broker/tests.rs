@@ -866,3 +866,218 @@ fn a_note_goes_through_the_approvals_directory() {
     assert_eq!(v.answer, Answer::DenySession);
     assert_eq!(v.note.as_deref(), Some("not now"));
 }
+
+/// A broker whose user configuration holds `config`, with a fake `faketool`
+/// on the executor's PATH. The tool prints its arguments, its folder and its
+/// environment.
+fn tool_setup(answer: Option<Answer>, config: &str) -> (tempfile::TempDir, Broker, Arc<Fixed>) {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    let project = tmp.path().join("work/app");
+    let bin = tmp.path().join("bin");
+    std::fs::create_dir_all(&project).unwrap();
+    std::fs::create_dir_all(&bin).unwrap();
+    let script = bin.join("faketool");
+    std::fs::write(
+        &script,
+        "#!/bin/sh\necho \"args:$*\"\necho \"pwd:$(pwd)\"\nenv | sort\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let mut vars = BTreeMap::new();
+    vars.insert("PATH".into(), format!("{}:/usr/bin:/bin", bin.display()));
+    let env = HostEnv::from_parts(home, "tester".into(), 1000, 1000, vars);
+    std::fs::create_dir_all(env.paddock_config()).unwrap();
+    std::fs::write(env.paddock_config().join("config.toml"), config).unwrap();
+    std::fs::create_dir_all(&env.home).unwrap();
+    let policy = HostPolicy::load(&env).unwrap();
+    let fixed = Arc::new(Fixed {
+        answer,
+        asked: AtomicUsize::new(0),
+    });
+    let ctx = Context {
+        id: "t-1".into(),
+        harness: "claude".into(),
+        project,
+        repo: None,
+        chain: vec![],
+        depth: 0,
+        role: None,
+    };
+    let mut b = Broker::new(env.clone(), ctx, policy, fixed.clone());
+    b.dispatch = Some(Arc::new(crate::gatewayd::InProcess {
+        key: vec![9u8; 32],
+        seen: Default::default(),
+        env,
+        isolation: crate::execbox::Isolation::None,
+    }));
+    (tmp, b, fixed)
+}
+
+fn tool(name: &str, args: &[&str]) -> Request {
+    req(
+        "tool",
+        serde_json::json!({
+            "name": name,
+            "args": args,
+            // A sandbox cannot hand the tool variables: this is ignored.
+            "env": { "SANDBOX_SECRET": SECRET },
+        }),
+    )
+}
+
+const TOOLS: &str = "[host.tools.compose]\ncommand = [\"faketool\", \"compose\"]\nargs = [\"up -d\", \"logs *\"]\nmode = \"allow\"\n\
+[host.tools.ask]\ncommand = [\"faketool\"]\nargs = [\"run **\"]\n\
+[host.tools.home]\ncommand = [\"faketool\"]\ncwd = \"home\"\nmode = \"allow\"\n\
+[host.tools.off]\ncommand = [\"faketool\"]\nmode = \"deny\"\n";
+
+#[test]
+fn a_tool_runs_allowed_shapes_with_a_clean_environment() {
+    let (_t, b, fixed) = tool_setup(Some(Answer::Deny), TOOLS);
+    let r = b.handle(&tool("compose", &["up", "-d"]));
+    assert_eq!(r.status, Status::Done, "{}", r.message);
+    let out = r.result["stdout"].as_str().unwrap();
+    assert!(out.contains("args:compose up -d\n"), "{out}");
+    assert!(
+        out.contains(&format!("pwd:{}\n", b.ctx.project.display())),
+        "{out}"
+    );
+    assert!(!out.contains(SECRET), "{out}");
+    for line in out
+        .lines()
+        .filter(|l| !l.starts_with("args:") && !l.starts_with("pwd:"))
+    {
+        let k = line.split('=').next().unwrap();
+        assert!(
+            crate::execbox::BASE_ENV.contains(&k) || ["PWD", "SHLVL", "_", "OLDPWD"].contains(&k),
+            "a variable outside the clean environment: {line}"
+        );
+    }
+    assert_eq!(
+        fixed.asked.load(Ordering::SeqCst),
+        0,
+        "mode allow asks nobody"
+    );
+    let r = b.handle(&tool("compose", &["logs", "web"]));
+    assert!(r.result["stdout"]
+        .as_str()
+        .unwrap()
+        .contains("args:compose logs web\n"));
+    let r = b.handle(&tool("home", &[]));
+    assert!(r.result["stdout"]
+        .as_str()
+        .unwrap()
+        .contains(&format!("pwd:{}\n", b.env.home.display())));
+
+    let lines = audit_lines(&b);
+    assert_eq!(lines[0]["capability"], "tool");
+    assert_eq!(lines[0]["tool"], "compose");
+    assert_eq!(lines[0]["args"], serde_json::json!(["up", "-d"]));
+    assert_eq!(lines[0]["decision"], "allowed by configuration");
+    assert_eq!(lines[0]["exit_code"], 0);
+}
+
+#[test]
+fn a_tool_refuses_other_arguments_before_asking() {
+    let (_t, b, fixed) = tool_setup(Some(Answer::Once), TOOLS);
+    for (name, args) in [
+        ("compose", &["up"][..]),
+        ("compose", &["run", "--privileged", "x"][..]),
+        ("compose", &["logs", "-f"][..]),
+        ("compose", &["logs", "a", "b"][..]),
+        ("home", &["x"][..]),
+        ("ask", &["run", "a", "--rm"][..]),
+        ("missing", &[][..]),
+    ] {
+        let r = b.handle(&tool(name, args));
+        assert_eq!(r.status, Status::Invalid, "{name} {args:?}: {}", r.message);
+    }
+    assert_eq!(b.handle(&tool("off", &[])).status, Status::Disabled);
+    assert_eq!(fixed.asked.load(Ordering::SeqCst), 0);
+    let lines = audit_lines(&b);
+    assert_eq!(lines.len(), 8);
+    assert_eq!(lines[0]["decision"], "invalid");
+    assert_eq!(lines[7]["decision"], "disabled");
+}
+
+#[test]
+fn an_ask_tool_asks_and_a_session_grant_covers_the_same_arguments() {
+    let (_t, b, fixed) = tool_setup(Some(Answer::Deny), TOOLS);
+    assert_eq!(b.handle(&tool("ask", &["run", "a"])).status, Status::Denied);
+    assert_eq!(fixed.asked.load(Ordering::SeqCst), 1);
+
+    let (_t, b, fixed) = tool_setup(Some(Answer::Session), TOOLS);
+    let r = b.handle(&tool("ask", &["run", "a", "b"]));
+    assert_eq!(r.status, Status::Done, "{}", r.message);
+    assert!(r.result["stdout"]
+        .as_str()
+        .unwrap()
+        .contains("args:run a b\n"));
+    b.handle(&tool("ask", &["run", "a", "b"]));
+    assert_eq!(
+        fixed.asked.load(Ordering::SeqCst),
+        1,
+        "the same arguments are not asked again"
+    );
+    b.handle(&tool("ask", &["run", "c"]));
+    assert_eq!(
+        fixed.asked.load(Ordering::SeqCst),
+        2,
+        "other arguments are asked again"
+    );
+}
+
+#[test]
+fn host_tool_deny_turns_every_tool_off() {
+    let (_t, b, _) = tool_setup(
+        Some(Answer::Once),
+        &format!("[host]\ntool = \"deny\"\n{TOOLS}"),
+    );
+    assert_eq!(
+        b.handle(&tool("compose", &["up", "-d"])).status,
+        Status::Disabled
+    );
+}
+
+#[test]
+fn the_executor_checks_a_tool_request_again() {
+    // A signed request for arguments that the configuration does not allow
+    // (the broker would never sign it) still does not run.
+    let (_t, b, _) = tool_setup(None, TOOLS);
+    let e = b
+        .execute(&tool("compose", &["down"]), serde_json::Value::Null)
+        .unwrap_err();
+    assert!(format!("{e:#}").contains("no shape"), "{e:#}");
+}
+
+#[test]
+fn capabilities_list_the_tools() {
+    let (_t, b, _) = tool_setup(None, TOOLS);
+    let r = b.handle(&req(
+        "capabilities",
+        serde_json::json!({ "list_tools": true }),
+    ));
+    let tools = r.result["tools"].as_array().unwrap();
+    assert_eq!(tools.len(), 4);
+    let c = tools.iter().find(|t| t["name"] == "compose").unwrap();
+    assert_eq!(c["args"], serde_json::json!(["up -d", "logs *"]));
+    assert_eq!(c["mode"], "allow");
+}
+
+#[test]
+fn an_allowed_plain_exec_line_is_logged_for_suggest_only_when_asked() {
+    let (_t, b, _) = setup(Some(Answer::Once), HostPolicy::default());
+    // Off by default: no command line in the log.
+    b.handle(&exec(&["echo", "a"]));
+    let cfg = b.env.paddock_config();
+    std::fs::create_dir_all(&cfg).unwrap();
+    std::fs::write(cfg.join("config.toml"), "[exec]\nremember_allowed = true\n").unwrap();
+    b.handle(&exec(&["echo", "a"]));
+    b.handle(&exec(&["echo", "--token", "x"]));
+    let lines = audit_lines(&b);
+    assert!(lines[0].get("argv").is_none(), "{}", lines[0]);
+    assert_eq!(lines[0]["exit_code"], 0);
+    assert_eq!(lines[1]["argv"], serde_json::json!(["echo", "a"]));
+    assert!(lines[2].get("argv").is_none());
+}

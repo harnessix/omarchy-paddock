@@ -82,6 +82,63 @@ fn run(
             }
             Ok(serde_json::json!({ "exit_code": code, "stdout": out, "stderr": err }))
         }
+        "tool" => {
+            // The executor reads the tools itself and checks the request
+            // again: a signed request still runs only what the user wrote.
+            let name = job
+                .request
+                .args
+                .get("name")
+                .and_then(|n| n.as_str())
+                .context("tool needs a name")?;
+            let args = crate::broker::tool_args(&job.request)?;
+            let tools = crate::hosttools::load(env)?;
+            let tool = tools
+                .get(name)
+                .with_context(|| format!("no tool {name} in the user configuration"))?;
+            if tool.mode == crate::broker::Mode::Deny {
+                bail!("tool {name} is set to deny");
+            }
+            tool.check(&args)?;
+            let argv = crate::hosttools::argv(env, tool, &args)?;
+            let timeout = job
+                .request
+                .args
+                .get("timeout")
+                .and_then(|t| t.as_u64())
+                .unwrap_or(120)
+                .clamp(1, 3600);
+            let how = how.map_err(|e| anyhow::anyhow!("{e}"))?;
+            let mut cfg = crate::execbox::ExecCfg::load(env)?;
+            let cwd = match tool.cwd {
+                crate::hosttools::Cwd::Project => job.grant.project.clone(),
+                crate::hosttools::Cwd::Home => {
+                    // An empty home has no such folder: show it read-only.
+                    if cfg.home == crate::execbox::Home::Hidden {
+                        cfg.home = crate::execbox::Home::ReadOnly;
+                    }
+                    env.home.clone()
+                }
+            };
+            let unit = unit_name("tool", job);
+            let mut cmd = crate::execbox::command_in(
+                how,
+                &cfg,
+                &env.home,
+                &job.grant.project,
+                &cwd,
+                &argv,
+                &cfg.pass_env(&job.env),
+                timeout,
+                &unit,
+            );
+            let (code, out, err) =
+                crate::broker::run_capture(&mut cmd, Duration::from_secs(timeout + 10))?;
+            if let Some(why) = crate::execbox::setup_failure(how, code, &err) {
+                bail!("{why}");
+            }
+            Ok(serde_json::json!({ "exit_code": code, "stdout": out, "stderr": err }))
+        }
         "git-push" => {
             let x: crate::broker::git::PushExec =
                 serde_json::from_value(job.plan.clone()).context("a push needs its plan")?;
@@ -107,6 +164,7 @@ fn run(
                     .iter()
                     .map(|s| s.to_string())
                     .collect(),
+                remember_allowed: false,
             };
             let unit = format!(
                 "paddock-push-{}",
@@ -157,6 +215,7 @@ fn run(
                     .iter()
                     .map(|s| s.to_string())
                     .collect(),
+                remember_allowed: false,
             };
             let mut vars = cfg.pass_env(&job.env);
             vars.extend(crate::broker::forge::forge_vars());
@@ -244,6 +303,7 @@ fn desktop_cfg(job: &Job, workdir: &Path) -> crate::execbox::ExecCfg {
         paths: vec![workdir.to_path_buf()],
         ro_paths: ro.into_iter().filter(|p| p.exists()).collect(),
         env: DESKTOP_ENV.iter().map(|s| s.to_string()).collect(),
+        remember_allowed: false,
     }
 }
 

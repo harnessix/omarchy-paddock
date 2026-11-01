@@ -46,6 +46,10 @@ pub const CAPABILITIES: &[(&str, &str)] = &[
         "run one command on the host, in the project directory, and return its output",
     ),
     (
+        "tool",
+        "run a named host tool that the user defined in [host.tools], with allowed arguments only",
+    ),
+    (
         "fetch",
         "copy one host file or directory into the project inbox",
     ),
@@ -82,6 +86,8 @@ pub struct HostPolicy {
     pub modes: BTreeMap<String, Mode>,
     /// Seconds to wait for an answer before a request times out.
     pub wait: u64,
+    /// The named host tools of `[host.tools]`.
+    pub tools: BTreeMap<String, crate::hosttools::Tool>,
 }
 
 impl Default for HostPolicy {
@@ -91,7 +97,11 @@ impl Default for HostPolicy {
             modes.insert(cap.to_string(), Mode::Ask);
         }
         modes.insert("notify".into(), Mode::Allow);
-        Self { modes, wait: 120 }
+        Self {
+            modes,
+            wait: 120,
+            tools: BTreeMap::new(),
+        }
     }
 }
 
@@ -107,7 +117,12 @@ impl HostPolicy {
         let Some(host) = doc.get("host").and_then(|h| h.as_table()) else {
             return Ok(p);
         };
+        p.tools = crate::hosttools::parse_host(host)
+            .with_context(|| format!("{} is invalid", file.display()))?;
         for (k, v) in host {
+            if k == "tools" {
+                continue;
+            }
             if k == "wait" {
                 p.wait = v
                     .as_integer()
@@ -491,6 +506,10 @@ pub fn audit_file(env: &HostEnv) -> PathBuf {
 /// - clipboard-write: the length of the text, never the text.
 /// - exec: the program and the number of arguments. Arguments can hold
 ///   tokens or passwords (`curl -H "Authorization: ..."`), so they stay out.
+///   An allowed command line of plain words (`hosttools::loggable_argv`)
+///   goes into `argv`, for `paddock tools suggest`.
+/// - tool: the tool name and the arguments, which match a shape that the
+///   user wrote.
 /// - forge: the command line without the body text, and the body length.
 /// - notify: the lengths of the title and the body.
 /// - open-url: the scheme and host. Paths and queries can hold login codes.
@@ -513,6 +532,8 @@ pub fn audit_detail(req: &Request, project: &Path, prepared: Option<&str>) -> St
                 a.len().saturating_sub(1),
             )
         }
+        // The arguments match a shape that the user wrote: they stay.
+        "tool" => format!("run the host tool {}", tool_line(req)),
         "forge" => {
             let tool = arg_str(req, "tool").unwrap_or("gh");
             let t = forge::tool(tool).unwrap_or(&forge::GH);
@@ -594,6 +615,23 @@ fn audit(
     let mut line = line;
     if let Some(n) = note {
         line["note_chars"] = n.chars().count().into();
+    }
+    if let Some(code) = resp.result.get("exit_code") {
+        line["exit_code"] = code.clone();
+    }
+    if req.cap == "tool" {
+        line["tool"] = arg_str(req, "name").unwrap_or("").into();
+        line["args"] = serde_json::json!(tool_args(req).unwrap_or_default());
+    }
+    // A plain exec line that the user allowed, for `paddock tools suggest`,
+    // only when the user asked for it (`[exec] remember_allowed = true`).
+    if req.cap == "exec"
+        && decision.starts_with("allowed")
+        && crate::execbox::ExecCfg::load(env).is_ok_and(|c| c.remember_allowed)
+    {
+        if let Some(a) = crate::hosttools::loggable_argv(&argv(req)) {
+            line["argv"] = serde_json::json!(a);
+        }
     }
     if let Some(parent) = ctx.chain.last() {
         line["parent"] = parent.clone().into();
@@ -902,6 +940,22 @@ fn arg_str<'a>(req: &'a Request, key: &str) -> Option<&'a str> {
     req.args.get(key).and_then(|v| v.as_str())
 }
 
+/// The arguments of a `tool` request: a list of strings, or none.
+pub(crate) fn tool_args(req: &Request) -> Result<Vec<String>> {
+    match req.args.get("args") {
+        None | Some(serde_json::Value::Null) => Ok(Vec::new()),
+        Some(v) => serde_json::from_value(v.clone()).context("tool arguments must be strings"),
+    }
+}
+
+fn tool_line(req: &Request) -> String {
+    std::iter::once(arg_str(req, "name").unwrap_or("").to_string())
+        .chain(tool_args(req).unwrap_or_default())
+        .map(|a| shell_quote(&a))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 fn argv(req: &Request) -> Vec<String> {
     req.args
         .get("argv")
@@ -1040,6 +1094,13 @@ fn validate(req: &Request) -> Result<()> {
             if argv(req).is_empty() {
                 bail!("exec needs a command");
             }
+        }
+        "tool" => {
+            let n = arg_str(req, "name").context("tool needs a tool name")?;
+            if !crate::hosttools::valid_name(n) {
+                bail!("not a valid tool name: {n}");
+            }
+            tool_args(req)?;
         }
         "fetch" => {
             let p = PathBuf::from(arg_str(req, "path").context("fetch needs a path")?);
@@ -1590,6 +1651,62 @@ impl Broker {
         }
     }
 
+    /// Check a tool request before the user is asked: the tool exists, its
+    /// mode is not deny, and the arguments match one of its shapes. Err is
+    /// the response to send instead.
+    fn prepare_tool(&self, req: &Request) -> std::result::Result<Prepared, Response> {
+        let name = arg_str(req, "name").unwrap_or("");
+        let Some(tool) = self.policy.tools.get(name) else {
+            let known: Vec<&str> = self.policy.tools.keys().map(String::as_str).collect();
+            return Err(Response::new(
+                Status::Invalid,
+                if known.is_empty() {
+                    format!("no tool {name}: the user defines none in [host.tools]")
+                } else {
+                    format!("no tool {name}. Tools: {}", known.join(", "))
+                },
+            ));
+        };
+        if tool.mode == Mode::Deny {
+            return Err(Response::new(
+                Status::Disabled,
+                format!("tool {name} is set to deny in the user configuration"),
+            ));
+        }
+        let args = tool_args(req).map_err(|e| Response::new(Status::Invalid, format!("{e:#}")))?;
+        tool.check(&args)
+            .map_err(|e| Response::new(Status::Invalid, format!("{e:#}")))?;
+        let line = tool
+            .command
+            .iter()
+            .chain(args.iter())
+            .map(|a| shell_quote(a))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let place = match tool.cwd {
+            crate::hosttools::Cwd::Project => self.ctx.project.display().to_string(),
+            crate::hosttools::Cwd::Home => "your home folder".into(),
+        };
+        let mut key = format!("tool\0{name}");
+        for a in &args {
+            key.push('\0');
+            key.push_str(a);
+        }
+        Ok(Prepared {
+            summary: format!(
+                "host tool {}",
+                tool_line(req).chars().take(80).collect::<String>()
+            ),
+            detail: format!("Run the host tool {name} in {place}:\n{line}"),
+            keys: vec![key],
+            session_allowed: true,
+            always_ask: false,
+            read_only: false,
+            audit: None,
+            work: Work::Plain,
+        })
+    }
+
     /// Work out a spawn request before the user is asked. Err is the
     /// response to send instead.
     fn prepare_spawn(&self, req: &Request) -> std::result::Result<Prepared, Response> {
@@ -1849,6 +1966,12 @@ impl Broker {
         if let Some(p) = self.ctx.chain.last() {
             v["started_by"] = p.clone().into();
         }
+        v["tools"] = self
+            .policy
+            .tools
+            .values()
+            .map(crate::hosttools::Tool::listing)
+            .collect();
         v
     }
 
@@ -1926,11 +2049,40 @@ impl Broker {
                     return r;
                 }
             }
+        } else if req.cap == "tool" {
+            match self.prepare_tool(req) {
+                Ok(p) => p,
+                Err(r) => {
+                    let decision = if r.status == Status::Disabled {
+                        "disabled"
+                    } else {
+                        "invalid"
+                    };
+                    audit(
+                        &self.env,
+                        &self.ctx,
+                        req,
+                        &audit_detail(req, &self.ctx.project, None),
+                        None,
+                        decision,
+                        &r,
+                        None,
+                    );
+                    return r;
+                }
+            }
         } else {
             match prepare(&self.env, &self.ctx, req) {
                 Ok(p) => p,
                 Err(e) => return invalid(e),
             }
+        };
+        // A tool has its own mode; `[host] tool` only turns every tool off.
+        let mode = match req.cap.as_str() {
+            "tool" => arg_str(req, "name")
+                .and_then(|n| self.policy.tools.get(n))
+                .map_or(Mode::Deny, |t| t.mode),
+            _ => mode,
         };
         if reviewer && req.cap == "forge" && !prep.read_only {
             return self.refuse_reviewer(req);
@@ -2047,10 +2199,12 @@ impl Broker {
                     Err(e) => Response::new(Status::Failed, format!("{e:#}")),
                 }
             }
-            _ if req.cap == "exec" => match self.execute(req, serde_json::Value::Null) {
-                Ok(result) => Response::done(result),
-                Err(e) => Response::new(Status::Failed, format!("{e:#}")),
-            },
+            _ if req.cap == "exec" || req.cap == "tool" => {
+                match self.execute(req, serde_json::Value::Null) {
+                    Ok(result) => Response::done(result),
+                    Err(e) => Response::new(Status::Failed, format!("{e:#}")),
+                }
+            }
             // The push runs in the executor too, from the plan of the card.
             _ if matches!(prep.work, Work::Push(_)) => {
                 let Work::Push(plan) = &prep.work else {

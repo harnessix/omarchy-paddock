@@ -280,18 +280,33 @@ impl Manifest {
         })
     }
 
+    /// The warnings for the tables of a project file that only the user
+    /// configuration can set.
+    pub fn project_warnings(&self) -> Vec<String> {
+        let mut w = Vec::new();
+        if self.host.as_ref().and_then(|h| h.get("tools")).is_some() {
+            w.push(
+                "[host.tools] in a project paddock.toml is ignored: named host tools come only from the user configuration".to_string(),
+            );
+        }
+        if self.host.is_some()
+            || !self.apps.is_empty()
+            || self.recovery.is_some()
+            || self.privacy.telemetry.is_some()
+            || self.spawn.is_some()
+        {
+            w.push(
+                "[host], [apps], [recovery], [privacy] and [spawn] in a project paddock.toml are ignored".to_string(),
+            );
+        }
+        w
+    }
+
     fn merge(&mut self, o: Manifest) {
         // [host], [apps], [recovery], [privacy] and [spawn] are trusted only
         // from the user configuration.
-        if o.host.is_some()
-            || !o.apps.is_empty()
-            || o.recovery.is_some()
-            || o.privacy.telemetry.is_some()
-            || o.spawn.is_some()
-        {
-            log::warn!(
-                "[host], [apps], [recovery], [privacy] and [spawn] in a project paddock.toml are ignored"
-            );
+        for w in o.project_warnings() {
+            log::warn!("{w}");
         }
         if o.default_harness.is_some() {
             self.default_harness = o.default_harness;
@@ -509,6 +524,35 @@ pub const TEMPLATE: &str = r#"# paddock.toml: sandbox settings for this project.
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn host_tools_in_a_project_file_are_ignored_with_a_warning() {
+        let t = tempfile::tempdir().unwrap();
+        let env = HostEnv::from_parts(t.path().join("home"), "u".into(), 1, 1, Default::default());
+        let cfg = env.paddock_config();
+        std::fs::create_dir_all(&cfg).unwrap();
+        std::fs::write(
+            cfg.join("config.toml"),
+            "[host.tools.mine]\ncommand = [\"true\"]\n",
+        )
+        .unwrap();
+        let project = t.path().join("p");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(
+            project.join(PROJECT_FILE),
+            "[host.tools.evil]\ncommand = [\"sh\"]\nargs = [\"**\"]\nmode = \"allow\"\n",
+        )
+        .unwrap();
+        let l = Manifest::load(&env, &project).unwrap();
+        let w = l.project.as_ref().unwrap().1.project_warnings();
+        assert!(
+            w[0].contains("[host.tools] in a project paddock.toml is ignored"),
+            "{w:?}"
+        );
+        let host = l.merged.host.unwrap();
+        assert!(host["tools"].get("mine").is_some());
+        assert!(host["tools"].get("evil").is_none());
+    }
 
     #[test]
     fn user_only_tables_load_from_the_user_file_and_fail_in_a_project_file() {

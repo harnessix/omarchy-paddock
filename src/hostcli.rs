@@ -29,6 +29,7 @@ USAGE
   paddock-host capabilities [--json]
   paddock-host screenshot [--target screen|window|output:NAME] [--out FILE] [--reason TEXT]
   paddock-host exec [--timeout SECONDS] [--reason TEXT] -- COMMAND [ARG...]
+  paddock-host tool --list | tool [--timeout SECONDS] [--reason TEXT] NAME [ARG...]
   paddock-host fetch HOST_PATH [--reason TEXT]
   paddock-host clipboard get [--reason TEXT]
   paddock-host clipboard set TEXT [--reason TEXT]
@@ -153,6 +154,25 @@ exec to allow: every new command line needs an answer.
 --timeout stops the command after SECONDS (default 120, at most 3600).
 stdout and stderr are returned (at most 1 MiB each), and paddock-host exits
 with the command's exit code."#
+        }
+        "tool" => {
+            r#"paddock-host tool: run a named host tool that the user defined.
+
+  paddock-host tool --list
+  paddock-host tool [--timeout SECONDS] [--reason TEXT] NAME [ARG...]
+
+The user defines tools in [host.tools] of their configuration: a fixed host
+command and the argument shapes that it accepts. --list shows each tool, its
+mode and its shapes. Options go before NAME; every word after NAME is an
+argument. The arguments must match one shape word by word: `*` is one word
+that does not start with -, `**` (last) is the rest of the words, none
+starting with -. A tool without shapes takes no arguments. Other arguments are
+refused at once, without a question to the user. Do not try variants: ask the
+user to add a shape instead.
+The tool runs like exec: isolated, without your environment, in the project
+folder or the user's home. Mode allow runs it at once, ask shows the user the
+tool and the exact arguments, deny refuses. stdout and stderr are returned,
+and paddock-host exits with the tool's exit code."#
         }
         "fetch" => {
             r#"paddock-host fetch: copy one host file or directory into the project.
@@ -427,7 +447,12 @@ pub fn main(args: &[String]) -> i32 {
         }
         return 0;
     }
-    if rest.iter().any(|a| a == "-h" || a == "--help") {
+    let help_asked = if cmd == "tool" {
+        rest.first().is_some_and(|a| a == "-h" || a == "--help")
+    } else {
+        rest.iter().any(|a| a == "-h" || a == "--help")
+    };
+    if help_asked {
         println!("{}", cap_help(cmd).unwrap_or(HELP));
         return 0;
     }
@@ -469,6 +494,58 @@ pub fn main(args: &[String]) -> i32 {
                     );
                 }
                 (req("exec", p.reason, a), p.json)
+            }
+            "tool" => {
+                let mut opts = Vec::new();
+                let mut words = rest.iter();
+                let mut list = false;
+                let mut name = None;
+                while let Some(a) = words.next() {
+                    match a.as_str() {
+                        "--list" => list = true,
+                        "--json" => opts.push(a.clone()),
+                        "--reason" | "--timeout" => {
+                            opts.push(a.clone());
+                            opts.push(words.next().ok_or(format!("{a} needs a value"))?.clone());
+                        }
+                        "--" => {
+                            name = words.next().cloned();
+                            break;
+                        }
+                        o if o.starts_with('-') => return Err(format!("unknown option {o}")),
+                        _ => {
+                            name = Some(a.clone());
+                            break;
+                        }
+                    }
+                }
+                let p = parse(&opts, &["timeout"])?;
+                if list {
+                    if name.is_some() {
+                        return Err("tool --list takes no tool name".into());
+                    }
+                    let mut a = BTreeMap::new();
+                    a.insert("list_tools".into(), serde_json::json!(true));
+                    (req("capabilities", String::new(), a), p.json)
+                } else {
+                    let name =
+                        name.ok_or("tool needs a tool name; see paddock-host tool --list")?;
+                    let mut a = BTreeMap::new();
+                    a.insert("name".into(), serde_json::json!(name));
+                    a.insert(
+                        "args".into(),
+                        serde_json::json!(words.cloned().collect::<Vec<_>>()),
+                    );
+                    if let Some(t) = p.opts.get("timeout") {
+                        a.insert(
+                            "timeout".into(),
+                            serde_json::json!(t
+                                .parse::<u64>()
+                                .map_err(|_| "--timeout needs a number")?),
+                        );
+                    }
+                    (req("tool", p.reason, a), p.json)
+                }
             }
             "fetch" => {
                 let p = parse(rest, &[])?;
@@ -600,7 +677,7 @@ pub fn main(args: &[String]) -> i32 {
     } else {
         print_human(&request, &resp);
     }
-    if resp.status == Status::Done && request.cap == "exec" {
+    if resp.status == Status::Done && (request.cap == "exec" || request.cap == "tool") {
         return resp.result["exit_code"].as_i64().unwrap_or(0) as i32;
     }
     if resp.status == Status::Done && cmd == "wait" {
@@ -656,6 +733,30 @@ fn print_human(req: &Request, resp: &Response) {
     }
     let r = &resp.result;
     match req.cap.as_str() {
+        "capabilities" if req.args.contains_key("list_tools") => {
+            let tools = r["tools"].as_array().cloned().unwrap_or_default();
+            if tools.is_empty() {
+                println!("No tools. The user defines them in [host.tools] of the configuration.");
+            }
+            for t in &tools {
+                let shapes: Vec<String> = t["args"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|s| s.as_str().map(|s| format!("\"{s}\"")))
+                    .collect();
+                println!(
+                    "{:<20} {:<5}  {}",
+                    t["name"].as_str().unwrap_or(""),
+                    t["mode"].as_str().unwrap_or(""),
+                    if shapes.is_empty() {
+                        "(no arguments)".to_string()
+                    } else {
+                        shapes.join(", ")
+                    }
+                );
+            }
+        }
         "capabilities" => {
             println!("wait for an answer: {} seconds", r["wait_seconds"]);
             for c in r["capabilities"].as_array().into_iter().flatten() {
@@ -672,7 +773,7 @@ fn print_human(req: &Request, resp: &Response) {
                 );
             }
         }
-        "exec" | "forge" => {
+        "exec" | "forge" | "tool" => {
             print!("{}", r["stdout"].as_str().unwrap_or(""));
             eprint!("{}", r["stderr"].as_str().unwrap_or(""));
         }
