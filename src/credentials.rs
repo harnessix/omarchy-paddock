@@ -462,9 +462,9 @@ pub fn ask(
     );
     let second = card(
         "confirm",
-        format!("confirm: hand over {}", names.join(", ")),
+        format!("confirm: {} for this run", names.join(", ")),
         format!(
-            "Second step. Yes hands over {} for this run. No starts the sandbox without them.",
+            "Second step. Yes gives this sandbox {} for this run, as the first card lists. No starts the sandbox without them.",
             names.join(", ")
         ),
     );
@@ -573,7 +573,7 @@ pub fn audit(env: &HostEnv, spec: &crate::spec::SandboxSpec, names: &str, decisi
             "harness": spec.harness,
             "project": spec.project,
             "capability": CAPABILITY,
-            "detail": format!("deliver {names}"),
+            "detail": format!("credentials {names}"),
             "decision": decision,
         }),
     );
@@ -634,10 +634,11 @@ pub fn rows(env: &HostEnv) -> Result<Vec<Row>> {
             if v["decision"] != "delivered" {
                 continue;
             }
-            if let Some(name) = v["detail"]
-                .as_str()
-                .and_then(|d| d.strip_prefix("deliver "))
-            {
+            if let Some(name) = v["detail"].as_str().and_then(|d| {
+                // "deliver NAME" in logs of older versions.
+                d.strip_prefix("credentials ")
+                    .or_else(|| d.strip_prefix("deliver "))
+            }) {
                 let e = used.entry(name.to_string()).or_default();
                 e.0 += 1;
                 e.1 = e.1.max(v["time"].as_u64().unwrap_or(0));

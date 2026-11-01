@@ -185,6 +185,6 @@ fn deliver_needs_two_answers_before_the_harness_starts() {
     assert_eq!(v["credentials"][0]["delivered"], 1);
     let log = w.cmd().args(["log", "--json"]).output().unwrap();
     let log = String::from_utf8_lossy(&log.stdout);
-    assert!(log.contains("deliver DB_PASSWORD"), "{log}");
+    assert!(log.contains("credentials DB_PASSWORD"), "{log}");
     assert!(!log.contains(SECRET));
 }
