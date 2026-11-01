@@ -179,6 +179,7 @@ pub fn run(
             .unwrap_or_default(),
         can_spawn: spawner.as_ref().is_some_and(|s| s.available()),
     };
+    let kv_project_path = kv_project.clone();
     let kv = crate::kv::start(env, &mut built.spec, kv_project, kv_approver, lineage);
     let mut devices = crate::devices::start(
         env,
@@ -292,6 +293,32 @@ pub fn run(
     if stdin.is_some() {
         cmd.stdin(Stdio::piped());
     }
+    // A scope of its own, so that `paddock freeze` can freeze exactly this
+    // sandbox. A spawned child is in the scope of its limits already.
+    let inherited = crate::freeze::own_scope();
+    let new_scope = (inherited.is_none()
+        && matches!(backend.name(), "bwrap" | "srt")
+        && (env.var("DBUS_SESSION_BUS_ADDRESS").is_some() || env.runtime_dir.is_some()))
+    .then(|| crate::freeze::scope_name(&spec.id));
+    if new_scope.is_some() {
+        // paddock's start stub runs first and stops; paddock moves it into
+        // the scope, and it becomes the sandbox command (same process), so
+        // every process of the sandbox is in there.
+        let me = std::env::current_exe().context("cannot find the paddock executable")?;
+        let mut stub = Command::new(me);
+        stub.arg(crate::freeze::SCOPE_EXEC)
+            .arg(&launch.program)
+            .args(&launch.args)
+            .env_clear()
+            .envs(&launch.env);
+        cmd = stub;
+        if capture {
+            cmd.stdout(Stdio::piped());
+        }
+        if stdin.is_some() {
+            cmd.stdin(Stdio::piped());
+        }
+    }
     if built.spawn.is_some() {
         use std::os::unix::process::CommandExt;
         // A child sandbox ends with the paddock process that runs it, even
@@ -310,6 +337,23 @@ pub fn run(
     let mut child = cmd
         .spawn()
         .with_context(|| format!("cannot start {}", launch.program.display()))?;
+    let unit = match new_scope {
+        Some(name) => {
+            let moved = crate::freeze::wait_stopped(child.id())
+                .and_then(|_| crate::freeze::move_to_scope(env, child.id(), &name, &spec.id));
+            // It continues in any case; without the scope it only cannot be
+            // frozen.
+            crate::freeze::resume(child.id());
+            match moved {
+                Ok(()) => Some(name),
+                Err(e) => {
+                    log::debug!("no scope for the sandbox, so it cannot be frozen: {e:#}");
+                    None
+                }
+            }
+        }
+        None => inherited,
+    };
     forwarding.set_child(child.id());
     if let (Some(data), Some(mut w)) = (stdin, child.stdin.take()) {
         // A thread, so a harness that does not read cannot block paddock.
@@ -347,6 +391,8 @@ pub fn run(
         parent: built.spawn.as_ref().map(|c| c.parent.clone()),
         spawn_id: built.spawn.as_ref().map(|c| c.spawn_id.clone()),
         logins: auth.host_logins(),
+        unit,
+        kv_project: Some(kv_project_path),
     };
     running.register(env)?;
     // Kept after exit, so `paddock files` can list what the sandbox left.

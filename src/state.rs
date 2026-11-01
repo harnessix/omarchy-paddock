@@ -670,6 +670,15 @@ pub struct Running {
     /// the Omarchy agents panel from its side (omarchy_usage.rs).
     #[serde(default)]
     pub logins: Vec<HeldLogin>,
+    /// The systemd scope that holds the sandbox (`paddock-…`), which
+    /// `paddock freeze` freezes. None for container backends and without a
+    /// systemd user instance.
+    #[serde(default)]
+    pub unit: Option<String>,
+    /// The project of paddock kv for this sandbox (the repository of a
+    /// worktree), where paddock writes the sandbox's state.
+    #[serde(default)]
+    pub kv_project: Option<PathBuf>,
 }
 
 /// A host login file and the sandbox's copy of it.

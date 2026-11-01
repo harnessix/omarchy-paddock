@@ -147,5 +147,11 @@
   "new.otherFolder": "Choose another folder…",
   "new.otherFolderHint": "Any project folder on this computer",
   "new.chooseFolderTitle": "Choose a project folder for paddock",
-  "new.noZenity": "Install zenity to choose any folder"
+  "new.noZenity": "Install zenity to choose any folder",
+  "action.freeze": "Freeze this sandbox (it keeps its memory and uses no CPU)",
+  "action.thaw": "Thaw this sandbox: it continues where it stopped",
+  "row.frozen": "frozen for %1",
+  "msg.frozen": "Frozen",
+  "msg.thawed": "Thawed",
+  "msg.freezeFailed": "paddock could not freeze or thaw it"
 }

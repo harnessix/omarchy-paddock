@@ -143,6 +143,8 @@ impl World {
                 rel: rel.into(),
                 store: store.to_path_buf(),
             }],
+            unit: None,
+            kv_project: None,
         }
         .register(&self.env())
         .unwrap();
