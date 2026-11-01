@@ -1,7 +1,7 @@
 name: Release
 
-# Builds the paddock binary for a version tag and attaches it to the GitHub
-# Release of that tag. The release notes come from the matching section of
+# Builds the paddock binaries (x86_64 and aarch64 Linux) for a version tag
+# and attaches them to the GitHub Release of that tag. The release notes come from the matching section of
 # CHANGELOG.md. Run it by hand to add binaries to an existing tag.
 on:
   push:
@@ -17,10 +17,19 @@ permissions:
 
 jobs:
   build:
-    name: build and publish
-    # An older Ubuntu links against an older glibc, so the binary also runs
-    # on distributions with a newer one.
-    runs-on: ubuntu-22.04
+    name: build and publish (${{ matrix.arch }})
+    # Each architecture builds on a native GitHub runner. An older Ubuntu
+    # links against an older glibc, so the binary also runs on distributions
+    # with a newer one.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-22.04
+          - arch: aarch64
+            runner: ubuntu-22.04-arm
+    runs-on: ${{ matrix.runner }}
     env:
       TAG: ${{ github.event.inputs.tag || github.ref_name }}
       GH_TOKEN: ${{ github.token }}
@@ -36,7 +45,7 @@ jobs:
       - run: cargo build --release --locked
       - name: Package
         run: |
-          name="paddock-${TAG#v}-x86_64-linux"
+          name="paddock-${TAG#v}-${{ matrix.arch }}-linux"
           mkdir -p "dist/$name"
           cp target/release/paddock README.md LICENSE CHANGELOG.md "dist/$name/"
           tar -C dist -czf "dist/$name.tar.gz" "$name"
@@ -45,7 +54,10 @@ jobs:
           [ -s dist/notes.md ] || { echo "::error::CHANGELOG.md has no section ## ${TAG#v}"; exit 1; }
       - name: Publish
         run: |
+          # Both jobs can get here at the same time. The loser of the race
+          # finds the release on the second view.
           if ! gh release view "$TAG" >/dev/null 2>&1; then
-            gh release create "$TAG" --verify-tag --title "paddock ${TAG#v}" --notes-file dist/notes.md
+            gh release create "$TAG" --verify-tag --title "paddock ${TAG#v}" --notes-file dist/notes.md \
+              || gh release view "$TAG" >/dev/null
           fi
           gh release upload "$TAG" dist/*.tar.gz dist/*.sha256 --clobber

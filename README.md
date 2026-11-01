@@ -83,6 +83,8 @@ install -m 755 paddock-0.1.7-x86_64-linux/paddock ~/.local/bin/paddock
 paddock doctor
 ```
 
+On a 64-bit Arm machine (aarch64), use `aarch64` in place of `x86_64` in these names. Releases after 0.1.7 have this binary.
+
 All releases are on the [releases page](https://github.com/harnessix/omarchy-paddock/releases).
 
 On Arch Linux, the installer installs a package with makepkg. It also knows apt and dnf, and then copies the binary to `~/.local/bin`; that path is best effort and is not tested on every release (see [Support scope](#support-scope)). Use `bin/install --minimal` to skip the desktop packages.

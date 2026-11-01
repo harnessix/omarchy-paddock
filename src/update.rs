@@ -170,29 +170,52 @@ pub fn is_newer(latest: &str, current: &str) -> bool {
 pub struct Release {
     pub version: String,
     pub tag: String,
+    /// The CPU architecture of the assets, one of [`ARCHS`].
+    pub arch: &'static str,
+}
+
+/// The CPU architectures that have a release binary, as
+/// `std::env::consts::ARCH` names them.
+pub const ARCHS: &[&str] = &["x86_64", "aarch64"];
+
+/// The release architecture for `arch`, or an error for one without a
+/// release binary.
+pub fn release_arch(arch: &str) -> Result<&'static str> {
+    ARCHS.iter().copied().find(|a| *a == arch).ok_or_else(|| {
+        anyhow!(
+            "paddock has no release binary for the {arch} architecture, only for {}. Build paddock from source with cargo instead",
+            ARCHS.join(" and ")
+        )
+    })
 }
 
 impl Release {
-    /// The release of a tag such as `v0.1.8`. The tag must be a plain
-    /// version: it goes into URLs and into the tarball member name.
-    pub fn for_tag(tag: &str) -> Result<Self> {
+    /// The release of a tag such as `v0.1.8` for the architecture `arch`
+    /// (`std::env::consts::ARCH`). The tag must be a plain version: it goes
+    /// into URLs and into the tarball member name.
+    pub fn for_tag(tag: &str, arch: &str) -> Result<Self> {
+        let arch = release_arch(arch)?;
         let v = Version::parse(tag).ok_or_else(|| {
             anyhow!("the latest release has the tag {tag:?}, which is not a version")
         })?;
         Ok(Self {
             version: v.to_string(),
             tag: format!("v{v}"),
+            arch,
         })
     }
+    fn stem(&self) -> String {
+        format!("paddock-{}-{}-linux", self.version, self.arch)
+    }
     pub fn tarball(&self) -> String {
-        format!("paddock-{}-x86_64-linux.tar.gz", self.version)
+        format!("{}.tar.gz", self.stem())
     }
     pub fn checksum(&self) -> String {
         format!("{}.sha256", self.tarball())
     }
     /// The binary inside the tarball.
     pub fn member(&self) -> String {
-        format!("paddock-{}-x86_64-linux/paddock", self.version)
+        format!("{}/paddock", self.stem())
     }
     fn asset_url(&self, name: &str) -> String {
         format!("{REPO_URL}/releases/download/{}/{name}", self.tag)
@@ -407,7 +430,7 @@ impl GitHub {
             .rsplit_once("/releases/tag/")
             .map(|(_, t)| t.to_string())
             .context("github.com did not name the latest release")?;
-        Release::for_tag(&tag)
+        Release::for_tag(&tag, std::env::consts::ARCH)
     }
 }
 
@@ -431,7 +454,7 @@ impl Source for GitHub {
             200 => {
                 let a: ApiRelease = serde_json::from_slice(&r.body)
                     .context("the GitHub API sent an unexpected answer")?;
-                let rel = Release::for_tag(&a.tag_name)?;
+                let rel = Release::for_tag(&a.tag_name, std::env::consts::ARCH)?;
                 for need in [rel.tarball(), rel.checksum()] {
                     if !a.assets.iter().any(|x| x.name == need) {
                         bail!(
