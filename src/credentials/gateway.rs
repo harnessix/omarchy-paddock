@@ -166,8 +166,9 @@ pub fn path_matches(bound: &str, path: &str) -> bool {
     if !bound.contains('*') {
         return path.starts_with(bound);
     }
-    // No escaped slashes or dots behind a wildcard.
-    if path.contains('%') {
+    // No escaped slashes or dots behind a wildcard, and no `.` or `..`
+    // segment, which a server can resolve to another path.
+    if path.contains('%') || path.split('/').any(|s| s == "." || s == "..") {
         return false;
     }
     let (b, p): (Vec<&str>, Vec<&str>) = (bound.split('/').collect(), path.split('/').collect());
@@ -879,6 +880,8 @@ mod tests {
         assert!(r.allows("/o/r.git/git-receive-pack", None));
         assert!(path_matches("/*/*.git/x", "/o/r.git/x"));
         assert!(!path_matches("/*/*.git/x", "/o/r/x"));
+        assert!(!path_matches("/*/*/info/refs", "/../x/info/refs"));
+        assert!(!path_matches("/*/*/info/refs", "/o/./info/refs"));
     }
 
     #[test]
