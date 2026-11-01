@@ -75,6 +75,8 @@ pub struct PastureInfo {
     pub keys: u64,
     pub bytes: u64,
     pub leases: u64,
+    /// The ports that members share (`paddock-host pasture share`).
+    pub ports: Vec<crate::pasture::ports::Shared>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -106,11 +108,24 @@ pub fn pastures(env: &HostEnv, project: &Path) -> Result<Vec<PastureInfo>> {
         running: r.ended.is_none() && running.contains(&r.id),
         frozen_since: crate::freeze::frozen(env, &r.id).map(|(since, _)| since),
     };
-    let count = |ns: &Ns| -> Result<(u64, u64, u64)> {
+    type Counts = (u64, u64, u64, Vec<crate::pasture::ports::Shared>);
+    let count = |ns: &Ns| -> Result<Counts> {
         let Some(st) = open(env, ns)? else {
-            return Ok((0, 0, 0));
+            return Ok((0, 0, 0, Vec::new()));
         };
         let (items, _) = st.list(&ns.key(), "", usize::MAX, now)?;
+        let mut ports: Vec<crate::pasture::ports::Shared> = items
+            .iter()
+            .filter_map(|m| {
+                Some(crate::pasture::ports::Shared {
+                    port: crate::pasture::ports::port_of_key(&m.key)?,
+                    sandbox: m.writer.clone(),
+                    harness: m.writer_harness.clone(),
+                    updated: m.updated,
+                })
+            })
+            .collect();
+        ports.sort_by_key(|p| p.port);
         Ok((
             items.len() as u64,
             items.iter().map(|m| m.bytes).sum(),
@@ -118,6 +133,7 @@ pub fn pastures(env: &HostEnv, project: &Path) -> Result<Vec<PastureInfo>> {
                 .iter()
                 .filter(|m| m.key.starts_with(LEASE_PREFIX))
                 .count() as u64,
+            ports,
         ))
     };
     let mut names = shard::pastures_of(&root, project);
@@ -132,7 +148,7 @@ pub fn pastures(env: &HostEnv, project: &Path) -> Result<Vec<PastureInfo>> {
     let mut out = Vec::new();
     for name in names {
         let ns = Ns::pasture(project, &name)?;
-        let (keys, bytes, leases) = count(&ns)?;
+        let (keys, bytes, leases, ports) = count(&ns)?;
         let members: Vec<Member> = records
             .iter()
             .filter(|r| r.pasture.as_deref() == Some(name.as_str()))
@@ -148,6 +164,7 @@ pub fn pastures(env: &HostEnv, project: &Path) -> Result<Vec<PastureInfo>> {
             keys,
             bytes,
             leases,
+            ports,
         });
     }
     // A spawned sandbox has no pasture, so it is left out.
@@ -159,7 +176,7 @@ pub fn pastures(env: &HostEnv, project: &Path) -> Result<Vec<PastureInfo>> {
             project: project.to_path_buf(),
             sandbox: r.id.clone(),
         };
-        let (keys, bytes, leases) = count(&ns)?;
+        let (keys, bytes, leases, ports) = count(&ns)?;
         let m = member(r);
         if keys == 0 && !m.running {
             continue;
@@ -171,6 +188,7 @@ pub fn pastures(env: &HostEnv, project: &Path) -> Result<Vec<PastureInfo>> {
             keys,
             bytes,
             leases,
+            ports,
         });
     }
     Ok(out)

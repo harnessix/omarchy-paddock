@@ -11,6 +11,7 @@ pub mod device;
 pub mod forage;
 mod git;
 pub mod kv;
+pub mod pasture;
 pub mod status;
 pub mod timer;
 
@@ -41,6 +42,8 @@ USAGE
   paddock-host kill ID
   paddock-host kv COMMAND [ARG...]              (key-value store, see `paddock-host kv --help`)
   paddock-host timer COMMAND [ARG...]           (task timers, see `paddock-host timer --help`)
+  paddock-host pasture share|unshare PORT       (ports for your pasture, see `paddock-host pasture --help`)
+  paddock-host pasture members
   paddock-host forage [--refresh] [--json]      (limits left and how fast they go)
   paddock-host status                           (your timers and limits in a few lines)
   paddock-host device NAME [REQUEST]            (a device in /dev/paddock, see `paddock-host device --help`)
@@ -405,6 +408,7 @@ pub fn main(args: &[String]) -> i32 {
         "gh" => return git::gh_main(rest),
         "kv" => return kv::main(rest),
         "timer" => return timer::main(rest),
+        "pasture" => return pasture::main(rest),
         "forage" => return forage::main(rest),
         "status" => return status::main(rest),
         "device" => return device::main(rest),

@@ -2698,6 +2698,12 @@ fn pasture_cmd(env: &HostEnv, cmd: PastureCmd) -> Result<i32> {
                         format!("running: {}", running.join(", "))
                     }
                 );
+                for port in &p.ports {
+                    println!(
+                        "{:<20} port {} shared by {} ({})",
+                        "", port.port, port.harness, port.sandbox
+                    );
+                }
             }
             let solo = all.iter().filter(|p| p.solo).count();
             if solo > 0 {

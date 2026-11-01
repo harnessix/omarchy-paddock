@@ -1239,6 +1239,16 @@ impl Service {
                 });
             }
         }
+        // A shared port of a pasture: a valid port, and a limit per pasture.
+        if name.starts_with(crate::pasture::ports::LEASE_NAME) {
+            let prefix = crate::pasture::ports::lease_prefix();
+            let (taken, _) = st.list(ns, &prefix, usize::MAX, now)?;
+            if let Err((status, message)) =
+                crate::pasture::ports::check_claim(name, taken.len(), cur.is_some())
+            {
+                return Ok(Response::new(status, message));
+            }
+        }
         let expires = now + ttl;
         let value = serde_json::json!({
             "owner": self.id.sandbox,

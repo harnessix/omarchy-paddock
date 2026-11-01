@@ -778,6 +778,9 @@ pub fn build_with(env: &HostEnv, opts: &Options, harness: Harness) -> Result<Bui
         ));
         spec.set_env("PADDOCK_PASTURE", crate::pasture::MOUNT, "pasture");
         spec.set_env("PADDOCK_PASTURE_NAME", name.clone(), "pasture");
+        // The helper that relays the ports that members share.
+        spec.setup
+            .push("paddock host pasture serve >/dev/null 2>&1 &".into());
     }
 
     policy::enforce(env, &spec)?;

@@ -14,6 +14,8 @@
 //! `pasture` scope of paddock kv. A sandbox started without `--pasture` is a
 //! pasture of its own, so by default no two sandboxes share kv data.
 
+pub mod ports;
+
 use crate::env::HostEnv;
 use anyhow::{bail, Context as _, Result};
 use serde::Deserialize;
