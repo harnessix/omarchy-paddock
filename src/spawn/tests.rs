@@ -811,6 +811,7 @@ fn ps_lists_children_under_their_parent() {
         kv_project: None,
         pasture: None,
         credentials: Vec::new(),
+        gateway: Vec::new(),
     };
     let list = vec![
         r("a", None, 1),

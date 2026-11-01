@@ -202,5 +202,9 @@
   "keys.kvRow": "↵ 或 K 查看共享数据",
   "row.pasture": "牧场 %1",
   "row.holdsCredentials": "持有真值：%1",
-  "popup.ask.credentials": "把这些凭据交给 %2 中的 %1 吗？agent 能读到它们。"
+  "popup.ask.credentials": "把这些凭据交给 %2 中的 %1 吗？agent 能读到它们。",
+  "row.gateway": "通过网关使用：%1",
+  "action.revoke": "撤销凭据",
+  "msg.revoked": "凭据已撤销，之后用它的请求都会被拒绝。",
+  "msg.revokeFailed": "paddock 没能撤销凭据。"
 }
