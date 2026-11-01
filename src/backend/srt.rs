@@ -225,7 +225,7 @@ pub fn settings(env: &HostEnv, spec: &SandboxSpec) -> Result<serde_json::Value> 
             // a session bus need them. Nested user namespaces stay blocked either
             // way, and srt's own network namespace isolates abstract sockets.
             // The host passthrough socket (broker.rs) needs it too.
-            "allowAllUnixSockets": spec.gui.enabled() || spec.host_socket.is_some() || spec.kv_socket.is_some() || spec.keyring,
+            "allowAllUnixSockets": spec.gui.enabled() || spec.host_socket.is_some() || spec.kv_socket.is_some() || spec.ssh_agent_socket.is_some() || spec.keyring,
         },
         "filesystem": {
             "denyRead": deny_read,
@@ -345,6 +345,9 @@ impl Backend for Srt {
         }
         if let Some(sock) = &spec.kv_socket {
             vars.insert("PADDOCK_KV_SOCKET".into(), s(sock));
+        }
+        if let Some(sock) = &spec.ssh_agent_socket {
+            vars.insert("SSH_AUTH_SOCK".into(), s(sock));
         }
         if let Some(dir) = &spec.devices {
             vars.insert("PADDOCK_DEVICES".into(), s(dir));
@@ -503,6 +506,20 @@ mod tests {
         let v = settings(&env, &s).unwrap();
         assert!(list(&v, "allowWrite").contains(&dev.to_str().unwrap()));
         assert_eq!(v["network"]["allowAllUnixSockets"], true);
+    }
+
+    #[test]
+    fn the_ssh_agent_socket_needs_unix_sockets() {
+        let (env, mut s) = spec();
+        assert_ne!(
+            settings(&env, &s).unwrap()["network"]["allowAllUnixSockets"],
+            true
+        );
+        s.ssh_agent_socket = Some(env.paddock_run().join(&s.id).join("ssh-agent.sock"));
+        assert_eq!(
+            settings(&env, &s).unwrap()["network"]["allowAllUnixSockets"],
+            true
+        );
     }
 
     #[test]

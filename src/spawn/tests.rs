@@ -812,6 +812,7 @@ fn ps_lists_children_under_their_parent() {
         pasture: None,
         credentials: Vec::new(),
         gateway: Vec::new(),
+        agent: Vec::new(),
         kept_logins: Vec::new(),
     };
     let list = vec![
