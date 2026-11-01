@@ -99,13 +99,25 @@ pub struct Route {
     pub prefix: String,
     pub query: Option<String>,
     pub value: String,
+    /// git smart HTTP: `info/refs` passes only for a service whose own path
+    /// is bound.
+    pub git: bool,
 }
 
 impl Route {
     pub fn new(c: &Credential, value: String) -> Self {
         let header = c.header.clone().unwrap_or_else(|| "Authorization".into());
+        let value = match &c.basic_user {
+            Some(u) => {
+                use base64::Engine as _;
+                base64::engine::general_purpose::STANDARD.encode(format!("{u}:{value}"))
+            }
+            None => value,
+        };
         let prefix = c.prefix.clone().unwrap_or_else(|| {
-            if header.eq_ignore_ascii_case("authorization") {
+            if c.basic_user.is_some() {
+                "Basic ".into()
+            } else if header.eq_ignore_ascii_case("authorization") {
                 "Bearer ".into()
             } else {
                 String::new()
@@ -118,8 +130,73 @@ impl Route {
             prefix,
             query: c.query.clone(),
             value,
+            git: c.is_git(),
         }
     }
+
+    /// Whether the route lets a request to `path` with `query` through.
+    pub fn allows(&self, path: &str, query: Option<&str>) -> bool {
+        let bound =
+            |p: &str| self.paths.is_empty() || self.paths.iter().any(|b| path_matches(b, p));
+        if !bound(path) {
+            return false;
+        }
+        if !self.git {
+            return true;
+        }
+        // `GET .../info/refs?service=git-upload-pack` opens a fetch, and
+        // `git-receive-pack` a push: each needs its own path bound.
+        match path.strip_suffix("/info/refs") {
+            Some(repo) => query
+                .unwrap_or("")
+                .split('&')
+                .find_map(|kv| kv.strip_prefix("service="))
+                .is_some_and(|s| {
+                    matches!(s, "git-upload-pack" | "git-receive-pack")
+                        && bound(&format!("{repo}/{s}"))
+                }),
+            None => true,
+        }
+    }
+}
+
+/// A bound path: a prefix, or with `*` a whole path where each `*` stands
+/// for text inside one segment (`/*/*/info/refs`).
+pub fn path_matches(bound: &str, path: &str) -> bool {
+    if !bound.contains('*') {
+        return path.starts_with(bound);
+    }
+    // No escaped slashes or dots behind a wildcard, and no `.` or `..`
+    // segment, which a server can resolve to another path.
+    if path.contains('%') || path.split('/').any(|s| s == "." || s == "..") {
+        return false;
+    }
+    let (b, p): (Vec<&str>, Vec<&str>) = (bound.split('/').collect(), path.split('/').collect());
+    b.len() == p.len() && b.iter().zip(&p).all(|(b, p)| glob(b, p))
+}
+
+/// `*` matches any text, at least one character when it is the whole
+/// pattern.
+fn glob(pat: &str, s: &str) -> bool {
+    if pat == "*" {
+        return !s.is_empty();
+    }
+    let mut parts = pat.split('*');
+    let first = parts.next().unwrap_or("");
+    let Some(mut rest) = s.strip_prefix(first) else {
+        return false;
+    };
+    let parts: Vec<&str> = parts.collect();
+    let Some((last, mid)) = parts.split_last() else {
+        return rest.is_empty();
+    };
+    for m in mid {
+        match rest.find(m) {
+            Some(i) => rest = &rest[i + m.len()..],
+            None => return false,
+        }
+    }
+    rest.len() >= last.len() && rest.ends_with(last)
 }
 
 /// What the gateway reports for each request: the name, the method, the
@@ -242,7 +319,7 @@ impl Gateway {
                 &upath,
             );
         }
-        if !route.paths.is_empty() && !route.paths.iter().any(|p| upath.starts_with(p.as_str())) {
+        if !route.allows(&upath, query.as_deref()) {
             return self.refuse(&mut conn, 403, "path not bound", name, &method, &upath);
         }
         if self.is_revoked(name) {
@@ -600,6 +677,7 @@ mod tests {
                 prefix: "Bearer ".into(),
                 query: query.map(str::to_string),
                 value: "ghp_REALvalue".into(),
+                git: false,
             },
         );
         let log = Arc::new(Mutex::new(Vec::new()));
@@ -769,6 +847,41 @@ mod tests {
             seen.ends_with("5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n"),
             "{seen}"
         );
+    }
+
+    #[test]
+    fn a_git_route_lets_only_fetch_through() {
+        let c = crate::credentials::parse(
+            "[credentials.g]\nvia = \"gateway\"\npreset = \"github-git\"\n",
+        )
+        .unwrap()
+        .remove("g")
+        .unwrap();
+        let r = Route::new(&c, "t".into());
+        let up = Some("service=git-upload-pack");
+        let rp = Some("service=git-receive-pack");
+        assert!(r.allows("/o/r.git/info/refs", up));
+        assert!(r.allows("/o/r/info/refs", up));
+        assert!(r.allows("/o/r.git/git-upload-pack", None));
+        // Push, the API, other depths, empty or escaped segments: no.
+        assert!(!r.allows("/o/r.git/info/refs", rp));
+        assert!(!r.allows("/o/r.git/info/refs", None));
+        assert!(!r.allows("/o/r.git/git-receive-pack", None));
+        assert!(!r.allows("/user", None));
+        assert!(!r.allows("/o/r.git/HEAD", None));
+        assert!(!r.allows("/o/r/x/git-upload-pack", None));
+        assert!(!r.allows("//r/git-upload-pack", None));
+        assert!(!r.allows("/o%2Fx/r/git-upload-pack", None));
+        // Push only when the user binds it.
+        let mut c = c;
+        c.paths.push("/*/*/git-receive-pack".into());
+        let r = Route::new(&c, "t".into());
+        assert!(r.allows("/o/r.git/info/refs", rp));
+        assert!(r.allows("/o/r.git/git-receive-pack", None));
+        assert!(path_matches("/*/*.git/x", "/o/r.git/x"));
+        assert!(!path_matches("/*/*.git/x", "/o/r/x"));
+        assert!(!path_matches("/*/*/info/refs", "/../x/info/refs"));
+        assert!(!path_matches("/*/*/info/refs", "/o/./info/refs"));
     }
 
     #[test]

@@ -499,6 +499,18 @@ paths = ["/repos/my-org/"]  # optional: only these path prefixes
 
 Without a preset, name `hosts` (`HOST` or `HOST:PORT`), `base_url_env` (the variable that points the tool at the gateway), and how the value goes: `header` (default `Authorization`) with `prefix` (default `Bearer ` for Authorization), or `query` for an API that takes the key as a query parameter. `env` names the variable for the stand-in (default: the name), and `base_path` is added to the base URL. A request to another path gets 403, and nothing leaves your computer. After 20 refused requests, paddock freezes the sandbox and tells you. The gateway works in every network mode, also `none`: the sandbox can then reach the model API and nothing else. It needs the bwrap, docker or podman backend; srt cannot reach it. A tool must accept a base URL: the `gh` command does not, because it talks only HTTPS to its host.
 
+git over HTTPS works through the gateway too, for `git fetch`, `git pull`, `git clone` of a private repository and submodules:
+
+```toml
+[credentials.github_git]
+via = "gateway"
+preset = "github-git"     # github.com, git fetch and clone only
+from = "command"
+command = ["gh", "auth", "token"]
+```
+
+paddock sets `url.http://127.0.0.1:3130/s/github_git/.insteadOf = https://github.com/` for git in the sandbox, in the environment (`GIT_CONFIG_COUNT`), never in a repository file. Your remotes keep their `https://github.com/` URLs. The gateway adds `Authorization: Basic` with the user `x-access-token` and the token, and lets only git smart HTTP through: `/OWNER/REPO/info/refs` and `/OWNER/REPO/git-upload-pack`. A `*` in `paths` stands for one path segment. The audit log names the repository path, never the token. `git push` still goes through `paddock-host git push`, with your own credentials and an approval card. To push through the gateway instead, add `"/*/*/git-receive-pack"` to `paths` together with the two paths above. For GitHub Enterprise, set `hosts = ["git.example.com"]`. ssh remotes do not change: they use the ssh agent channel.
+
 `via = "deliver"` hands the value over. It enters the sandbox as a variable, the agent can read it, and it cannot be taken back. Use it only for a tool that can do nothing else, such as a database password:
 
 ```toml

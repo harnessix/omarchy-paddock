@@ -191,6 +191,7 @@ fn setup_credentials(
     let mut out = RunCredentials::default();
     let mut routes = std::collections::BTreeMap::new();
     let mut agents = Vec::new();
+    let mut git = Vec::new();
     for (name, var, value) in values {
         let Some((_, c)) = plan.deliver.iter().find(|(n, _)| *n == name) else {
             continue;
@@ -204,15 +205,20 @@ fn setup_credentials(
                 gateway::stand_in(&value, &mark),
                 &format!("credentials: stand-in for {name}"),
             );
-            built.spec.set_env(
-                c.base_url_env.as_deref().unwrap_or_default(),
-                format!(
-                    "http://127.0.0.1:{}/s/{name}{}",
-                    gateway::PORT,
-                    c.base_path.as_deref().unwrap_or("")
-                ),
-                &format!("credentials: gateway for {name}"),
-            );
+            if let Some(base) = &c.base_url_env {
+                built.spec.set_env(
+                    base,
+                    format!(
+                        "http://127.0.0.1:{}/s/{name}{}",
+                        gateway::PORT,
+                        c.base_path.as_deref().unwrap_or("")
+                    ),
+                    &format!("credentials: gateway for {name}"),
+                );
+            }
+            if c.is_git() {
+                git.push((name.clone(), c.hosts[0].clone()));
+            }
             crate::credentials::audit(
                 env,
                 &built.spec,
@@ -235,6 +241,13 @@ fn setup_credentials(
             Err(e) => say(&format!(
                 "the sandbox starts without the ssh agent socket: {e:#}"
             )),
+        }
+    }
+    if !git.is_empty() {
+        for (k, v) in crate::credentials::git_env(gateway::PORT, &git) {
+            built
+                .spec
+                .set_env(&k, v, "credentials: git through the gateway");
         }
     }
     if !routes.is_empty() {
