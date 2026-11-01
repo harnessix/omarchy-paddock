@@ -19,6 +19,7 @@
 //! `[exec]`. Values are read when they are needed, never written to disk.
 
 pub mod gateway;
+pub mod secret;
 pub mod sshagent;
 
 use crate::env::HostEnv;
@@ -72,6 +73,21 @@ pub enum Confirm {
     Each,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum DeliverAs {
+    /// An environment variable of the sandbox.
+    #[default]
+    Env,
+    /// The file `/dev/paddock/secret/NAME`, served by paddock.
+    File,
+}
+
+/// Where a `deliver` credential appears in the sandbox, as a file.
+pub fn secret_path(name: &str) -> String {
+    format!("{}/secret/{name}", crate::devices::MOUNT_IN_SANDBOX)
+}
+
 /// One `[credentials.NAME]` table.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -122,6 +138,10 @@ pub struct Credential {
     /// the name.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub env: Option<String>,
+    /// deliver: an environment variable (`env`, the default) or the file
+    /// `/dev/paddock/secret/NAME` (`file`).
+    #[serde(default, rename = "as")]
+    pub as_: DeliverAs,
     /// Only for these harnesses. Empty: every harness.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub harnesses: Vec<String>,
@@ -282,7 +302,16 @@ pub fn parse(text: &str) -> Result<BTreeMap<String, Credential>> {
         if !c.keys.is_empty() && c.via != Via::Agent {
             bail!("[credentials.{name}]: keys are only for via = \"agent\"");
         }
-        if c.via == Via::Deliver && c.env.is_none() && !valid_var(name) {
+        if c.as_ == DeliverAs::File && c.via != Via::Deliver {
+            bail!("[credentials.{name}]: as = \"file\" is only for via = \"deliver\"");
+        }
+        if c.as_ == DeliverAs::File && c.env.is_some() {
+            bail!(
+                "[credentials.{name}]: env is only for as = \"env\"; the file is {}",
+                secret_path(name)
+            );
+        }
+        if c.via == Via::Deliver && c.as_ == DeliverAs::Env && c.env.is_none() && !valid_var(name) {
             bail!("[credentials.{name}]: name the variable for the sandbox with env = \"...\"");
         }
         let c = c
@@ -468,6 +497,10 @@ fn describe(name: &str, c: &Credential) -> String {
                 format!(" under {}", c.paths.join(", "))
             }
         ),
+        _ if c.as_ == DeliverAs::File => format!(
+            "{name}: {from}. The sandbox can read the value in the file {}; the agent can read it. Each open counts as a use, and paddock credentials revoke ends it",
+            secret_path(name)
+        ),
         _ => format!(
             "{name}: {from}. The value enters the sandbox as the variable {}; the agent can read it, and it cannot be taken back",
             c.sandbox_var(name)
@@ -538,20 +571,24 @@ pub fn ask(
     true
 }
 
+/// One value that `read` got: the name, the variable in the sandbox, and
+/// the value (empty for `agent`).
+pub type Value = (String, String, secret::Secret);
+
 /// Read the values. A source that fails is left out, with a notice.
-pub fn read(env: &HostEnv, plan: &Plan) -> (Vec<(String, String, String)>, Vec<String>) {
+pub fn read(env: &HostEnv, plan: &Plan) -> (Vec<Value>, Vec<String>) {
     let mut out = Vec::new();
     let mut notices = Vec::new();
     for (name, c) in &plan.deliver {
         if c.via == Via::Agent {
             // No value: the host agent keeps the keys.
-            out.push((name.clone(), String::new(), String::new()));
+            out.push((name.clone(), String::new(), String::new().into()));
             continue;
         }
         let value = match c.from {
             Source::Env => env
                 .var(c.host_var(name))
-                .map(str::to_string)
+                .map(secret::Secret::from)
                 .ok_or_else(|| anyhow::anyhow!("{} is not set", c.host_var(name))),
             Source::Command => run_command(&c.command),
         };
@@ -563,7 +600,7 @@ pub fn read(env: &HostEnv, plan: &Plan) -> (Vec<(String, String, String)>, Vec<S
     (out, notices)
 }
 
-fn run_command(cmd: &[String]) -> Result<String> {
+fn run_command(cmd: &[String]) -> Result<secret::Secret> {
     use std::io::Read as _;
     use std::process::{Command, Stdio};
     let mut child = Command::new(&cmd[0])
@@ -595,24 +632,21 @@ fn run_command(cmd: &[String]) -> Result<String> {
         }
         std::thread::sleep(std::time::Duration::from_millis(20));
     };
-    let buf = reader.join().unwrap_or_default();
+    // Locked and wiped from here on, whatever the outcome.
+    let buf = secret::Secret::new(reader.join().unwrap_or_default());
     if !status.success() {
         bail!("{} failed ({status})", cmd[0]);
     }
     if buf.len() > MAX_VALUE {
         bail!("{} printed more than {MAX_VALUE} bytes", cmd[0]);
     }
-    let mut v = String::from_utf8(buf).context("the value is not UTF-8")?;
-    if v.ends_with('\n') {
-        v.pop();
-        if v.ends_with('\r') {
-            v.pop();
-        }
-    }
+    let mut v = std::str::from_utf8(buf.as_bytes()).context("the value is not UTF-8")?;
+    v = v.strip_suffix('\n').unwrap_or(v);
+    v = v.strip_suffix('\r').unwrap_or(v);
     if v.is_empty() {
         bail!("{} printed nothing", cmd[0]);
     }
-    Ok(v)
+    Ok(secret::Secret::from(v))
 }
 
 /// One line in the audit log of host requests. Names only.
@@ -642,9 +676,12 @@ pub struct Row {
     pub harnesses: Vec<String>,
     pub delivered: u64,
     pub last_delivered: Option<u64>,
-    /// Requests that the gateway forwarded with it, or signatures that the
-    /// ssh agent channel allowed.
+    /// Requests that the gateway forwarded with it, signatures that the
+    /// ssh agent channel allowed, or opens of its secret file.
     pub used: u64,
+    /// deliver: `env` or `file`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deliver_as: Option<&'static str>,
 }
 
 pub fn rows(env: &HostEnv) -> Result<Vec<Row>> {
@@ -669,6 +706,12 @@ pub fn rows(env: &HostEnv) -> Result<Vec<Row>> {
                     .and_then(|d| d.strip_prefix("gateway "))
                     .and_then(|d| d.split(' ').next())
                 {
+                    *forwarded.entry(name.to_string()).or_default() += 1;
+                }
+                continue;
+            }
+            if v["decision"] == "read" {
+                if let Some(name) = v["detail"].as_str().and_then(|d| d.strip_prefix("secret ")) {
                     *forwarded.entry(name.to_string()).or_default() += 1;
                 }
                 continue;
@@ -715,9 +758,30 @@ pub fn rows(env: &HostEnv) -> Result<Vec<Row>> {
                 delivered: n,
                 last_delivered: (last > 0).then_some(last),
                 used: forwarded.get(name).copied().unwrap_or(0),
+                deliver_as: (c.via == Via::Deliver).then_some(match c.as_ {
+                    DeliverAs::Env => "env",
+                    DeliverAs::File => "file",
+                }),
             }
         })
         .collect())
+}
+
+/// One open of a secret file, in the audit log of host requests. The name
+/// only.
+pub fn audit_read(env: &HostEnv, spec: &crate::spec::SandboxSpec, name: &str) {
+    crate::broker::audit_line(
+        env,
+        &serde_json::json!({
+            "time": crate::state::now(),
+            "sandbox": spec.id,
+            "harness": spec.harness,
+            "project": spec.project,
+            "capability": CAPABILITY,
+            "detail": format!("secret {name}"),
+            "decision": "read",
+        }),
+    );
 }
 
 /// One request through the gateway, in the audit log of host requests:
@@ -753,14 +817,20 @@ pub fn revoked_file(env: &HostEnv, sandbox: &str) -> std::path::PathBuf {
 }
 
 /// Revoke a credential (or all, with None) of a running sandbox. The next
-/// request through the gateway gets 403, and the ssh agent channel signs
-/// no more; the sandbox keeps running.
+/// request through the gateway gets 403, the ssh agent channel signs no
+/// more, and a secret file fails to open or read; the sandbox keeps running.
 pub fn revoke(env: &HostEnv, sandbox: &str, name: Option<&str>) -> Result<Vec<String>> {
     let r = crate::state::Running::list(env)
         .into_iter()
         .find(|r| r.id == sandbox)
         .with_context(|| format!("no running sandbox with id {sandbox}"))?;
-    let held: Vec<String> = r.gateway.iter().chain(&r.agent).cloned().collect();
+    let held: Vec<String> = r
+        .gateway
+        .iter()
+        .chain(&r.agent)
+        .chain(&r.secret_files)
+        .cloned()
+        .collect();
     let names: Vec<String> = match name {
         Some(n) if held.iter().any(|g| g == n) => vec![n.to_string()],
         Some(n) if r.credentials.iter().any(|c| c == n) => bail!(
@@ -768,7 +838,7 @@ pub fn revoke(env: &HostEnv, sandbox: &str, name: Option<&str>) -> Result<Vec<St
         ),
         Some(n) => bail!("sandbox {sandbox} does not use the credential {n}"),
         None if held.is_empty() => {
-            bail!("sandbox {sandbox} uses no credential through the gateway or the ssh agent channel")
+            bail!("sandbox {sandbox} uses no credential through the gateway, the ssh agent channel or a secret file")
         }
         None => held,
     };
@@ -786,7 +856,13 @@ pub fn revoke(env: &HostEnv, sandbox: &str, name: Option<&str>) -> Result<Vec<St
                 "harness": r.harness,
                 "project": r.project,
                 "capability": CAPABILITY,
-                "detail": if r.agent.contains(n) { format!("agent {n}") } else { format!("gateway {n}") },
+                "detail": if r.agent.contains(n) {
+                    format!("agent {n}")
+                } else if r.secret_files.contains(n) {
+                    format!("secret {n}")
+                } else {
+                    format!("gateway {n}")
+                },
                 "decision": "revoked by the user",
             }),
         );
@@ -834,6 +910,41 @@ confirm = "each"
         assert!(!bare["git"].available());
         assert!(parse("[credentials.x]\nvia = \"deliver\"\nkeys = [\"k.pub\"]\n").is_err());
         assert!(parse("").unwrap().is_empty());
+    }
+
+    #[test]
+    fn deliver_as_file_parses_and_needs_no_variable_name() {
+        let all = parse(
+            "[credentials.my-token]\nvia = \"deliver\"\nas = \"file\"\n\n[credentials.DB]\nvia = \"deliver\"\nas = \"env\"\n\n[credentials.PLAIN]\nvia = \"deliver\"\n",
+        )
+        .unwrap();
+        assert_eq!(all["my-token"].as_, DeliverAs::File);
+        assert_eq!(all["DB"].as_, DeliverAs::Env);
+        assert_eq!(all["PLAIN"].as_, DeliverAs::Env);
+        assert_eq!(secret_path("my-token"), "/dev/paddock/secret/my-token");
+        assert!(describe("my-token", &all["my-token"]).contains("/dev/paddock/secret/my-token"));
+        for bad in [
+            "[credentials.x]\nvia = \"deliver\"\nas = \"disk\"\n",
+            "[credentials.x]\nvia = \"deliver\"\nas = \"file\"\nenv = \"X\"\n",
+            "[credentials.x]\nvia = \"gateway\"\npreset = \"github\"\nas = \"file\"\n",
+        ] {
+            assert!(parse(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn secret_file_reads_count_as_uses() {
+        let (_t, env) = world(
+            "[credentials.GH]\nvia = \"deliver\"\nas = \"file\"\n",
+            &[("GH", "v")],
+        );
+        let s = spec(&env);
+        audit(&env, &s, "GH", "delivered");
+        audit_read(&env, &s, "GH");
+        audit_read(&env, &s, "GH");
+        let r = rows(&env).unwrap();
+        assert_eq!((r[0].delivered, r[0].used), (1, 2));
+        assert_eq!(r[0].deliver_as, Some("file"));
     }
 
     #[test]
@@ -1005,19 +1116,15 @@ via = "deliver"
         assert!(!notes.contains("ONLY_CODEX"));
         let (values, notes) = read(&env, &p);
         assert!(notes.is_empty(), "{notes:?}");
+        let values: Vec<(&str, &str, &str)> = values
+            .iter()
+            .map(|(n, v, s)| (n.as_str(), v.as_str(), s.as_str()))
+            .collect();
         assert_eq!(
             values,
             [
-                (
-                    "DB_PASSWORD".to_string(),
-                    "DB_PASSWORD".to_string(),
-                    "s3cret".to_string()
-                ),
-                (
-                    "FROM_CMD".to_string(),
-                    "FROM_CMD".to_string(),
-                    "line1\nline2".to_string()
-                ),
+                ("DB_PASSWORD", "DB_PASSWORD", "s3cret"),
+                ("FROM_CMD", "FROM_CMD", "line1\nline2"),
             ]
         );
         // A spawned sandbox gets none.

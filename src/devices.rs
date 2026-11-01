@@ -25,6 +25,11 @@
 //! the child's own `/dev/paddock` serves only those that the user
 //! configuration still turns on.
 //!
+//! `/dev/paddock/secret/NAME` is not a device: it holds the value of a
+//! `deliver` credential with `as = "file"` (credentials/secret.rs). A plain
+//! read returns the value. Each open counts as one use, and after
+//! `paddock credentials revoke` the file fails with EACCES.
+//!
 //! Devices are off unless `[devices]` in the user configuration turns them
 //! on. The project `paddock.toml` cannot do this, because the agent can edit
 //! that file. Requests and responses never go into logs or process
@@ -59,7 +64,12 @@ const MAX_RUNNING: usize = 16;
 
 const ROOT: u64 = 1;
 const CATALOG_INO: u64 = 2;
+const SECRET_DIR_INO: u64 = 3;
 const FIRST_DEVICE_INO: u64 = 16;
+/// The inode of the first secret file. Devices stay below it.
+const FIRST_SECRET_INO: u64 = 1 << 20;
+/// The folder of the secret files.
+pub const SECRET_DIR: &str = "secret";
 const TTL: Duration = Duration::from_secs(1);
 
 /// Limits of one device. The catalog shows them.
@@ -261,6 +271,11 @@ impl DevicesCfg {
 
 /// The text of `.catalog`: every known device, with its state.
 pub fn catalog(on: &[Arc<dyn Device>]) -> Vec<u8> {
+    catalog_with(on, &[])
+}
+
+/// The catalog, with the secret files of the sandbox by name.
+pub fn catalog_with(on: &[Arc<dyn Device>], secrets: &[String]) -> Vec<u8> {
     let mut devices = Vec::new();
     let mut names: Vec<&str> = on.iter().map(|d| d.name()).collect();
     for b in BUILTIN {
@@ -293,11 +308,24 @@ pub fn catalog(on: &[Arc<dyn Device>]) -> Vec<u8> {
         }
         devices.push(entry);
     }
-    let doc = serde_json::json!({
+    let mut doc = serde_json::json!({
         "version": 1,
         "protocol": "Open a device read-write, write the whole request, then read the response until end of file. One open is one request. The first read sends the request and blocks until the response is ready. Closing the file early cancels the request. A read fails with ETIMEDOUT after the deadline, EFBIG means the request is too large, EINVAL that the device rejected it. A waiting device (wait, ask) fails a read with ETIME (still waiting) when the timeout of the request passes before the event: send the same request again. EACCES means that the user declined. `paddock-host device NAME` does all of this and exits with 75 for still waiting.",
         "devices": devices,
     });
+    if !secrets.is_empty() {
+        doc["secrets"] = secrets
+            .iter()
+            .map(|n| {
+                serde_json::json!({
+                    "name": n,
+                    "path": crate::credentials::secret_path(n),
+                })
+            })
+            .collect::<Vec<_>>()
+            .into();
+        doc["secrets_how"] = "Each file holds the value of a credential that the user gave this sandbox. Read it with a plain read, no request: cat FILE. Each open counts as one use. Use it in one command only, for example GH_TOKEN=$(cat /dev/paddock/secret/GH_TOKEN) gh pr list, or give the path to a tool that reads a token file. Do not copy the value into files or logs. EACCES means that the user revoked it.".into();
+    }
     let mut out = serde_json::to_vec_pretty(&doc).unwrap_or_default();
     out.push(b'\n');
     out
@@ -314,6 +342,8 @@ enum Phase {
 enum Kind {
     Catalog,
     Device(usize),
+    /// A secret file: its name and the value, held while the file is open.
+    Secret(String, Arc<crate::credentials::secret::Secret>),
 }
 
 struct Handle {
@@ -334,7 +364,10 @@ struct Inner {
     uid: u32,
     gid: u32,
     devices: Vec<Arc<dyn Device>>,
-    catalog: Arc<Vec<u8>>,
+    secrets: Arc<SecretFiles>,
+    /// The names of the secret files by inode, from `FIRST_SECRET_INO` on.
+    /// A name keeps its inode after a revoke.
+    secret_inos: Mutex<Vec<String>>,
     handles: Mutex<HashMap<u64, Handle>>,
     next_fh: AtomicU64,
     running: AtomicU64,
@@ -361,16 +394,27 @@ fn take(cursor: &mut usize, data: &[u8], size: u32) -> std::ops::Range<usize> {
     start..end
 }
 
+use crate::credentials::secret::{FileError, SecretFiles};
+
 impl DeviceFs {
     pub fn new(sandbox: &str, devices: Vec<Arc<dyn Device>>) -> Self {
-        let catalog = Arc::new(catalog(&devices));
+        Self::with_secrets(sandbox, devices, SecretFiles::new(None, None))
+    }
+
+    /// A file system that also serves the secret files of `secrets`.
+    pub fn with_secrets(
+        sandbox: &str,
+        devices: Vec<Arc<dyn Device>>,
+        secrets: Arc<SecretFiles>,
+    ) -> Self {
         Self {
             inner: Arc::new(Inner {
                 sandbox: sandbox.to_string(),
                 uid: unsafe { libc::getuid() },
                 gid: unsafe { libc::getgid() },
                 devices,
-                catalog,
+                secrets,
+                secret_inos: Mutex::new(Vec::new()),
                 handles: Mutex::new(HashMap::new()),
                 next_fh: AtomicU64::new(1),
                 running: AtomicU64::new(0),
@@ -379,11 +423,46 @@ impl DeviceFs {
         }
     }
 
+    fn catalog(&self) -> Arc<Vec<u8>> {
+        Arc::new(catalog_with(
+            &self.inner.devices,
+            &self.inner.secrets.names(),
+        ))
+    }
+
+    /// The name of a secret file inode.
+    fn secret_name(&self, ino: u64) -> Option<String> {
+        let idx = usize::try_from(ino.checked_sub(FIRST_SECRET_INO)?).ok()?;
+        self.inner.secret_inos.lock().unwrap().get(idx).cloned()
+    }
+
+    /// The inode of a secret file that the store holds now.
+    fn secret_ino(&self, name: &str) -> Option<u64> {
+        if !self.inner.secrets.contains(name) {
+            return None;
+        }
+        let mut inos = self.inner.secret_inos.lock().unwrap();
+        let idx = match inos.iter().position(|n| n == name) {
+            Some(i) => i,
+            None => {
+                inos.push(name.to_string());
+                inos.len() - 1
+            }
+        };
+        Some(FIRST_SECRET_INO + idx as u64)
+    }
+
     fn attr(&self, ino: u64) -> Option<FileAttr> {
         let i = &self.inner;
         let (kind, perm, size, nlink) = match ino {
             ROOT => (FileType::Directory, 0o555, 0, 2),
-            CATALOG_INO => (FileType::RegularFile, 0o444, i.catalog.len() as u64, 1),
+            CATALOG_INO => (FileType::RegularFile, 0o444, self.catalog().len() as u64, 1),
+            SECRET_DIR_INO => (FileType::Directory, 0o500, 0, 2),
+            n if n >= FIRST_SECRET_INO => {
+                let name = self.secret_name(n)?;
+                let v = i.secrets.check(&name).ok()?;
+                (FileType::RegularFile, 0o400, v.len() as u64, 1)
+            }
             n if n >= FIRST_DEVICE_INO && ((n - FIRST_DEVICE_INO) as usize) < i.devices.len() => {
                 (FileType::RegularFile, 0o600, 0, 1)
             }
@@ -513,11 +592,19 @@ impl DeviceFs {
 
 impl Filesystem for DeviceFs {
     fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
-        if u64::from(parent) != ROOT {
-            return reply.error(Errno::ENOENT);
-        }
-        let ino = if name == CATALOG {
+        let ino = match u64::from(parent) {
+            ROOT => None,
+            SECRET_DIR_INO => name.to_str().and_then(|n| self.secret_ino(n)),
+            _ => return reply.error(Errno::ENOENT),
+        };
+        let ino = if ino.is_some() {
+            ino
+        } else if u64::from(parent) == SECRET_DIR_INO {
+            None
+        } else if name == CATALOG {
             Some(CATALOG_INO)
+        } else if name == SECRET_DIR && !self.inner.secrets.names().is_empty() {
+            Some(SECRET_DIR_INO)
         } else {
             self.inner
                 .devices
@@ -560,7 +647,11 @@ impl Filesystem for DeviceFs {
         reply: ReplyAttr,
     ) {
         let ino = u64::from(ino);
-        if ino < FIRST_DEVICE_INO || mode.is_some() || uid.is_some() || gid.is_some() {
+        if !(FIRST_DEVICE_INO..FIRST_SECRET_INO).contains(&ino)
+            || mode.is_some()
+            || uid.is_some()
+            || gid.is_some()
+        {
             return reply.error(Errno::EACCES);
         }
         if size.is_some_and(|s| s != 0) {
@@ -581,6 +672,23 @@ impl Filesystem for DeviceFs {
                 }
                 Kind::Catalog
             }
+            n if n >= FIRST_SECRET_INO => {
+                if flags.acc_mode() != OpenAccMode::O_RDONLY {
+                    return reply.error(Errno::EACCES);
+                }
+                let Some(name) = self.secret_name(n) else {
+                    return reply.error(Errno::ENOENT);
+                };
+                match self.inner.secrets.open(&name) {
+                    Ok(v) => {
+                        log::info!("sandbox {}: secret file {name} opened", self.inner.sandbox);
+                        Kind::Secret(name, v)
+                    }
+                    Err(FileError::Revoked) => return reply.error(Errno::EACCES),
+                    Err(FileError::Missing) => return reply.error(Errno::ENOENT),
+                }
+            }
+            SECRET_DIR_INO => return reply.error(Errno::EISDIR),
             n if self.attr(n).is_some() && n >= FIRST_DEVICE_INO => {
                 Kind::Device((n - FIRST_DEVICE_INO) as usize)
             }
@@ -660,13 +768,21 @@ impl Filesystem for DeviceFs {
         let Some(handle) = h.get_mut(&fh) else {
             return reply.error(Errno::EBADF);
         };
-        let i = match handle.kind {
+        let i = match &handle.kind {
             Kind::Catalog => {
-                let c = self.inner.catalog.clone();
                 drop(h);
-                return reply_slice(reply, &c, offset, size);
+                return reply_slice(reply, &self.catalog(), offset, size);
             }
-            Kind::Device(i) => i,
+            Kind::Secret(name, value) => {
+                // A revoke ends the file at once, also while it is open.
+                if self.inner.secrets.check(name).is_err() {
+                    return reply.error(Errno::EACCES);
+                }
+                let value = value.clone();
+                drop(h);
+                return reply_slice(reply, value.as_bytes(), offset, size);
+            }
+            Kind::Device(i) => *i,
         };
         match &handle.phase {
             Phase::Done(Ok(data)) => {
@@ -730,7 +846,7 @@ impl Filesystem for DeviceFs {
     }
 
     fn opendir(&self, _req: &Request, ino: INodeNo, _flags: OpenFlags, reply: ReplyOpen) {
-        if u64::from(ino) != ROOT {
+        if !matches!(u64::from(ino), ROOT | SECRET_DIR_INO) {
             return reply.error(Errno::ENOTDIR);
         }
         reply.opened(FileHandle(0), FopenFlags::empty());
@@ -744,20 +860,39 @@ impl Filesystem for DeviceFs {
         offset: u64,
         mut reply: ReplyDirectory,
     ) {
-        if u64::from(ino) != ROOT {
-            return reply.error(Errno::ENOTDIR);
-        }
-        let mut entries: Vec<(u64, FileType, String)> = vec![
-            (ROOT, FileType::Directory, ".".into()),
-            (ROOT, FileType::Directory, "..".into()),
-            (CATALOG_INO, FileType::RegularFile, CATALOG.into()),
-        ];
-        for (i, d) in self.inner.devices.iter().enumerate() {
-            entries.push((
-                FIRST_DEVICE_INO + i as u64,
-                FileType::RegularFile,
-                d.name().to_string(),
-            ));
+        let names = self.inner.secrets.names();
+        let mut entries: Vec<(u64, FileType, String)> = match u64::from(ino) {
+            ROOT => {
+                let mut e = vec![
+                    (ROOT, FileType::Directory, ".".into()),
+                    (ROOT, FileType::Directory, "..".into()),
+                    (CATALOG_INO, FileType::RegularFile, CATALOG.into()),
+                ];
+                if !names.is_empty() {
+                    e.push((SECRET_DIR_INO, FileType::Directory, SECRET_DIR.into()));
+                }
+                e
+            }
+            SECRET_DIR_INO => vec![
+                (SECRET_DIR_INO, FileType::Directory, ".".into()),
+                (ROOT, FileType::Directory, "..".into()),
+            ],
+            _ => return reply.error(Errno::ENOTDIR),
+        };
+        if u64::from(ino) == SECRET_DIR_INO {
+            for n in names {
+                if let Some(i) = self.secret_ino(&n) {
+                    entries.push((i, FileType::RegularFile, n));
+                }
+            }
+        } else {
+            for (i, d) in self.inner.devices.iter().enumerate() {
+                entries.push((
+                    FIRST_DEVICE_INO + i as u64,
+                    FileType::RegularFile,
+                    d.name().to_string(),
+                ));
+            }
         }
         for (n, (ino, kind, name)) in entries.into_iter().enumerate().skip(offset as usize) {
             if reply.add(INodeNo(ino), (n + 1) as u64, kind, name) {
@@ -1104,7 +1239,8 @@ impl Drop for Devices {
 /// the empty folder now and the mount after the start (`after_start`). A
 /// problem is a notice, not an error: the sandbox starts without devices.
 /// `ceiling` holds the devices of the parent, for a spawned sandbox, and
-/// `started_by` the sandboxes above it.
+/// `started_by` the sandboxes above it. `secrets` holds the secret files.
+#[allow(clippy::too_many_arguments)]
 pub fn start(
     env: &HostEnv,
     spec: &mut SandboxSpec,
@@ -1113,6 +1249,7 @@ pub fn start(
     ceiling: Option<&[String]>,
     started_by: &[String],
     gateway: Option<crate::gateway::Handler>,
+    secrets: Arc<SecretFiles>,
 ) -> Option<Devices> {
     let cfg = match DevicesCfg::load(env) {
         Ok(c) => c,
@@ -1157,7 +1294,7 @@ pub fn start(
         return None;
     }
     let dir = mount_dir(env, backend, &spec.id);
-    let fs = DeviceFs::new(&spec.id, devices);
+    let fs = DeviceFs::with_secrets(&spec.id, devices, secrets);
     let mut out = Devices {
         dir: dir.clone(),
         mounted: Arc::new(Mutex::new(None)),
