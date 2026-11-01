@@ -52,6 +52,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
 pub mod blocking;
+pub mod command;
+pub mod user;
 
 /// Where the devices appear inside the sandbox.
 pub const MOUNT_IN_SANDBOX: &str = "/dev/paddock";
@@ -153,6 +155,15 @@ pub trait Device: Send + Sync {
     fn name(&self) -> &str;
     fn info(&self) -> Info;
     fn call(&self, call: &Call, request: &[u8]) -> Result<Vec<u8>, DevError>;
+    /// "on", or "off" for the file of a user device that is not turned on.
+    fn state(&self) -> &'static str {
+        "on"
+    }
+    /// More fields for the catalog entry, for example the configuration of
+    /// a user device.
+    fn details(&self) -> Option<serde_json::Value> {
+        None
+    }
 }
 
 /// The built-in test device: the response is the request.
@@ -188,6 +199,8 @@ pub struct DeviceCtx {
     pub project: PathBuf,
     /// The sandboxes above this one, root first, the parent last.
     pub started_by: Vec<String>,
+    /// Who answers the approval card of a user device.
+    pub approver: Arc<dyn crate::broker::Approver>,
 }
 
 /// A built-in device, ready to serve.
@@ -220,6 +233,8 @@ pub struct DevicesCfg {
     pub mount: bool,
     /// Devices that the user turned on.
     pub enabled: Vec<String>,
+    /// `[devices.NAME]` tables: http and command devices, on or off.
+    pub user: Vec<user::UserDev>,
 }
 
 impl Default for DevicesCfg {
@@ -227,6 +242,7 @@ impl Default for DevicesCfg {
         Self {
             mount: true,
             enabled: Vec::new(),
+            user: Vec::new(),
         }
     }
 }
@@ -248,9 +264,17 @@ impl DevicesCfg {
         };
         let t = t.as_table().context("[devices] must be a table")?;
         for (k, v) in t {
-            let on = v
-                .as_bool()
-                .with_context(|| format!("[devices] {k} must be true or false"))?;
+            if let Some(table) = v.as_table() {
+                let d = user::UserDev::parse(k, table)?;
+                if d.enabled {
+                    cfg.enabled.push(k.clone());
+                }
+                cfg.user.push(d);
+                continue;
+            }
+            let on = v.as_bool().with_context(|| {
+                format!("[devices] {k} must be true or false, or a [devices.{k}] table")
+            })?;
             if k == "mount" {
                 cfg.mount = on;
                 continue;
@@ -284,8 +308,9 @@ pub fn catalog_with(on: &[Arc<dyn Device>], secrets: &[String]) -> Vec<u8> {
         }
     }
     for name in names {
-        let (state, info) = match on.iter().find(|d| d.name() == name) {
-            Some(d) => ("on", d.info()),
+        let served = on.iter().find(|d| d.name() == name);
+        let (state, info) = match served {
+            Some(d) => (d.state(), d.info()),
             None => match builtin_info(name) {
                 Some(i) => ("off", i),
                 None => continue,
@@ -298,9 +323,15 @@ pub fn catalog_with(on: &[Arc<dyn Device>], secrets: &[String]) -> Vec<u8> {
             "response": info.response,
             "limits": info.limits,
         });
-        if state == "on" {
+        if let Some(serde_json::Value::Object(more)) = served.and_then(|d| d.details()) {
+            for (k, v) in more {
+                entry[k] = v;
+            }
+        }
+        if served.is_some() {
             entry["path"] = format!("{MOUNT_IN_SANDBOX}/{name}").into();
-        } else {
+        }
+        if state != "on" && entry.get("how_to_enable").is_none() {
             entry["how_to_enable"] = format!(
                 "the user sets [devices] {name} = true in ~/.config/paddock/config.toml on the host"
             )
@@ -310,7 +341,7 @@ pub fn catalog_with(on: &[Arc<dyn Device>], secrets: &[String]) -> Vec<u8> {
     }
     let mut doc = serde_json::json!({
         "version": 1,
-        "protocol": "Open a device read-write, write the whole request, then read the response until end of file. One open is one request. The first read sends the request and blocks until the response is ready. Closing the file early cancels the request. A read fails with ETIMEDOUT after the deadline, EFBIG means the request is too large, EINVAL that the device rejected it. A waiting device (wait, ask) fails a read with ETIME (still waiting) when the timeout of the request passes before the event: send the same request again. EACCES means that the user declined. `paddock-host device NAME` does all of this and exits with 75 for still waiting.",
+        "protocol": "Open a device read-write, write the whole request, then read the response until end of file. One open is one request. The first read sends the request and blocks until the response is ready. Closing the file early cancels the request. A read fails with ETIMEDOUT after the deadline, EFBIG means the request is too large, EINVAL that the device rejected it. A waiting device (wait, ask) fails a read with ETIME (still waiting) when the timeout of the request passes before the event: send the same request again. EACCES means that the user declined. An http or command device of the user asks the user once per sandbox at its first request; an off one answers with a disabled status. `paddock-host device NAME` does all of this and exits with 75 for still waiting.",
         "devices": devices,
     });
     if !secrets.is_empty() {
@@ -1151,7 +1182,10 @@ pub fn enabled_names(cfg: &DevicesCfg, test: bool, ceiling: Option<&[String]>) -
     if test && !names.iter().any(|n| n == "echo") {
         names.push("echo".into());
     }
-    names.retain(|n| builtin_info(n).is_some() && ceiling.is_none_or(|c| c.contains(n)));
+    names.retain(|n| {
+        (builtin_info(n).is_some() || cfg.user.iter().any(|u| u.name == *n))
+            && ceiling.is_none_or(|c| c.contains(n))
+    });
     names
 }
 
@@ -1162,9 +1196,27 @@ pub fn enabled(
     ceiling: Option<&[String]>,
     ctx: &DeviceCtx,
 ) -> Vec<Arc<dyn Device>> {
-    enabled_names(cfg, test, ceiling)
+    let names = enabled_names(cfg, test, ceiling);
+    names
         .iter()
-        .filter_map(|n| builtin(n, ctx))
+        .filter_map(|n| match cfg.user.iter().find(|u| u.name == *n) {
+            Some(u) => Some(u.build(ctx, true)),
+            None => builtin(n, ctx),
+        })
+        .collect()
+}
+
+/// The files of user devices that this sandbox does not get: they answer
+/// with a disabled status.
+pub fn disabled(
+    cfg: &DevicesCfg,
+    served: &[Arc<dyn Device>],
+    ctx: &DeviceCtx,
+) -> Vec<Arc<dyn Device>> {
+    cfg.user
+        .iter()
+        .filter(|u| !served.iter().any(|d| d.name() == u.name))
+        .map(|u| u.build(ctx, false))
         .collect()
 }
 
@@ -1267,12 +1319,16 @@ pub fn start(
         harness: spec.harness.clone(),
         project: spec.project.clone(),
         started_by: started_by.to_vec(),
+        approver: Arc::new(crate::broker::HostApprover),
     };
     let mut devices = enabled(&cfg, test, ceiling, &ctx);
     // Without an enabled device the mount is only a catalog, so a missing
-    // FUSE is not worth a notice at each start. The gateway does not count:
-    // without the mount, paddock-host uses the host socket.
+    // FUSE is not worth a notice at each start. The gateway and the files
+    // of off devices do not count: without the mount, paddock-host uses
+    // the host socket.
     let quiet = devices.is_empty();
+    let off = disabled(&cfg, &devices, &ctx);
+    devices.extend(off);
     if let Some(h) = gateway {
         devices.push(Arc::new(crate::gateway::GwDevice::new(&spec.id, h)));
     }

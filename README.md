@@ -1189,6 +1189,42 @@ mount = true   # false: no /dev/paddock at all
 
 `paddock-host device NAME` in the sandbox sends one request and turns errors into exit codes. See "Wait without sleep" below.
 
+### Your own devices: a loopback service or a host command
+
+A sandbox cannot reach a service on the host loopback address, for example a local model server or the HTTP API of a dev database. `--network host` opens much more than that one service. An `http` device opens one address and port. A `command` device runs one fixed host command with the request on its standard input. Define them in `~/.config/paddock/config.toml` only. A project `paddock.toml` cannot define or turn on a device.
+
+```toml
+[devices.ollama]
+kind = "http"
+enabled = true
+target = "127.0.0.1:11434"   # one loopback address and port
+methods = ["GET", "POST"]
+paths = ["/api/"]            # path prefixes
+max_body = "1M"
+timeout = 30                 # seconds, default 30
+
+[devices.jq]
+kind = "command"
+enabled = true
+command = ["jq", "-c", "."]  # fixed arguments
+max_body = "256K"
+timeout = 30
+network = false              # default false
+```
+
+- Each device is the file `/dev/paddock/NAME`, and `.catalog` shows its format, its limits and whether it is on.
+- A device is off until its table says `enabled = true`. An off device answers with a `disabled` status.
+- The first request of each sandbox puts a card on the host: "allow the device `ollama` for this sandbox". "Allow for this session" lets the later requests of this sandbox through without a card.
+- `http`: the target must be a loopback address (`127.0.0.0/8` or `::1`). paddock refuses any other address when it reads the configuration. The request is the first line `METHOD PATH`, then header lines, an empty line and the body. paddock checks the method and the path prefix and refuses paths with `..`, `//` or an encoded dot or slash. It drops `Authorization`, `Cookie` and hop-by-hop headers, and sets `Host`, `Content-Length` and `Connection` itself. The response is the status line, the headers, an empty line and the body. A `Paddock-Status` header (`disabled`, `refused` or `unreachable`) means that paddock answered itself.
+- `command`: the request goes to the standard input. The command never gets arguments from the request. It runs like an approved `exec`: a clean environment, the `[exec]` view of the system, an empty working folder, and no network unless the device says `network = true`. `timeout` stops it. The response is header lines (`status: exit 0`, `timeout` or `disabled`, and the first five lines of the standard error as `stderr:`), an empty line, then the standard output.
+- A response over `max_body` fails with `EMSGSIZE`. A declined device fails with `EACCES`.
+- The audit log records the device, the method and path (`http`) or the byte counts (`command`), the status and the duration. It never records a body.
+
+```sh
+paddock-host device ollama "GET /api/tags"
+printf '{"a":1}' | paddock-host device jq -
+```
+
 The mount needs FUSE: `/dev/fuse` and `fusermount3` (package `fuse3`). `paddock doctor` checks both. The bwrap backend binds the mount at the start. docker and podman bind an empty folder and paddock mounts the file system on it after the container starts. The container waits up to five seconds for it before the harness starts. This needs a shared mount for the paddock run folder, which is the systemd default. srt cannot place a mount at `/dev/paddock`: there, the devices are at the path in `$PADDOCK_DEVICES`. When FUSE is missing, the sandbox starts without devices, and `paddock doctor` says why.
 
 Programs must read the response with `read`. `cat` from coreutils, `dd`, shells, Python and Rust do that. busybox `cat` uses `sendfile` and sees an empty file: use `dd` there. Requests and responses never go into logs or process arguments. The log records the device name, the sizes and the result.
