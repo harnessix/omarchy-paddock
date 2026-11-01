@@ -2242,7 +2242,7 @@ fn real_main() -> Result<i32> {
         } => {
             let names = paddock::credentials::revoke(&env, &id, name.as_deref())?;
             println!(
-                "Revoked for {id}: {}. Its next request with them gets 403, and the ssh agent channel signs no more.",
+                "Revoked for {id}: {}. The gateway refuses their next request with 403, the ssh agent channel signs no more, and their secret files are gone.",
                 names.join(", ")
             );
             Ok(0)
