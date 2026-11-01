@@ -279,6 +279,8 @@ pub fn thaw(env: &HostEnv, id: &str, tree: bool) -> Result<Vec<String>> {
             continue;
         };
         set(env, t, false).with_context(|| format!("cannot thaw {}", t.id))?;
+        // Timers do not count the frozen time.
+        crate::timer::record_frozen(env, &t.id, since, now);
         let _ = std::fs::remove_file(frozen_file(env, &t.id));
         kv_state(env, t, "running", now);
         audit(

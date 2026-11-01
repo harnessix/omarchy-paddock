@@ -144,6 +144,15 @@ Panel {
     return home !== "" && p.indexOf(home + "/") === 0 ? "~" + p.slice(home.length) : p
   }
 
+  // A number of seconds as 45s, 20m, 1h40m.
+  function span(secs) {
+    var s = Math.max(0, Math.floor(Number(secs || 0)))
+    var h = Math.floor(s / 3600), m = Math.floor(s % 3600 / 60)
+    if (h === 0 && m === 0) return s + "s"
+    if (h === 0) return m + "m"
+    return m === 0 ? h + "h" : h + "h" + (m < 10 ? "0" : "") + m + "m"
+  }
+
   function uptime(started) {
     var mins = Math.max(0, Math.floor((Date.now() / 1000 - Number(started || 0)) / 60))
     if (mins < 60) return strings.tn("time.minutes", mins).arg(Commons.I18n.formatNumber(mins))
@@ -687,6 +696,15 @@ Panel {
             pasture: root.plain(r.pasture || "", 32),
             // Credentials whose values the sandbox holds (deliver).
             credentials: Array.isArray(r.credentials) ? r.credentials.slice(0, 8).map(function(c) { return root.plain(c, 64) }).join(", ") : "",
+            // The timer nearest its end (timer.rs): name, used, budget, over.
+            timer: (function() {
+              var ts = Array.isArray(r.timers) ? r.timers.filter(function(t) { return t && !t.stopped }) : []
+              if (!ts.length) return null
+              ts.sort(function(a, b) { return Number(a.left || 0) - Number(b.left || 0) })
+              var t = ts[0]
+              return { name: root.plain(t.name, 64), used: Number(t.used || 0), budget: Number(t.budget || 0),
+                       over: t.over === true, hard: t.hard === true }
+            })(),
             // Credentials it uses through the gateway: it holds stand-ins.
             gateway: Array.isArray(r.gateway) ? r.gateway.slice(0, 8).map(function(c) { return root.plain(c, 64) }).join(", ") : "",
             parentHarness: "",
@@ -1262,13 +1280,15 @@ Panel {
                   : strings.t("row.title").arg(modelData.harness).arg(modelData.projectName)
                 caption: strings.t("row.detail").arg(modelData.backend).arg(modelData.network).arg(modelData.gui).arg(root.uptime(modelData.started))
                 caption2: modelData.frozenSince > 0 ? strings.t("row.frozen").arg(root.uptime(modelData.frozenSince))
+                  : modelData.timer !== null ? strings.t(modelData.timer.over ? "row.timerOver" : "row.timer")
+                      .arg(modelData.timer.name).arg(root.span(modelData.timer.used)).arg(root.span(modelData.timer.budget))
                   : modelData.warning !== "" ? modelData.warning
                   : modelData.credentials !== "" ? strings.t("row.holdsCredentials").arg(modelData.credentials)
                   : modelData.gateway !== "" ? strings.t("row.gateway").arg(modelData.gateway)
                   : (modelData.parent !== "" ? strings.t("row.startedBy").arg(modelData.parent)
                   : (modelData.auth !== "" && modelData.auth !== "shared" ? strings.t("row.auth").arg(modelData.auth)
                   : (modelData.pasture !== "" ? strings.t("row.pasture").arg(modelData.pasture) : "")))
-                caption2Color: modelData.warning !== "" || (modelData.frozenSince === 0 && modelData.credentials !== "") ? root.urgent : root.dim
+                caption2Color: modelData.warning !== "" || (modelData.frozenSince === 0 && (modelData.credentials !== "" || (modelData.timer !== null && modelData.timer.over))) ? root.urgent : root.dim
                 showActions: true
                 onActivated: root.goToTerminal(modelData)
 

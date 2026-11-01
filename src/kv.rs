@@ -87,9 +87,9 @@ const MAX_BATCH: usize = 100;
 /// The values of one mset hold at most this many times `max_value`.
 const BATCH_VALUES: usize = 16;
 pub const OPS: &[&str] = &[
-    "get", "mget", "put", "mset", "delete", "list", "history", "watch", "claim", "release",
+    "get", "mget", "put", "mset", "delete", "list", "history", "watch", "claim", "release", "timer",
 ];
-const WRITE_OPS: &[&str] = &["put", "mset", "delete", "claim", "release"];
+const WRITE_OPS: &[&str] = &["put", "mset", "delete", "claim", "release", "timer"];
 
 /// The folder of the kv files (shard.rs).
 pub fn kv_root(env: &HostEnv) -> PathBuf {
@@ -338,6 +338,21 @@ pub struct Request {
     /// lease is always the sandbox of the connection.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub owner: Option<String>,
+    /// timer: start, status, list, extend or stop.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action: Option<String>,
+    /// timer start: seconds that the task may take.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub budget: Option<u64>,
+    /// timer start: a hard deadline freezes the sandbox.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hard: Option<bool>,
+    /// timer extend: seconds to add.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub by: Option<u64>,
+    /// timer extend: why, shown to the user.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -782,10 +797,10 @@ impl Service {
         }
         // Lease keys hold an owner that paddock writes. A plain write could
         // forge one, so only claim and release change them.
-        let leased = |k: &str| k.starts_with(LEASE_PREFIX);
+        let leased = |k: &str| k.starts_with(LEASE_PREFIX) || k.starts_with(crate::timer::PREFIX);
         if matches!(op, "put" | "delete") && req.key.as_deref().is_some_and(leased) {
             return invalid(format!(
-                "keys that start with {LEASE_PREFIX} change only through claim and release"
+                "keys that start with {LEASE_PREFIX} or timer: change only through claim, release and timer"
             ));
         }
         if req.ttl.is_some_and(|t| t == 0 || t > MAX_TTL) {
@@ -827,7 +842,7 @@ impl Service {
                     check_key(k, "key", false).or_else(invalid)?;
                     if leased(k) {
                         return invalid(format!(
-                            "keys that start with {LEASE_PREFIX} change only through claim and release"
+                            "keys that start with {LEASE_PREFIX} or timer: change only through claim, release and timer"
                         ));
                     }
                     value_ok(v)?;
@@ -953,6 +968,7 @@ impl Service {
                 Response::done(mark(serde_json::json!({ "history": h })))
             }
             "claim" => self.claim(st, ns, key, req.ttl.unwrap_or(60), quota, now)?,
+            "timer" => self.timer(st, req, ns, quota, now)?,
             "release" => self.release(st, ns, key, req.force == Some(true), quota, now)?,
             "watch" => self.watch(st, ns, req, conn, &mark)?,
             _ => unreachable!(),
@@ -960,6 +976,177 @@ impl Service {
     }
 
     /// Take the lease `lease:<name>`, or renew it when this sandbox holds it.
+    /// The timer operations (timer.rs). A timer counts the time of the
+    /// sandbox that starts it; only its owner extends or stops it, anyone
+    /// else asks the user for more time.
+    fn timer(
+        &self,
+        st: &mut Store,
+        req: &Request,
+        ns: &str,
+        quota: Quota,
+        now: u64,
+    ) -> Result<Response> {
+        use crate::timer::{self, Timer};
+        let action = req.action.as_deref().unwrap_or("status");
+        let status_of = |t: &Timer| {
+            serde_json::to_value(t.status(now, &timer::frozen_periods(&self.env, &t.subject, now)))
+                .unwrap_or_default()
+        };
+        if action == "list" {
+            let all: Vec<serde_json::Value> = timer::in_store(st, ns, now)?
+                .iter()
+                .map(|(t, _)| status_of(t))
+                .collect();
+            return Ok(Response::done(serde_json::json!({ "timers": all })));
+        }
+        let name = req.key.as_deref().unwrap_or("");
+        if let Err(e) = timer::check_name(name) {
+            return Ok(Response::new(Status::Invalid, format!("{e:#}")));
+        }
+        let key = format!("{}{name}", timer::PREFIX);
+        let cur = st.get(ns, &key, now)?.and_then(|e| {
+            serde_json::from_str::<Timer>(&e.value)
+                .ok()
+                .map(|t| (t, e.version))
+        });
+        let w = self.writer();
+        match action {
+            "start" => {
+                let Some(budget) = req.budget else {
+                    return Ok(Response::new(Status::Invalid, "timer start needs a budget"));
+                };
+                if let Err(e) = timer::check_budget(budget) {
+                    return Ok(Response::new(Status::Invalid, format!("{e:#}")));
+                }
+                if let Some((t, _)) = &cur {
+                    if t.stopped.is_none() {
+                        return Ok(Response {
+                            status: Status::Conflict,
+                            message: format!(
+                                "the timer {name} runs; its owner ({}) can stop it",
+                                t.owner
+                            ),
+                            result: status_of(t),
+                        });
+                    }
+                }
+                let t = Timer {
+                    name: name.into(),
+                    owner: self.id.sandbox.clone(),
+                    subject: self.id.sandbox.clone(),
+                    started: now,
+                    budget,
+                    hard: req.hard == Some(true),
+                    stopped: None,
+                    announced: false,
+                    enforced: false,
+                    extensions: vec![],
+                };
+                timer::save(st, ns, &t, Some(cur.map_or(0, |(_, v)| v)), &w, quota, now)?;
+                Ok(Response::done(status_of(&t)))
+            }
+            "status" => Ok(match &cur {
+                Some((t, _)) => Response::done(status_of(t)),
+                None => Response::new(Status::NotFound, format!("no timer {name}")),
+            }),
+            "extend" | "stop" => {
+                let Some((mut t, version)) = cur else {
+                    return Ok(Response::new(Status::NotFound, format!("no timer {name}")));
+                };
+                let mine = t.owner == self.id.sandbox;
+                if action == "stop" {
+                    if !mine {
+                        return Ok(Response::new(
+                            Status::Denied,
+                            format!("only the owner of the timer ({}) can stop it", t.owner),
+                        ));
+                    }
+                    t.stopped = Some(now);
+                    timer::save(st, ns, &t, Some(version), &w, quota, now)?;
+                    return Ok(Response::done(status_of(&t)));
+                }
+                let Some(by) = req.by.filter(|b| *b > 0 && *b <= timer::MAX_BUDGET) else {
+                    return Ok(Response::new(
+                        Status::Invalid,
+                        "timer extend needs --by, at most 30 days",
+                    ));
+                };
+                let reason: String = req
+                    .reason
+                    .as_deref()
+                    .unwrap_or("")
+                    .chars()
+                    .take(500)
+                    .collect();
+                let who = if mine {
+                    self.id.sandbox.clone()
+                } else {
+                    // Someone else's deadline: the user decides.
+                    let p = Pending {
+                        id: request_id(),
+                        sandbox: self.id.sandbox.clone(),
+                        harness: self.id.harness.clone(),
+                        project: self.id.project.clone(),
+                        capability: timer::CAPABILITY.into(),
+                        summary: format!("{} more for the timer {name}", timer::format_duration(by)),
+                        detail: format!(
+                            "The timer {name} ({}) has used {} of {}. The sandbox asks for {} more.",
+                            if t.hard { "hard deadline: the sandbox is frozen when it ends" } else { "soft deadline" },
+                            timer::format_duration(t.status(now, &[]).used),
+                            timer::format_duration(t.budget),
+                            timer::format_duration(by)
+                        ),
+                        reason: reason.clone(),
+                        created: now,
+                        expires: now + self.wait.as_secs(),
+                        session_allowed: false,
+                        choices: Vec::new(),
+                        started_by: self.id.chain.clone(),
+                    };
+                    match self.approver.ask(&self.env, &p, self.wait) {
+                        Some(Answer::Once | Answer::Session) => "user".to_string(),
+                        Some(Answer::Deny) => {
+                            return Ok(Response::new(
+                                Status::Denied,
+                                "the user did not give more time",
+                            ))
+                        }
+                        None => {
+                            return Ok(Response::new(
+                                Status::Timeout,
+                                format!("nobody answered within {} seconds", self.wait.as_secs()),
+                            ))
+                        }
+                    }
+                };
+                // Reread: the timer may have changed while the user decided.
+                let Some((mut t, version)) = st.get(ns, &key, crate::state::now())?.and_then(|e| {
+                    serde_json::from_str::<Timer>(&e.value)
+                        .ok()
+                        .map(|t| (t, e.version))
+                }) else {
+                    return Ok(Response::new(Status::NotFound, format!("no timer {name}")));
+                };
+                t.budget = (t.budget + by).min(timer::MAX_BUDGET);
+                t.announced = false;
+                t.enforced = false;
+                t.extensions.push(timer::Extension {
+                    seconds: by,
+                    by: who,
+                    at: now,
+                    reason,
+                });
+                timer::save(st, ns, &t, Some(version), &w, quota, now)?;
+                Ok(Response::done(status_of(&t)))
+            }
+            other => Ok(Response::new(
+                Status::Invalid,
+                format!("unknown timer action '{other}': use start, status, list, extend or stop"),
+            )),
+        }
+    }
+
     fn claim(
         &self,
         st: &mut Store,
@@ -1175,6 +1362,122 @@ fn request_id() -> String {
     format!("r-{}-{}", crate::state::now(), &h[..8])
 }
 
+/// The paddock process of a sandbox watches the timers that time it: a
+/// soft deadline that passed gets one notification, a hard one freezes the
+/// sandbox. It also writes the summary that `paddock ps` and the panel read.
+pub fn watch_timers(env: HostEnv, id: Identity, root: PathBuf, cfg: KvCfg) {
+    std::thread::spawn(move || loop {
+        if let Err(e) = timer_tick(&env, &id, &root, &cfg) {
+            log::debug!("timers of {}: {e:#}", id.sandbox);
+        }
+        std::thread::sleep(Duration::from_secs(30));
+    });
+}
+
+fn timer_tick(env: &HostEnv, id: &Identity, root: &Path, cfg: &KvCfg) -> Result<()> {
+    use crate::timer;
+    let now = crate::state::now();
+    let mut spaces = vec![(Ns::Own(id.sandbox.clone()), Scope::Own)];
+    if !id.is_child() {
+        spaces.push((pasture_ns(id), Scope::Pasture));
+    }
+    if let Some(t) = &id.tree {
+        spaces.push((Ns::Tree(t.clone()), Scope::Tree));
+    }
+    let w = Writer {
+        sandbox: "paddock",
+        harness: "paddock",
+    };
+    let mut summary = Vec::new();
+    for (ns, scope) in spaces {
+        let file = ns.file(root)?;
+        if !file.is_file() {
+            continue;
+        }
+        let mut st = Store::open(&file)?;
+        for (mut t, version) in timer::in_store(&st, &ns.key(), now)? {
+            if t.subject != id.sandbox {
+                continue;
+            }
+            let s = t.status(now, &timer::frozen_periods(env, &id.sandbox, now));
+            summary.push(s.clone());
+            if s.stopped || !s.over {
+                continue;
+            }
+            let what = format!(
+                "the timer {} of {} ({}) used its {}",
+                t.name,
+                id.sandbox,
+                id.harness,
+                timer::format_duration(t.budget)
+            );
+            if !t.hard && !t.announced {
+                t.announced = true;
+                timer::save(
+                    &mut st,
+                    &ns.key(),
+                    &t,
+                    Some(version),
+                    &w,
+                    cfg.quota(scope),
+                    now,
+                )?;
+                timer_notice(
+                    env,
+                    id,
+                    "a task ran out of time",
+                    &format!("{what}. It keeps running; the owner of the timer can give it more."),
+                );
+            } else if t.hard && !t.enforced {
+                t.enforced = true;
+                timer::save(
+                    &mut st,
+                    &ns.key(),
+                    &t,
+                    Some(version),
+                    &w,
+                    cfg.quota(scope),
+                    now,
+                )?;
+                let reason = format!("{what} (hard deadline)");
+                if let Err(e) = crate::freeze::freeze(env, &id.sandbox, false, &reason) {
+                    log::warn!("cannot freeze {}: {e:#}", id.sandbox);
+                }
+                timer_notice(env, id, "paddock froze a sandbox: its time is up", &format!("{reason}. paddock thaw {} lets it continue; paddock timer extend gives it more time.", id.sandbox));
+            }
+        }
+    }
+    crate::privfs::write(
+        &crate::timer::summary_file(env, &id.sandbox),
+        serde_json::to_string(&summary)?,
+    )?;
+    Ok(())
+}
+
+fn timer_notice(env: &HostEnv, id: &Identity, summary: &str, body: &str) {
+    crate::broker::audit_line(
+        env,
+        &serde_json::json!({
+            "time": crate::state::now(),
+            "sandbox": id.sandbox,
+            "harness": id.harness,
+            "project": id.project,
+            "capability": crate::timer::CAPABILITY,
+            "detail": body,
+            "decision": summary,
+        }),
+    );
+    let _ = crate::broker::notify::show(
+        env,
+        &crate::broker::notify::Note {
+            summary: summary.into(),
+            body: body.into(),
+            actions: Vec::new(),
+            critical: false,
+        },
+    );
+}
+
 /// The pasture namespace of a sandbox: the pasture it joined, or its own.
 pub fn pasture_ns(id: &Identity) -> Ns {
     match &id.pasture {
@@ -1288,6 +1591,7 @@ pub fn start(
         parent: lineage.parent,
         chain: lineage.chain,
     };
+    watch_timers(env.clone(), id.clone(), kv_root(env), cfg.clone());
     let svc = Service::new(env.clone(), id, cfg, approver, Duration::from_secs(wait));
     let sock = env.paddock_run().join(&spec.id).join("kv.sock");
     match serve(&sock, svc) {
