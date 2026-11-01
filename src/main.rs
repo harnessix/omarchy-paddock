@@ -1258,7 +1258,7 @@ fn real_main() -> Result<i32> {
                             hidden.push(k.clone());
                         } else if paddock::policy::is_cloud_secret(k) && !m.env.pass.contains(k) {
                             cloud.push(k.clone());
-                        } else if paddock::policy::looks_secret(k) {
+                        } else if paddock::policy::looks_secret(k) && !m.env.pass.contains(k) {
                             secret.push(k.clone());
                         } else {
                             plain.push(k.clone());
@@ -1273,12 +1273,12 @@ fn real_main() -> Result<i32> {
                         }
                     );
                     if inherit {
+                        println!("\npassed ({}):\n  {}", plain.len(), plain.join(" "));
                         println!(
-                            "\npassed, look like secrets ({}):\n  {}",
+                            "\nnot passed: look like secrets; a harness gets its own login variables, and [env] pass hands over others ({}):\n  {}",
                             secret.len(),
                             secret.join(" ")
                         );
-                        println!("\npassed ({}):\n  {}", plain.len(), plain.join(" "));
                     }
                     println!(
                         "\nhidden by [env] hide ({}):\n  {}",

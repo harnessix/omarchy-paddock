@@ -416,7 +416,7 @@ pub fn build_with(env: &HostEnv, opts: &Options, harness: Harness) -> Result<Bui
     // The host environment, first, so profile, manifest and detectors override it.
     let inherit = opts.inherit_env.or(m.env.inherit).unwrap_or(true);
     if inherit {
-        let mut secret_names = Vec::new();
+        let mut withheld = Vec::new();
         let mut dropped = Vec::new();
         let mut count = 0;
         for (k, v) in &env.vars {
@@ -430,27 +430,47 @@ pub fn build_with(env: &HostEnv, opts: &Options, harness: Harness) -> Result<Bui
                 }
                 continue;
             }
-            count += 1;
+            // Real secrets stay on the host. The harness's own login
+            // variables (env_pass) and the ones that the user hands over in
+            // [env] pass are added below, with their values.
             if policy::looks_secret(k) {
-                secret_names.push(k.clone());
-                spec.set_secret_env(k, v.clone(), "host env (inherited)");
-            } else {
-                spec.set_env(k, v.clone(), "host env (inherited)");
+                if !m.env.pass.contains(k) && !profile.state.env_pass.contains(k) {
+                    withheld.push(k.clone());
+                }
+                continue;
             }
+            count += 1;
+            spec.set_env(k, v.clone(), "host env (inherited)");
         }
         for d in &env.path {
             spec.inherit_path.push(d.clone());
         }
         // Tell the user once per project, and again when the list of
         // secret-looking names changes.
-        let mut notice_key = secret_names.clone();
+        let login: Vec<String> = profile
+            .state
+            .env_pass
+            .iter()
+            .filter(|k| policy::looks_secret(k) && env.var(k).is_some())
+            .cloned()
+            .collect();
+        let mut notice_key: Vec<String> =
+            withheld.iter().map(|w| format!("withheld:{w}")).collect();
+        notice_key.extend(login.iter().map(|l| format!("login:{l}")));
         notice_key.extend(dropped.iter().map(|d| format!("dropped:{d}")));
         if crate::state::env_notice_changed(env, &project, &notice_key) {
             let mut note = format!("passing {count} host environment variables");
-            if !secret_names.is_empty() {
+            if !withheld.is_empty() {
                 note.push_str(&format!(
-                    ". The agent can read these, which look like secrets: {}",
-                    secret_names.join(", ")
+                    ". These look like secrets and stay on the host: {}. To give one to the sandbox, add it to [env] pass in the user configuration (the agent can then read it)",
+                    withheld.join(", ")
+                ));
+            }
+            if !login.is_empty() {
+                note.push_str(&format!(
+                    ". The login variables of {} pass with their values, so the harness can sign in: {}. A later paddock keeps them on the host as well",
+                    profile.name,
+                    login.join(", ")
                 ));
             }
             if !dropped.is_empty() {
