@@ -142,6 +142,7 @@ An agent in a sandbox can also start an agent of another harness in a second san
 A sandbox writes the project directly, but files that it saves elsewhere, for example in `~/Downloads` of its own home, stay in the sandbox.
 
 - `paddock files [ID]` lists those files and the project changes since the sandbox started.
+- `paddock undo [SESSION]` brings the project back to its snapshot from before a sandbox started. It lists the changes and asks first. Added files go to the undo trash. `paddock undo --list` lists the snapshots.
 - `paddock recover ID PATH` copies a file to the same place in the real home, or `--to DIR`. It never overwrites a file and never writes into hidden folders such as `~/.ssh`. Ask the user before you recover a file, and say where it goes.
 - `paddock discard ID PATH` deletes a file in the sandbox.
 
@@ -161,6 +162,7 @@ Ask the user before you run `paddock gc` with `--yes`. Show them the dry-run lis
 - `--include-app-logins` deletes the login of a desktop app. The user must log in again.
 - `--worktrees --force` deletes uncommitted changes in a worktree. Its branch and commits stay.
 - `--scratch` deletes the scratch projects of agents that started in the home folder, with their files.
+- `--snapshots` deletes old project snapshots of `paddock undo` and the undo trash, with the files an undo moved there.
 - `--dedupe` deletes nothing. It lets identical files in the sandbox homes share their data (btrfs, xfs, bcachefs), and the files keep their content.
 
 Do not delete sandbox homes, images or worktrees with `rm`, `docker rmi` or `git worktree remove`. `paddock gc` checks that no sandbox runs in them.
