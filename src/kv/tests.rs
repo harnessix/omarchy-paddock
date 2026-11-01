@@ -1433,3 +1433,26 @@ fn the_watch_announces_a_soft_deadline_once_and_enforces_a_hard_one() {
     let log = std::fs::read_to_string(crate::broker::audit_file(&w.env)).unwrap();
     assert_eq!(log.matches("\"capability\":\"timer\"").count(), 2, "{log}");
 }
+
+#[test]
+fn forage_shows_the_accounts_that_the_sandbox_can_use() {
+    let w = world();
+    let dir = w.env.state_dir.join("omarchy/agents/usage");
+    std::fs::create_dir_all(&dir).unwrap();
+    for (agent, pct) in [("t", 0.4), ("other", 0.9)] {
+        std::fs::write(
+            dir.join(format!("{agent}.json")),
+            serde_json::json!({"limitsFetchedAt": 1_000_000, "limits": [{"label": "Weekly", "percent": pct, "resetsAt": ""}]})
+                .to_string(),
+        )
+        .unwrap();
+    }
+    let (a, _) = service(&w, "a", None, KvCfg::default(), None);
+    let r = a.handle(&req("forage", Scope::Own, ""), None);
+    assert_eq!(r.status, Status::Done, "{}", r.message);
+    // Its own harness ("t"); not an account that it cannot start.
+    assert_eq!(r.result["agents"], serde_json::json!(["t"]));
+    let ws = r.result["windows"].as_array().unwrap();
+    assert_eq!(ws.len(), 1);
+    assert_eq!(ws[0]["used"], 0.4);
+}

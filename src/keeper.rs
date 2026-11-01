@@ -177,6 +177,11 @@ pub fn due(bytes: &[u8], now: u64, cfg: &Cfg) -> bool {
     }
 }
 
+/// The UTC seconds of `YYYY-MM-DDTHH:MM:SS`, the rest ignored.
+pub fn parse_rfc3339_utc(s: &str) -> Option<u64> {
+    parse_rfc3339(s)
+}
+
 fn parse_rfc3339(s: &str) -> Option<u64> {
     // YYYY-MM-DDTHH:MM:SS, the rest ignored: enough for a 7-day rule.
     let b = s.as_bytes();
