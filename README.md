@@ -347,6 +347,31 @@ paddock claude --auth isolated:work     # another one, named "work"
 paddock auth import claude --auth isolated:work   # start it from a copy of your login
 ```
 
+### Codex logins: the refresh stays outside the sandbox
+
+A ChatGPT login holds an access token, which expires soon, and a refresh token, which trades for a new pair and is then spent. When two copies of one login each spend the same refresh token, one of them is logged out, and a service can take the reuse for a stolen token and end the login.
+
+So for Codex, paddock keeps the refresh token out of the sandbox:
+
+- The sandbox gets `~/.codex/auth.json` without its refresh token (the field is there, empty). Codex in the sandbox uses the access token as usual, and cannot refresh it. An agent in the sandbox can take at most an access token that expires soon.
+- A keeper refreshes the login before the access token runs out (30 minutes before, by default; Codex itself would refresh 5 minutes before). It runs Codex's own refresh (`codex app-server`) in a sandbox of its own that looks like the agent's sandbox to OpenAI: the same machine ID, the host name `paddock`, and your routes and proxy. It sees nothing of your home but the login.
+- The keeper writes the new login back where it lives (your `~/.codex/auth.json`, or the isolated store), and the new access token, without the refresh token, into every running sandbox that uses the login. Codex reads the file again before it would refresh, so it takes the new token.
+- Several sandboxes of one login share one keeper. When the sandbox whose paddock runs it ends, another one takes over. If a refresh fails three times in a row, paddock shows a notification.
+- The sandbox's copy is never written back at exit. A login that you make inside the sandbox, when it started logged out, is saved as before.
+
+In `~/.config/paddock/config.toml`:
+
+```toml
+[logins]
+keep = true              # false: copy the whole login into the sandbox, as before
+refresh_margin = 1800    # seconds before the access token expires; at least 360
+check_interval = 60      # seconds between two looks
+```
+
+`paddock logins refresh codex [--auth isolated:NAME]` refreshes a login at once, in a keeper sandbox, and updates the running sandboxes that use it. It refuses while a running sandbox's keeper holds the login.
+
+An API-key login is not touched. Claude Code and Grok Build logins are copied whole, as before.
+
 ### MCP servers
 
 MCP servers come from the same configuration as on the host, and MCP OAuth tokens come with the login. A stdio server runs a command on your computer, so paddock must mount that command into the sandbox. paddock mounts only the smallest part that runs: the binary, the interpreter in its script header, or the `node_modules` folder of a package. It never mounts the whole repository or install folder around a package.
