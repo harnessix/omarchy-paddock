@@ -180,7 +180,15 @@ pub fn run(
         can_spawn: spawner.as_ref().is_some_and(|s| s.available()),
     };
     let kv_project_path = kv_project.clone();
-    let kv = crate::kv::start(env, &mut built.spec, kv_project, kv_approver, lineage);
+    let kv_pasture = built.pasture.clone();
+    let kv = crate::kv::start(
+        env,
+        &mut built.spec,
+        kv_project,
+        built.pasture.clone(),
+        kv_approver,
+        lineage,
+    );
     let mut devices = crate::devices::start(
         env,
         &mut built.spec,
@@ -393,6 +401,7 @@ pub fn run(
         logins: auth.host_logins(),
         unit,
         kv_project: Some(kv_project_path),
+        pasture: kv_pasture,
     };
     running.register(env)?;
     // Kept after exit, so `paddock files` can list what the sandbox left.

@@ -564,7 +564,7 @@ fn children_claim_tasks_in_the_tree_scope_and_the_parent_watch_wakes() {
             .starts_with("paddock/spawn-childkv-"));
     }
     // Each child took a different task, read its parent's self scope and
-    // could not write the project scope.
+    // has no pasture scope (`project` is its other name): exit 4, off.
     let mut claimed = Vec::new();
     for e in std::fs::read_dir(w.repo.join(".paddock/inbox"))
         .unwrap()
@@ -572,7 +572,7 @@ fn children_claim_tasks_in_the_tree_scope_and_the_parent_watch_wakes() {
     {
         let output = std::fs::read_to_string(e.path().join("output.txt")).unwrap();
         assert!(output.contains("PARENT from-the-parent"), "{output}");
-        assert!(output.contains("PROJECT_EXIT 3"), "{output}");
+        assert!(output.contains("PROJECT_EXIT 4"), "{output}");
         let t = output
             .lines()
             .find_map(|l| l.strip_prefix("CLAIMED "))

@@ -1,12 +1,12 @@
-//! The key-value store on the host: one SQLite file in paddock's state
-//! folder. Every sandbox's paddock process opens the same file; SQLite's
+//! One SQLite file of the key-value store on the host (shard.rs says which
+//! file holds what). Every sandbox's paddock process can open it; SQLite's
 //! locking keeps concurrent writers apart, and a write transaction makes
 //! compare-and-swap atomic across processes. SQLite is compiled into the
 //! paddock binary, so the same binary still runs inside containers without
 //! a system library.
 //!
-//! A key lives in a namespace: `self:<sandbox id>`, `tree:<root sandbox
-//! id>`, `project:<path>` or `user`. Versions come from one counter for the whole store, so a key that
+//! A key lives in a namespace (shard::Ns), and each namespace has a file
+//! of its own. Versions come from one counter per file, so a key that
 //! is deleted and written again never gets an old version back, and a
 //! watcher never misses that change. Each write and delete also goes to a
 //! short history per key; prefix watches read their changes from it.
@@ -15,21 +15,6 @@ use anyhow::{Context, Result};
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use serde::Serialize;
 use std::path::Path;
-
-pub fn ns_self(sandbox: &str) -> String {
-    format!("self:{sandbox}")
-}
-
-/// The namespace of a spawn tree: it belongs to the root sandbox.
-pub fn ns_tree(root: &str) -> String {
-    format!("tree:{root}")
-}
-
-pub fn ns_project(project: &Path) -> String {
-    format!("project:{}", project.display())
-}
-
-pub const NS_USER: &str = "user";
 
 /// Versions of one key that the history keeps.
 pub const HISTORY_PER_KEY: u64 = 16;
@@ -115,6 +100,18 @@ pub struct Stale {
     pub last: u64,
 }
 
+/// A sandbox as the registry recorded it.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct Record {
+    pub id: String,
+    pub harness: String,
+    pub parent: Option<String>,
+    /// The pasture it joined; None: a pasture of its own.
+    pub pasture: Option<String>,
+    pub started: u64,
+    pub ended: Option<u64>,
+}
+
 /// One write of a batch.
 pub struct Put<'a> {
     pub key: &'a str,
@@ -161,6 +158,7 @@ CREATE TABLE IF NOT EXISTS sandboxes (
   harness TEXT NOT NULL,
   project TEXT NOT NULL,
   parent TEXT,
+  pasture TEXT,
   started INTEGER NOT NULL,
   ended INTEGER
 );
@@ -291,6 +289,14 @@ impl Store {
         conn.busy_timeout(std::time::Duration::from_secs(10))?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
+        conn.execute_batch(SCHEMA)?;
+        Ok(Self { conn })
+    }
+
+    /// A store in memory with no keys: reads of a namespace that has no
+    /// file yet use it, so that a read never creates a file.
+    pub fn empty() -> Result<Self> {
+        let conn = Connection::open_in_memory()?;
         conn.execute_batch(SCHEMA)?;
         Ok(Self { conn })
     }
@@ -622,12 +628,13 @@ impl Store {
         harness: &str,
         project: &Path,
         parent: Option<&str>,
+        pasture: Option<&str>,
         now: u64,
     ) -> Result<()> {
         self.conn.execute(
-            "INSERT OR REPLACE INTO sandboxes (id, harness, project, parent, started, ended)
-             VALUES (?1, ?2, ?3, ?4, ?5, NULL)",
-            params![id, harness, project.display().to_string(), parent, now],
+            "INSERT OR REPLACE INTO sandboxes (id, harness, project, parent, pasture, started, ended)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL)",
+            params![id, harness, project.display().to_string(), parent, pasture, now],
         )?;
         Ok(())
     }
@@ -707,58 +714,6 @@ impl Store {
             .flatten())
     }
 
-    /// Sandboxes whose `self` data or `tree` scope is older than `cutoff`
-    /// and that do not run. `running` holds the running sandboxes; the
-    /// sandboxes above them are kept too, because a running child reads its
-    /// parent and writes the tree of its root. `self:` and `tree:` have the
-    /// same length, so one `substr` gives the sandbox of both.
-    pub fn stale(&self, cutoff: u64, running: &[String]) -> Result<Vec<Stale>> {
-        let mut keep: Vec<String> = running.to_vec();
-        for id in running {
-            keep.extend(self.ancestors(id)?);
-        }
-        let mut st = self.conn.prepare(
-            "SELECT substr(e.ns, 6), COUNT(*), SUM(e.size), MAX(e.updated),
-                    MAX(COALESCE(s.ended, 0)), MAX(COALESCE(s.started, 0))
-             FROM entries e LEFT JOIN sandboxes s ON s.id = substr(e.ns, 6)
-             WHERE e.ns LIKE 'self:%' OR e.ns LIKE 'tree:%' GROUP BY substr(e.ns, 6)",
-        )?;
-        let rows = st.query_map([], |r| {
-            let (u, e, s): (u64, u64, u64) = (r.get(3)?, r.get(4)?, r.get(5)?);
-            Ok(Stale {
-                sandbox: r.get(0)?,
-                entries: r.get(1)?,
-                bytes: r.get(2)?,
-                last: u.max(e).max(s),
-            })
-        })?;
-        let mut out = Vec::new();
-        for s in rows {
-            let s = s?;
-            if s.last < cutoff && !keep.contains(&s.sandbox) {
-                out.push(s);
-            }
-        }
-        Ok(out)
-    }
-
-    /// Remove the `self` data, the `tree` scope of a root, their history
-    /// and the records of these sandboxes.
-    pub fn remove_sandboxes(&mut self, ids: &[String]) -> Result<u64> {
-        let tx = self.conn.transaction()?;
-        let mut n = 0;
-        for id in ids {
-            for ns in [ns_self(id), ns_tree(id)] {
-                n += tx.execute("DELETE FROM entries WHERE ns = ?1", params![ns])? as u64;
-                tx.execute("DELETE FROM history WHERE ns = ?1", params![ns])?;
-            }
-            tx.execute("DELETE FROM sandboxes WHERE id = ?1", params![id])?;
-            tx.execute("DELETE FROM grants WHERE sandbox = ?1", params![id])?;
-        }
-        tx.commit()?;
-        Ok(n)
-    }
-
     /// Entries whose time to live has passed: count and bytes.
     pub fn expired(&self, now: u64) -> Result<(u64, u64)> {
         Ok(self.conn.query_row(
@@ -800,14 +755,67 @@ impl Store {
         Ok(n)
     }
 
-    /// Records of ended sandboxes without data, older than `cutoff`.
-    pub fn forget_ended(&mut self, cutoff: u64) -> Result<u64> {
-        Ok(self.conn.execute(
-            "DELETE FROM sandboxes WHERE ended IS NOT NULL AND ended < ?1
-             AND NOT EXISTS (SELECT 1 FROM entries
-                             WHERE ns IN ('self:' || sandboxes.id, 'tree:' || sandboxes.id))",
-            params![cutoff],
-        )? as u64)
+    /// Registry: forget the records of sandboxes that ended before
+    /// `cutoff` and have no files left. The sandboxes above a running one
+    /// stay, because the running one reads them.
+    pub fn forget_ended(&mut self, cutoff: u64, running: &[String]) -> Result<u64> {
+        let mut keep: Vec<String> = running.to_vec();
+        for id in running {
+            keep.extend(self.ancestors(id)?);
+        }
+        let old: Vec<String> = {
+            let mut st = self
+                .conn
+                .prepare("SELECT id FROM sandboxes WHERE ended IS NOT NULL AND ended < ?1")?;
+            let rows = st.query_map(params![cutoff], |r| r.get::<_, String>(0))?;
+            rows.collect::<rusqlite::Result<_>>()?
+        };
+        let mut n = 0;
+        for id in old.iter().filter(|i| !keep.contains(i)) {
+            self.forget_sandbox(id)?;
+            n += 1;
+        }
+        Ok(n)
+    }
+
+    /// Registry: the sandboxes recorded for a project, oldest first.
+    pub fn sandboxes_of(&self, project: &Path) -> Result<Vec<Record>> {
+        let mut st = self.conn.prepare(
+            "SELECT id, harness, parent, pasture, started, ended FROM sandboxes
+             WHERE project = ?1 ORDER BY started, id",
+        )?;
+        let rows = st.query_map(params![project.display().to_string()], |r| {
+            Ok(Record {
+                id: r.get(0)?,
+                harness: r.get(1)?,
+                parent: r.get(2)?,
+                pasture: r.get(3)?,
+                started: r.get(4)?,
+                ended: r.get(5)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Registry: when a sandbox started and ended. None without a record.
+    pub fn times(&self, id: &str) -> Result<Option<(u64, Option<u64>)>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT started, ended FROM sandboxes WHERE id = ?1",
+                params![id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?)
+    }
+
+    /// All keys of this file that have not expired: count and bytes.
+    pub fn totals(&self) -> Result<(u64, u64)> {
+        Ok(self.conn.query_row(
+            "SELECT COUNT(*), COALESCE(SUM(size), 0) FROM entries",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?)
     }
 
     /// Remove a whole namespace with its history. `paddock doctor` cleans up

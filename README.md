@@ -576,15 +576,31 @@ You can let an agent on the host answer requests for you (`paddock approver`). p
 
 ## Shared state: paddock kv
 
-Agents need to keep state between runs and hand work to each other. paddock kv is a small key-value store for that. It lives on the host, in `~/.local/state/paddock/kv/store.db`. Each sandbox reaches it through its own socket. The socket tells paddock which sandbox asks, so an agent cannot claim to be another sandbox.
+Agents need to keep state between runs and hand work to each other. paddock kv is a small key-value store for that. It lives on the host, in `~/.local/state/paddock/kv/`, with one SQLite file for each pasture, each run, each spawn tree and the `user` scope. Each sandbox reaches it through its own socket. The socket tells paddock which sandbox asks, so an agent cannot claim to be another sandbox. The paddock process of a sandbox opens only the files of the scopes that the sandbox can use.
 
 Inside the sandbox, the agent uses `paddock-host kv`:
 
 ```sh
-paddock-host kv put task:review '{"title":"review src/auth.rs","status":"todo"}' --scope project
-paddock-host kv claim review --ttl 600 --scope project
-paddock-host kv watch --prefix result: --scope project --timeout 300
+paddock-host kv put task:review '{"title":"review src/auth.rs","status":"todo"}' --scope pasture
+paddock-host kv claim review --ttl 600 --scope pasture
+paddock-host kv watch --prefix result: --scope pasture --timeout 300
 ```
+
+### Pastures
+
+Two agents share the `pasture` scope only when you put them in one pasture. Define the pasture in `~/.config/paddock/config.toml`, and start each member with `--pasture`:
+
+```toml
+[pastures.review]
+members = ["claude", "codex"]
+```
+
+```sh
+paddock claude --pasture review
+paddock codex --pasture review
+```
+
+A pasture belongs to one project: `review` in another project is another pasture. A project `paddock.toml` cannot define pastures. A sandbox that you start without `--pasture` is a pasture of its own: nobody else reads what it writes there, and its data goes with its run. So two agents that you start in the same folder do not share state unless you say so.
 
 In a spawn tree, the parent writes the tasks into the `tree` scope, each child claims one with a lease and writes its result, and the parent waits for `result:`:
 
@@ -603,22 +619,24 @@ Each key belongs to a scope:
 | Scope | Who reads and writes it | Default |
 | :--- | :--- | :--- |
 | `self` | This sandbox only | on |
-| `project` | Every sandbox of the same project. Each entry records the sandbox that wrote it. | on |
+| `pasture` | The members of the pasture of this sandbox, or this sandbox only without `--pasture`. Each entry records the sandbox that wrote it. `project` is another name for it. | on |
 | `parent` | Read-only: the `self` scope of the sandbox that started this one with `spawn` | only in a spawned sandbox |
 | `tree` | The sandbox that you started and every sandbox that it started with `spawn`, and theirs. Each entry records its writer. | on as soon as a sandbox can use `spawn` |
 | `user` | Every sandbox of every project | asks you at the first use |
 
-An agent with a prompt injection can write a false tip into the `project` scope, and the next agent reads it. So paddock records the writer of every entry, and the client marks what another sandbox wrote as untrusted.
+An agent with a prompt injection can write a false tip into the `pasture` scope, and the other members read it. So paddock records the writer of every entry, and the client marks what another sandbox wrote as untrusted.
 
 A spawned sandbox never gets more than its parent here either:
 
-- It writes its own `self` scope and `tree`. It reads `project`, but does not write it, so that what a child picks up stays in the tree until its parent decides what the project keeps. `child_project_write = true` in `[kv]` changes that.
+- It has no `pasture` scope. It shares through `tree`, and its parent decides what the pasture keeps.
 - For `user`, it inherits "Allow for this session" from the sandboxes above it. Without that, it is refused, and it never asks you itself: one prompt injection must not turn into many questions. Use the scope in the root sandbox first, or set `[kv] user = "allow"`.
 - The `tree` scope belongs to the root of the tree: the sandbox that you started. When the root ends, its children stop and the tree is read-only. The data stays for you to review (`paddock kv list --tree ROOT-ID`) until `paddock gc` removes it with the root's `self` data.
 
 A write can depend on the current version of a key (`--if-version`). A key can expire (`--ttl`). `mget` and `mset` read and write several keys at once. `history` shows the last versions of a key. `watch` waits for a change of one key or of a prefix. A lease (`claim NAME --ttl SECONDS`) makes sure that only one agent does a task. paddock sets the owner of a lease from the socket. Only the owner releases it, or with `--force` a sandbox above the owner in its spawn tree (its parent, or the parent of that one), or you on the host. A sibling cannot. A lease expires at the end of its time. Keep values small: put diffs, files and logs in a git branch or a file, and store the reference. `paddock-host kv --help` in the sandbox lists the key names that agents share: `task:`, `lease:`, `result:`, `heartbeat:` and `note:`.
 
-On the host, `paddock kv list`, `paddock kv get KEY`, `paddock kv delete KEY` and `paddock kv release NAME` read the project scope of the current folder. `--user`, `--sandbox ID` and `--tree ROOT-ID` choose another scope.
+On the host, `paddock kv list` shows the pastures of the current folder and their keys. `paddock kv list --pasture NAME`, `paddock kv get KEY --pasture NAME`, `paddock kv delete KEY --pasture NAME` and `paddock kv release NAME --pasture NAME` read one of them. The pasture of a sandbox without one is `solo-<sandbox id>`. `--user`, `--sandbox ID` and `--tree ROOT-ID` choose another scope.
+
+Older paddock versions kept one `project` scope for all sandboxes of a project, in `store.db`. Sandboxes no longer read it, because nobody chose to share it. `paddock kv list --legacy` shows it, and `paddock gc` removes it when nothing changed it for `keep_days`.
 
 The limits and the `user` scope are in `~/.config/paddock/config.toml`. A project `paddock.toml` cannot change them.
 
@@ -626,14 +644,13 @@ The limits and the `user` scope are in `~/.config/paddock/config.toml`. A projec
 [kv]
 user = "ask"           # ask | allow | deny
 max_value = 65536      # bytes per value
-self_bytes = 4194304   # bytes per scope; also project_bytes and user_bytes
+self_bytes = 4194304   # bytes per scope; also project_bytes (pasture and tree) and user_bytes
 max_keys = 4096        # keys per scope
-keep_days = 30         # paddock gc removes the self scope of a run, and the tree of a root, this many days after it ended
-child_project_write = false   # true: spawned sandboxes can write the project scope too
+keep_days = 30         # paddock gc removes the files of a run, and the tree of a root, this many days after it ended
 enabled = true
 ```
 
-`paddock gc` removes the `self` data of runs, and the `tree` scope of spawn trees whose root ended, more than `keep_days` ago, and keys whose time to live passed. The audit log `~/.local/state/paddock/kv-audit.jsonl` records each write with its key name and size. It never records a value.
+`paddock gc` removes the file of each run (its `self` scope and its own pasture), and the `tree` scope of spawn trees whose root ended, more than `keep_days` ago, and keys whose time to live passed. A named pasture keeps its data until you delete it. The audit log `~/.local/state/paddock/kv-audit.jsonl` records each write with its key name and size. It never records a value.
 
 ## Devices: /dev/paddock
 
@@ -700,7 +717,7 @@ With a systemd user instance, every bwrap or srt sandbox runs in a scope of its 
 
 - `paddock stop` thaws a frozen sandbox first, so that it can end.
 - Each freeze and thaw goes to the audit log, with the reason.
-- The other agents of the project see the state in paddock kv: `sandbox:<id>` in the project scope is `{"state": "suspended", ...}` while it is frozen and `running` after.
+- The other members of its pasture see the state in paddock kv: `sandbox:<id>` in the `pasture` scope is `{"state": "suspended", ...}` while it is frozen and `running` after.
 - The clock keeps running while a sandbox is frozen: a harness timeout or a model's prompt cache can run out. A lease in paddock kv expires as usual.
 
 ## App mode

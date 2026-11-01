@@ -52,6 +52,12 @@ impl World {
             ),
         )
         .unwrap();
+        // The other members of a pasture see the state of a frozen one.
+        std::fs::write(
+            root.join("cfg/paddock/config.toml"),
+            "[pastures.team]\nmembers = [\"counter\"]\n",
+        )
+        .unwrap();
         World { _tmp: tmp, root }
     }
 
@@ -117,6 +123,8 @@ fn a_frozen_sandbox_stops_and_a_thawed_one_continues() {
             "none",
             "--env",
             "clean",
+            "--pasture",
+            "team",
             "-y",
         ])
         .arg(w.root.join("project"))
@@ -144,7 +152,7 @@ fn a_frozen_sandbox_stops_and_a_thawed_one_continues() {
     assert_eq!(sb["frozen_reason"], "test");
     let kv = ok(w
         .paddock()
-        .args(["kv", "get", &format!("sandbox:{id}")])
+        .args(["kv", "get", &format!("sandbox:{id}"), "--pasture", "team"])
         .output()
         .unwrap());
     assert!(kv.contains("suspended"), "{kv}");
@@ -157,7 +165,7 @@ fn a_frozen_sandbox_stops_and_a_thawed_one_continues() {
     assert!(w.ps().into_iter().next().unwrap()["frozen_since"].is_null());
     let kv = ok(w
         .paddock()
-        .args(["kv", "get", &format!("sandbox:{id}")])
+        .args(["kv", "get", &format!("sandbox:{id}"), "--pasture", "team"])
         .output()
         .unwrap());
     assert!(kv.contains("running"), "{kv}");

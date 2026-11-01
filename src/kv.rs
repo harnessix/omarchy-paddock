@@ -2,8 +2,8 @@
 //!
 //! Agents use it for state that must outlive one harness or one run: a task
 //! for a child, a result for a parent, a tip about a tool for the next agent
-//! in the project. The store is one SQLite file in paddock's state folder
-//! (store.rs). Each sandbox reaches it through its own Unix socket, which the
+//! in the project. The store is one SQLite file per pasture, run and
+//! spawn tree, and one for the `user` scope (shard.rs, store.rs). Each sandbox reaches it through its own Unix socket, which the
 //! paddock process of that sandbox serves. The socket is the identity: the
 //! service knows which sandbox it serves, so a request never names a sandbox
 //! and cannot claim to be another one.
@@ -12,9 +12,12 @@
 //!
 //! - `self`: this sandbox (this run). Removed by `paddock gc` some days after
 //!   the run ends.
-//! - `project`: every sandbox of the same project folder. Each entry records
-//!   the sandbox that wrote it. Readers get it marked as untrusted, because
-//!   an agent with a prompt injection can write there.
+//! - `pasture`: the sandboxes of one pasture (`--pasture NAME`, see
+//!   pasture.rs). A sandbox started without one is a pasture of its own,
+//!   so by default no two sandboxes share it. `project` is another name
+//!   for it. Each entry records the sandbox that wrote it. Readers get it
+//!   marked as untrusted, because an agent with a prompt injection can
+//!   write there.
 //! - `parent`: the `self` scope of the sandbox that started this one, read
 //!   only. Only a sandbox started by another sandbox has one.
 //! - `tree`: shared by one spawn tree. The root sandbox (the one the user
@@ -27,8 +30,8 @@
 //!   first use asks through the approval card.
 //!
 //! A sandbox that another one started never gets more than its parent. It
-//! writes only its own scope and `tree`: `project` is read-only for it
-//! unless `[kv] child_project_write` says otherwise. For `user` it inherits
+//! has no `pasture` scope: what it shares goes to `tree`, and the sandbox
+//! that started it decides what the pasture keeps. For `user` it inherits
 //! the session grant of the sandboxes above it. Without one, its first use
 //! asks the user on a card that names the sandbox that started it.
 //!
@@ -50,12 +53,14 @@
 
 pub mod escape;
 pub mod host;
+pub mod shard;
 pub mod store;
 
 use crate::broker::{Answer, Approver, Mode, Pending};
 use crate::env::HostEnv;
 use anyhow::{Context as _, Result};
 use serde::{Deserialize, Serialize};
+use shard::Ns;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -86,8 +91,9 @@ pub const OPS: &[&str] = &[
 ];
 const WRITE_OPS: &[&str] = &["put", "mset", "delete", "claim", "release"];
 
-pub fn store_path(env: &HostEnv) -> PathBuf {
-    env.paddock_state().join("kv").join("store.db")
+/// The folder of the kv files (shard.rs).
+pub fn kv_root(env: &HostEnv) -> PathBuf {
+    shard::root(env)
 }
 
 pub fn audit_file(env: &HostEnv) -> PathBuf {
@@ -108,10 +114,6 @@ pub struct KvCfg {
     /// `paddock gc` removes the `self` data of a run, and the `tree` scope
     /// of a root, this many days after it ended.
     pub keep_days: u64,
-    /// Whether a sandbox that another one started can write the `project`
-    /// scope. Off by default: what a child learns goes to `tree`, and the
-    /// parent decides what the project keeps.
-    pub child_project_write: bool,
 }
 
 impl Default for KvCfg {
@@ -125,7 +127,6 @@ impl Default for KvCfg {
             user_bytes: 4 << 20,
             max_keys: 4096,
             keep_days: 30,
-            child_project_write: false,
         }
     }
 }
@@ -141,6 +142,10 @@ struct RawCfg {
     user_bytes: Option<u64>,
     max_keys: Option<u64>,
     keep_days: Option<u64>,
+    /// Older versions let spawned sandboxes write the project scope with
+    /// it. Spawned sandboxes have no pasture scope now; it is accepted and
+    /// has no effect, so that old configurations still load.
+    #[allow(dead_code)]
     child_project_write: Option<bool>,
 }
 
@@ -182,14 +187,13 @@ impl KvCfg {
             user_bytes: range("user_bytes", raw.user_bytes, d.user_bytes, 1024, 1 << 30)?,
             max_keys: range("max_keys", raw.max_keys, d.max_keys, 1, 1_000_000)?,
             keep_days: range("keep_days", raw.keep_days, d.keep_days, 1, 3650)?,
-            child_project_write: raw.child_project_write.unwrap_or(d.child_project_write),
         })
     }
 
     fn quota(&self, scope: Scope) -> Quota {
         Quota {
             bytes: match scope {
-                Scope::Project | Scope::Tree => self.project_bytes,
+                Scope::Pasture | Scope::Tree => self.project_bytes,
                 Scope::User => self.user_bytes,
                 _ => self.self_bytes,
             },
@@ -204,7 +208,9 @@ pub enum Scope {
     #[default]
     #[serde(rename = "self")]
     Own,
-    Project,
+    /// `project` is the name of older versions; it means the same.
+    #[serde(alias = "project")]
+    Pasture,
     Parent,
     Tree,
     User,
@@ -214,7 +220,7 @@ impl Scope {
     pub fn name(self) -> &'static str {
         match self {
             Scope::Own => "self",
-            Scope::Project => "project",
+            Scope::Pasture => "pasture",
             Scope::Parent => "parent",
             Scope::Tree => "tree",
             Scope::User => "user",
@@ -222,7 +228,7 @@ impl Scope {
     }
     /// Entries that another sandbox can write.
     pub fn shared(self) -> bool {
-        matches!(self, Scope::Project | Scope::Tree | Scope::User)
+        matches!(self, Scope::Pasture | Scope::Tree | Scope::User)
     }
 }
 
@@ -231,12 +237,12 @@ impl std::str::FromStr for Scope {
     fn from_str(s: &str) -> Result<Self, String> {
         match s {
             "self" => Ok(Scope::Own),
-            "project" => Ok(Scope::Project),
+            "pasture" | "project" => Ok(Scope::Pasture),
             "parent" => Ok(Scope::Parent),
             "tree" => Ok(Scope::Tree),
             "user" => Ok(Scope::User),
             _ => Err(format!(
-                "unknown scope '{s}': use self, project, parent, tree or user"
+                "unknown scope '{s}': use self, pasture, parent, tree or user"
             )),
         }
     }
@@ -248,6 +254,9 @@ pub struct Identity {
     pub sandbox: String,
     pub harness: String,
     pub project: PathBuf,
+    /// The pasture this sandbox joined (`--pasture NAME`). None: it is a
+    /// pasture of its own.
+    pub pasture: Option<String>,
     /// The sandbox that started this one (`spawn`). None: the user did.
     pub parent: Option<String>,
     /// The sandboxes above this one, the root first and the parent last.
@@ -413,7 +422,8 @@ pub struct Service {
     cfg: KvCfg,
     approver: Arc<dyn Approver>,
     wait: Duration,
-    path: PathBuf,
+    /// The folder of the kv files (shard.rs).
+    root: PathBuf,
     user_granted: AtomicBool,
     /// One user-scope question at a time; the others wait for its answer.
     asking: Mutex<()>,
@@ -428,37 +438,43 @@ impl Service {
         approver: Arc<dyn Approver>,
         wait: Duration,
     ) -> Self {
-        let path = store_path(&env);
+        let root = kv_root(&env);
         Self {
             env,
             id,
             cfg,
             approver,
             wait,
-            path,
+            root,
             user_granted: AtomicBool::new(false),
             asking: Mutex::new(()),
             connections: AtomicUsize::new(0),
         }
     }
 
-    /// Use another store file. Tests use it.
-    pub fn with_store(mut self, path: PathBuf) -> Self {
-        self.path = path;
+    /// Use another kv folder. Tests use it.
+    pub fn with_root(mut self, root: PathBuf) -> Self {
+        self.root = root;
         self
+    }
+
+    fn registry(&self) -> Result<Store> {
+        Store::open(&shard::registry(&self.root))
     }
 
     pub fn identity(&self) -> &Identity {
         &self.id
     }
 
-    fn ns(&self, scope: Scope) -> Option<String> {
+    fn ns(&self, scope: Scope) -> Option<Ns> {
         Some(match scope {
-            Scope::Own => store::ns_self(&self.id.sandbox),
-            Scope::Project => store::ns_project(&self.id.project),
-            Scope::Parent => store::ns_self(self.id.parent.as_deref()?),
-            Scope::Tree => store::ns_tree(self.id.tree.as_deref()?),
-            Scope::User => store::NS_USER.to_string(),
+            Scope::Own => Ns::Own(self.id.sandbox.clone()),
+            // A spawned sandbox has no pasture: it shares through `tree`.
+            Scope::Pasture if self.id.is_child() => return None,
+            Scope::Pasture => pasture_ns(&self.id),
+            Scope::Parent => Ns::Own(self.id.parent.clone()?),
+            Scope::Tree => Ns::Tree(self.id.tree.clone()?),
+            Scope::User => Ns::User,
         })
     }
 
@@ -542,8 +558,9 @@ impl Service {
             Some(Answer::Session) => {
                 self.user_granted.store(true, Ordering::SeqCst);
                 // The children of this sandbox inherit it.
-                if let Err(e) =
-                    Store::open(&self.path).and_then(|s| s.grant(&self.id.sandbox, USER_CAPABILITY))
+                if let Err(e) = self
+                    .registry()
+                    .and_then(|s| s.grant(&self.id.sandbox, USER_CAPABILITY))
                 {
                     log::warn!("cannot record the user scope grant: {e:#}");
                 }
@@ -576,7 +593,7 @@ impl Service {
         if self.id.chain.is_empty() {
             return false;
         }
-        let Ok(st) = Store::open(&self.path) else {
+        let Ok(st) = self.registry() else {
             return false;
         };
         self.id
@@ -585,23 +602,23 @@ impl Service {
             .any(|a| st.granted(a, USER_CAPABILITY).unwrap_or(false))
     }
 
-    /// Whether this sandbox may write the project scope.
-    fn project_writable(&self) -> bool {
-        !self.id.is_child() || self.cfg.child_project_write
-    }
-
     fn info(&self) -> serde_json::Value {
         serde_json::json!({
             "protocol": PROTOCOL,
             "sandbox": self.id.sandbox,
             "harness": self.id.harness,
             "project": self.id.project,
+            "pasture": self.id.pasture,
             "parent": self.id.parent,
             "started_by": self.id.chain,
             "tree_root": self.id.tree,
             "scopes": {
                 "self": "read-write; this sandbox only",
-                "project": if self.project_writable() { "read-write; shared with every sandbox of this project; untrusted" } else { "read-only for a sandbox that another one started ([kv] child_project_write); shared with every sandbox of this project; untrusted" },
+                "pasture": match (&self.id.pasture, self.id.is_child()) {
+                    (_, true) => "none: a sandbox that another one started shares through the tree scope".to_string(),
+                    (Some(n), false) => format!("read-write; shared with the members of the pasture '{n}' of this project; untrusted; 'project' is another name for it"),
+                    (None, false) => "read-write; this sandbox only, because it was started without --pasture; 'project' is another name for it".to_string(),
+                },
                 "parent": if self.id.parent.is_some() { "read-only; the self scope of the sandbox that started this one" } else { "none: no sandbox started this one" },
                 "tree": match &self.id.tree {
                     Some(r) if r == &self.id.sandbox => "read-write; shared with every sandbox that this one starts, and their children; untrusted".to_string(),
@@ -619,7 +636,7 @@ impl Service {
                 "max_key_bytes": MAX_KEY,
                 "max_value_bytes": self.cfg.max_value,
                 "self_bytes": self.cfg.self_bytes,
-                "project_bytes": self.cfg.project_bytes,
+                "pasture_bytes": self.cfg.project_bytes,
                 "tree_bytes": self.cfg.project_bytes,
                 "user_bytes": self.cfg.user_bytes,
                 "max_keys_per_scope": self.cfg.max_keys,
@@ -690,21 +707,15 @@ impl Service {
         let Some(ns) = self.ns(scope) else {
             return Response::new(
                 Status::Disabled,
-                if scope == Scope::Tree {
-                    "this sandbox has no tree scope: only a sandbox that can start other agents (paddock-host spawn), and the sandboxes it starts, have one"
-                } else {
-                    "this sandbox has no parent scope: only a sandbox that another sandbox started has one"
+                match scope {
+                    Scope::Tree => "this sandbox has no tree scope: only a sandbox that can start other agents (paddock-host spawn), and the sandboxes it starts, have one",
+                    Scope::Pasture => "a sandbox that another sandbox started has no pasture scope: use the tree scope, and the sandbox that started you decides what the pasture keeps",
+                    _ => "this sandbox has no parent scope: only a sandbox that another sandbox started has one",
                 },
             );
         };
         if write && scope == Scope::Parent {
             return Response::new(Status::Denied, "the parent scope is read-only");
-        }
-        if write && scope == Scope::Project && !self.project_writable() {
-            return Response::new(
-                Status::Denied,
-                "a sandbox that another sandbox started cannot write the project scope: write to the tree scope, and the sandbox that started you decides what the project keeps ([kv] child_project_write in the user configuration)",
-            );
         }
         // Check the whole request before the user is asked anything.
         if let Err(e) = self.check(req) {
@@ -715,14 +726,23 @@ impl Service {
                 return r;
             }
         }
-        let mut st = match Store::open(&self.path) {
+        // A read of a namespace without a file finds nothing, and leaves no
+        // file behind. A watch waits for the first write, so it opens it.
+        let opened = ns.file(&self.root).and_then(|f| {
+            if !write && req.op != "watch" && !f.exists() {
+                Store::empty()
+            } else {
+                Store::open(&f)
+            }
+        });
+        let mut st = match opened {
             Ok(s) => s,
             Err(e) => return Response::new(Status::Failed, format!("{e:#}")),
         };
         // The tree ends with its root. Its data stays for review, read-only.
         if write && scope == Scope::Tree {
             let root = self.id.tree.as_deref().unwrap_or_default();
-            match st.ended(root) {
+            match self.registry().and_then(|r| r.ended(root)) {
                 Ok(Some(false)) => {}
                 Ok(_) => {
                     return Response::new(
@@ -735,7 +755,7 @@ impl Service {
                 Err(e) => return Response::new(Status::Failed, format!("{e:#}")),
             }
         }
-        let r = self.run(&mut st, req, scope, &ns, conn);
+        let r = self.run(&mut st, req, scope, &ns.key(), conn);
         r.unwrap_or_else(|e| Response::new(Status::Failed, format!("{e:#}")))
     }
 
@@ -1007,7 +1027,7 @@ impl Service {
             return Ok(Response::new(Status::NotFound, format!("no lease {key:?}")));
         };
         if e.writer != self.id.sandbox {
-            let above = st.ancestors(&e.writer)?;
+            let above = self.registry()?.ancestors(&e.writer)?;
             if !force || !above.contains(&self.id.sandbox) {
                 return Ok(Response {
                     status: Status::Denied,
@@ -1155,16 +1175,30 @@ fn request_id() -> String {
     format!("r-{}-{}", crate::state::now(), &h[..8])
 }
 
+/// The pasture namespace of a sandbox: the pasture it joined, or its own.
+pub fn pasture_ns(id: &Identity) -> Ns {
+    match &id.pasture {
+        Some(name) => Ns::Pasture {
+            project: id.project.clone(),
+            name: name.clone(),
+        },
+        None => Ns::Solo {
+            project: id.project.clone(),
+            sandbox: id.sandbox.clone(),
+        },
+    }
+}
+
 /// A running service. `finish` records the end of the run in the store.
 pub struct Served {
-    path: PathBuf,
+    root: PathBuf,
     sandbox: String,
 }
 
 impl Served {
     pub fn finish(self) {
-        if let Err(e) =
-            Store::open(&self.path).and_then(|s| s.finish(&self.sandbox, crate::state::now()))
+        if let Err(e) = Store::open(&shard::registry(&self.root))
+            .and_then(|s| s.finish(&self.sandbox, crate::state::now()))
         {
             log::debug!(
                 "cannot record the end of {} in the kv store: {e:#}",
@@ -1176,12 +1210,14 @@ impl Served {
 
 /// Serve requests on `socket` until the process exits.
 pub fn serve(socket: &Path, svc: Service) -> Result<Served> {
-    let st = Store::open(&svc.path)?;
+    shard::check_id(&svc.id.sandbox)?;
+    let st = svc.registry()?;
     st.register(
         &svc.id.sandbox,
         &svc.id.harness,
         &svc.id.project,
         svc.id.parent.as_deref(),
+        svc.id.pasture.as_deref(),
         crate::state::now(),
     )?;
     drop(st);
@@ -1192,7 +1228,7 @@ pub fn serve(socket: &Path, svc: Service) -> Result<Served> {
     let listener = UnixListener::bind(socket)
         .with_context(|| format!("cannot listen on {}", socket.display()))?;
     let served = Served {
-        path: svc.path.clone(),
+        root: svc.root.clone(),
         sandbox: svc.id.sandbox.clone(),
     };
     let svc = Arc::new(svc);
@@ -1226,6 +1262,7 @@ pub fn start(
     env: &HostEnv,
     spec: &mut crate::spec::SandboxSpec,
     project: PathBuf,
+    pasture: Option<String>,
     approver: Arc<dyn Approver>,
     lineage: Lineage,
 ) -> Option<Served> {
@@ -1247,6 +1284,7 @@ pub fn start(
         sandbox: spec.id.clone(),
         harness: spec.harness.clone(),
         project,
+        pasture,
         parent: lineage.parent,
         chain: lineage.chain,
     };
@@ -1264,54 +1302,149 @@ pub fn start(
     }
 }
 
-/// What `paddock gc` can remove from the store.
+/// What `paddock gc` can remove from paddock kv.
 #[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
 pub struct GcPlan {
-    /// Finished runs whose `self` data, or whose `tree` scope as a root, is
-    /// older than `keep_days`.
+    /// Finished runs whose files (`self` and their own pasture, or the
+    /// `tree` scope of a root) are older than `keep_days`.
     pub stale: Vec<store::Stale>,
     pub expired_entries: u64,
     pub expired_bytes: u64,
+    /// The store of older paddock versions, when nothing changed it for
+    /// `keep_days`: its size.
+    pub legacy_bytes: Option<u64>,
+}
+
+fn mtime(path: &Path) -> u64 {
+    std::fs::metadata(path)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Every store file except the registry and the old store.
+fn shard_files(root: &Path) -> Vec<PathBuf> {
+    let mut out = vec![root.join("user.db")];
+    for dir in ["sandbox", "tree"] {
+        out.extend(
+            shard::ids_in(root, dir)
+                .into_iter()
+                .map(|id| root.join(dir).join(format!("{id}.db"))),
+        );
+    }
+    for p in std::fs::read_dir(root.join("pasture"))
+        .into_iter()
+        .flatten()
+        .flatten()
+    {
+        for f in std::fs::read_dir(p.path()).into_iter().flatten().flatten() {
+            if f.path().extension().is_some_and(|e| e == "db") {
+                out.push(f.path());
+            }
+        }
+    }
+    out.retain(|p| p.is_file());
+    out
 }
 
 pub fn gc_plan(env: &HostEnv, running: &[String], now: u64) -> Result<GcPlan> {
-    let path = store_path(env);
-    if !path.exists() {
+    let root = kv_root(env);
+    if !root.is_dir() {
         return Ok(GcPlan::default());
     }
     let cfg = KvCfg::load(env)?;
-    let st = Store::open(&path)?;
     let cutoff = now.saturating_sub(cfg.keep_days * 24 * 3600);
-    let (n, b) = st.expired(now)?;
+    let reg_file = shard::registry(&root);
+    let reg = if reg_file.is_file() {
+        Some(Store::open(&reg_file)?)
+    } else {
+        None
+    };
+    // A running child reads its parent and writes the tree of its root, so
+    // the sandboxes above a running one stay too.
+    let mut keep: Vec<String> = running.to_vec();
+    if let Some(r) = &reg {
+        for id in running {
+            keep.extend(r.ancestors(id)?);
+        }
+    }
+    let mut ids = shard::ids_in(&root, "sandbox");
+    ids.extend(shard::ids_in(&root, "tree"));
+    ids.sort();
+    ids.dedup();
+    let mut stale = Vec::new();
+    for id in ids.into_iter().filter(|i| !keep.contains(i)) {
+        let files = [
+            root.join("sandbox").join(format!("{id}.db")),
+            root.join("tree").join(format!("{id}.db")),
+        ];
+        let mut last = files.iter().map(|f| mtime(f)).max().unwrap_or(0);
+        if let Some((started, ended)) = reg.as_ref().map(|r| r.times(&id)).transpose()?.flatten() {
+            last = last.max(started).max(ended.unwrap_or(0));
+        }
+        if last >= cutoff {
+            continue;
+        }
+        let (mut entries, mut bytes) = (0, 0);
+        for f in files.iter().filter(|f| f.is_file()) {
+            entries += Store::open(f)?.totals()?.0;
+            bytes += shard::file_bytes(f);
+        }
+        stale.push(store::Stale {
+            sandbox: id,
+            entries,
+            bytes,
+            last,
+        });
+    }
+    let (mut expired_entries, mut expired_bytes) = (0, 0);
+    for f in shard_files(&root) {
+        let (n, b) = Store::open(&f)?.expired(now)?;
+        expired_entries += n;
+        expired_bytes += b;
+    }
+    let legacy = shard::legacy(&root);
+    let legacy_bytes =
+        (legacy.is_file() && mtime(&legacy) < cutoff).then(|| shard::file_bytes(&legacy));
     Ok(GcPlan {
-        stale: st.stale(cutoff, running)?,
-        expired_entries: n,
-        expired_bytes: b,
+        stale,
+        expired_entries,
+        expired_bytes,
+        legacy_bytes,
     })
 }
 
-/// The items of `paddock gc`: one for the `self` data of finished runs and
-/// expired keys. It is paddock's own data, so `--yes` alone removes it.
+/// The items of `paddock gc`: one for the files of finished runs, expired
+/// keys and the old store. It is paddock's own data, so `--yes` alone
+/// removes it.
 pub fn gc_items(env: &HostEnv, now: u64) -> Result<Vec<crate::storage::Item>> {
     let running: Vec<String> = crate::state::Running::list(env)
         .into_iter()
         .map(|r| r.id)
         .collect();
     let plan = gc_plan(env, &running, now)?;
-    if plan.stale.is_empty() && plan.expired_entries == 0 {
+    if plan.stale.is_empty() && plan.expired_entries == 0 && plan.legacy_bytes.is_none() {
         return Ok(Vec::new());
     }
     let days = KvCfg::load(env)?.keep_days;
     let entries: u64 = plan.stale.iter().map(|s| s.entries).sum::<u64>() + plan.expired_entries;
+    let mut what = format!(
+        "paddock kv: {entries} keys of {} finished runs and expired keys",
+        plan.stale.len()
+    );
+    if plan.legacy_bytes.is_some() {
+        what.push_str(", and the store of older paddock versions");
+    }
     Ok(vec![crate::storage::Item {
-        what: format!(
-            "paddock kv: {entries} keys of {} finished runs and expired keys",
-            plan.stale.len()
-        ),
+        what,
         tier: crate::storage::Tier::Auto,
-        bytes: plan.stale.iter().map(|s| s.bytes).sum::<u64>() + plan.expired_bytes,
+        bytes: plan.stale.iter().map(|s| s.bytes).sum::<u64>()
+            + plan.expired_bytes
+            + plan.legacy_bytes.unwrap_or(0),
         reason: format!(
-            "the self scope of runs, and the tree scope of spawn trees, that ended more than {days} days ago ([kv] keep_days), and keys whose time to live passed"
+            "the self scope and the own pasture of runs, and the tree scope of spawn trees, that ended more than {days} days ago ([kv] keep_days), keys whose time to live passed, and the project scope of older paddock versions when nothing changed it for {days} days"
         ),
         warning: None,
         needs: vec![],
@@ -1327,16 +1460,31 @@ pub fn gc_apply(env: &HostEnv, sandboxes: &[String], now: u64) -> Result<u64> {
         .into_iter()
         .map(|r| r.id)
         .collect();
+    let root = kv_root(env);
     let cfg = KvCfg::load(env)?;
-    let mut st = Store::open(&store_path(env))?;
-    let ids: Vec<String> = sandboxes
-        .iter()
-        .filter(|s| !running.contains(s))
-        .cloned()
-        .collect();
-    let mut n = st.remove_sandboxes(&ids)?;
-    n += st.purge_expired(now)?;
-    st.forget_ended(now.saturating_sub(cfg.keep_days * 24 * 3600))?;
+    let cutoff = now.saturating_sub(cfg.keep_days * 24 * 3600);
+    let mut n = 0;
+    let mut reg = Store::open(&shard::registry(&root))?;
+    for id in sandboxes.iter().filter(|s| !running.contains(s)) {
+        shard::check_id(id)?;
+        for dir in ["sandbox", "tree"] {
+            let f = root.join(dir).join(format!("{id}.db"));
+            if f.is_file() {
+                n += Store::open(&f)?.totals()?.0;
+                shard::remove_file(&f)?;
+            }
+        }
+        reg.forget_sandbox(id)?;
+    }
+    for f in shard_files(&root) {
+        n += Store::open(&f)?.purge_expired(now)?;
+    }
+    let legacy = shard::legacy(&root);
+    if legacy.is_file() && mtime(&legacy) < cutoff {
+        n += Store::open(&legacy)?.totals()?.0;
+        shard::remove_file(&legacy)?;
+    }
+    reg.forget_ended(cutoff, &running)?;
     Ok(n)
 }
 
@@ -1349,24 +1497,33 @@ pub fn doctor_lines(env: &HostEnv) -> Vec<String> {
     if !cfg.enabled {
         return vec!["  off      paddock kv: [kv] enabled = false".into()];
     }
-    let path = store_path(env);
+    let root = kv_root(env);
     let user = match cfg.user {
         Mode::Ask => "asks at first use",
         Mode::Allow => "allowed",
         Mode::Deny => "off",
     };
-    let state = if path.exists() {
-        match Store::open(&path) {
-            Ok(_) => format!("store {}", path.display()),
+    let reg = shard::registry(&root);
+    let state = if reg.is_file() {
+        match Store::open(&reg) {
+            Ok(_) => format!("files in {}", root.display()),
             Err(e) => return vec![format!("  error    paddock kv: {e:#}")],
         }
     } else {
-        "the store is created at the first start".to_string()
+        "the files are created at the first start".to_string()
     };
-    vec![format!(
+    let mut out = vec![format!(
         "  on       paddock kv: {state}; user scope {user}; self data kept {} days after a run",
         cfg.keep_days
-    )]
+    )];
+    if shard::legacy(&root).is_file() {
+        out.push(format!(
+            "  note     paddock kv: {} holds the project scope of an older paddock; sandboxes no longer read it. `paddock kv list --legacy` shows it, and `paddock gc` removes it {} days after its last change",
+            shard::legacy(&root).display(),
+            cfg.keep_days
+        ));
+    }
+    out
 }
 
 #[cfg(test)]
