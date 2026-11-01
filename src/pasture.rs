@@ -38,6 +38,23 @@ struct RawPasture {
     members: Vec<String>,
 }
 
+/// Where the shared folder of a pasture appears in each member.
+pub const MOUNT: &str = "/pasture";
+
+/// The shared folder of a pasture on the host:
+/// `~/.local/share/paddock/pastures/<project hash>/<name>/ground`.
+pub fn ground(env: &HostEnv, project: &std::path::Path, name: &str) -> std::path::PathBuf {
+    folder(env, project, name).join("ground")
+}
+
+/// Everything paddock keeps for one pasture outside paddock kv.
+pub fn folder(env: &HostEnv, project: &std::path::Path, name: &str) -> std::path::PathBuf {
+    env.paddock_data()
+        .join("pastures")
+        .join(crate::kv::shard::project_hash(project))
+        .join(name)
+}
+
 /// Whether `name` can name a configured pasture: lowercase letters, digits
 /// and `-`, starting with a letter, and not `solo-`.
 pub fn check_name(name: &str) -> Result<()> {

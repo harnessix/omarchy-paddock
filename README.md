@@ -602,6 +602,13 @@ paddock codex --pasture review
 
 A pasture belongs to one project: `review` in another project is another pasture. A project `paddock.toml` cannot define pastures. A sandbox that you start without `--pasture` is a pasture of its own: nobody else reads what it writes there, and its data goes with its run. So two agents that you start in the same folder do not share state unless you say so.
 
+The members of a pasture also share a folder, `/pasture` in each sandbox (`$PADDOCK_PASTURE` names it; the srt backend keeps it at its host path). It lives in `~/.local/share/paddock/pastures/`, outside the project, so a member can hand a file to another without a commit. `$PADDOCK_PASTURE_NAME` holds the name.
+
+- `paddock pasture list` shows the pastures of the current folder, their running members and their keys.
+- `paddock pasture stop NAME` stops every running member.
+- `paddock pasture remove NAME --yes` deletes the data of a pasture: its paddock kv file and its folder. It refuses while a member runs.
+- `paddock ps` lists the members of one pasture together and names the pasture.
+
 In a spawn tree, the parent writes the tasks into the `tree` scope, each child claims one with a lease and writes its result, and the parent waits for `result:`:
 
 ```sh
