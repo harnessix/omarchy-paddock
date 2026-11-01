@@ -128,6 +128,17 @@ struct RunCredentials {
     gateway: Vec<String>,
     agent: Vec<String>,
     secret_files: Vec<String>,
+    /// Clears the gateway routes when the run ends, which wipes their values.
+    gateway_routes: Option<ClearOnDrop>,
+}
+
+/// Drops the routes of the credential gateway at the end of the run.
+struct ClearOnDrop(std::sync::Arc<crate::credentials::gateway::Gateway>);
+
+impl Drop for ClearOnDrop {
+    fn drop(&mut self) {
+        self.0.clear();
+    }
 }
 
 /// Hand one `deliver` value to the sandbox: an environment variable, or a
@@ -264,10 +275,7 @@ fn setup_credentials(
                 &name,
                 &format!("gateway ready, stand-in mark {mark}"),
             );
-            routes.insert(
-                name.clone(),
-                gateway::Route::new(c, value.as_str().to_string()),
-            );
+            routes.insert(name.clone(), gateway::Route::new(c, value));
             out.gateway.push(name);
         } else {
             crate::credentials::audit(env, &built.spec, &name, "delivered");
@@ -323,7 +331,7 @@ fn setup_credentials(
                 );
             }),
         );
-        g.serve(&sock)?;
+        out.gateway_routes = Some(ClearOnDrop(g.serve(&sock)?));
         built.spec.add_mount(crate::spec::Mount::bind(
             &sock,
             gateway::SOCKET_IN_SANDBOX,

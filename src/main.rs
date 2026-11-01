@@ -2291,6 +2291,8 @@ fn real_main() -> Result<i32> {
                 if r.used > 0 {
                     if r.via == "agent" {
                         println!("{:<24} {} ssh signatures allowed", "", r.used);
+                    } else if r.deliver_as == Some("file") {
+                        println!("{:<24} {} reads of the secret file", "", r.used);
                     } else {
                         println!("{:<24} {} requests through the gateway", "", r.used);
                     }

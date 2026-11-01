@@ -248,7 +248,7 @@ fn git_clone_goes_through_the_gateway_and_the_token_stays_on_the_host() {
         Ok(Box::new(rustls::StreamOwned::new(conn, tcp)))
     });
     let mut routes = BTreeMap::new();
-    routes.insert("github_git".to_string(), Route::new(&c, SECRET.to_string()));
+    routes.insert("github_git".to_string(), Route::new(&c, SECRET.into()));
     let revoked = root.join("revoked");
     std::fs::write(&revoked, "").unwrap();
     let log = Arc::new(Mutex::new(Vec::<String>::new()));

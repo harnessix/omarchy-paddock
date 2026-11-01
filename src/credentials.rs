@@ -995,7 +995,7 @@ confirm = "each"
         assert_eq!(c.base_url_env, None);
         let r = gateway::Route::new(c, "ghp_tok".into());
         // base64("x-access-token:ghp_tok")
-        assert_eq!(r.value, "eC1hY2Nlc3MtdG9rZW46Z2hwX3Rvaw==");
+        assert_eq!(r.value.as_str(), "eC1hY2Nlc3MtdG9rZW46Z2hwX3Rvaw==");
         assert_eq!(r.prefix, "Basic ");
         assert!(parse(
             "[credentials.g]\nvia = \"gateway\"\npreset = \"github-git\"\nbasic_user = \"a:b\"\n"

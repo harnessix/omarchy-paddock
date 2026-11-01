@@ -620,6 +620,22 @@ command = ["secret-tool", "lookup", "service", "mydb"]
 harnesses = ["claude"]              # optional: only these harnesses
 ```
 
+With `as = "file"`, paddock sets no variable. The sandbox reads the value in the file `/dev/paddock/secret/NAME` (on srt: `$PADDOCK_DEVICES/secret/NAME`), and only that sandbox sees it. A read returns the value as it is, with no newline added. Each open counts as one use in the audit log and in `paddock credentials list`. `paddock credentials revoke` makes the file fail at once. `/dev/paddock/.catalog` lists the file by name. The child processes of the harness do not inherit the value, and it is not in their `/proc/PID/environ`. Give it to one command only, or to a tool that reads a token file:
+
+```toml
+[credentials.GH_TOKEN]
+via = "deliver"
+as = "file"                         # default: "env"
+from = "command"
+command = ["gh", "auth", "token"]
+```
+
+```sh
+GH_TOKEN=$(cat /dev/paddock/secret/GH_TOKEN) gh pr list
+```
+
+The file needs `/dev/paddock` (FUSE on the host). Without it, the sandbox starts without the credential and paddock says so.
+
 `via = "agent"` with `keys` gives the sandbox your ssh keys through your ssh agent. The private keys stay in the ssh agent on your computer (`SSH_AUTH_SOCK` where paddock started). The sandbox gets its own agent socket, and `SSH_AUTH_SOCK` in the sandbox points at it. paddock answers on that socket: a list of keys shows only the keys that you name, and a signature passes only for them. Every other request (add or remove keys, lock, unlock, extensions) fails and never reaches your agent. A message over 256 KiB, or a malformed one, fails too.
 
 ```toml
@@ -639,9 +655,10 @@ For every way:
 - paddock reads the value only after both answers. A command runs on the host. paddock never writes the value to disk.
 - A registered credential never passes in any other way: not with the inherited environment, not as a harness login variable, not through `[env] pass`. To keep a harness login key such as `ANTHROPIC_API_KEY` on the host, register it with its preset.
 - A sandbox that another one started gets no credentials. A project `paddock.toml` cannot register one.
-- `paddock credentials revoke ID [NAME]` stops a sandbox from using a gateway credential or the ssh agent channel at once; the sandbox keeps running. The bar panel has a button for it. A delivered value cannot be revoked: stop the sandbox.
+- `paddock credentials revoke ID [NAME]` stops a sandbox from using a gateway credential, the ssh agent channel or a secret file at once. The sandbox keeps running. The bar panel has a button for it. A value delivered as a variable cannot be revoked: stop the sandbox.
+- The paddock process locks delivered and gateway values in RAM, so they never go to swap. It overwrites them with zeros after a revoke and when the sandbox ends.
 - The bar panel marks a sandbox that holds a delivered value, and names the gateway credentials that it uses.
-- `paddock credentials list` shows the registered credentials, whether their source is there, how often each was delivered, how many requests went through the gateway, and how many ssh signatures were allowed. The audit log (`paddock log`) records each question, answer, request (method, host, path without its query) and revocation by name, never a value.
+- `paddock credentials list` shows the registered credentials, whether their source is there, how often each was delivered, how many requests went through the gateway, how many ssh signatures were allowed, and how often each secret file was opened. The audit log (`paddock log`) records each question, answer, request (method, host, path without its query) and revocation by name, never a value.
 
 ## Privacy defaults
 

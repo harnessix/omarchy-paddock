@@ -143,6 +143,8 @@ exec 3<>/dev/paddock/echo; printf 'hello' >&3; cat <&3; exec 3<&-
 
 A device that the catalog shows as `off` cannot be used. Do not try to turn it on: only the user can, on the host. `paddock-host device NAME [REQUEST]` sends one request and exits with a clear code.
 
+A credential that the user gave as a file is in `/dev/paddock/secret/NAME` (`.catalog` lists it). Read it with a plain `cat`, for one command only: `GH_TOKEN=$(cat /dev/paddock/secret/GH_TOKEN) gh pr list`. Never copy it into files or logs. Each open counts as a use, and EACCES means that the user revoked it.
+
 `/dev/paddock/gw` is the gateway: `paddock-host` sends every host request through it, and you never need to use it directly. A request that waits for the user stays one request: if you send the same request again, it joins the one that waits, and the user sees one card. So after exit code 75, send the identical request again, not a changed one.
 
 ## Waiting
