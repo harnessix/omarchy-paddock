@@ -849,6 +849,29 @@ codex  = { quota = "weekly=2%", hard = true }
 - A member that used up its ration answers no bridge questions. The asker gets a refusal and exit code 3.
 - Each key of `rations` names a member of `members`. A wrong key, quota or duration stops the start with an error that names the pasture.
 
+A pasture can also have a workbench: one terminal that every member and you can use, and that belongs to no member. A command in the terminal of a member runs in that member's sandbox and can read its login. The workbench is a sandbox of its own: a shell with no login, no harness, no MCP servers, an empty home, the clean environment and no network. It sees the project, `/pasture` and the shared ports, and it can share ports too. It runs one tmux session. Turn it on for a pasture:
+
+```toml
+[pastures.review]
+members = ["claude", "codex"]
+workbench = true
+```
+
+```sh
+paddock pasture workbench review --start     # start it
+paddock pasture workbench review --attach    # attach your terminal
+paddock pasture workbench review --stop      # stop it
+paddock-host pasture workbench               # in a member: join it
+```
+
+- Every member and you can type into the workbench, and each one sees what the others run there. A member can read the output of your commands, and it can run commands that you then see. Type no secret into it.
+- The first member that runs `paddock-host pasture workbench` starts it. In a terminal, the command attaches to it. Without a terminal, or with `--print`, it prints the tmux command. A member needs `tmux` in its sandbox to attach. When it has none, the output says so.
+- The workbench stops with `--stop`, when you set `workbench = false`, and when the last member ends. When you start it before any member, it waits for them.
+- The tmux socket lives in a folder of the pasture on the host, never in a shared `/tmp`. Each member sees this folder read-only at `/run/paddock/workbench` from its start, so a member that started earlier can join later. The workbench itself can write it. `$PADDOCK_WORKBENCH` names the folder (the srt backend keeps it at its host path).
+- The workbench uses the backend of your configuration and the project folder of the pasture, not the worktree of a member. It gets no extra mounts, ports or host access from the project `paddock.toml`. Its home is emptied at each start.
+- The audit log records each start, stop and join, and who did it. It never records what the terminal shows.
+- `paddock pasture list` and `paddock-host pasture members` show whether the workbench runs.
+
 The bar panel shows the shared data too. A "Shared data" row opens a list of the pastures, your `user` scope and the data of older versions, with their members and the number of keys and locks. A pasture opens to its keys, grouped by the part before the first `:`, with locks first: who wrote each key, when, and its size. A key opens to its value, shown as plain text. From there you can copy the value, delete the key or free a lock; each delete asks twice. The panel reads a value only when you open its key, and reads paddock kv only while it is open. Bind a key to `omarchy-shell harnessix.paddock.kv open` to open the shared data directly.
 
 In a spawn tree, the parent writes the tasks into the `tree` scope, each child claims one with a lease and writes its result, and the parent waits for `result:`:
