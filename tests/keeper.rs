@@ -62,7 +62,7 @@ fn can_run() -> bool {
             .output()
             .is_ok_and(|o| o.status.success())
     };
-    ok("bwrap", &["--unshare-user", "--ro-bind", "/", "/", "true"])
+    common::bwrap_works()
         && Command::new("pasta").arg("--version").output().is_ok()
         && ok("python3", &["-c", "pass"])
 }

@@ -11,20 +11,7 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 fn can_run() -> bool {
-    let bwrap = Command::new("bwrap")
-        .args(["--unshare-user", "--ro-bind", "/", "/", "true"])
-        .status()
-        .is_ok_and(|s| s.success());
-    let systemd = Command::new("systemctl")
-        .args(["--user", "is-system-running"])
-        .output()
-        .is_ok_and(|o| {
-            matches!(
-                String::from_utf8_lossy(&o.stdout).trim(),
-                "running" | "degraded"
-            )
-        });
-    bwrap && systemd && std::env::var("DBUS_SESSION_BUS_ADDRESS").is_ok()
+    common::bwrap_works() && common::systemd_user()
 }
 
 struct World {

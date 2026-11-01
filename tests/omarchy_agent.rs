@@ -16,14 +16,6 @@ mod common;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
-fn bwrap_works() -> bool {
-    Command::new("bwrap")
-        .args(["--unshare-user", "--ro-bind", "/", "/", "true"])
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
-}
-
 const USER_CONFIG: &str =
     "# my mise settings\n[settings]\nexperimental = true # keep this\n\n[tools]\nnode = \"24\"";
 
@@ -182,7 +174,7 @@ fn ok(o: &Output) -> String {
 
 #[test]
 fn omarchy_agent_starts_run_in_a_sandbox_and_typed_commands_do_not() {
-    if !bwrap_works() {
+    if !common::bwrap_works() {
         eprintln!("skipped: bwrap cannot create a user namespace here");
         return;
     }
@@ -400,7 +392,7 @@ fn the_real_omarchy_agent_builds_one_command_for_both_paths() {
 
 #[test]
 fn the_shell_form_a_host_only_agent_and_a_read_only_install() {
-    if !bwrap_works() {
+    if !common::bwrap_works() {
         eprintln!("skipped: bwrap cannot create a user namespace here");
         return;
     }
@@ -446,7 +438,7 @@ fn the_shell_form_a_host_only_agent_and_a_read_only_install() {
 
 #[test]
 fn history_reaches_the_host_and_other_projects_stay_hidden() {
-    if !bwrap_works() {
+    if !common::bwrap_works() {
         eprintln!("skipped: bwrap cannot create a user namespace here");
         return;
     }
@@ -509,7 +501,7 @@ fn history_reaches_the_host_and_other_projects_stay_hidden() {
 
 #[test]
 fn a_normal_run_keeps_its_history_in_the_sandbox() {
-    if !bwrap_works() {
+    if !common::bwrap_works() {
         eprintln!("skipped: bwrap cannot create a user namespace here");
         return;
     }
@@ -533,7 +525,7 @@ fn a_normal_run_keeps_its_history_in_the_sandbox() {
 
 #[test]
 fn a_start_in_the_home_folder_works_in_a_scratch_project() {
-    if !bwrap_works() {
+    if !common::bwrap_works() {
         eprintln!("skipped: bwrap cannot create a user namespace here");
         return;
     }
