@@ -40,6 +40,7 @@ USAGE
   paddock-host notify TITLE [BODY]
   paddock-host git push [REMOTE] [REFSPEC...]   (plain `git push` works too)
   paddock-host gh COMMAND [ARG...]              (plain `gh` works too)
+  paddock-host tea|glab COMMAND [ARG...]        (plain `tea` and `glab` too, when the host has them)
   paddock-host spawn HARNESS --prompt-file FILE [--role ROLE] [--from-head] [--reason TEXT]
   paddock-host status [ID]
   paddock-host wait ID [--timeout SECONDS]
