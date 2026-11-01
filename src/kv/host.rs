@@ -82,6 +82,8 @@ pub struct Member {
     pub sandbox: String,
     pub harness: String,
     pub running: bool,
+    /// Since when it is frozen (`paddock freeze`).
+    pub frozen_since: Option<u64>,
 }
 
 /// The pastures of a project that hold keys or have a running member.
@@ -102,6 +104,7 @@ pub fn pastures(env: &HostEnv, project: &Path) -> Result<Vec<PastureInfo>> {
         sandbox: r.id.clone(),
         harness: r.harness.clone(),
         running: r.ended.is_none() && running.contains(&r.id),
+        frozen_since: crate::freeze::frozen(env, &r.id).map(|(since, _)| since),
     };
     let count = |ns: &Ns| -> Result<(u64, u64, u64)> {
         let Some(st) = open(env, ns)? else {
@@ -351,4 +354,95 @@ fn quota(env: &HostEnv) -> Result<Quota> {
 /// The project of a folder, as paddock names it at a sandbox start.
 pub fn project_of(dir: Option<&Path>) -> Result<PathBuf> {
     crate::build::resolve_project(dir)
+}
+
+/// Everything the bar panel shows of paddock kv, without any value: the
+/// pastures of every project, the `user` scope and the data of older
+/// versions.
+pub fn overview(env: &HostEnv) -> Result<serde_json::Value> {
+    let root = kv_root(env);
+    let now = crate::state::now();
+    let mut projects: Vec<PathBuf> = Vec::new();
+    let reg = shard::registry(&root);
+    if reg.is_file() {
+        projects.extend(
+            Store::open(&reg)?
+                .projects()?
+                .into_iter()
+                .map(PathBuf::from),
+        );
+    }
+    // A named pasture outlives the records of its members: its file names
+    // its project.
+    for dir in std::fs::read_dir(root.join("pasture"))
+        .into_iter()
+        .flatten()
+        .flatten()
+    {
+        for f in std::fs::read_dir(dir.path())
+            .into_iter()
+            .flatten()
+            .flatten()
+        {
+            if f.path().extension().is_some_and(|e| e == "db") {
+                for ns in Store::open(&f.path())?.namespaces()? {
+                    if let Some(p) = pasture_project(&ns) {
+                        projects.push(p);
+                    }
+                }
+            }
+        }
+    }
+    projects.extend(
+        crate::state::Running::list(env)
+            .into_iter()
+            .filter_map(|r| r.kv_project),
+    );
+    projects.sort();
+    projects.dedup();
+    let mut rows = Vec::new();
+    for project in &projects {
+        for p in pastures(env, project)? {
+            let mut v = serde_json::to_value(&p)?;
+            v["project"] = project.display().to_string().into();
+            rows.push(v);
+        }
+    }
+    let user = match open(env, &Ns::User)? {
+        Some(st) => {
+            let (items, _) = st.list(&Ns::User.key(), "", usize::MAX, now)?;
+            serde_json::json!({
+                "keys": items.len(),
+                "leases": items.iter().filter(|m| m.key.starts_with(LEASE_PREFIX)).count(),
+            })
+        }
+        None => serde_json::json!({ "keys": 0, "leases": 0 }),
+    };
+    let mut legacy = Vec::new();
+    let old = shard::legacy(&root);
+    if old.is_file() {
+        let st = Store::open(&old)?;
+        for ns in st.namespaces()? {
+            if let Some(p) = ns.strip_prefix("project:") {
+                let (items, _) = st.list(&ns, "", usize::MAX, now)?;
+                if !items.is_empty() {
+                    legacy.push(serde_json::json!({ "project": p, "keys": items.len() }));
+                }
+            }
+        }
+    }
+    Ok(serde_json::json!({
+        "api_version": "paddock.kv/v1",
+        "pastures": rows,
+        "user": user,
+        "legacy": legacy,
+    }))
+}
+
+/// The project of a pasture namespace: `pasture:<project>:<name>`. A
+/// project path can hold `:`, the name cannot.
+fn pasture_project(ns: &str) -> Option<PathBuf> {
+    let rest = ns.strip_prefix("pasture:")?;
+    let (project, _name) = rest.rsplit_once(':')?;
+    Some(PathBuf::from(project))
 }

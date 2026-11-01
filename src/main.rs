@@ -524,6 +524,13 @@ enum PastureCmd {
 
 #[derive(Subcommand)]
 enum KvCmd {
+    /// The pastures of every project, the user scope and the data of older
+    /// versions: key counts and members, never a value. The bar panel
+    /// reads it.
+    Overview {
+        #[arg(long)]
+        json: bool,
+    },
     /// List keys, with the sandbox that wrote each one.
     List {
         prefix: Option<String>,
@@ -1708,6 +1715,34 @@ fn real_main() -> Result<i32> {
         Cmd::Kv { cmd } => {
             use paddock::kv::host;
             match cmd {
+                KvCmd::Overview { json } => {
+                    let v = host::overview(&env)?;
+                    if json {
+                        println!("{}", serde_json::to_string_pretty(&v)?);
+                        return Ok(0);
+                    }
+                    let rows = v["pastures"].as_array().cloned().unwrap_or_default();
+                    if rows.is_empty() {
+                        println!("No pasture holds keys or has a running member.");
+                    }
+                    for p in &rows {
+                        println!(
+                            "{:<32} {:>5} keys  {}",
+                            p["name"].as_str().unwrap_or_default(),
+                            p["keys"],
+                            p["project"].as_str().unwrap_or_default()
+                        );
+                    }
+                    println!("user scope: {} keys", v["user"]["keys"]);
+                    for l in v["legacy"].as_array().into_iter().flatten() {
+                        println!(
+                            "older paddock: {} keys of {} (paddock kv list --legacy)",
+                            l["keys"],
+                            l["project"].as_str().unwrap_or_default()
+                        );
+                    }
+                    Ok(0)
+                }
                 KvCmd::List {
                     prefix,
                     scope,
