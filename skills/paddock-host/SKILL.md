@@ -109,6 +109,17 @@ Rules that you can rely on:
 - Keep values small. Put diffs, files and logs in a git branch or a file, and store only a reference in `ref`.
 - If several agents change the same key, use `--if-version N`. Exit code 9 means that the key changed: read it again.
 
+## Timers
+
+A timer lives on the host, so it outlasts your context. Use it for any task that can take long, and check it often:
+
+1. When you start a task that may take long, run `paddock-host timer start NAME --budget 2h` (choose a budget that fits the task).
+2. Run `paddock-host timer status` after a compaction, when you resume work, and before you try one more fix for the same bug. If you used most of the time and the bug is still there, stop and report what you tried instead of trying again.
+3. A timer that someone else set (the user, or the agent that started you) is not yours: you cannot stop it. `paddock-host timer extend NAME --by 30m --reason TEXT` asks the user for more time; say why in the reason.
+4. A hard deadline freezes your sandbox when it ends. Save your work and report before that.
+
+Timers in `--scope pasture` or `--scope tree` show the other agents there how long a shared task has run.
+
 ## Devices
 
 The user can turn on host devices. Each device is a file in `/dev/paddock` (on srt: in `$PADDOCK_DEVICES`). Read `/dev/paddock/.catalog` first. One open is one request: open the device read-write, write the request, then read the response.

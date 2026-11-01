@@ -1328,3 +1328,108 @@ fn the_overview_counts_keys_and_never_shows_a_value() {
     assert_eq!(v["legacy"][0]["keys"], 1);
     assert_eq!(v["user"]["keys"], 0);
 }
+
+fn timer_req(action: &str, scope: Scope, name: &str) -> Request {
+    Request {
+        action: Some(action.into()),
+        ..req("timer", scope, name)
+    }
+}
+
+#[test]
+fn a_timer_counts_and_only_its_owner_changes_it() {
+    let w = world();
+    let (a, _) = service(&w, "a", None, KvCfg::default(), None);
+    let (b, asked) = service(&w, "b", None, KvCfg::default(), Some(Answer::Once));
+    let start = Request {
+        budget: Some(3600),
+        ..timer_req("start", Scope::Pasture, "fix")
+    };
+    let r = a.handle(&start, None);
+    assert_eq!(r.status, Status::Done, "{}", r.message);
+    assert_eq!(r.result["owner"], "a");
+    assert_eq!(r.result["budget"], 3600);
+    // A second start of a running timer is refused.
+    assert_eq!(a.handle(&start, None).status, Status::Conflict);
+    // Others in the pasture read it.
+    let s = b.handle(&timer_req("status", Scope::Pasture, "fix"), None);
+    assert_eq!(s.result["name"], "fix");
+    let l = b.handle(&timer_req("list", Scope::Pasture, ""), None);
+    assert_eq!(l.result["timers"].as_array().unwrap().len(), 1);
+    // A plain write cannot touch it.
+    assert_eq!(
+        b.handle(&put(Scope::Pasture, "timer:fix", "{}"), None)
+            .status,
+        Status::Invalid
+    );
+    assert_eq!(
+        b.handle(&req("delete", Scope::Pasture, "timer:fix"), None)
+            .status,
+        Status::Invalid
+    );
+    // Only the owner stops it.
+    assert_eq!(
+        b.handle(&timer_req("stop", Scope::Pasture, "fix"), None)
+            .status,
+        Status::Denied
+    );
+    // The owner extends at once; anyone else asks the user.
+    let ext = |by| Request {
+        by: Some(by),
+        reason: Some("the tests need longer".into()),
+        ..timer_req("extend", Scope::Pasture, "fix")
+    };
+    assert_eq!(a.handle(&ext(600), None).result["budget"], 4200);
+    assert!(asked.asked.lock().unwrap().is_empty());
+    let r = b.handle(&ext(600), None);
+    assert_eq!(r.result["budget"], 4800, "{}", r.message);
+    let card = asked.asked.lock().unwrap();
+    assert_eq!(card.len(), 1);
+    assert_eq!(card[0].capability, "timer");
+    assert_eq!(card[0].reason, "the tests need longer");
+    drop(card);
+    let (c, _) = service(&w, "c", None, KvCfg::default(), Some(Answer::Deny));
+    assert_eq!(c.handle(&ext(600), None).status, Status::Denied);
+    assert_eq!(
+        a.handle(&timer_req("stop", Scope::Pasture, "fix"), None)
+            .result["stopped"],
+        true
+    );
+}
+
+#[test]
+fn the_watch_announces_a_soft_deadline_once_and_enforces_a_hard_one() {
+    let w = world();
+    let (a, _) = service(&w, "a", None, KvCfg::default(), None);
+    for (name, hard) in [("soft", false), ("hard", true)] {
+        let r = a.handle(
+            &Request {
+                budget: Some(1),
+                hard: Some(hard),
+                ..timer_req("start", Scope::Own, name)
+            },
+            None,
+        );
+        assert_eq!(r.status, Status::Done, "{}", r.message);
+    }
+    std::thread::sleep(Duration::from_millis(1100));
+    let id = a.identity().clone();
+    timer_tick(&w.env, &id, &w.root, &KvCfg::default()).unwrap();
+    let get = |n: &str| {
+        let r = a.handle(&req("get", Scope::Own, &format!("timer:{n}")), None);
+        serde_json::from_str::<crate::timer::Timer>(r.result["value"].as_str().unwrap()).unwrap()
+    };
+    assert!(get("soft").announced && !get("soft").enforced);
+    assert!(get("hard").enforced);
+    // The summary for ps and the panel.
+    let sum = crate::timer::read_summary(&w.env, "a");
+    assert_eq!(sum.len(), 2);
+    assert!(sum.iter().all(|s| s.over));
+    // A second look does not announce again.
+    let before = get("soft");
+    timer_tick(&w.env, &id, &w.root, &KvCfg::default()).unwrap();
+    assert_eq!(get("soft"), before);
+    // The audit log names both, once.
+    let log = std::fs::read_to_string(crate::broker::audit_file(&w.env)).unwrap();
+    assert_eq!(log.matches("\"capability\":\"timer\"").count(), 2, "{log}");
+}

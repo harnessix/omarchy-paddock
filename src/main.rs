@@ -298,6 +298,12 @@ enum Cmd {
         #[command(subcommand)]
         cmd: PastureCmd,
     },
+    /// Timers of the running sandboxes: how long a task has run, and how
+    /// long it may.
+    Timer {
+        #[command(subcommand)]
+        cmd: TimerCmd,
+    },
     /// The OAuth logins that paddock keeps outside the sandboxes (Codex).
     Logins {
         #[command(subcommand)]
@@ -503,6 +509,35 @@ impl KvScope {
             }
         })
     }
+}
+
+#[derive(Subcommand)]
+enum TimerCmd {
+    /// The timers of every running sandbox.
+    List {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Give a running sandbox a timer that you own. --hard freezes the
+    /// sandbox when the time is up.
+    Set {
+        id: String,
+        name: String,
+        /// For example 2h, 30m, 1h30m.
+        #[arg(long)]
+        budget: String,
+        #[arg(long)]
+        hard: bool,
+    },
+    /// Add time to a timer of a sandbox's own scope.
+    Extend {
+        id: String,
+        name: String,
+        #[arg(long)]
+        by: String,
+    },
+    /// Stop a timer of a sandbox's own scope.
+    Stop { id: String, name: String },
 }
 
 #[derive(Subcommand)]
@@ -1711,6 +1746,13 @@ fn real_main() -> Result<i32> {
                             o.insert("frozen_since".into(), since.into());
                             o.insert("frozen_reason".into(), reason.into());
                         }
+                        let timers = paddock::timer::read_summary(&env, &r.id);
+                        if let (Some(o), false) = (v.as_object_mut(), timers.is_empty()) {
+                            o.insert(
+                                "timers".into(),
+                                serde_json::to_value(timers).unwrap_or_default(),
+                            );
+                        }
                         v
                     })
                     .collect();
@@ -1825,6 +1867,75 @@ fn real_main() -> Result<i32> {
         } => recover_cmd(&env, &id, paths, all, to.as_deref(), keep),
         Cmd::Discard { id, paths, all } => discard_cmd(&env, &id, paths, all),
         Cmd::Pasture { cmd } => pasture_cmd(&env, cmd),
+        Cmd::Timer { cmd } => {
+            use paddock::timer;
+            let show = |s: &timer::Status| {
+                format!(
+                    "{}: used {} of {}, {}{}",
+                    s.name,
+                    timer::format_duration(s.used),
+                    timer::format_duration(s.budget),
+                    if s.over {
+                        "over".to_string()
+                    } else {
+                        format!("{} left", timer::format_duration(s.left))
+                    },
+                    if s.hard { " (hard)" } else { "" }
+                )
+            };
+            match cmd {
+                TimerCmd::List { json } => {
+                    let all: Vec<(String, Vec<timer::Status>)> = Running::list(&env)
+                        .into_iter()
+                        .map(|r| {
+                            let t = timer::read_summary(&env, &r.id);
+                            (r.id, t)
+                        })
+                        .filter(|(_, t)| !t.is_empty())
+                        .collect();
+                    if json {
+                        let v: Vec<serde_json::Value> = all
+                            .iter()
+                            .map(|(id, t)| serde_json::json!({"sandbox": id, "timers": t}))
+                            .collect();
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(
+                                &serde_json::json!({"api_version": "paddock.timer/v1", "sandboxes": v})
+                            )?
+                        );
+                    } else if all.is_empty() {
+                        println!("No running sandbox has a timer.");
+                    } else {
+                        for (id, ts) in &all {
+                            for t in ts {
+                                println!("{id}  {}", show(t));
+                            }
+                        }
+                    }
+                }
+                TimerCmd::Set {
+                    id,
+                    name,
+                    budget,
+                    hard,
+                } => {
+                    let s =
+                        timer::host_set(&env, &id, &name, timer::parse_duration(&budget)?, hard)?;
+                    println!("{id}  {}", show(&s));
+                }
+                TimerCmd::Extend { id, name, by } => {
+                    let s =
+                        timer::host_change(&env, &id, &name, Some(timer::parse_duration(&by)?))?;
+                    println!("{id}  {}", show(&s));
+                }
+                TimerCmd::Stop { id, name } => {
+                    let s = timer::host_change(&env, &id, &name, None)?;
+                    println!("{id}  {} (stopped)", show(&s));
+                }
+            }
+            Ok(0)
+        }
         Cmd::Logins {
             cmd: LoginsCmd::Refresh { harness, auth },
         } => {
