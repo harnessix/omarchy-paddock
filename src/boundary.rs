@@ -139,6 +139,14 @@ pub fn read(env: &HostEnv, id: &str) -> Vec<Entry> {
     read_at(&file(env, id))
 }
 
+/// Write the denials that the build decided (`SandboxSpec::deny`): one line
+/// each at the start.
+pub fn record_start(env: &HostEnv, spec: &crate::spec::SandboxSpec) {
+    for (kind, target, rule) in &spec.boundary {
+        record(env, &spec.id, kind, target, rule);
+    }
+}
+
 /// The sink of the host proxy: each refused target goes into the log of
 /// sandbox `id`.
 pub fn proxy_sink(env: &HostEnv, id: &str) -> crate::proxy::Boundary {
@@ -154,7 +162,7 @@ pub fn count(env: &HostEnv, id: &str) -> u64 {
 }
 
 /// The denials of one kind and target, for `paddock boundary`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Group {
     pub kind: String,
     pub target: String,
@@ -226,6 +234,60 @@ pub fn to_json(lines: &[Entry]) -> serde_json::Value {
         "count": lines.iter().map(|e| e.count).sum::<u64>(),
         "groups": groups,
     })
+}
+
+/// `paddock boundary ID [--json] [--follow]`.
+pub fn cmd(env: &HostEnv, id: &str, json: bool, follow: bool) -> anyhow::Result<i32> {
+    if id.is_empty() || id.contains('/') || id.starts_with('.') {
+        anyhow::bail!("{id} is not a sandbox id");
+    }
+    let path = file(env, id);
+    let running = crate::state::Running::list(env).iter().any(|r| r.id == id);
+    if !running && !path.exists() {
+        anyhow::bail!("no running sandbox with id {id} (paddock ps lists them)");
+    }
+    let lines = read_at(&path);
+    if json {
+        let mut v = to_json(&lines);
+        v["api_version"] = "paddock.boundary/v1".into();
+        v["sandbox"] = id.into();
+        println!("{}", serde_json::to_string_pretty(&v)?);
+    } else {
+        print!("{}", render(&group(&lines)));
+    }
+    if !follow {
+        return Ok(0);
+    }
+    let mut seen = lines;
+    loop {
+        std::thread::sleep(std::time::Duration::from_secs(1));
+        let now = read_at(&path);
+        for e in changed(&seen, &now) {
+            if json {
+                println!("{}", line(e));
+            } else {
+                println!(
+                    "{}  {}  {}  ({}, {}x)",
+                    e.last, e.kind, e.target, e.rule, e.count
+                );
+            }
+        }
+        seen = now;
+        if !path.exists() && !crate::state::Running::list(env).iter().any(|r| r.id == id) {
+            return Ok(0);
+        }
+    }
+}
+
+/// The lines of `now` that are new or have a higher count than in `before`.
+fn changed<'a>(before: &[Entry], now: &'a [Entry]) -> Vec<&'a Entry> {
+    now.iter()
+        .filter(|e| {
+            !before
+                .iter()
+                .any(|b| b.same(e) && b.time == e.time && b.count >= e.count)
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -303,5 +365,17 @@ mod tests {
         assert!(text.contains("network:\n      6x  10.0.0.5:22  (lan; other)"));
         assert_eq!(to_json(&lines)["count"], 8);
         assert!(render(&[]).contains("denied nothing"));
+    }
+
+    #[test]
+    fn follow_prints_new_and_raised_lines() {
+        let a = at(10, HOST, "x", "r");
+        let b = Entry {
+            count: 2,
+            ..a.clone()
+        };
+        let c = at(20, NETWORK, "y", "r");
+        assert!(changed(std::slice::from_ref(&a), std::slice::from_ref(&a)).is_empty());
+        assert_eq!(changed(&[a], &[b.clone(), c.clone()]), vec![&b, &c]);
     }
 }

@@ -617,6 +617,7 @@ pub fn run(
         _ => None,
     };
 
+    crate::boundary::record_start(env, spec);
     if !quiet {
         eprintln!(
             "paddock: {} in {} (backend {}, network {}, display {})",

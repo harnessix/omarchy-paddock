@@ -201,7 +201,9 @@ pub struct HostProxy {
 
 /// The sink of the boundary log: target and rule, never content.
 #[derive(Clone)]
-pub struct Boundary(pub Arc<dyn Fn(&str, &str) + Send + Sync>);
+pub struct Boundary(pub BoundaryFn);
+
+pub type BoundaryFn = Arc<dyn Fn(&str, &str) + Send + Sync>;
 
 impl std::fmt::Debug for Boundary {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

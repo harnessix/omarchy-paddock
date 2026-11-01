@@ -27,6 +27,7 @@ user first, or refuses. Nothing here opens the sandbox itself.
 
 USAGE
   paddock-host capabilities [--json]
+  paddock-host boundary [--json]   (what the sandbox boundary denied)
   paddock-host screenshot [--target screen|window|output:NAME] [--out FILE] [--reason TEXT]
   paddock-host exec [--timeout SECONDS] [--reason TEXT] -- COMMAND [ARG...]
   paddock-host tool --list | tool [--timeout SECONDS] [--reason TEXT] NAME [ARG...]
@@ -490,6 +491,10 @@ pub fn main(args: &[String]) -> i32 {
                 let p = parse(rest, &[])?;
                 (req("capabilities", String::new(), BTreeMap::new()), p.json)
             }
+            "boundary" => {
+                let p = parse(rest, &[])?;
+                (req("boundary", String::new(), BTreeMap::new()), p.json)
+            }
             "screenshot" => {
                 let p = parse(rest, &["target", "out"])?;
                 let mut a = BTreeMap::new();
@@ -802,6 +807,11 @@ fn print_human(req: &Request, resp: &Response) {
                     }
                 );
             }
+        }
+        "boundary" => {
+            let groups: Vec<crate::boundary::Group> =
+                serde_json::from_value(r["groups"].clone()).unwrap_or_default();
+            print!("{}", crate::boundary::render(&groups));
         }
         "capabilities" => {
             println!("wait for an answer: {} seconds", r["wait_seconds"]);

@@ -434,7 +434,11 @@ pub fn build_with(env: &HostEnv, opts: &Options, harness: Harness) -> Result<Bui
         let mut dropped = Vec::new();
         let mut count = 0;
         for (k, v) in &env.vars {
-            if !policy::inheritable_var(k, v) || k.starts_with("LC_") || m.env.hide.contains(k) {
+            if m.env.hide.contains(k) {
+                spec.deny(crate::boundary::ENV, k, "env hide");
+                continue;
+            }
+            if !policy::inheritable_var(k, v) || k.starts_with("LC_") {
                 continue;
             }
             // Named in [env] pass or env_pass: those loops below add it.
@@ -458,6 +462,21 @@ pub fn build_with(env: &HostEnv, opts: &Options, harness: Harness) -> Result<Bui
         }
         for d in &env.path {
             spec.inherit_path.push(d.clone());
+        }
+        // Names only, never values.
+        for w in &withheld {
+            spec.deny(
+                crate::boundary::ENV,
+                w,
+                "secret-looking name; [env] pass hands it over",
+            );
+        }
+        for d in &dropped {
+            spec.deny(
+                crate::boundary::ENV,
+                d,
+                "cloud credential; [env] pass hands it over",
+            );
         }
         // Tell the user once per project, and again when the list of
         // secret-looking names changes.

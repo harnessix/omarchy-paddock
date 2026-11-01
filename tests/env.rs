@@ -182,3 +182,32 @@ fn a_registered_credential_never_passes_with_the_environment() {
         assert!(!b.spec.env.contains_key(k), "{k}");
     }
 }
+
+#[test]
+fn withheld_names_go_into_the_boundary_log_without_values() {
+    let (_t, mut env, project) = setup(&["HIDE_ME"]);
+    env.vars
+        .insert("SERVICE_TOKEN".into(), "value-that-must-not-leak".into());
+    env.vars
+        .insert("HIDE_ME".into(), "hidden-value-that-must-not-leak".into());
+    let opts = Options {
+        harness: "t".into(),
+        project: Some(project),
+        assume_yes: true,
+        ..Default::default()
+    };
+    let b = build_with(&env, &opts, harness()).unwrap();
+    paddock::boundary::record_start(&env, &b.spec);
+    let raw = std::fs::read_to_string(paddock::boundary::file(&env, &b.spec.id)).unwrap();
+    assert!(!raw.contains("must-not-leak"), "{raw}");
+    let lines = paddock::boundary::read(&env, &b.spec.id);
+    let rule = |name: &str| {
+        lines
+            .iter()
+            .find(|l| l.kind == "env" && l.target == name)
+            .map(|l| l.rule.clone())
+    };
+    assert!(rule("SERVICE_TOKEN").unwrap().contains("secret-looking"));
+    assert_eq!(rule("HIDE_ME").unwrap(), "env hide");
+    assert!(rule("PLAIN_SETTING").is_none());
+}
