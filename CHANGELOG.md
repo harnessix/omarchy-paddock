@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- `paddock timer list`, `paddock ps --json` and the panel show a timer at once after `paddock timer set`, `paddock timer extend`, `paddock timer stop` or `paddock-host timer` in a sandbox. Before, they waited up to 30 seconds.
 - The bar panel lists the credentials a sandbox uses through the ssh agent channel ("ssh agent: NAME"), and its revoke button covers them.
 - New: network mode `api` (`--network api`, `[network] mode = "api"`). The sandbox has no network, only the paddock proxy on `127.0.0.1:3131`, which lets through HTTPS to the `[network] endpoints` of the harness profile and the `--allow` domains (`*.DOMAIN` for subdomains). The TLS server name must equal the CONNECT host, and IP addresses and plain HTTP are refused. The audit log records each refused host once per minute, and `paddock explain` lists the allowed hosts and their sources. A spawned reviewer now gets `api` under a parent with `egress` or `host`. bwrap, docker and podman use the paddock proxy, srt its own allowlist.
 - Fix: two sandboxes that start at the same moment could leave one of them without paddock kv ("database is locked" when both created a new store file), and so without shared ports in a pasture. paddock now tries again for up to 10 seconds. The port helper of a pasture member notes what it does in `$TMPDIR/paddock-pasture-serve.log` in the sandbox.

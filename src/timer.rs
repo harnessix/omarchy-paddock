@@ -407,6 +407,14 @@ pub fn read_summary(env: &HostEnv, sandbox: &str) -> Vec<Status> {
         .unwrap_or_default()
 }
 
+/// Write the summary at once after a change, so that readers do not wait
+/// for the 30-second tick. A failure only delays it until the tick.
+fn write_summary_now(env: &HostEnv, sandbox: &str) {
+    if let Err(e) = crate::kv::refresh_timer_summary(env, &crate::kv::kv_root(env), sandbox) {
+        log::debug!("timer summary of {sandbox}: {e:#}");
+    }
+}
+
 /// The timers stored in one namespace of a store.
 pub fn in_store(st: &crate::kv::store::Store, ns: &str, now: u64) -> Result<Vec<(Timer, u64)>> {
     let (metas, _) = st.list(ns, PREFIX, 1000, now)?;
@@ -531,6 +539,7 @@ pub fn host_set(
         host_quota(env)?,
         now,
     )?;
+    write_summary_now(env, id);
     Ok(t.status_in(env, now))
 }
 
@@ -636,6 +645,7 @@ pub fn host_change(env: &HostEnv, id: &str, name: &str, by: Option<More>) -> Res
         host_quota(env)?,
         now,
     )?;
+    write_summary_now(env, id);
     Ok(t.status_in(env, now))
 }
 

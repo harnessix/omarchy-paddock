@@ -1037,7 +1037,11 @@ impl Service {
                 Response::done(mark(serde_json::json!({ "history": h })))
             }
             "claim" => self.claim(st, ns, key, req.ttl.unwrap_or(60), quota, now)?,
-            "timer" => self.timer(st, req, ns, quota, now)?,
+            "timer" => {
+                let r = self.timer(st, req, ns, quota, now)?;
+                self.after_timer_op(req, &r);
+                r
+            }
             "forage" => self.forage(req),
             "release" => self.release(st, ns, key, req.force == Some(true), quota, now)?,
             "watch" => self.watch(st, ns, req, conn, &mark)?,
@@ -1259,6 +1263,22 @@ impl Service {
                 Status::Invalid,
                 format!("unknown timer action '{other}': use start, status, list, extend or stop"),
             )),
+        }
+    }
+
+    /// After a timer op: write the summary of the sandbox that the timer
+    /// times at once, so that `paddock timer list` does not wait for the tick.
+    fn after_timer_op(&self, req: &Request, r: &Response) {
+        if matches!(req.action.as_deref(), None | Some("status" | "list")) {
+            return;
+        }
+        let subject = r.result.get("subject").and_then(|v| v.as_str());
+        let res = match subject {
+            Some(s) if s != self.id.sandbox => refresh_timer_summary(&self.env, &self.root, s),
+            _ => write_timer_summary(&self.env, &self.id, &self.root),
+        };
+        if let Err(e) = res {
+            log::debug!("timer summary of {}: {e:#}", self.id.sandbox);
         }
     }
 
@@ -1510,9 +1530,8 @@ pub fn watch_timers(env: HostEnv, id: Identity, root: PathBuf, cfg: KvCfg) {
     });
 }
 
-fn timer_tick(env: &HostEnv, id: &Identity, root: &Path, cfg: &KvCfg) -> Result<()> {
-    use crate::timer;
-    let now = crate::state::now();
+/// The namespaces whose timers can time a sandbox.
+fn timer_spaces(id: &Identity) -> Vec<(Ns, Scope)> {
     let mut spaces = vec![(Ns::Own(id.sandbox.clone()), Scope::Own)];
     if !id.is_child() {
         spaces.push((pasture_ns(id), Scope::Pasture));
@@ -1520,6 +1539,75 @@ fn timer_tick(env: &HostEnv, id: &Identity, root: &Path, cfg: &KvCfg) -> Result<
     if let Some(t) = &id.tree {
         spaces.push((Ns::Tree(t.clone()), Scope::Tree));
     }
+    spaces
+}
+
+/// Write the summary that `paddock ps`, `paddock timer list` and the panel
+/// read: the timers of a sandbox, the same content as the 30-second tick.
+pub fn write_timer_summary(env: &HostEnv, id: &Identity, root: &Path) -> Result<()> {
+    let now = crate::state::now();
+    let mut summary = Vec::new();
+    for (ns, _) in timer_spaces(id) {
+        let file = ns.file(root)?;
+        if !file.is_file() {
+            continue;
+        }
+        let st = Store::open(&file)?;
+        for (t, _) in crate::timer::in_store(&st, &ns.key(), now)? {
+            if t.subject == id.sandbox {
+                summary.push(t.status_in(env, now));
+            }
+        }
+    }
+    crate::privfs::write(
+        &crate::timer::summary_file(env, &id.sandbox),
+        serde_json::to_string(&summary)?,
+    )?;
+    Ok(())
+}
+
+/// The kv identity of a running sandbox, from its record (state.rs), for
+/// the host side that has no kv service at hand.
+pub fn identity_of(r: &crate::state::Running, all: &[crate::state::Running]) -> Identity {
+    // The sandboxes above it, the root first.
+    let mut chain = Vec::new();
+    let mut up = r.parent.clone();
+    while let Some(p) = up {
+        if chain.contains(&p) || chain.len() > 16 {
+            break;
+        }
+        up = all
+            .iter()
+            .find(|o| o.id == p)
+            .and_then(|o| o.parent.clone());
+        chain.insert(0, p);
+    }
+    // A root that cannot spawn has no tree file, so its tree adds nothing.
+    let tree = chain.first().cloned().or_else(|| Some(r.id.clone()));
+    Identity {
+        sandbox: r.id.clone(),
+        harness: r.harness.clone(),
+        project: r.kv_project.clone().unwrap_or_else(|| r.project.clone()),
+        pasture: r.pasture.clone(),
+        parent: r.parent.clone(),
+        chain,
+        tree,
+    }
+}
+
+/// Write the timer summary of the running sandbox `sandbox`, if it runs.
+pub fn refresh_timer_summary(env: &HostEnv, root: &Path, sandbox: &str) -> Result<()> {
+    let all = crate::state::Running::list(env);
+    let Some(r) = all.iter().find(|r| r.id == sandbox) else {
+        return Ok(());
+    };
+    write_timer_summary(env, &identity_of(r, &all), root)
+}
+
+fn timer_tick(env: &HostEnv, id: &Identity, root: &Path, cfg: &KvCfg) -> Result<()> {
+    use crate::timer;
+    let now = crate::state::now();
+    let spaces = timer_spaces(id);
     let w = Writer {
         sandbox: "paddock",
         harness: "paddock",
