@@ -213,5 +213,12 @@
   "row.timerOver": "计时 %1：%2 / %3，已超时",
   "row.quota": "计时 %1：%4 已用 %2% / %3%",
   "row.quotaOver": "计时 %1：%4 已用 %2% / %3%，配额已用完",
+  "row.monitorTunnel": "隧道：%1",
+  "row.monitorUpload": "上传：本小时 %1",
+  "row.monitorCredential": "新凭据文件：%1",
+  "row.monitorMore": "%1 +%2",
+  "action.ack": "知道了，清除标记",
+  "msg.acked": "标记已清除。审计日志保留这些发现。",
+  "msg.ackFailed": "paddock 没能清除标记。",
   "forage.overgrazing": "%1 %2：已用 %3%，按现在的速度 %4 后用完，%5 后才重置"
 }

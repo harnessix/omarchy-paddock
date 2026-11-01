@@ -112,6 +112,7 @@ Panel {
     if (s && s.windowPid > 0) a.push("display")
     if (s && s.canFreeze) a.push("freeze")
     if (s && s.gateway !== "") a.push("revoke")
+    if (s && s.monitor !== "") a.push("ack")
     a.push("stop")
     return a
   }
@@ -355,6 +356,22 @@ Panel {
       root.refresh()
     })
   }
+  // Say OK to the monitoring findings of a sandbox: the mark goes away
+  // until a new finding. The audit log keeps them.
+  function ackMonitor(s) {
+    runPaddock(["monitor", "ack", s.id], function(code) {
+      root.say(code === 0 ? strings.t("msg.acked") : strings.t("msg.ackFailed"))
+      root.refresh()
+    })
+  }
+  // The caption of the first monitoring finding, and "+N" for the others.
+  function monitorText(marks) {
+    if (!Array.isArray(marks) || !marks.length) return ""
+    var m = marks[0] || {}
+    var key = m.kind === "tunnel" ? "row.monitorTunnel" : (m.kind === "upload" ? "row.monitorUpload" : "row.monitorCredential")
+    var text = strings.t(key).arg(root.plain(m.detail, 96))
+    return marks.length > 1 ? strings.t("row.monitorMore").arg(text).arg(Commons.I18n.formatNumber(marks.length - 1)) : text
+  }
   // Freeze a running sandbox, or thaw a frozen one.
   function toggleFreeze(s) {
     var verb = s.frozenSince > 0 ? "thaw" : "freeze"
@@ -371,6 +388,7 @@ Panel {
     else if (name === "copy") copyPath(s)
     else if (name === "display") showDisplay(s)
     else if (name === "revoke") revokeCredentials(s)
+    else if (name === "ack") ackMonitor(s)
     else if (name === "stop") stop(s)
   }
 
@@ -722,6 +740,9 @@ Panel {
             })(),
             // Credentials it uses through the gateway: it holds stand-ins.
             gateway: Array.isArray(r.gateway) ? r.gateway.slice(0, 8).map(function(c) { return root.plain(c, 64) }).join(", ") : "",
+            // Monitoring findings that the user did not say OK to, outside
+            // muted projects (monitor.rs): "tunnel: ngrok", "+N".
+            monitor: root.monitorText(r.monitor_marks),
             parentHarness: "",
             depth: 0,
             children: 0
@@ -1314,19 +1335,21 @@ Panel {
                   ? strings.t("row.childTitle").arg(modelData.harness).arg(modelData.parentHarness || modelData.parent)
                   : strings.t("row.title").arg(modelData.harness).arg(modelData.projectName)
                 caption: strings.t("row.detail").arg(modelData.backend).arg(modelData.network).arg(modelData.gui).arg(root.uptime(modelData.started))
+                // Frozen and warnings first, then monitoring, then timers.
                 caption2: modelData.frozenSince > 0 ? strings.t("row.frozen").arg(root.uptime(modelData.frozenSince))
+                  : modelData.warning !== "" ? modelData.warning
+                  : modelData.monitor !== "" ? modelData.monitor
                   : modelData.timer !== null && modelData.timer.quota !== null && (modelData.timer.budget === 0 || modelData.timer.quota.over)
                     ? strings.t(modelData.timer.quota.over ? "row.quotaOver" : "row.quota")
                       .arg(modelData.timer.name).arg(modelData.timer.quota.used).arg(modelData.timer.quota.share).arg(modelData.timer.quota.window)
                   : modelData.timer !== null ? strings.t(modelData.timer.over ? "row.timerOver" : "row.timer")
                       .arg(modelData.timer.name).arg(root.span(modelData.timer.used)).arg(root.span(modelData.timer.budget))
-                  : modelData.warning !== "" ? modelData.warning
                   : modelData.credentials !== "" ? strings.t("row.holdsCredentials").arg(modelData.credentials)
                   : modelData.gateway !== "" ? strings.t("row.gateway").arg(modelData.gateway)
                   : (modelData.parent !== "" ? strings.t("row.startedBy").arg(modelData.parent)
                   : (modelData.auth !== "" && modelData.auth !== "shared" ? strings.t("row.auth").arg(modelData.auth)
                   : (modelData.pasture !== "" ? strings.t("row.pasture").arg(modelData.pasture) : "")))
-                caption2Color: modelData.warning !== "" || (modelData.frozenSince === 0 && (modelData.credentials !== "" || (modelData.timer !== null && modelData.timer.over))) ? root.urgent : root.dim
+                caption2Color: modelData.warning !== "" || (modelData.frozenSince === 0 && (modelData.monitor !== "" || modelData.credentials !== "" || (modelData.timer !== null && modelData.timer.over))) ? root.urgent : root.dim
                 showActions: true
                 onActivated: root.goToTerminal(modelData)
 
@@ -1363,6 +1386,13 @@ Panel {
                 ActionButton {
                   sandboxIndex: index + root.approvals.length
                   position: (modelData.windowPid > 0 ? 3 : 2) + (modelData.canFreeze ? 1 : 0) + (modelData.gateway !== "" ? 1 : 0)
+                  visible: modelData.monitor !== ""
+                  iconText: "󰄬"; tooltipText: strings.t("action.ack")
+                  onClicked: root.ackMonitor(modelData)
+                }
+                ActionButton {
+                  sandboxIndex: index + root.approvals.length
+                  position: (modelData.windowPid > 0 ? 3 : 2) + (modelData.canFreeze ? 1 : 0) + (modelData.gateway !== "" ? 1 : 0) + (modelData.monitor !== "" ? 1 : 0)
                   iconText: root.confirmId === modelData.id ? "󰗖" : "󰓛"
                   tooltipText: root.confirmId === modelData.id ? strings.t("action.confirmStop") : strings.t("action.stop")
                   foreground: root.confirmId === modelData.id ? root.urgent : root.fg
