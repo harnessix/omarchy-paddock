@@ -146,6 +146,10 @@ enum Cmd {
         /// Also paddock worktrees.
         #[arg(long)]
         worktrees: bool,
+        /// Also share the data of identical files in the sandbox homes
+        /// (btrfs, xfs, bcachefs). Reports the space it gets back.
+        #[arg(long)]
+        dedupe: bool,
         /// Also scratch projects (starts in the home folder through `paddock
         /// wrap`) that were not used for --older-than days. Their files are lost.
         #[arg(long)]
@@ -374,6 +378,10 @@ enum Cmd {
     /// (`paddock-host spawn`). The parent's paddock starts this.
     #[command(hide = true)]
     SpawnChild { job: PathBuf },
+    /// After a sandbox ends: share the data of identical files of its home
+    /// with the other homes, within a time limit. paddock starts this.
+    #[command(hide = true)]
+    DedupeHome { home: PathBuf },
     /// Update the launcher entries, the Omarchy menu and the shell shims to
     /// the harnesses installed now. Only the parts that are turned on.
     Refresh {
@@ -2043,6 +2051,7 @@ fn real_main() -> Result<i32> {
             worktrees,
             force,
             scratch,
+            dedupe,
             json,
         } => gc_cmd(
             &env,
@@ -2054,9 +2063,17 @@ fn real_main() -> Result<i32> {
                 worktrees,
                 force,
                 scratch,
+                dedupe,
             },
             json,
         ),
+        Cmd::DedupeHome { home } => {
+            paddock::storage::dedupe::be_idle();
+            let r =
+                paddock::storage::dedupe::home(&env, &home, paddock::storage::dedupe::AFTER_RUN)?;
+            log::info!("dedupe after the run: {r:?}");
+            Ok(0)
+        }
         Cmd::Recover {
             id,
             paths,
@@ -2598,6 +2615,9 @@ A desktop app keeps its login in its home: those homes also need --include-app-l
 also needs --force, and paddock keeps its branch.
 --scratch adds scratch projects (agents that `paddock wrap` started in the home folder) that
 were not used for --older-than days. Their files are lost.
+--dedupe lets identical files in the sandbox homes share their data (btrfs, xfs, bcachefs).
+The kernel compares the bytes first, and a later write to one copy gets its own blocks.
+Without --yes it only counts the files and their size.
 
 paddock never removes the home or worktree of a running sandbox, and never deletes outside
 its own directories or through a symlink.
@@ -2605,13 +2625,17 @@ its own directories or through a symlink.
 Examples:
   paddock gc                      what --yes would remove
   paddock gc --homes --older-than 30
-  paddock gc --yes";
+  paddock gc --yes
+  paddock gc --dedupe --yes       share identical data between homes";
 
 fn du_cmd(env: &HostEnv, json: bool) -> Result<i32> {
     use paddock::storage;
     let containers = storage::RealContainers(env);
     let host = storage::Host::real(env, &containers);
-    let inv = storage::scan(env, &host, true);
+    let mut inv = storage::scan(env, &host, true);
+    if let Some(n) = storage::dedupe::du_note(env) {
+        inv.notes.push(n);
+    }
     if json {
         let mut v = serde_json::to_value(&inv)?;
         v["api_version"] = "paddock.du/v1".into();
@@ -2640,6 +2664,7 @@ fn gc_cmd(env: &HostEnv, o: &paddock::storage::GcOptions, json: bool) -> Result<
     } else {
         vec![]
     };
+    let dedupe = o.dedupe.then(|| storage::dedupe::all(env, o.yes));
     if json {
         println!(
             "{}",
@@ -2649,6 +2674,7 @@ fn gc_cmd(env: &HostEnv, o: &paddock::storage::GcOptions, json: bool) -> Result<
                 "items": items,
                 "removed": removed,
                 "notes": inv.notes,
+                "dedupe": dedupe,
             }))?
         );
         return Ok(i32::from(removed.iter().any(|r| r.error.is_some())));
@@ -2658,6 +2684,9 @@ fn gc_cmd(env: &HostEnv, o: &paddock::storage::GcOptions, json: bool) -> Result<
     }
     if !o.yes {
         print!("{}", storage::render_plan(&items, false));
+        if let Some(d) = &dedupe {
+            print!("{}", storage::dedupe::render(d, false));
+        }
         return Ok(0);
     }
     let mut freed = 0;
@@ -2689,6 +2718,9 @@ fn gc_cmd(env: &HostEnv, o: &paddock::storage::GcOptions, json: bool) -> Result<
         );
     }
     println!("paddock gc: freed {}.", storage::human(freed));
+    if let Some(d) = &dedupe {
+        print!("{}", storage::dedupe::render(d, true));
+    }
     Ok(i32::from(failed))
 }
 
