@@ -2,16 +2,17 @@
 //! the paddock kv socket of this sandbox.
 
 use crate::kv::{Request, Scope, Status, PROTOCOL};
-use crate::timer::{format_duration, parse_duration};
+use crate::timer::{format_duration, parse_duration, parse_more, parse_quota, More};
 
 pub const HELP: &str = r#"paddock-host timer: how long a task has run, and how long it may.
 
 USAGE
-  paddock-host timer start NAME --budget DURATION [--hard] [--scope SCOPE]
+  paddock-host timer start NAME [--budget DURATION] [--quota WINDOW=PCT] [--hard]
+                           [--scope SCOPE]
   paddock-host timer status [NAME] [--scope SCOPE]
-  paddock-host timer extend NAME --by DURATION [--reason TEXT] [--scope SCOPE]
+  paddock-host timer extend NAME --by DURATION|PCT [--reason TEXT] [--scope SCOPE]
   paddock-host timer stop NAME [--scope SCOPE]
-Every command takes --json. DURATION: 90s, 30m, 2h, 1h30m, 1d.
+Every command takes --json. DURATION: 90s, 30m, 2h, 1h30m, 1d. PCT: 5%.
 
 A timer lives on the host, so it outlasts your context: after a compaction,
 or when another agent takes over, `paddock-host timer status` still knows
@@ -21,9 +22,14 @@ frozen does not count.
 Run `paddock-host timer status` when you start working again, after a
 compaction, and before you try one more fix for the same bug.
 
-- start: you own the timer. A --hard deadline freezes this sandbox when it
-  ends; without --hard, the user gets a notice and you keep running.
-- extend: the owner adds time at once. A timer that someone else set (the
+- start: you own the timer. It needs --budget, --quota, or both.
+  --quota weekly=10% lets the task use 10% of the account's weekly limit
+  window, counted from now (`paddock-host forage` shows the windows). It
+  counts everything that the account uses meanwhile, also elsewhere, and
+  its numbers are up to 15 minutes old.
+  A --hard timer freezes this sandbox when a budget is used up; without
+  --hard, the user gets a notice and you keep running.
+- extend: --by 30m adds time, --by 5% adds quota. The owner adds at once. A timer that someone else set (the
   user, or the agent that started you) asks the user, who sees --reason.
 - stop: only the owner stops a timer.
 
@@ -32,7 +38,7 @@ Timers in pasture and tree are visible to the other agents there.
 
 EXIT CODES
   0 done   1 no such timer   2 wrong usage   3 denied   5 nobody answered
-  9 a timer of that name runs already
+  8 refused, for example an unknown window   9 a timer of that name runs already
 "#;
 
 fn usage(msg: &str) -> i32 {
@@ -72,8 +78,14 @@ pub fn main(args: &[String]) -> i32 {
                     req.budget =
                         Some(parse_duration(&value("--budget")?).map_err(|e| e.to_string())?)
                 }
-                "--by" => {
-                    req.by = Some(parse_duration(&value("--by")?).map_err(|e| e.to_string())?)
+                "--by" => match parse_more(&value("--by")?).map_err(|e| e.to_string())? {
+                    More::Time(n) => req.by = Some(n),
+                    More::Share(x) => req.share = Some(x),
+                },
+                "--quota" => {
+                    let (w, x) = parse_quota(&value("--quota")?).map_err(|e| e.to_string())?;
+                    req.window = Some(w);
+                    req.share = Some(x);
                 }
                 "--reason" => req.reason = Some(value("--reason")?),
                 "--scope" => {
@@ -93,8 +105,10 @@ pub fn main(args: &[String]) -> i32 {
         "start" | "extend" | "stop" if name.is_none() => {
             return usage(&format!("{action} needs a NAME"))
         }
-        "start" if req.budget.is_none() => return usage("start needs --budget"),
-        "extend" if req.by.is_none() => return usage("extend needs --by"),
+        "start" if req.budget.is_none() && req.window.is_none() => {
+            return usage("start needs --budget, --quota, or both")
+        }
+        "extend" if req.by.is_none() && req.share.is_none() => return usage("extend needs --by"),
         "status" if name.is_none() => req.action = Some("list".into()),
         "start" | "status" | "extend" | "stop" => {}
         other => return usage(&format!("unknown command '{other}'")),
@@ -120,15 +134,19 @@ pub fn main(args: &[String]) -> i32 {
     }
     let line = |t: &serde_json::Value| {
         let n = |k: &str| t[k].as_u64().unwrap_or(0);
+        let used = serde_json::from_value::<crate::timer::Status>(t.clone())
+            .map(|s| crate::timer::describe(&s))
+            .unwrap_or_default();
         format!(
-            "{}: used {} of {}, {}{}{}",
+            "{}: used {}, {}{}{}",
             t["name"].as_str().unwrap_or(""),
-            format_duration(n("used")),
-            format_duration(n("budget")),
+            used,
             if t["over"] == true {
                 "over".to_string()
-            } else {
+            } else if n("budget") > 0 {
                 format!("{} left", format_duration(n("left")))
+            } else {
+                "within budget".to_string()
             },
             if t["hard"] == true {
                 " (hard: the sandbox is frozen at the end)"

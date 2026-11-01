@@ -354,6 +354,13 @@ pub struct Request {
     /// timer extend: why, shown to the user.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    /// timer start: the limit window of a quota budget, for example `weekly`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window: Option<String>,
+    /// timer start: the share of the window that the task may use, 0 to 1;
+    /// timer extend: the share to add.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub share: Option<f64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1013,10 +1020,8 @@ impl Service {
     ) -> Result<Response> {
         use crate::timer::{self, Timer};
         let action = req.action.as_deref().unwrap_or("status");
-        let status_of = |t: &Timer| {
-            serde_json::to_value(t.status(now, &timer::frozen_periods(&self.env, &t.subject, now)))
-                .unwrap_or_default()
-        };
+        let status_of =
+            |t: &Timer| serde_json::to_value(t.status_in(&self.env, now)).unwrap_or_default();
         if action == "list" {
             let all: Vec<serde_json::Value> = timer::in_store(st, ns, now)?
                 .iter()
@@ -1037,10 +1042,9 @@ impl Service {
         let w = self.writer();
         match action {
             "start" => {
-                let Some(budget) = req.budget else {
-                    return Ok(Response::new(Status::Invalid, "timer start needs a budget"));
-                };
-                if let Err(e) = timer::check_budget(budget) {
+                let budget = req.budget.unwrap_or(0);
+                let wants_quota = req.window.is_some() || req.share.is_some();
+                if let Err(e) = timer::check_budgets(budget, wants_quota) {
                     return Ok(Response::new(Status::Invalid, format!("{e:#}")));
                 }
                 if let Some((t, _)) = &cur {
@@ -1055,6 +1059,22 @@ impl Service {
                         });
                     }
                 }
+                let grazing = match (req.window.as_deref(), req.share) {
+                    (None, None) => None,
+                    (Some(window), Some(share)) if share > 0.0 && share <= 1.0 => {
+                        let agent = crate::forage::agent_of(&self.id.harness);
+                        match timer::quota_from_now(&self.env, &agent, window, share) {
+                            Ok(q) => Some(q),
+                            Err(e) => return Ok(Response::new(Status::Invalid, format!("{e:#}"))),
+                        }
+                    }
+                    _ => {
+                        return Ok(Response::new(
+                            Status::Invalid,
+                            "a quota budget needs a window and a share above 0% and at most 100%",
+                        ))
+                    }
+                };
                 let t = Timer {
                     name: name.into(),
                     owner: self.id.sandbox.clone(),
@@ -1062,6 +1082,7 @@ impl Service {
                     started: now,
                     budget,
                     hard: req.hard == Some(true),
+                    quota: grazing,
                     stopped: None,
                     announced: false,
                     enforced: false,
@@ -1090,11 +1111,21 @@ impl Service {
                     timer::save(st, ns, &t, Some(version), &w, quota, now)?;
                     return Ok(Response::done(status_of(&t)));
                 }
-                let Some(by) = req.by.filter(|b| *b > 0 && *b <= timer::MAX_BUDGET) else {
-                    return Ok(Response::new(
+                let more = match (req.by, req.share) {
+                    (Some(b), None) if b > 0 && b <= timer::MAX_BUDGET => timer::More::Time(b),
+                    (None, Some(x)) if x > 0.0 && x <= 1.0 => timer::More::Share(x),
+                    _ => return Ok(Response::new(
                         Status::Invalid,
-                        "timer extend needs --by, at most 30 days",
-                    ));
+                        "timer extend needs --by: a time of at most 30 days, or a share such as 5%",
+                    )),
+                };
+                // Check the kind before anyone asks the user.
+                if let Err(e) = timer::add_more(&mut t.clone(), more, "", now, String::new()) {
+                    return Ok(Response::new(Status::Invalid, format!("{e:#}")));
+                }
+                let asked = match more {
+                    timer::More::Time(b) => timer::format_duration(b),
+                    timer::More::Share(x) => format!("{:.0}% more quota", x * 100.0),
                 };
                 let reason: String = req
                     .reason
@@ -1113,13 +1144,15 @@ impl Service {
                         harness: self.id.harness.clone(),
                         project: self.id.project.clone(),
                         capability: timer::CAPABILITY.into(),
-                        summary: format!("{} more for the timer {name}", timer::format_duration(by)),
+                        summary: format!("{asked} for the timer {name}"),
                         detail: format!(
-                            "The timer {name} ({}) has used {} of {}. The sandbox asks for {} more.",
-                            if t.hard { "hard deadline: the sandbox is frozen when it ends" } else { "soft deadline" },
-                            timer::format_duration(t.status(now, &[]).used),
-                            timer::format_duration(t.budget),
-                            timer::format_duration(by)
+                            "The timer {name} ({}) has used {}. The sandbox asks for {asked}.",
+                            if t.hard {
+                                "hard deadline: the sandbox is frozen when it ends"
+                            } else {
+                                "soft deadline"
+                            },
+                            timer::describe(&t.status_in(&self.env, now)),
                         ),
                         reason: reason.clone(),
                         created: now,
@@ -1152,15 +1185,9 @@ impl Service {
                 }) else {
                     return Ok(Response::new(Status::NotFound, format!("no timer {name}")));
                 };
-                t.budget = (t.budget + by).min(timer::MAX_BUDGET);
-                t.announced = false;
-                t.enforced = false;
-                t.extensions.push(timer::Extension {
-                    seconds: by,
-                    by: who,
-                    at: now,
-                    reason,
-                });
+                if let Err(e) = timer::add_more(&mut t, more, &who, now, reason) {
+                    return Ok(Response::new(Status::Invalid, format!("{e:#}")));
+                }
                 timer::save(st, ns, &t, Some(version), &w, quota, now)?;
                 Ok(Response::done(status_of(&t)))
             }
@@ -1414,6 +1441,8 @@ fn timer_tick(env: &HostEnv, id: &Identity, root: &Path, cfg: &KvCfg) -> Result<
     };
     let mut summary = Vec::new();
     let mut timed = false;
+    // The accounts whose numbers a running timer needs.
+    let mut sample: Vec<String> = Vec::new();
     for (ns, scope) in spaces {
         let file = ns.file(root)?;
         if !file.is_file() {
@@ -1424,20 +1453,23 @@ fn timer_tick(env: &HostEnv, id: &Identity, root: &Path, cfg: &KvCfg) -> Result<
             if t.subject != id.sandbox {
                 continue;
             }
-            let s = t.status(now, &timer::frozen_periods(env, &id.sandbox, now));
+            let s = t.status_in(env, now);
             summary.push(s.clone());
             if !s.stopped && !s.over {
                 timed = true;
+                if let Some(q) = &t.quota {
+                    sample.push(q.agent.clone());
+                }
             }
             if s.stopped || !s.over {
                 continue;
             }
             let what = format!(
-                "the timer {} of {} ({}) used its {}",
+                "the timer {} of {} ({}) used {}",
                 t.name,
                 id.sandbox,
                 id.harness,
-                timer::format_duration(t.budget)
+                t.what_is_up(&s)
             );
             if !t.hard && !t.announced {
                 t.announced = true;
@@ -1471,13 +1503,18 @@ fn timer_tick(env: &HostEnv, id: &Identity, root: &Path, cfg: &KvCfg) -> Result<
                 if let Err(e) = crate::freeze::freeze(env, &id.sandbox, false, &reason) {
                     log::warn!("cannot freeze {}: {e:#}", id.sandbox);
                 }
-                timer_notice(env, id, "paddock froze a sandbox: its time is up", &format!("{reason}. paddock thaw {} lets it continue; paddock timer extend gives it more time.", id.sandbox));
+                timer_notice(env, id, "paddock froze a sandbox: its time is up", &format!("{reason}. paddock thaw {} lets it continue; paddock timer extend gives it more.", id.sandbox));
             }
         }
     }
     // A timed task: keep the forage ledger fresh for its account.
     if timed {
-        if let Err(e) = crate::forage::sample_if_due(env, &crate::forage::agent_of(&id.harness)) {
+        sample.push(crate::forage::agent_of(&id.harness));
+    }
+    sample.sort();
+    sample.dedup();
+    for agent in &sample {
+        if let Err(e) = crate::forage::sample_if_due(env, agent) {
             log::debug!("forage sample: {e:#}");
         }
     }

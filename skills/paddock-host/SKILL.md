@@ -117,6 +117,7 @@ A timer lives on the host, so it outlasts your context. Use it for any task that
 2. Run `paddock-host timer status` after a compaction, when you resume work, and before you try one more fix for the same bug. If you used most of the time and the bug is still there, stop and report what you tried instead of trying again.
 3. A timer that someone else set (the user, or the agent that started you) is not yours: you cannot stop it. `paddock-host timer extend NAME --by 30m --reason TEXT` asks the user for more time; say why in the reason.
 4. A hard deadline freezes your sandbox when it ends. Save your work and report before that.
+5. A timer can also limit how much of the account's limits a task uses: `paddock-host timer start NAME --quota weekly=10%` (the window names come from `paddock-host forage`). It counts everything that the account uses meanwhile. `--by 5%` asks for more quota, as `--by 30m` asks for more time.
 
 Timers in `--scope pasture` or `--scope tree` show the other agents there how long a shared task has run.
 

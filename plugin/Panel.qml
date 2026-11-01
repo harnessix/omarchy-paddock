@@ -699,14 +699,26 @@ Panel {
             pasture: root.plain(r.pasture || "", 32),
             // Credentials whose values the sandbox holds (deliver).
             credentials: Array.isArray(r.credentials) ? r.credentials.slice(0, 8).map(function(c) { return root.plain(c, 64) }).join(", ") : "",
-            // The timer nearest its end (timer.rs): name, used, budget, over.
+            // The timer nearest its end (timer.rs): name, used, budget, over,
+            // and its quota budget, if any (shares 0 to 1).
             timer: (function() {
               var ts = Array.isArray(r.timers) ? r.timers.filter(function(t) { return t && !t.stopped }) : []
               if (!ts.length) return null
-              ts.sort(function(a, b) { return Number(a.left || 0) - Number(b.left || 0) })
+              // The share of its budgets left: the smaller of time and quota.
+              var left = function(t) {
+                if (t.over === true) return -1
+                var f = 1
+                if (Number(t.budget || 0) > 0) f = Math.min(f, Number(t.left || 0) / Number(t.budget))
+                if (t.quota && Number(t.quota.share || 0) > 0) f = Math.min(f, Number(t.quota.left || 0) / Number(t.quota.share))
+                return f
+              }
+              ts.sort(function(a, b) { return left(a) - left(b) })
               var t = ts[0]
+              var q = t.quota || null
               return { name: root.plain(t.name, 64), used: Number(t.used || 0), budget: Number(t.budget || 0),
-                       over: t.over === true, hard: t.hard === true }
+                       over: t.over === true, hard: t.hard === true,
+                       quota: q === null ? null : { used: Math.round(Number(q.used || 0) * 100), share: Math.round(Number(q.share || 0) * 100),
+                                                    window: root.plain((q.agent || "") + " " + (q.window || ""), 64), over: q.over === true } }
             })(),
             // Credentials it uses through the gateway: it holds stand-ins.
             gateway: Array.isArray(r.gateway) ? r.gateway.slice(0, 8).map(function(c) { return root.plain(c, 64) }).join(", ") : "",
@@ -1303,6 +1315,9 @@ Panel {
                   : strings.t("row.title").arg(modelData.harness).arg(modelData.projectName)
                 caption: strings.t("row.detail").arg(modelData.backend).arg(modelData.network).arg(modelData.gui).arg(root.uptime(modelData.started))
                 caption2: modelData.frozenSince > 0 ? strings.t("row.frozen").arg(root.uptime(modelData.frozenSince))
+                  : modelData.timer !== null && modelData.timer.quota !== null && (modelData.timer.budget === 0 || modelData.timer.quota.over)
+                    ? strings.t(modelData.timer.quota.over ? "row.quotaOver" : "row.quota")
+                      .arg(modelData.timer.name).arg(modelData.timer.quota.used).arg(modelData.timer.quota.share).arg(modelData.timer.quota.window)
                   : modelData.timer !== null ? strings.t(modelData.timer.over ? "row.timerOver" : "row.timer")
                       .arg(modelData.timer.name).arg(root.span(modelData.timer.used)).arg(root.span(modelData.timer.budget))
                   : modelData.warning !== "" ? modelData.warning
