@@ -368,6 +368,8 @@ refresh_margin = 1800    # seconds before the access token expires; at least 360
 check_interval = 60      # seconds between two looks
 ```
 
+`paddock logins refresh codex [--auth isolated:NAME]` refreshes a login at once, in a keeper sandbox, and updates the running sandboxes that use it. It refuses while a running sandbox's keeper holds the login.
+
 An API-key login is not touched. Claude Code and Grok Build logins are copied whole, as before.
 
 ### MCP servers

@@ -573,6 +573,56 @@ pub fn start(env: &HostEnv, harness: &str, kind: &'static Kind, auth: &AuthMode,
     });
 }
 
+/// `paddock logins refresh`: refresh a login now, in a keeper sandbox, and
+/// bring the running sandboxes of that login up to date. Refused while a
+/// keeper holds the login: two refreshers are what this avoids.
+pub fn refresh_now(env: &HostEnv, harness: &str, auth: &AuthMode) -> Result<String> {
+    let kind = kind_for(harness).with_context(|| {
+        format!(
+            "paddock keeps no login of {harness}; it keeps: {}",
+            KINDS
+                .iter()
+                .map(|k| k.harness)
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    })?;
+    let h = crate::profile::HarnessFactory::new(env)?.create(harness)?;
+    let store = crate::state::auth_file(env, &h.profile, auth, kind.file);
+    let lock = env
+        .paddock_run()
+        .join("keepers")
+        .join(format!("{}.lock", key(&store)));
+    let Some(_held) = try_lock(&lock) else {
+        bail!("a running sandbox keeps this login; its keeper refreshes it when it is due");
+    };
+    let before =
+        std::fs::read(&store).with_context(|| format!("no login in {}", store.display()))?;
+    if !keepable(&before) {
+        bail!("{} holds no login with a refresh token", store.display());
+    }
+    let changed = refresh(env, &h, kind, auth, &store)?;
+    let after = std::fs::read(&store)?;
+    let n = push(env, &store)?;
+    let until = access_expiry(&after)
+        .map(crate::storage::date)
+        .unwrap_or_else(|| "an unknown time".into());
+    Ok(format!(
+        "{}: {}; the access token is valid until {until}{}",
+        store.display(),
+        if changed && hash(&after) != hash(&before) {
+            "refreshed"
+        } else {
+            "unchanged"
+        },
+        if n > 0 {
+            format!("; {n} running sandboxes updated")
+        } else {
+            String::new()
+        }
+    ))
+}
+
 fn try_lock(path: &Path) -> Option<std::fs::File> {
     use std::os::fd::AsRawFd;
     if let Some(d) = path.parent() {

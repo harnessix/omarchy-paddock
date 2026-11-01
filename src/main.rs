@@ -298,6 +298,11 @@ enum Cmd {
         #[command(subcommand)]
         cmd: PastureCmd,
     },
+    /// The OAuth logins that paddock keeps outside the sandboxes (Codex).
+    Logins {
+        #[command(subcommand)]
+        cmd: LoginsCmd,
+    },
     /// The credentials registered in [credentials] of the user
     /// configuration, and how often each was delivered. Never a value.
     Credentials {
@@ -498,6 +503,18 @@ impl KvScope {
             }
         })
     }
+}
+
+#[derive(Subcommand)]
+enum LoginsCmd {
+    /// Refresh a login now, in a keeper sandbox, and update the running
+    /// sandboxes that use it.
+    Refresh {
+        harness: String,
+        /// shared (default), isolated or isolated:NAME.
+        #[arg(long, default_value = "shared")]
+        auth: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1808,6 +1825,15 @@ fn real_main() -> Result<i32> {
         } => recover_cmd(&env, &id, paths, all, to.as_deref(), keep),
         Cmd::Discard { id, paths, all } => discard_cmd(&env, &id, paths, all),
         Cmd::Pasture { cmd } => pasture_cmd(&env, cmd),
+        Cmd::Logins {
+            cmd: LoginsCmd::Refresh { harness, auth },
+        } => {
+            println!(
+                "{}",
+                paddock::keeper::refresh_now(&env, &harness, &auth.parse()?)?
+            );
+            Ok(0)
+        }
         Cmd::Credentials {
             cmd: CredentialsCmd::Revoke { id, name },
         } => {
