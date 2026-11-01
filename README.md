@@ -808,6 +808,27 @@ paddock-host pasture unshare 3000
 - `paddock pasture list` on the host shows the shared ports and their owners.
 - Members trust each other with shared ports, as with the shared folder: every member can write `/pasture`, so a member can replace another member's socket there and receive its traffic. Put only agents that you would let edit each other's files into one pasture.
 
+A member can also ask another member a question. The other member answers with one run of its own harness, in its own sandbox, with its own login. This is the bridge, and it is off until you turn it on for a pasture:
+
+```toml
+[pastures.review]
+members = ["claude", "codex"]
+bridge = true
+```
+
+```sh
+# in the claude member
+paddock-host pasture ask codex --prompt-file question.md --timeout 300
+```
+
+- The answer is the final text of the one-shot run (`[oneshot]` of the profile). The asker never sees the login of the other member.
+- The question goes through the kv socket of the asker, a folder outside every sandbox, and the kv socket of the other member. Its helper runs the harness with the prompt on stdin or in a private file, never in the arguments of a process.
+- Before the answer goes back, paddock compares it with the login secrets of every member: the token values in their login files (`state.auth`) and their delivered credentials. Spaces and case do not matter, and a match needs at least 16 characters, so short words never match. On a match, the asker gets a short refusal instead of the answer, and the audit log names the member and the file or credential, never the value.
+- Name the member by its harness, or by its sandbox id when two members run the same harness. `paddock-host pasture members` shows whether the bridge is on.
+- Limits: one question at a time per member, questions and answers up to 256 KiB (the end of a longer answer), and a timeout of 300 seconds by default, at most `[spawn] timeout`. A member that is busy or frozen answers with exit code 9, one that ended with exit code 1.
+- The audit log `kv-audit.jsonl` records who asked whom, the sizes, the time and the result. It never records the question or the answer.
+- Only the user configuration turns the bridge on. A project `paddock.toml` cannot.
+
 The bar panel shows the shared data too. A "Shared data" row opens a list of the pastures, your `user` scope and the data of older versions, with their members and the number of keys and locks. A pasture opens to its keys, grouped by the part before the first `:`, with locks first: who wrote each key, when, and its size. A key opens to its value, shown as plain text. From there you can copy the value, delete the key or free a lock; each delete asks twice. The panel reads a value only when you open its key, and reads paddock kv only while it is open. Bind a key to `omarchy-shell harnessix.paddock.kv open` to open the shared data directly.
 
 In a spawn tree, the parent writes the tasks into the `tree` scope, each child claims one with a lease and writes its result, and the parent waits for `result:`:
