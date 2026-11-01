@@ -292,6 +292,12 @@ enum Cmd {
         #[command(subcommand)]
         cmd: Option<ApprovalsCmd>,
     },
+    /// Pastures: sandboxes that you put together (--pasture NAME). They
+    /// share paddock kv and the folder /pasture.
+    Pasture {
+        #[command(subcommand)]
+        cmd: PastureCmd,
+    },
     /// Read what agents wrote to paddock kv, and free their leases.
     Kv {
         #[command(subcommand)]
@@ -486,6 +492,34 @@ impl KvScope {
             }
         })
     }
+}
+
+#[derive(Subcommand)]
+enum PastureCmd {
+    /// The pastures of the project, with their members and keys.
+    List {
+        /// The project folder (default: the current folder).
+        #[arg(long)]
+        project: Option<PathBuf>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Stop every running member of a pasture.
+    Stop {
+        name: String,
+        #[arg(long)]
+        project: Option<PathBuf>,
+    },
+    /// Delete the data of a pasture: its paddock kv file and its shared
+    /// folder. No member may run.
+    Remove {
+        name: String,
+        #[arg(long)]
+        project: Option<PathBuf>,
+        /// Delete without asking.
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1652,8 +1686,13 @@ fn real_main() -> Result<i32> {
                     let frozen = paddock::freeze::frozen(&env, &r.id)
                         .map(|(since, _)| format!("  frozen {}m", now.saturating_sub(since) / 60))
                         .unwrap_or_default();
+                    let pasture = r
+                        .pasture
+                        .as_deref()
+                        .map(|p| format!("  pasture {p}"))
+                        .unwrap_or_default();
                     println!(
-                        "{:<28} {:<8} {:<7} {:<7} {:>5}m  {}{frozen}",
+                        "{:<28} {:<8} {:<7} {:<7} {:>5}m  {}{pasture}{frozen}",
                         id,
                         r.harness,
                         r.backend,
@@ -1715,32 +1754,10 @@ fn real_main() -> Result<i32> {
             keep,
         } => recover_cmd(&env, &id, paths, all, to.as_deref(), keep),
         Cmd::Discard { id, paths, all } => discard_cmd(&env, &id, paths, all),
+        Cmd::Pasture { cmd } => pasture_cmd(&env, cmd),
         Cmd::Stop { id } => {
             let all = Running::list(&env);
-            let Some(r) = all.iter().find(|r| r.id == id) else {
-                bail!("no running sandbox with id {id}")
-            };
-            // The sandboxes that this one started stop with it. Its own
-            // paddock stops them too when it ends; this does not wait for that.
-            let children = state::descendants(&all, &id);
-            // A frozen process gets SIGTERM only when it thaws.
-            let _ = paddock::freeze::thaw(&env, &id, true);
-            for c in &children {
-                unsafe { libc::kill(c.pid as i32, libc::SIGTERM) };
-            }
-            unsafe { libc::kill(r.pid as i32, libc::SIGTERM) };
-            println!("Sent SIGTERM to {id}.");
-            if !children.is_empty() {
-                println!(
-                    "Sent SIGTERM to the sandboxes it started: {}.",
-                    children
-                        .iter()
-                        .map(|c| c.id.as_str())
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                );
-            }
-            Ok(0)
+            stop_one(&env, &all, &id)
         }
         Cmd::Doctor {
             escape,
@@ -2099,6 +2116,160 @@ fn gc_cmd(env: &HostEnv, o: &paddock::storage::GcOptions, json: bool) -> Result<
     }
     println!("paddock gc: freed {}.", storage::human(freed));
     Ok(i32::from(failed))
+}
+
+/// Stop one sandbox and the sandboxes it started.
+fn stop_one(env: &HostEnv, all: &[Running], id: &str) -> Result<i32> {
+    let Some(r) = all.iter().find(|r| r.id == id) else {
+        bail!("no running sandbox with id {id}")
+    };
+    // The sandboxes that this one started stop with it. Its own
+    // paddock stops them too when it ends; this does not wait for that.
+    let children = state::descendants(all, id);
+    // A frozen process gets SIGTERM only when it thaws.
+    let _ = paddock::freeze::thaw(env, id, true);
+    for c in &children {
+        unsafe { libc::kill(c.pid as i32, libc::SIGTERM) };
+    }
+    unsafe { libc::kill(r.pid as i32, libc::SIGTERM) };
+    println!("Sent SIGTERM to {id}.");
+    if !children.is_empty() {
+        println!(
+            "Sent SIGTERM to the sandboxes it started: {}.",
+            children
+                .iter()
+                .map(|c| c.id.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    Ok(0)
+}
+
+fn pasture_cmd(env: &HostEnv, cmd: PastureCmd) -> Result<i32> {
+    use paddock::kv::{host, shard};
+    let project = |p: Option<PathBuf>| host::project_of(p.as_deref());
+    match cmd {
+        PastureCmd::List { project: p, json } => {
+            let project = project(p)?;
+            let all = host::pastures(env, &project)?;
+            if json {
+                let rows: Vec<serde_json::Value> = all
+                    .iter()
+                    .map(|p| {
+                        let mut v = serde_json::to_value(p).unwrap_or_default();
+                        if !p.solo {
+                            v["folder"] = paddock::pasture::ground(env, &project, &p.name)
+                                .display()
+                                .to_string()
+                                .into();
+                        }
+                        v
+                    })
+                    .collect();
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "api_version": "paddock.pasture/v1", "project": project, "pastures": rows,
+                    }))?
+                );
+                return Ok(0);
+            }
+            let named: Vec<_> = all.iter().filter(|p| !p.solo).collect();
+            if named.is_empty() {
+                println!(
+                    "No pasture of {} has data or a running member. Define one in {} ([pastures.NAME] members = [...]) and start agents with --pasture NAME.",
+                    project.display(),
+                    env.paddock_config().join("config.toml").display()
+                );
+            }
+            for p in named {
+                let running: Vec<String> = p
+                    .members
+                    .iter()
+                    .filter(|m| m.running)
+                    .map(|m| format!("{} ({})", m.harness, m.sandbox))
+                    .collect();
+                println!(
+                    "{:<20} {:>5} keys  {}",
+                    p.name,
+                    p.keys,
+                    if running.is_empty() {
+                        "no member runs".to_string()
+                    } else {
+                        format!("running: {}", running.join(", "))
+                    }
+                );
+            }
+            let solo = all.iter().filter(|p| p.solo).count();
+            if solo > 0 {
+                println!("{solo} sandboxes without a pasture keep data of their own: `paddock kv list` lists them.");
+            }
+            Ok(0)
+        }
+        PastureCmd::Stop { name, project: p } => {
+            paddock::pasture::check_name(&name)?;
+            let project = project(p)?;
+            let all = Running::list(env);
+            let members = state::pasture_members(&all, &project, &name);
+            if members.is_empty() {
+                println!("No member of the pasture '{name}' runs.");
+                return Ok(0);
+            }
+            for m in members {
+                stop_one(env, &all, &m.id)?;
+            }
+            Ok(0)
+        }
+        PastureCmd::Remove {
+            name,
+            project: p,
+            yes,
+        } => {
+            if name.starts_with(paddock::pasture::SOLO_PREFIX) {
+                bail!("the data of a sandbox without a pasture goes with its run: `paddock gc` removes it");
+            }
+            paddock::pasture::check_name(&name)?;
+            let project = project(p)?;
+            let running = state::pasture_members(&Running::list(env), &project, &name)
+                .iter()
+                .map(|r| r.id.clone())
+                .collect::<Vec<_>>();
+            if !running.is_empty() {
+                bail!(
+                    "members of the pasture '{name}' still run: {}. Stop them first: paddock pasture stop {name}",
+                    running.join(", ")
+                );
+            }
+            let file = shard::Ns::pasture(&project, &name)?.file(&paddock::kv::kv_root(env))?;
+            let folder = paddock::pasture::folder(env, &project, &name);
+            let keys = if file.is_file() {
+                paddock::kv::store::Store::open(&file)?.totals()?.0
+            } else {
+                0
+            };
+            if !file.is_file() && !folder.exists() {
+                println!("The pasture '{name}' of {} has no data.", project.display());
+                return Ok(0);
+            }
+            if !yes {
+                println!(
+                    "This deletes the pasture '{name}' of {}: {keys} keys in paddock kv ({}) and the shared folder {}. Run it again with --yes to delete.",
+                    project.display(),
+                    file.display(),
+                    folder.display()
+                );
+                return Ok(1);
+            }
+            shard::remove_file(&file)?;
+            if folder.exists() {
+                std::fs::remove_dir_all(&folder)
+                    .map_err(|e| anyhow::anyhow!("cannot remove {}: {e}", folder.display()))?;
+            }
+            println!("Deleted the pasture '{name}' of {}.", project.display());
+            Ok(0)
+        }
+    }
 }
 
 fn files_cmd(env: &HostEnv, id: Option<&str>, json: bool) -> Result<i32> {

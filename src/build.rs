@@ -715,6 +715,25 @@ pub fn build_with(env: &HostEnv, opts: &Options, harness: Harness) -> Result<Bui
         crate::spawn::make_read_only(&mut spec, &[project.clone(), home_key.clone()]);
     }
 
+    // The shared folder of the pasture. paddock sets the variables last,
+    // so that nothing from the host or the project replaces them.
+    if let Some(name) = &opts.pasture {
+        let kv_project = worktree
+            .as_ref()
+            .map(|w| w.repo.clone())
+            .unwrap_or_else(|| home_key.clone());
+        let ground = crate::pasture::ground(env, &kv_project, name);
+        crate::privfs::dir(&ground)?;
+        spec.add_mount(Mount::bind(
+            &ground,
+            crate::pasture::MOUNT,
+            true,
+            &format!("pasture {name}"),
+        ));
+        spec.set_env("PADDOCK_PASTURE", crate::pasture::MOUNT, "pasture");
+        spec.set_env("PADDOCK_PASTURE_NAME", name.clone(), "pasture");
+    }
+
     policy::enforce(env, &spec)?;
 
     let backend = opts
@@ -795,6 +814,55 @@ mod tests {
         };
         let built = build_with(&env, &opts, h).unwrap();
         (tmp, built)
+    }
+
+    #[test]
+    fn a_pasture_member_gets_the_shared_folder() {
+        let (t, b) = privacy_spec("claude", "", "");
+        assert!(b.pasture.is_none());
+        assert!(!b.spec.mounts.iter().any(|m| m.dst == Path::new("/pasture")));
+        assert!(!b.spec.env.contains_key("PADDOCK_PASTURE"));
+        drop(t);
+
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let proj = tmp.path().join("proj");
+        std::fs::create_dir_all(&proj).unwrap();
+        let env = HostEnv::from_parts(home, "t".into(), 1000, 1000, Default::default());
+        let h = Harness {
+            profile: crate::profile::builtin("claude").unwrap(),
+            exe: PathBuf::from("/usr/bin/true"),
+            install_mounts: vec![],
+            path_dirs: vec![],
+            source: "test".into(),
+        };
+        let opts = Options {
+            harness: "claude".into(),
+            project: Some(proj.clone()),
+            assume_yes: true,
+            pasture: Some("team".into()),
+            ..Default::default()
+        };
+        let b = build_with(&env, &opts, h).unwrap();
+        let m = b
+            .spec
+            .mounts
+            .iter()
+            .find(|m| m.dst == Path::new("/pasture"))
+            .expect("no /pasture mount");
+        assert_eq!(m.kind, crate::spec::MountKind::Rw);
+        let ground = crate::pasture::ground(&env, &b.home_key, "team");
+        assert_eq!(m.src.as_deref(), Some(ground.as_path()));
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(&ground).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(b.spec.env["PADDOCK_PASTURE"].value, "/pasture");
+        assert_eq!(b.spec.env["PADDOCK_PASTURE_NAME"].value, "team");
+        // The admission check of `build` comes before this: a configured
+        // member only.
+        assert!(build(&env, &opts).is_err());
     }
 
     #[test]

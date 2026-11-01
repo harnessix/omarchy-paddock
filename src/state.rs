@@ -795,14 +795,30 @@ pub fn tree_order(list: Vec<Running>) -> Vec<Running> {
             add(c, all, out, depth + 1);
         }
     }
+    let roots: Vec<&Running> = list
+        .iter()
+        .filter(|r| {
+            !r.parent
+                .as_deref()
+                .is_some_and(|p| list.iter().any(|o| o.id == p))
+        })
+        .collect();
+    // The members of one pasture follow each other, where the first of
+    // them is.
+    let key = |r: &Running| r.pasture.clone().map(|n| (r.kv_project.clone(), n));
     let mut out = Vec::new();
-    for r in &list {
-        let has_parent = r
-            .parent
-            .as_deref()
-            .is_some_and(|p| list.iter().any(|o| o.id == p));
-        if !has_parent {
-            add(r, &list, &mut out, 0);
+    for (i, r) in roots.iter().enumerate() {
+        if out.iter().any(|o: &Running| o.id == r.id) {
+            continue;
+        }
+        add(r, &list, &mut out, 0);
+        if let Some(k) = key(r) {
+            for other in roots[i + 1..]
+                .iter()
+                .filter(|o| key(o).as_ref() == Some(&k))
+            {
+                add(other, &list, &mut out, 0);
+            }
         }
     }
     out
@@ -822,6 +838,13 @@ pub fn depth_in(list: &[Running], r: &Running) -> usize {
         }
     }
     d
+}
+
+/// The running members of the pasture `name` of `project`.
+pub fn pasture_members<'a>(list: &'a [Running], project: &Path, name: &str) -> Vec<&'a Running> {
+    list.iter()
+        .filter(|r| r.pasture.as_deref() == Some(name) && r.kv_project.as_deref() == Some(project))
+        .collect()
 }
 
 /// Every running sandbox that `id` started, and the ones they started.

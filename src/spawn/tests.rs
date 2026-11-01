@@ -823,6 +823,31 @@ fn ps_lists_children_under_their_parent() {
         .map(|r| r.id)
         .collect();
     assert_eq!(ids, ["a", "a1", "a1x", "b", "orphan"]);
+    // The members of one pasture follow each other, with their children.
+    let member = |id: &str, project: &str, pasture: &str| state::Running {
+        kv_project: Some(PathBuf::from(project)),
+        pasture: Some(pasture.into()),
+        ..r(id, None, 1)
+    };
+    let herd = vec![
+        member("x", "/p", "team"),
+        r("solo", None, 2),
+        member("y", "/other", "team"),
+        r("x1", Some("x"), 3),
+        member("z", "/p", "team"),
+    ];
+    let ids: Vec<String> = state::tree_order(herd.clone())
+        .into_iter()
+        .map(|r| r.id)
+        .collect();
+    assert_eq!(ids, ["x", "x1", "z", "solo", "y"]);
+    assert_eq!(
+        state::pasture_members(&herd, Path::new("/p"), "team")
+            .iter()
+            .map(|r| r.id.as_str())
+            .collect::<Vec<_>>(),
+        ["x", "z"]
+    );
     assert_eq!(state::depth_in(&list, &list[3]), 2);
     let d: Vec<String> = state::descendants(&list, "a")
         .into_iter()

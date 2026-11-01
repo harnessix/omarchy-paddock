@@ -161,6 +161,14 @@ pub fn settings(env: &HostEnv, spec: &SandboxSpec) -> Result<serde_json::Value> 
                 deny_read.push(s(&m.dst));
                 deny_write.push(s(&m.dst));
             }
+            // srt cannot bind the pasture folder to /pasture either: it
+            // stays at its host path, and PADDOCK_PASTURE names it.
+            MountKind::Rw if m.dst == Path::new(crate::pasture::MOUNT) => {
+                if let Some(src) = &m.src {
+                    allow_read.push(s(src));
+                    allow_write.push(s(src));
+                }
+            }
             // Shared caches and other remapped mounts cannot be expressed:
             // the sandbox home holds its own caches instead.
             _ => {}
@@ -328,6 +336,14 @@ impl Backend for Srt {
         if let Some(dir) = &spec.devices {
             vars.insert("PADDOCK_DEVICES".into(), s(dir));
         }
+        if let Some(src) = spec
+            .mounts
+            .iter()
+            .find(|m| m.dst == Path::new(crate::pasture::MOUNT))
+            .and_then(|m| m.src.as_ref())
+        {
+            vars.insert("PADDOCK_PASTURE".into(), s(src));
+        }
         vars.insert("CLAUDE_CODE_TMPDIR".into(), s(&tmp));
         // Host tools appear in their own directories, not under /run/paddock/bin.
         // paddock's own wrappers in the run folder come first. Other tools,
@@ -474,5 +490,20 @@ mod tests {
         let v = settings(&env, &s).unwrap();
         assert!(list(&v, "allowWrite").contains(&dev.to_str().unwrap()));
         assert_eq!(v["network"]["allowAllUnixSockets"], true);
+    }
+
+    #[test]
+    fn the_pasture_folder_stays_at_its_host_path() {
+        let (env, mut s) = spec();
+        let ground = crate::pasture::ground(&env, Path::new("/h/src/app"), "team");
+        s.add_mount(crate::spec::Mount::bind(
+            &ground,
+            crate::pasture::MOUNT,
+            true,
+            "pasture team",
+        ));
+        let v = settings(&env, &s).unwrap();
+        assert!(list(&v, "allowWrite").contains(&ground.to_str().unwrap()));
+        assert!(!list(&v, "allowWrite").contains(&crate::pasture::MOUNT));
     }
 }
