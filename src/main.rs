@@ -1826,6 +1826,13 @@ fn real_main() -> Result<i32> {
                                 serde_json::json!({ "sent": t.sent, "received": t.received }),
                             );
                         }
+                        let creds = paddock::monitor::read_credential_files(&env, &r.id);
+                        if let (Some(o), false) = (v.as_object_mut(), creds.is_empty()) {
+                            o.insert(
+                                "credential_files".into(),
+                                serde_json::to_value(creds).unwrap_or_default(),
+                            );
+                        }
                         v
                     })
                     .collect();

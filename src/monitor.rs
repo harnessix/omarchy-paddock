@@ -18,11 +18,16 @@
 //! when the sent bytes of one hour pass a limit or the usual amount by far.
 //! It keeps numbers only: totals in the run folder, and the sent bytes per
 //! hour of each harness and project in `~/.local/state/paddock/monitor/`.
+//!
+//! It also looks for new credential files in the sandbox home (`~/.ssh/`,
+//! `~/.netrc`, token files and the like) every few minutes and once at the
+//! end. It records paths and sizes, never content. A change to a login file
+//! of the harness profile is a token refresh: it counts, with no alert.
 
 use crate::env::HostEnv;
 use crate::kv::Identity;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -50,6 +55,7 @@ pub struct MonitorCfg {
     pub upload_per_hour: u64,
     /// An hour that sends this many times the usual hour makes an alert.
     pub factor: f64,
+    pub credentials: bool,
 }
 
 /// The default `upload_per_hour`: 5 GB.
@@ -114,6 +120,7 @@ impl MonitorCfg {
             traffic: get("traffic"),
             upload_per_hour,
             factor,
+            credentials: get("credentials"),
         }
     }
 }
@@ -225,6 +232,11 @@ pub fn read_traffic(env: &HostEnv, sandbox: &str) -> Option<Traffic> {
     load_record(&seen_file(env, sandbox)).traffic
 }
 
+/// The new credential files that paddock reported for a sandbox.
+pub fn read_credential_files(env: &HostEnv, sandbox: &str) -> Vec<CredFile> {
+    load_record(&seen_file(env, sandbox)).credential_files
+}
+
 #[cfg(test)]
 fn load_seen(file: &Path) -> BTreeSet<String> {
     load_record(file).tunnels
@@ -239,6 +251,15 @@ struct Record {
     alerts: BTreeSet<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     traffic: Option<Traffic>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    credential_files: Vec<CredFile>,
+    /// Changes to the harness's own login files: token refreshes.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    login_refreshes: u64,
+}
+
+fn is_zero(n: &u64) -> bool {
+    *n == 0
 }
 
 fn load_record(file: &Path) -> Record {
@@ -291,6 +312,176 @@ impl Seen {
             self.save();
         }
         out
+    }
+
+    /// The credential files that are new for this sandbox, and the count of
+    /// login refreshes. It records both.
+    pub fn fresh_creds(&mut self, found: Vec<CredFile>, refreshed: u64) -> Vec<CredFile> {
+        let out: Vec<CredFile> = found
+            .into_iter()
+            .filter(|f| !self.rec.credential_files.iter().any(|c| c.path == f.path))
+            .collect();
+        self.rec.credential_files.extend(out.iter().cloned());
+        self.rec.login_refreshes += refreshed;
+        if !out.is_empty() || refreshed > 0 {
+            self.save();
+        }
+        out
+    }
+}
+
+/// How often the credential check looks.
+const CRED_INTERVAL: Duration = Duration::from_secs(180);
+/// The credential check stops after this many entries of the home.
+const MAX_ENTRIES: usize = 50_000;
+/// Credential files by their path relative to the home.
+const CRED_PATHS: &[&str] = &[
+    ".netrc",
+    ".git-credentials",
+    ".config/gh/hosts.yml",
+    ".docker/config.json",
+    ".aws/credentials",
+    ".kube/config",
+];
+/// Words in a file name that make it a credential file.
+const CRED_WORDS: &[&str] = &["token", "credential", "secret", "apikey"];
+/// Folders that the check skips by name: caches, packages and builds.
+const SKIP_NAMES: &[&str] = &[
+    ".cache",
+    ".npm",
+    "node_modules",
+    "target",
+    ".git",
+    ".rustup",
+    "site-packages",
+];
+/// Folders that the check skips by their path relative to the home.
+const SKIP_PATHS: &[&str] = &[".cargo/registry", ".local/share/mise"];
+
+/// A new credential file: its path relative to the sandbox home and its size.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CredFile {
+    pub path: String,
+    pub size: u64,
+}
+
+/// Whether a path relative to the home names a credential file.
+pub fn is_credential(rel: &str) -> bool {
+    if rel.starts_with(".ssh/") || CRED_PATHS.contains(&rel) {
+        return true;
+    }
+    let name = base(rel);
+    let low = name.to_ascii_lowercase();
+    crate::detect::is_secret_name(name) || CRED_WORDS.iter().any(|w| low.contains(w))
+}
+
+/// Size and change time of one file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Stamp {
+    size: u64,
+    mtime: (i64, i64),
+}
+
+/// The regular files below `home` that `keep` accepts, by their path
+/// relative to `home`. It never follows a symlink.
+fn scan(home: &Path, keep: &dyn Fn(&str) -> bool) -> BTreeMap<String, Stamp> {
+    use std::os::unix::fs::MetadataExt;
+    let mut out = BTreeMap::new();
+    let mut left = MAX_ENTRIES;
+    let mut stack = vec![(home.to_path_buf(), String::new())];
+    while let Some((dir, rel)) = stack.pop() {
+        let Ok(rd) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for e in rd.flatten() {
+            if left == 0 {
+                return out;
+            }
+            left -= 1;
+            let name = e.file_name().to_string_lossy().into_owned();
+            let r = if rel.is_empty() {
+                name.clone()
+            } else {
+                format!("{rel}/{name}")
+            };
+            // The file type of a directory entry is that of the link itself.
+            let Ok(ft) = e.file_type() else { continue };
+            if ft.is_dir() {
+                if !SKIP_NAMES.contains(&name.as_str()) && !SKIP_PATHS.contains(&r.as_str()) {
+                    stack.push((e.path(), r));
+                }
+            } else if ft.is_file() && keep(&r) {
+                if let Ok(m) = e.metadata() {
+                    let mtime = (m.mtime(), m.mtime_nsec());
+                    out.insert(
+                        r,
+                        Stamp {
+                            size: m.len(),
+                            mtime,
+                        },
+                    );
+                }
+            }
+        }
+    }
+    out
+}
+
+/// The credential files of a sandbox home, as seen at the last look.
+pub struct Creds {
+    home: PathBuf,
+    /// The login files of the harness profile (`state.auth`), relative to
+    /// the home. A name that ends in `/` is a folder.
+    login: Vec<String>,
+    snap: BTreeMap<String, Stamp>,
+}
+
+impl Creds {
+    /// Take the first snapshot.
+    pub fn new(home: PathBuf, login: Vec<String>) -> Self {
+        let mut c = Creds {
+            home,
+            login,
+            snap: BTreeMap::new(),
+        };
+        c.snap = c.scan();
+        c
+    }
+
+    fn is_login(&self, rel: &str) -> bool {
+        self.login.iter().any(|l| match l.strip_suffix('/') {
+            Some(dir) => rel
+                .strip_prefix(dir)
+                .is_some_and(|rest| rest.starts_with('/')),
+            None => rel == l,
+        })
+    }
+
+    fn scan(&self) -> BTreeMap<String, Stamp> {
+        scan(&self.home, &|r| is_credential(r) || self.is_login(r))
+    }
+
+    /// Look again. It returns the credential files that are new or changed
+    /// since the last look, and the number of login files that changed.
+    pub fn check(&mut self) -> (Vec<CredFile>, u64) {
+        let now = self.scan();
+        let mut found = Vec::new();
+        let mut refreshed = 0;
+        for (rel, st) in &now {
+            if self.snap.get(rel) == Some(st) {
+                continue;
+            }
+            if self.is_login(rel) {
+                refreshed += 1;
+            } else {
+                found.push(CredFile {
+                    path: rel.clone(),
+                    size: st.size,
+                });
+            }
+        }
+        self.snap = now;
+        (found, refreshed)
     }
 }
 
@@ -523,6 +714,9 @@ struct Live {
     counter: Counter,
     base_file: PathBuf,
     done: bool,
+    creds: Option<Creds>,
+    /// The last credential check ran.
+    creds_done: bool,
 }
 
 impl Live {
@@ -555,6 +749,16 @@ impl Live {
         (new, hour_sent, base.median())
     }
 
+    /// Look for new credential files. It returns the ones that are new for
+    /// this sandbox.
+    fn check_creds(&mut self) -> Vec<CredFile> {
+        let Some(c) = self.creds.as_mut() else {
+            return Vec::new();
+        };
+        let (found, refreshed) = c.check();
+        self.seen.fresh_creds(found, refreshed)
+    }
+
     /// Add the current hour to the baseline, once.
     fn finish(&mut self) {
         if self.done {
@@ -571,34 +775,83 @@ impl Live {
     }
 }
 
-/// The handle of a running watch. `finish` at the end of the sandbox adds
-/// its last hour to the baseline and stops the watch.
+/// The handle of a running watch. `finish` at the end of the sandbox looks
+/// for credential files a last time, adds its last hour to the baseline and
+/// stops the watch.
 #[derive(Clone)]
-pub struct Watch(Option<Arc<Mutex<Live>>>);
+pub struct Watch {
+    live: Arc<Mutex<Live>>,
+    env: HostEnv,
+    id: Identity,
+    cfg: MonitorCfg,
+}
 
 impl Watch {
     pub fn finish(&self) {
-        if let Some(l) = &self.0 {
-            if let Ok(mut l) = l.lock() {
-                l.finish();
-            }
+        let new = {
+            let Ok(mut l) = self.live.lock() else { return };
+            let new = if l.creds_done {
+                Vec::new()
+            } else {
+                l.creds_done = true;
+                l.check_creds()
+            };
+            l.finish();
+            new
+        };
+        report_creds(&self.env, &self.id, &new, self.cfg.notify);
+    }
+
+    /// Start the credential check of the sandbox home `home` (its host
+    /// path), with the login files of the harness profile. Call it after
+    /// paddock filled the home, so that the snapshot holds what paddock
+    /// put there.
+    pub fn credentials(&self, home: PathBuf, login: Vec<String>) {
+        if !self.cfg.credentials || !home.is_dir() {
+            return;
         }
+        let creds = Creds::new(home, login);
+        match self.live.lock() {
+            Ok(mut l) => l.creds = Some(creds),
+            Err(_) => return,
+        }
+        let w = self.clone();
+        std::thread::spawn(move || loop {
+            std::thread::sleep(CRED_INTERVAL);
+            let new = {
+                let Ok(mut l) = w.live.lock() else { return };
+                if l.creds_done {
+                    return;
+                }
+                l.check_creds()
+            };
+            report_creds(&w.env, &w.id, &new, w.cfg.notify);
+        });
     }
 }
 
-/// Start the watch for a sandbox, unless the user turned it off.
+/// Start the watch for a sandbox. The tunnel and traffic part runs unless
+/// the user turned both off.
 pub fn watch(env: HostEnv, id: Identity) -> Watch {
     let cfg = MonitorCfg::load(&env);
-    if !cfg.tunnels && !cfg.traffic {
-        return Watch(None);
-    }
     let live = Arc::new(Mutex::new(Live {
         seen: Seen::open(seen_file(&env, &id.sandbox)),
         counter: Counter::default(),
         base_file: baseline_file(&env, &id.harness, &id.project),
         done: false,
+        creds: None,
+        creds_done: false,
     }));
-    let shared = live.clone();
+    let handle = Watch {
+        live: live.clone(),
+        env: env.clone(),
+        id: id.clone(),
+        cfg,
+    };
+    if !cfg.tunnels && !cfg.traffic {
+        return handle;
+    }
+    let shared = live;
     std::thread::spawn(move || {
         let mut dir: Option<PathBuf> = None;
         let mut tries = 0;
@@ -653,7 +906,7 @@ pub fn watch(env: HostEnv, id: Identity) -> Watch {
             }
         }
     });
-    Watch(Some(live))
+    handle
 }
 
 /// A byte count for people: `512 B`, `151 KB`, `4.2 MB`, `5.0 GB` (1024-based).
@@ -720,6 +973,58 @@ fn alert(
                 body: format!(
                     "{detail}. paddock does not know what it sends. paddock stop {} ends the sandbox.",
                     id.sandbox
+                ),
+                actions: Vec::new(),
+                critical: false,
+            },
+        );
+    }
+}
+
+/// New credential files: one audit line per file, with its path and size,
+/// and one notification for all of them.
+fn report_creds(env: &HostEnv, id: &Identity, files: &[CredFile], notify: bool) {
+    if files.is_empty() {
+        return;
+    }
+    for f in files {
+        crate::broker::audit_line(
+            env,
+            &serde_json::json!({
+                "time": crate::state::now(),
+                "sandbox": id.sandbox,
+                "harness": id.harness,
+                "project": id.project,
+                "capability": CAPABILITY,
+                "path": f.path,
+                "size": f.size,
+                "detail": format!(
+                    "{} has a new credential file: ~/{} ({})",
+                    id.sandbox,
+                    f.path,
+                    size(f.size)
+                ),
+                "decision": "reported",
+            }),
+        );
+    }
+    if notify {
+        let mut names: Vec<String> = files
+            .iter()
+            .take(3)
+            .map(|f| format!("~/{}", f.path))
+            .collect();
+        if files.len() > 3 {
+            names.push(format!("and {} more", files.len() - 3));
+        }
+        let _ = crate::broker::notify::show(
+            env,
+            &crate::broker::notify::Note {
+                summary: "new credential files in a sandbox".into(),
+                body: format!(
+                    "{} wrote {}. A key or token in its home can keep access later. paddock log shows the list.",
+                    id.sandbox,
+                    names.join(", ")
                 ),
                 actions: Vec::new(),
                 critical: false,
@@ -860,12 +1165,13 @@ mod tests {
                 traffic: true,
                 upload_per_hour: 5 << 30,
                 factor: 10.0,
+                credentials: true,
             }
         );
         let off = MonitorCfg::parse(
-            "[monitor]\ntunnels = false\nnotify = false\ntraffic = false\nupload_per_hour = \"300M\"\nfactor = 4\n",
+            "[monitor]\ntunnels = false\nnotify = false\ntraffic = false\nupload_per_hour = \"300M\"\nfactor = 4\ncredentials = false\n",
         );
-        assert!(!off.tunnels && !off.notify && !off.traffic);
+        assert!(!off.tunnels && !off.notify && !off.traffic && !off.credentials);
         assert_eq!((off.upload_per_hour, off.factor), (300 << 20, 4.0));
         let num = MonitorCfg::parse("[monitor]\nupload_per_hour = 1000\nfactor = 2.5\n");
         assert_eq!((num.upload_per_hour, num.factor), (1000, 2.5));
@@ -1009,6 +1315,8 @@ Inter-|   Receive                                                |  Transmit
             counter: Counter::default(),
             base_file: tmp.path().join("state/monitor/h-1.json"),
             done: false,
+            creds: None,
+            creds_done: false,
         };
         let (new, sent, _) = live.count((300, 200), &cfg);
         assert!(new.is_empty());
@@ -1047,5 +1355,154 @@ Inter-|   Receive                                                |  Transmit
         // Another sandbox has a file of its own.
         let mut other = Seen::open(tmp.path().join("other.json"));
         assert_eq!(other.fresh(vec![ngrok()]).len(), 1);
+    }
+
+    fn put(home: &Path, rel: &str, body: &str) {
+        let f = home.join(rel);
+        std::fs::create_dir_all(f.parent().unwrap()).unwrap();
+        std::fs::write(f, body).unwrap();
+    }
+
+    fn paths(files: &[CredFile]) -> Vec<&str> {
+        files.iter().map(|f| f.path.as_str()).collect()
+    }
+
+    #[test]
+    fn credential_names() {
+        for yes in [
+            ".ssh/id_ed25519",
+            ".ssh/authorized_keys",
+            ".ssh/config",
+            ".netrc",
+            ".git-credentials",
+            ".config/gh/hosts.yml",
+            ".docker/config.json",
+            ".aws/credentials",
+            ".kube/config",
+            "work/server.pem",
+            ".config/x/GitHub_Token.txt",
+            "notes/apikey",
+        ] {
+            assert!(is_credential(yes), "{yes}");
+        }
+        for no in [".bashrc", ".config/x/config.json", ".gitconfig"] {
+            assert!(!is_credential(no), "{no}");
+        }
+    }
+
+    #[test]
+    fn new_credential_files_are_found_and_login_refreshes_counted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        put(&home, ".bashrc", "x");
+        put(&home, ".fake/auth.json", "login-1");
+        put(&home, ".fake/keys/a", "k");
+        put(&home, ".ssh/known_hosts", "h");
+        let mut c = Creds::new(
+            home.clone(),
+            vec![".fake/auth.json".into(), ".fake/keys/".into()],
+        );
+        assert_eq!(c.check(), (vec![], 0));
+        // The harness refreshes its token and adds a key to its login folder.
+        put(&home, ".fake/auth.json", "login-2-longer");
+        put(&home, ".fake/keys/b", "k");
+        assert_eq!(c.check(), (vec![], 2));
+        // A planted key, an authorized key and a file in a cache.
+        put(&home, ".ssh/id_ed25519", "PRIVATE");
+        put(&home, ".ssh/authorized_keys", "ssh-ed25519 AAA");
+        put(&home, ".cache/x/token", "t");
+        put(&home, "proj/node_modules/m/secret.js", "s");
+        let (found, n) = c.check();
+        assert_eq!(n, 0);
+        assert_eq!(paths(&found), [".ssh/authorized_keys", ".ssh/id_ed25519"]);
+        assert_eq!(found[1].size, 7);
+        // A change to a credential file that is not a login is news.
+        put(&home, ".ssh/known_hosts", "h2");
+        assert_eq!(paths(&c.check().0), [".ssh/known_hosts"]);
+        assert_eq!(c.check(), (vec![], 0));
+    }
+
+    #[test]
+    fn a_symlink_is_not_followed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let outside = tmp.path().join("outside");
+        put(&outside, ".ssh/id_rsa", "k");
+        put(&outside, "token", "t");
+        std::fs::create_dir_all(&home).unwrap();
+        let mut c = Creds::new(home.clone(), vec![]);
+        std::os::unix::fs::symlink(outside.join(".ssh"), home.join(".ssh")).unwrap();
+        std::os::unix::fs::symlink(outside.join("token"), home.join("token")).unwrap();
+        assert_eq!(c.check(), (vec![], 0));
+    }
+
+    #[test]
+    fn a_credential_file_counts_once_per_sandbox() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("monitor.json");
+        let key = |size| CredFile {
+            path: ".ssh/id_ed25519".into(),
+            size,
+        };
+        let mut seen = Seen::open(file.clone());
+        assert_eq!(seen.fresh_creds(vec![key(7)], 0), [key(7)]);
+        assert!(seen.fresh_creds(vec![key(9)], 2).is_empty());
+        let mut again = Seen::open(file.clone());
+        assert!(again.fresh_creds(vec![key(9)], 1).is_empty());
+        let rec = load_record(&file);
+        assert_eq!(rec.credential_files, [key(7)]);
+        assert_eq!(rec.login_refreshes, 3);
+    }
+
+    #[test]
+    fn the_audit_line_has_path_and_size_but_no_content() {
+        let tmp = tempfile::tempdir().unwrap();
+        let env = HostEnv::from_parts(
+            tmp.path().join("host"),
+            "u".into(),
+            1,
+            1,
+            Default::default(),
+        );
+        let home = tmp.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let id = Identity {
+            sandbox: "s-1".into(),
+            harness: "fake".into(),
+            project: tmp.path().join("p"),
+            pasture: None,
+            parent: None,
+            chain: Vec::new(),
+            tree: None,
+        };
+        let cfg = MonitorCfg {
+            notify: false,
+            ..MonitorCfg::parse("")
+        };
+        let w = Watch {
+            live: Arc::new(Mutex::new(Live {
+                seen: Seen::open(tmp.path().join("run/monitor.json")),
+                counter: Counter::default(),
+                base_file: tmp.path().join("base.json"),
+                done: false,
+                creds: None,
+                creds_done: false,
+            })),
+            env: env.clone(),
+            id,
+            cfg,
+        };
+        w.credentials(home.clone(), vec![]);
+        let secret = "SECRET-KEY-MATERIAL-1234";
+        put(&home, ".ssh/id_ed25519", secret);
+        w.finish();
+        w.finish();
+        let log = std::fs::read_to_string(crate::broker::audit_file(&env)).unwrap();
+        assert_eq!(log.lines().count(), 1);
+        let line: serde_json::Value = serde_json::from_str(log.trim()).unwrap();
+        assert_eq!(line["capability"], CAPABILITY);
+        assert_eq!(line["path"], ".ssh/id_ed25519");
+        assert_eq!(line["size"], secret.len());
+        assert!(!log.contains(secret));
     }
 }

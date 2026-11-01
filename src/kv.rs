@@ -1592,6 +1592,14 @@ pub struct Served {
 }
 
 impl Served {
+    /// Start the credential check of the sandbox home (its host path), with
+    /// the login files of the harness profile (`state.auth`).
+    pub fn watch_credentials(&self, home: PathBuf, login: Vec<String>) {
+        if let Some(m) = &self.monitor {
+            m.credentials(home, login);
+        }
+    }
+
     pub fn finish(self) {
         if let Some(m) = &self.monitor {
             m.finish();

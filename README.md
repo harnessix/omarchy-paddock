@@ -369,6 +369,17 @@ notify = true             # false keeps the audit line, without a notification
 - docker and podman sandboxes, sandboxes with `--network host` and sandboxes without a scope are not counted.
 - srt sends through a local proxy, so most of its traffic goes over `lo` and does not count.
 
+#### Credential files
+
+A key or a token that a sandbox plants in its home can keep access later. paddock takes a list of the credential files in the sandbox home when the sandbox starts, looks again every 3 minutes and once when the sandbox ends. It reads names, sizes and change times, never content.
+
+- Credential files: everything in `~/.ssh/`, `~/.netrc`, `~/.git-credentials`, `~/.config/gh/hosts.yml`, `~/.docker/config.json`, `~/.aws/credentials`, `~/.kube/config`, keys such as `*.pem` and `id_ed25519`, and files whose name contains `token`, `credential`, `secret` or `apikey`.
+- paddock skips caches and build folders (`.cache`, `.npm`, `.cargo/registry`, `node_modules`, `target` and similar), never follows a symlink, and stops after 50,000 entries.
+- A new credential file, or a changed one, gets one line in the audit log with its path and size, and the check gets one desktop notification for all its files. Each path counts once per sandbox. `paddock ps --json` lists them in `credential_files`.
+- The login files of the harness are not news: when the harness refreshes its token, paddock only counts it in the run folder.
+- In `~/.config/paddock/config.toml`, `[monitor] credentials = false` turns the check off, and `[monitor] notify = false` keeps the audit lines without a notification.
+- It works with every backend, as long as paddock kv runs.
+
 ## Logins and MCP
 
 By default, a sandbox uses your existing login (auth mode `shared`). paddock copies the credential files of the harness from your home directory into the sandbox at start. If the harness refreshes a token in the sandbox, paddock writes it back when the sandbox exits. If the file also changed on the host in the meantime, the host version stays, and paddock tells you.
