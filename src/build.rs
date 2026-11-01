@@ -407,6 +407,15 @@ pub fn build_with(env: &HostEnv, opts: &Options, harness: Harness) -> Result<Bui
     for p in &harness.install_mounts {
         spec.add_mount(Mount::same(p, false, &format!("{porigin}: install")));
     }
+    // The harness's own folder: a shell in the sandbox (`paddock shell`),
+    // and tools that start the harness by name, find it. The folder is
+    // already among the install mounts. It goes after paddock's own tools:
+    // a harness in /usr/bin must not put the host's `gh` before paddock's.
+    if let Some(d) = harness.exe.parent() {
+        if !spec.tool_path.iter().any(|p| p == d) {
+            spec.tool_path.push(d.to_path_buf());
+        }
+    }
     for d in &harness.path_dirs {
         spec.add_path(d.clone());
     }
@@ -852,6 +861,44 @@ mod tests {
         };
         let built = build_with(&env, &opts, h).unwrap();
         (tmp, built)
+    }
+
+    #[test]
+    fn the_harness_folder_is_on_the_sandbox_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let proj = tmp.path().join("proj");
+        let tools = tmp.path().join("tools/codex/1.0/bin");
+        std::fs::create_dir_all(&proj).unwrap();
+        std::fs::create_dir_all(&tools).unwrap();
+        let env = HostEnv::from_parts(home, "t".into(), 1000, 1000, Default::default());
+        let h = Harness {
+            profile: crate::profile::builtin("codex").unwrap(),
+            exe: tools.join("codex"),
+            install_mounts: vec![tools.parent().unwrap().to_path_buf()],
+            path_dirs: vec![],
+            source: "test".into(),
+        };
+        for shell in [false, true] {
+            let opts = Options {
+                harness: "codex".into(),
+                project: Some(proj.clone()),
+                assume_yes: true,
+                shell,
+                ..Default::default()
+            };
+            let b = build_with(&env, &opts, h.clone()).unwrap();
+            let path = b.spec.path_value();
+            let dirs: Vec<&str> = path.split(':').collect();
+            let at = dirs.iter().position(|d| Path::new(d) == tools);
+            assert!(at.is_some(), "shell={shell}: {path}");
+            // Never before paddock's own tools (gh, git).
+            let tools_at = dirs
+                .iter()
+                .position(|d| *d == crate::spec::TOOL_DIR)
+                .unwrap();
+            assert!(at.unwrap() > tools_at, "{path}");
+        }
     }
 
     #[test]
