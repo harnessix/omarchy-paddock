@@ -296,6 +296,11 @@ sandbox ends. Use `paddock-host capabilities --json` to see the limits."#
 /// Send one request to the host: through the gateway device
 /// `/dev/paddock/gw` when the sandbox has it, else through the host socket.
 pub fn send(req: &Request) -> Result<Response, String> {
+    // A unit test talks to its own broker. Run in a paddock sandbox, the
+    // gateway would take the request to the real host instead.
+    if cfg!(test) && std::env::var_os("PADDOCK_HOST_SOCKET").is_some() {
+        return send_socket(req);
+    }
     let gw = device::root().join("gw");
     if gw.exists() {
         return send_gateway(req);
