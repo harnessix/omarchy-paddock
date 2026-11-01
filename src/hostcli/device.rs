@@ -267,6 +267,7 @@ mod tests {
         assert_eq!(exit_for_errno(libc::ETIMEDOUT), 5);
         assert_eq!(exit_for_errno(libc::EINVAL), 8);
         assert_eq!(exit_for_errno(libc::EMSGSIZE), 10);
+        assert_eq!(exit_for_errno(libc::EDQUOT), 11);
         assert_eq!(exit_for_errno(libc::EIO), 7);
         // The same code as a kv watch or a spawn wait that timed out.
         assert_eq!(

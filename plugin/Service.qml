@@ -119,7 +119,7 @@ Item {
   }
   function glyph(c) {
     return ({ "screenshot": "󰹑", "exec": "󰆍", "fetch": "󰉋", "clipboard-read": "󰅇",
-              "clipboard-write": "󰅌", "open-url": "󰌹", "notify": "󰂞", "spawn": "󰚩", "spawn-timeout": "󰔟", "ask": "󰘥" })[c] || "󰀦"
+              "clipboard-write": "󰅌", "open-url": "󰌹", "notify": "󰂞", "spawn": "󰚩", "spawn-timeout": "󰔟", "device-budget": "󰄔", "ask": "󰘥" })[c] || "󰀦"
   }
 
   function answer(r, decision) {

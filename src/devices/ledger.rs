@@ -344,17 +344,69 @@ impl Ledger {
     }
 }
 
-/// What a run spent, for `paddock ps --json`: only devices with a spent
-/// amount above zero. Empty when the ledger does not exist.
-pub fn spent_of(env: &crate::env::HostEnv, root: &str) -> Vec<Spent> {
+/// What the run of a sandbox spent, for `paddock ps --json`: only devices
+/// with a spent amount above zero. Empty when the ledger does not exist.
+pub fn spent_of(env: &crate::env::HostEnv, sandbox: &str) -> Vec<Spent> {
     let file = path(env);
     if !file.is_file() {
         return Vec::new();
     }
     Ledger::open(&file)
-        .and_then(|l| l.run(root))
+        .and_then(|l| l.run(&l.root(sandbox)?))
         .map(|v| v.into_iter().filter(|s| s.spent > 0).collect())
         .unwrap_or_default()
+}
+
+/// The text of `paddock devices ledger`: the sums by sandbox and device,
+/// since `since` seconds ago, for one project or all.
+pub fn report(
+    env: &crate::env::HostEnv,
+    project: Option<&Path>,
+    since: Option<u64>,
+    json: bool,
+) -> Result<String> {
+    let file = path(env);
+    let from = since.map_or(0, |s| crate::state::now().saturating_sub(s));
+    let project = project.map(|p| p.display().to_string());
+    let sums = if file.is_file() {
+        Ledger::open(&file)?.sums(project.as_deref(), from)?
+    } else {
+        Vec::new()
+    };
+    if json {
+        let rows: Vec<serde_json::Value> = sums
+            .iter()
+            .map(|s| {
+                let mut v = serde_json::to_value(s).unwrap_or_default();
+                v["spent"] = money(s.spent).into();
+                v
+            })
+            .collect();
+        return Ok(format!(
+            "{}\n",
+            serde_json::json!({ "api_version": "paddock.ledger/v1", "sums": rows })
+        ));
+    }
+    if sums.is_empty() {
+        return Ok("No requests of paid devices.\n".into());
+    }
+    let mut out = String::new();
+    for s in &sums {
+        let run = if s.root == s.sandbox {
+            String::new()
+        } else {
+            format!(" (run {})", s.root)
+        };
+        out.push_str(&format!(
+            "{}{run}  {}  {} requests  spent {}  {}\n",
+            s.sandbox,
+            s.device,
+            s.requests,
+            money(s.spent),
+            s.project
+        ));
+    }
+    Ok(out)
 }
 
 /// Raise the budget of a run on a device by `add` (`paddock devices

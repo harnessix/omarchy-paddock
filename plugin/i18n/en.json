@@ -246,6 +246,7 @@
   "msg.acked": "The mark is cleared. The audit log keeps the findings.",
   "msg.ackFailed": "paddock could not clear the mark.",
   "forage.overgrazing": "%1 %2: %3% used, runs out in %4 at this rate, resets in %5",
+  "row.spent": "spent %1 of %2 on %3",
   "row.boundary": {
     "one": "%1 denied · read it: paddock boundary %2",
     "other": "%1 denied · read them: paddock boundary %2"

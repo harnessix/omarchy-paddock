@@ -228,6 +228,7 @@
   "msg.acked": "标记已清除。审计日志保留这些发现。",
   "msg.ackFailed": "paddock 没能清除标记。",
   "forage.overgrazing": "%1 %2：已用 %3%，按现在的速度 %4 后用完，%5 后才重置",
+  "row.spent": "%3 已花费 %1 / %2",
   "row.boundary": {
     "other": "已拒绝 %1 次 · 查看：paddock boundary %2"
   },
