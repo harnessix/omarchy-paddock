@@ -57,7 +57,13 @@ fn inherit_skips_sockets_and_hidden_names() {
     let b = build_with(&env, &opts, harness()).unwrap();
     let e = &b.spec.env;
     assert!(e.contains_key("PLAIN_SETTING"));
-    assert!(e.get("SERVICE_TOKEN").is_some_and(|v| v.secret));
+    // A secret stays on the host unless something names it.
+    assert!(!e.contains_key("SERVICE_TOKEN"));
+    assert!(b
+        .spec
+        .notices
+        .iter()
+        .any(|n| n.contains("SERVICE_TOKEN") && n.contains("stay on the host")));
     assert!(!e.contains_key("HIDE_ME"));
     assert!(!e.contains_key("SSH_AUTH_SOCK"));
     assert!(
@@ -116,4 +122,36 @@ fn inherit_drops_cloud_credentials_unless_passed_by_name() {
     let b = build_with(&env, &opts, harness()).unwrap();
     assert!(b.spec.env.contains_key("AWS_SECRET_ACCESS_KEY"));
     assert!(!b.spec.env.contains_key("GOOGLE_APPLICATION_CREDENTIALS"));
+}
+
+#[test]
+fn a_harness_keeps_its_own_login_variables_and_pass_hands_over_others() {
+    let (_t, mut env, project) = setup(&[]);
+    env.vars.insert("T_API_KEY".into(), "login".into());
+    env.vars.insert("OTHER_API_KEY".into(), "other".into());
+    let mut h = harness();
+    h.profile.state.env_pass = vec!["T_API_KEY".into()];
+    let opts = Options {
+        harness: "t".into(),
+        project: Some(project),
+        assume_yes: true,
+        ..Default::default()
+    };
+    let b = build_with(&env, &opts, h.clone()).unwrap();
+    let e = &b.spec.env;
+    assert!(e
+        .get("T_API_KEY")
+        .is_some_and(|v| v.secret && v.value == "login"));
+    assert!(!e.contains_key("OTHER_API_KEY"));
+    let note = b.spec.notices.join("\n");
+    assert!(
+        note.contains("OTHER_API_KEY") && note.contains("T_API_KEY"),
+        "{note}"
+    );
+
+    // [env] pass in the user configuration hands one over.
+    let cfg = env.home.join(".config/paddock/config.toml");
+    std::fs::write(&cfg, "[env]\npass = [\"OTHER_API_KEY\"]\n").unwrap();
+    let b = build_with(&env, &opts, h).unwrap();
+    assert!(b.spec.env.get("OTHER_API_KEY").is_some_and(|v| v.secret));
 }

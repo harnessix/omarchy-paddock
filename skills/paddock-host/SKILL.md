@@ -7,6 +7,8 @@ description: Use when you run inside a paddock sandbox and a task needs the host
 
 You are in a paddock sandbox when the environment variable `PADDOCK` is `1`. The sandbox contains the project, your own home directory and package caches. Everything else on the host is absent. Do not search for host files, and do not try to reach host services: they are not there.
 
+Host variables that look like secrets (tokens, passwords, API keys) stay on the host. Your harness gets only its own login variables. If a task needs another token, do not search for it: tell the user which variable it needs. The user decides whether to hand it over.
+
 When a task needs the host, use `paddock-host`. Each request goes to paddock on the host. The user can approve it, deny it, or have configured it in advance.
 
 1. Run `paddock-host capabilities --json` once. It lists each capability and its mode: `allow`, `ask` or `deny`. Do not use a capability in `deny` mode.
