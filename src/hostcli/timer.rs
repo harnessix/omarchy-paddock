@@ -12,7 +12,7 @@ USAGE
   paddock-host timer status [NAME] [--scope SCOPE]
   paddock-host timer extend NAME --by DURATION|PCT [--reason TEXT] [--scope SCOPE]
   paddock-host timer stop NAME [--scope SCOPE]
-Every command takes --json. DURATION: 90s, 30m, 2h, 1h30m, 1d. PCT: 5%.
+Every command takes --json. DURATION: 90s, 30m, 2h, 1h30m, 1d. PCT: 1%.
 
 A timer lives on the host, so it outlasts your context: after a compaction,
 or when another agent takes over, `paddock-host timer status` still knows
@@ -23,14 +23,16 @@ Run `paddock-host timer status` when you start working again, after a
 compaction, and before you try one more fix for the same bug.
 
 - start: you own the timer. It needs --budget, --quota, or both.
-  --quota weekly=10% lets the task use 10% of the account's weekly limit
+  --quota weekly=1% lets the task use 1% of the account's weekly limit
   window, counted from now (`paddock-host forage` shows the windows). It
   counts everything that the account uses meanwhile, also elsewhere, and
-  its numbers are up to 15 minutes old.
+  its numbers are up to 15 minutes old. Keep a task to about 1% of the
+  weekly limit; split larger work into several small tasks.
   A --hard timer freezes this sandbox when a budget is used up; without
   --hard, the user gets a notice and you keep running.
-- extend: --by 30m adds time, --by 5% adds quota. The owner adds at once. A timer that someone else set (the
-  user, or the agent that started you) asks the user, who sees --reason.
+- extend: --by 30m adds time, --by 1% adds quota. The owner adds at once.
+  A timer that someone else set (the user, or the agent that started you)
+  asks the user, who sees --reason.
 - stop: only the owner stops a timer.
 
 SCOPES (--scope, default self): self, pasture, tree, as for paddock-host kv.

@@ -16,7 +16,7 @@
 //!   sandbox was frozen.
 //!
 //! - A timer can also have a quota budget: a share of one limit window of
-//!   the account that the sandbox uses ("at most 10% of the weekly limit").
+//!   the account that the sandbox uses ("at most 1% of the weekly limit").
 //!   It counts what the account used since the timer started, from the
 //!   forage ledger (forage.rs). The ledger knows the account, not the
 //!   sandbox: what other sandboxes and apps on the same login use counts
@@ -115,15 +115,15 @@ impl Quota {
     }
 }
 
-/// `weekly=10%`: a window and a share. The window is a label of the usage
+/// `weekly=1%`: a window and a share. The window is a label of the usage
 /// record, or the first word of one, in any case.
 pub fn parse_quota(s: &str) -> Result<(String, f64)> {
     let (window, pct) = s
         .rsplit_once('=')
-        .with_context(|| format!("'{s}' is not a quota budget: use for example weekly=10%"))?;
+        .with_context(|| format!("'{s}' is not a quota budget: use for example weekly=1%"))?;
     let share = parse_share(pct)?;
     if window.trim().is_empty() {
-        bail!("'{s}' names no window: use for example weekly=10%");
+        bail!("'{s}' names no window: use for example weekly=1%");
     }
     Ok((window.trim().to_string(), share))
 }
@@ -563,7 +563,7 @@ pub enum More {
     Share(f64),
 }
 
-/// `30m` or `5%`.
+/// `30m` or `1%`.
 pub fn parse_more(s: &str) -> Result<More> {
     if s.trim().ends_with('%') {
         Ok(More::Share(parse_share(s)?))
@@ -579,7 +579,7 @@ pub fn add_more(t: &mut Timer, more: More, by: &str, at: u64, reason: String) ->
         More::Time(n) => {
             if t.budget == 0 {
                 bail!(
-                    "the timer {} has no time budget; add quota with --by 5%",
+                    "the timer {} has no time budget; add quota with --by 1%",
                     t.name
                 );
             }
