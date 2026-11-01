@@ -387,6 +387,28 @@ inherit = false
 pass = ["MY_TOOL_TOKEN"]
 ```
 
+### Credentials
+
+A variable in `[env] pass` reaches the sandbox at every start, without a question. For a credential that you want to hand over only when you agree, register it in `~/.config/paddock/config.toml`:
+
+```toml
+[credentials.DB_PASSWORD]
+via = "deliver"
+from = "command"                    # or "env": a host variable (var = "NAME", default: the name)
+command = ["secret-tool", "lookup", "service", "mydb"]
+harnesses = ["claude"]              # optional: only these harnesses
+```
+
+- When a sandbox starts, the approval card asks twice: first whether to give the credential, then to confirm. The harness starts only after the second answer. With "No" at either step, or no answer, the sandbox starts without it.
+- paddock reads the value only after both answers. A command runs on the host. The value then exists only in the environment of the sandbox. It is never written to disk by paddock.
+- The value enters the sandbox, and the agent can read it. It cannot be taken back: to end it, stop the sandbox. The bar panel marks a sandbox that holds a credential.
+- A registered credential never passes in any other way: not with the inherited environment, not as a harness login variable, not through `[env] pass`.
+- A sandbox that another one started gets no credentials.
+- A project `paddock.toml` cannot register a credential.
+- `paddock credentials list` shows the registered credentials, whether their source is there, and how often each was delivered. The audit log (`paddock log`) records each question, answer and delivery by name, never a value.
+
+`via = "deliver"` is the only way so far. A later version adds `gateway` (a local gateway adds the value to requests for the hosts that you bind it to, and the sandbox sees only a stand-in) and `agent` (ssh-agent and git credential helpers on the host).
+
 ## Privacy defaults
 
 paddock turns off vendor telemetry in every sandbox. It uses the switches that each vendor documents. It sets them only inside the sandbox: as environment variables, or in the sandbox's own copy of a settings file. Your host configuration does not change. `paddock explain` shows each switch and the profile that sets it.

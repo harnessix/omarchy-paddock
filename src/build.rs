@@ -565,6 +565,16 @@ pub fn build_with(env: &HostEnv, opts: &Options, harness: Harness) -> Result<Bui
     for (k, v) in &m.env.set {
         spec.set_env(k, v.clone(), "manifest env.set");
     }
+    // A registered credential reaches the sandbox only through its channel
+    // (credentials.rs), never with the environment, env_pass or [env] pass.
+    for (name, c) in crate::credentials::load(env)? {
+        if c.from == crate::credentials::Source::Env {
+            spec.env.remove(c.host_var(&name));
+        }
+        if c.via == crate::credentials::Via::Deliver {
+            spec.env.remove(c.sandbox_var(&name));
+        }
+    }
     // The `env` prefix of a `paddock wrap` command, as the agent gets it on
     // the host.
     if let Some(t) = &opts.transparent {

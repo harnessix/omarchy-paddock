@@ -676,6 +676,8 @@ Panel {
             // paddock ps lists it right after its parent.
             parent: root.plain(r.parent || "", 64),
             pasture: root.plain(r.pasture || "", 32),
+            // Credentials whose values the sandbox holds (deliver).
+            credentials: Array.isArray(r.credentials) ? r.credentials.slice(0, 8).map(function(c) { return root.plain(c, 64) }).join(", ") : "",
             parentHarness: "",
             depth: 0,
             children: 0
@@ -1250,10 +1252,11 @@ Panel {
                 caption: strings.t("row.detail").arg(modelData.backend).arg(modelData.network).arg(modelData.gui).arg(root.uptime(modelData.started))
                 caption2: modelData.frozenSince > 0 ? strings.t("row.frozen").arg(root.uptime(modelData.frozenSince))
                   : modelData.warning !== "" ? modelData.warning
+                  : modelData.credentials !== "" ? strings.t("row.holdsCredentials").arg(modelData.credentials)
                   : (modelData.parent !== "" ? strings.t("row.startedBy").arg(modelData.parent)
                   : (modelData.auth !== "" && modelData.auth !== "shared" ? strings.t("row.auth").arg(modelData.auth)
                   : (modelData.pasture !== "" ? strings.t("row.pasture").arg(modelData.pasture) : "")))
-                caption2Color: modelData.warning !== "" ? root.urgent : root.dim
+                caption2Color: modelData.warning !== "" || (modelData.frozenSince === 0 && modelData.credentials !== "") ? root.urgent : root.dim
                 showActions: true
                 onActivated: root.goToTerminal(modelData)
 

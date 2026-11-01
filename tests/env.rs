@@ -155,3 +155,30 @@ fn a_harness_keeps_its_own_login_variables_and_pass_hands_over_others() {
     let b = build_with(&env, &opts, h).unwrap();
     assert!(b.spec.env.get("OTHER_API_KEY").is_some_and(|v| v.secret));
 }
+
+#[test]
+fn a_registered_credential_never_passes_with_the_environment() {
+    let (_t, mut env, project) = setup(&[]);
+    env.vars.insert("T_API_KEY".into(), "login".into());
+    env.vars.insert("DB_PASS".into(), "db".into());
+    let cfg = env.home.join(".config/paddock/config.toml");
+    std::fs::write(
+        &cfg,
+        "[env]\npass = [\"DB_PASS\"]\n\n[credentials.T_API_KEY]\nvia = \"deliver\"\n\n[credentials.DB]\nvia = \"deliver\"\nvar = \"DB_PASS\"\n",
+    )
+    .unwrap();
+    let mut h = harness();
+    h.profile.state.env_pass = vec!["T_API_KEY".into()];
+    let opts = Options {
+        harness: "t".into(),
+        project: Some(project),
+        assume_yes: true,
+        ..Default::default()
+    };
+    let b = build_with(&env, &opts, h).unwrap();
+    // Not as a login variable, not through [env] pass, not under its
+    // sandbox name: only the deliver channel hands it over, after the card.
+    for k in ["T_API_KEY", "DB_PASS", "DB"] {
+        assert!(!b.spec.env.contains_key(k), "{k}");
+    }
+}

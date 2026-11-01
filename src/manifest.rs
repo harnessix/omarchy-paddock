@@ -17,10 +17,10 @@ pub const PROJECT_FILE: &str = "paddock.toml";
 
 /// Tables of `~/.config/paddock/config.toml` that other modules read
 /// themselves: `[devices]` (devices.rs), `[kv]` (kv.rs), `[pastures]`
-/// (pasture.rs) and `[exec]`
+/// (pasture.rs), `[credentials]` (credentials.rs) and `[exec]`
 /// (gatewayd.rs). A project
 /// `paddock.toml` with one of them is invalid.
-pub const USER_ONLY: &[&str] = &["devices", "kv", "exec", "pastures"];
+pub const USER_ONLY: &[&str] = &["devices", "kv", "exec", "pastures", "credentials"];
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
