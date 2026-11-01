@@ -281,6 +281,73 @@ fn unmount_leaves_an_empty_folder() {
     assert!(!root.join(CATALOG).exists());
 }
 
+#[test]
+fn catalog_lists_secret_files_by_name_only() {
+    let v: serde_json::Value =
+        serde_json::from_slice(&catalog_with(&[], &["GH_TOKEN".to_string()])).unwrap();
+    assert_eq!(v["secrets"][0]["name"], "GH_TOKEN");
+    assert_eq!(v["secrets"][0]["path"], "/dev/paddock/secret/GH_TOKEN");
+    assert!(v["secrets_how"].as_str().unwrap().contains("cat "));
+    let none: serde_json::Value = serde_json::from_slice(&catalog(&[])).unwrap();
+    assert!(none.get("secrets").is_none());
+}
+
+#[test]
+fn a_secret_file_returns_the_value_counts_a_use_and_fails_after_revoke() {
+    use crate::credentials::secret::{Secret, SecretFiles};
+    let Ok(env) = HostEnv::detect() else { return };
+    if let Err(why) = fuse_available(&env) {
+        eprintln!("skipped: {why}");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let revoked = dir.path().join("revoked");
+    let reads = Arc::new(Mutex::new(Vec::<String>::new()));
+    let r2 = reads.clone();
+    let secrets = SecretFiles::new(
+        Some(revoked.clone()),
+        Some(Arc::new(move |n: &str| {
+            r2.lock().unwrap().push(n.to_string())
+        })),
+    );
+    let fs = DeviceFs::with_secrets("test-sandbox", vec![Arc::new(Echo)], secrets.clone());
+    let root = dir.path().join("dev");
+    let _m = match mount(&root, fs) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("skipped: {e:#}");
+            return;
+        }
+    };
+    // Before the start card: no folder.
+    assert!(!root.join(SECRET_DIR).exists());
+    secrets.insert("GH_TOKEN", Secret::from("ghp_FILEvalue"));
+    let file = root.join("secret/GH_TOKEN");
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "ghp_FILEvalue");
+    assert_eq!(*reads.lock().unwrap(), ["GH_TOKEN"]);
+    let list: Vec<String> = std::fs::read_dir(root.join(SECRET_DIR))
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(list, ["GH_TOKEN"]);
+    let text = std::fs::read_to_string(root.join(CATALOG)).unwrap();
+    assert!(text.contains("/dev/paddock/secret/GH_TOKEN") && !text.contains("FILEvalue"));
+    // Read-only.
+    assert!(open_rw(&file).is_err());
+    assert!(std::fs::write(&file, "x").is_err());
+    // A file that is open when the user revokes fails at its next read.
+    let mut open = std::fs::File::open(&file).unwrap();
+    assert_eq!(reads.lock().unwrap().len(), 2);
+    std::fs::write(&revoked, "GH_TOKEN\n").unwrap();
+    let mut out = Vec::new();
+    let e = open.read_to_end(&mut out).unwrap_err();
+    assert_eq!(e.raw_os_error(), Some(libc::EACCES));
+    assert!(out.is_empty());
+    assert!(std::fs::read(&file).is_err());
+    assert!(secrets.names().is_empty());
+    assert_eq!(reads.lock().unwrap().len(), 2);
+}
+
 /// For manual checks of a backend: mount at $PADDOCK_TEST_MOUNT for
 /// $PADDOCK_TEST_SECONDS. `cargo test -- --ignored hold_a_mount`.
 #[test]

@@ -2242,7 +2242,7 @@ fn real_main() -> Result<i32> {
         } => {
             let names = paddock::credentials::revoke(&env, &id, name.as_deref())?;
             println!(
-                "Revoked for {id}: {}. Its next request with them gets 403, and the ssh agent channel signs no more.",
+                "Revoked for {id}: {}. The gateway refuses their next request with 403, the ssh agent channel signs no more, and their secret files are gone.",
                 names.join(", ")
             );
             Ok(0)
@@ -2291,6 +2291,8 @@ fn real_main() -> Result<i32> {
                 if r.used > 0 {
                     if r.via == "agent" {
                         println!("{:<24} {} ssh signatures allowed", "", r.used);
+                    } else if r.deliver_as == Some("file") {
+                        println!("{:<24} {} reads of the secret file", "", r.used);
                     } else {
                         println!("{:<24} {} requests through the gateway", "", r.used);
                     }

@@ -127,10 +127,45 @@ struct RunCredentials {
     marks: std::collections::BTreeMap<String, Vec<u64>>,
     gateway: Vec<String>,
     agent: Vec<String>,
+    secret_files: Vec<String>,
+    /// Clears the gateway routes when the run ends, which wipes their values.
+    gateway_routes: Option<ClearOnDrop>,
+}
+
+/// Drops the routes of the credential gateway at the end of the run.
+struct ClearOnDrop(std::sync::Arc<crate::credentials::gateway::Gateway>);
+
+impl Drop for ClearOnDrop {
+    fn drop(&mut self) {
+        self.0.clear();
+    }
+}
+
+/// Hand one `deliver` value to the sandbox: an environment variable, or a
+/// secret file for `as = "file"`, which sets no variable.
+fn deliver(
+    spec: &mut crate::spec::SandboxSpec,
+    secrets: &crate::credentials::secret::SecretFiles,
+    out: &mut RunCredentials,
+    c: &crate::credentials::Credential,
+    name: String,
+    var: &str,
+    value: crate::credentials::secret::Secret,
+) {
+    out.marks
+        .insert(name.clone(), crate::pasture::bridge::marks(value.as_str()));
+    if c.as_ == crate::credentials::DeliverAs::File {
+        secrets.insert(&name, value);
+        out.secret_files.push(name);
+    } else {
+        spec.set_secret_env(var, value.as_str(), &format!("credentials: deliver {name}"));
+        out.delivered.push(name);
+    }
 }
 
 /// Ask for the registered credentials and set up the ones that the user
-/// allowed twice: `deliver` values go into the environment; a `gateway`
+/// allowed twice: `deliver` values go into the environment, or into
+/// `secrets` for `/dev/paddock/secret` with `as = "file"`; a `gateway`
 /// credential gets a gateway on a socket (alive as long as this process),
 /// a stand-in and a base URL.
 fn setup_credentials(
@@ -138,8 +173,9 @@ fn setup_credentials(
     built: &mut Built,
     backend: &str,
     quiet: bool,
+    secrets: &crate::credentials::secret::SecretFiles,
 ) -> Result<RunCredentials> {
-    use crate::credentials::{gateway, Via};
+    use crate::credentials::{gateway, DeliverAs, Via};
     let say = |m: &str| {
         if !quiet {
             eprintln!("paddock: {m}");
@@ -158,6 +194,17 @@ fn setup_credentials(
             if !keep {
                 say(&format!(
                     "credential {n}: the srt backend cannot reach the gateway; use the bwrap, docker or podman backend"
+                ));
+            }
+            keep
+        });
+    }
+    if built.spec.devices.is_none() {
+        plan.deliver.retain(|(n, c)| {
+            let keep = c.as_ != DeliverAs::File;
+            if !keep {
+                say(&format!(
+                    "credential {n}: as = \"file\" needs /dev/paddock, which this sandbox does not have; the sandbox does not get it"
                 ));
             }
             keep
@@ -205,7 +252,7 @@ fn setup_credentials(
             let mark = gateway::new_mark();
             built.spec.set_env(
                 &var,
-                gateway::stand_in(&value, &mark),
+                gateway::stand_in(value.as_str(), &mark),
                 &format!("credentials: stand-in for {name}"),
             );
             if let Some(base) = &c.base_url_env {
@@ -231,13 +278,8 @@ fn setup_credentials(
             routes.insert(name.clone(), gateway::Route::new(c, value));
             out.gateway.push(name);
         } else {
-            out.marks
-                .insert(name.clone(), crate::pasture::bridge::marks(&value));
-            built
-                .spec
-                .set_secret_env(&var, value, &format!("credentials: deliver {name}"));
             crate::credentials::audit(env, &built.spec, &name, "delivered");
-            out.delivered.push(name);
+            deliver(&mut built.spec, secrets, &mut out, c, name, &var, value);
         }
     }
     if !agents.is_empty() {
@@ -289,7 +331,7 @@ fn setup_credentials(
                 );
             }),
         );
-        g.serve(&sock)?;
+        out.gateway_routes = Some(ClearOnDrop(g.serve(&sock)?));
         built.spec.add_mount(crate::spec::Mount::bind(
             &sock,
             gateway::SOCKET_IN_SANDBOX,
@@ -483,6 +525,18 @@ pub fn run(
         lineage,
         built.bridge.clone(),
     );
+    // The secret files of /dev/paddock: empty until the user allows the
+    // credentials, after the install steps.
+    let secrets = {
+        let (e, spec) = (env.clone(), built.spec.clone());
+        crate::credentials::secret::SecretFiles::new(
+            Some(crate::credentials::revoked_file(env, &built.spec.id)),
+            Some(std::sync::Arc::new(move |name: &str| {
+                crate::credentials::audit_read(&e, &spec, name)
+            })),
+        )
+    };
+    secrets.watch();
     let mut devices = crate::devices::start(
         env,
         &mut built.spec,
@@ -495,6 +549,7 @@ pub fn run(
             .map(|c| c.chain.clone())
             .unwrap_or_default(),
         broker.map(|b| -> crate::gateway::Handler { std::sync::Arc::new(move |r| b.handle(&r)) }),
+        secrets.clone(),
     );
     // Terminal harnesses that log in through a browser and a localhost callback.
     let _login = if built.profile.launch.login_callback && built.spec.gui.mode != GuiMode::App {
@@ -550,7 +605,7 @@ pub fn run(
     // Registered credentials (credentials.rs): after the install steps,
     // which never get them, and before the harness starts, which waits for
     // the user's two answers.
-    let creds = setup_credentials(env, &mut built, backend.name(), quiet)?;
+    let creds = setup_credentials(env, &mut built, backend.name(), quiet, &secrets)?;
     start_api_proxy(env, &mut built, backend.name())?;
     let launch = backend.render(env, &built.spec, interactive)?;
     write_files(&launch)?;
@@ -749,6 +804,7 @@ pub fn run(
         credentials: creds.delivered,
         gateway: creds.gateway,
         agent: creds.agent,
+        secret_files: creds.secret_files,
     };
     running.register(env)?;
     // The ration of a pasture member: after the registration, so that its
@@ -1308,5 +1364,50 @@ mod history_sync_tests {
         }
         let (_, copied) = live.finish();
         assert_eq!(copied, 1);
+    }
+}
+
+#[cfg(test)]
+mod deliver_tests {
+    use super::*;
+
+    #[test]
+    fn a_file_credential_sets_no_variable() {
+        let all = crate::credentials::parse(
+            "[credentials.GH_TOKEN]\nvia = \"deliver\"\nas = \"file\"\n\n[credentials.DB]\nvia = \"deliver\"\n",
+        )
+        .unwrap();
+        let home = std::path::Path::new("/home/demo");
+        let mut spec = crate::spec::SandboxSpec::new(
+            "sb-1".into(),
+            "claude",
+            std::path::Path::new("/home/demo/app"),
+            home.join("sb"),
+            home,
+            1000,
+            1000,
+            "t",
+        );
+        let secrets = crate::credentials::secret::SecretFiles::new(None, None);
+        let mut out = RunCredentials::default();
+        for (name, value) in [("GH_TOKEN", "ghp_file"), ("DB", "db_env")] {
+            let c = &all[name];
+            deliver(
+                &mut spec,
+                &secrets,
+                &mut out,
+                c,
+                name.to_string(),
+                c.sandbox_var(name),
+                value.into(),
+            );
+        }
+        assert!(!spec.env.contains_key("GH_TOKEN"));
+        assert!(!spec.env.values().any(|v| v.value == "ghp_file"));
+        assert_eq!(spec.env["DB"].value, "db_env");
+        assert_eq!(secrets.check("GH_TOKEN").unwrap().as_str(), "ghp_file");
+        assert_eq!(out.secret_files, ["GH_TOKEN"]);
+        assert_eq!(out.delivered, ["DB"]);
+        assert_eq!(out.marks.len(), 2);
     }
 }

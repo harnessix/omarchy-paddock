@@ -724,6 +724,10 @@ pub struct Running {
     /// The credentials that the sandbox uses through the ssh agent channel.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub agent: Vec<String>,
+    /// The credentials that the sandbox reads as files in
+    /// `/dev/paddock/secret` (`deliver`, `as = "file"`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub secret_files: Vec<String>,
     /// Logins that a keeper keeps for this sandbox (keeper.rs): the sandbox
     /// holds them without their refresh token, and the keeper writes the
     /// new access token here.

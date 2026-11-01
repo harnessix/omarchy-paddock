@@ -813,6 +813,7 @@ fn ps_lists_children_under_their_parent() {
         credentials: Vec::new(),
         gateway: Vec::new(),
         agent: Vec::new(),
+        secret_files: Vec::new(),
         kept_logins: Vec::new(),
     };
     let list = vec![

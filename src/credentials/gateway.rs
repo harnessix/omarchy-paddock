@@ -14,6 +14,7 @@
 //! One request per connection: the gateway asks the upstream to close after
 //! the response, and tells the client the same.
 
+use super::secret::Secret;
 use super::Credential;
 use crate::env::HostEnv;
 use anyhow::{bail, Context as _, Result};
@@ -22,7 +23,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 /// The loopback port inside the sandbox.
@@ -98,19 +99,21 @@ pub struct Route {
     pub header: String,
     pub prefix: String,
     pub query: Option<String>,
-    pub value: String,
+    /// Locked in RAM and wiped when the route goes (secret.rs).
+    pub value: Secret,
     /// git smart HTTP: `info/refs` passes only for a service whose own path
     /// is bound.
     pub git: bool,
 }
 
 impl Route {
-    pub fn new(c: &Credential, value: String) -> Self {
+    pub fn new(c: &Credential, value: Secret) -> Self {
         let header = c.header.clone().unwrap_or_else(|| "Authorization".into());
         let value = match &c.basic_user {
             Some(u) => {
                 use base64::Engine as _;
-                base64::engine::general_purpose::STANDARD.encode(format!("{u}:{value}"))
+                let pair = Secret::from(format!("{u}:{}", value.as_str()));
+                Secret::from(base64::engine::general_purpose::STANDARD.encode(pair.as_bytes()))
             }
             None => value,
         };
@@ -204,7 +207,9 @@ fn glob(pat: &str, s: &str) -> bool {
 pub type Report = Arc<dyn Fn(&str, &str, &str, &str, &str) + Send + Sync>;
 
 pub struct Gateway {
-    pub routes: BTreeMap<String, Route>,
+    /// A revoked route leaves the map, and the end of the sandbox clears
+    /// it: the value is wiped when the last request with it ends.
+    routes: Mutex<BTreeMap<String, Arc<Route>>>,
     pub connect: Connector,
     /// A file whose lines name revoked credentials. It is outside the
     /// sandbox; `paddock credentials revoke` writes it.
@@ -225,7 +230,7 @@ impl Gateway {
         on_abuse: Arc<dyn Fn() + Send + Sync>,
     ) -> Self {
         Self {
-            routes,
+            routes: Mutex::new(routes.into_iter().map(|(k, v)| (k, Arc::new(v))).collect()),
             connect,
             revoked,
             report,
@@ -241,12 +246,37 @@ impl Gateway {
             .unwrap_or(false)
     }
 
-    /// Serve on `socket` until the process ends.
-    pub fn serve(self, socket: &Path) -> Result<()> {
+    /// Drop the routes that the revoke file names.
+    pub fn drop_revoked(&self) {
+        let names: Vec<String> = self.routes.lock().unwrap().keys().cloned().collect();
+        for n in names {
+            if self.is_revoked(&n) {
+                self.routes.lock().unwrap().remove(&n);
+            }
+        }
+    }
+
+    /// Drop every route: the sandbox ended.
+    pub fn clear(&self) {
+        self.routes.lock().unwrap().clear();
+    }
+
+    /// Serve on `socket` until the process ends. The returned handle can
+    /// clear the routes.
+    pub fn serve(self, socket: &Path) -> Result<Arc<Self>> {
         let _ = std::fs::remove_file(socket);
         let listener = UnixListener::bind(socket)
             .with_context(|| format!("cannot listen on {}", socket.display()))?;
         let me = Arc::new(self);
+        let handle = me.clone();
+        let sweep = Arc::downgrade(&me);
+        std::thread::spawn(move || loop {
+            std::thread::sleep(Duration::from_secs(1));
+            match sweep.upgrade() {
+                Some(g) => g.drop_revoked(),
+                None => return,
+            }
+        });
         std::thread::spawn(move || {
             for conn in listener.incoming().flatten() {
                 if me.connections.fetch_add(1, Ordering::SeqCst) >= MAX_CONNECTIONS {
@@ -264,7 +294,7 @@ impl Gateway {
                 });
             }
         });
-        Ok(())
+        Ok(handle)
     }
 
     fn refuse(
@@ -306,9 +336,14 @@ impl Gateway {
             Some(i) => (&rest[..i], rest[i..].to_string()),
             None => (rest, "/".to_string()),
         };
-        let Some(route) = self.routes.get(name) else {
+        if self.is_revoked(name) {
+            self.routes.lock().unwrap().remove(name);
+            return self.refuse(&mut conn, 403, "revoked", name, &method, &upath);
+        }
+        let Some(route) = self.routes.lock().unwrap().get(name).cloned() else {
             return self.refuse(&mut conn, 404, "no such credential", name, &method, &upath);
         };
+        let route = &*route;
         if upath.split('/').any(|seg| seg == ".." || seg == ".") {
             return self.refuse(
                 &mut conn,
@@ -321,9 +356,6 @@ impl Gateway {
         }
         if !route.allows(&upath, query.as_deref()) {
             return self.refuse(&mut conn, 403, "path not bound", name, &method, &upath);
-        }
-        if self.is_revoked(name) {
-            return self.refuse(&mut conn, 403, "revoked", name, &method, &upath);
         }
         // The body: a length, or chunks.
         let mut length: Option<u64> = None;
@@ -361,7 +393,9 @@ impl Gateway {
         if route.query.is_none() {
             out.push_str(&format!(
                 "{}: {}{}\r\n",
-                route.header, route.prefix, route.value
+                route.header,
+                route.prefix,
+                route.value.as_str()
             ));
         }
         out.push_str("Connection: close\r\n\r\n");
@@ -450,7 +484,7 @@ fn rewrite_query(q: Option<&str>, route: &Route) -> String {
         .map(str::to_string)
         .collect();
     if let Some(k) = &route.query {
-        parts.push(format!("{k}={}", percent(&route.value)));
+        parts.push(format!("{k}={}", percent(route.value.as_str())));
     }
     parts.join("&")
 }
@@ -784,6 +818,22 @@ mod tests {
             .unwrap()
             .iter()
             .any(|l| l.contains("refused: revoked")));
+        // The revoked route left the gateway, so its value is wiped.
+        assert!(w.g.routes.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn revoke_and_the_end_of_the_sandbox_drop_the_routes() {
+        let w = world(&[], None);
+        w.g.drop_revoked();
+        assert_eq!(w.g.routes.lock().unwrap().len(), 1);
+        std::fs::write(w.revoked.path(), "*\n").unwrap();
+        w.g.drop_revoked();
+        assert!(w.g.routes.lock().unwrap().is_empty());
+        let w = world(&[], None);
+        w.g.clear();
+        assert!(w.g.routes.lock().unwrap().is_empty());
+        assert!(!format!("{:?}", Secret::from("ghp_REALvalue")).contains("REAL"));
     }
 
     #[test]
