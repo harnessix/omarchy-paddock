@@ -543,6 +543,7 @@ mod tests {
             harness: "fake".into(),
             project: dir.join("project"),
             started_by: vec![],
+            approver: std::sync::Arc::new(crate::broker::DenyAll),
         }
     }
 
