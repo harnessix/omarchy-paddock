@@ -215,14 +215,28 @@ pub fn command(
     timeout: u64,
     unit: &str,
 ) -> Command {
+    command_in(how, cfg, home, project, project, argv, env, timeout, unit)
+}
+
+/// Like `command`, with another working folder than the project: the
+/// project stays writable, and `cwd` must be visible in the view of `cfg`.
+#[allow(clippy::too_many_arguments)]
+pub fn command_in(
+    how: Isolation,
+    cfg: &ExecCfg,
+    home: &Path,
+    project: &Path,
+    cwd: &Path,
+    argv: &[String],
+    env: &BTreeMap<String, String>,
+    timeout: u64,
+    unit: &str,
+) -> Command {
     let s = |p: &Path| p.display().to_string();
     match how {
         Isolation::None => {
             let mut c = Command::new(&argv[0]);
-            c.args(&argv[1..])
-                .current_dir(project)
-                .env_clear()
-                .envs(env);
+            c.args(&argv[1..]).current_dir(cwd).env_clear().envs(env);
             c
         }
         Isolation::Systemd => {
@@ -238,7 +252,7 @@ pub fn command(
                 "LockPersonality=yes".into(),
                 "SystemCallFilter=@system-service".into(),
                 format!("RuntimeMaxSec={}", timeout + 5),
-                format!("WorkingDirectory={}", s(project)),
+                format!("WorkingDirectory={}", s(cwd)),
             ];
             match cfg.home {
                 Home::Hidden => p.push("ProtectHome=tmpfs".into()),
@@ -312,7 +326,7 @@ pub fn command(
             if !cfg.network {
                 c.arg("--unshare-net");
             }
-            c.args(["--chdir", &s(project), "--"]).args(argv);
+            c.args(["--chdir", &s(cwd), "--"]).args(argv);
             c.env_clear().envs(env);
             c
         }
