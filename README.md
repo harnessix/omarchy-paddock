@@ -306,6 +306,24 @@ The other items need a flag that names them:
 
 paddock never removes the home or worktree of a running sandbox. It deletes only inside its own directories. It never follows a symlink, so a link in a sandbox home cannot point it at your files. A sandbox can edit the `.paddock-origin` file in its home, which records the project. paddock uses that file only when it matches the folder name of the home, which contains a hash of the project path.
 
+### Deduplication
+
+Harnesses download the same runtimes into the home of each project. For example, `.codex/packages` holds about 400 MB, and it is the same in each project. On btrfs, xfs and bcachefs, the kernel can let identical files share their data (`FIDEDUPERANGE`). The kernel compares the bytes first and refuses data that differs. A later write to one copy gets its own blocks, so the other copy does not change.
+
+```sh
+paddock gc --dedupe                         # count the files with the same data and their size
+paddock gc --dedupe --yes                   # share the data and print the space that came back
+```
+
+After each sandbox ends, paddock also shares the data of the files in its home with the other homes. This runs in the background at the lowest priority, for at most two minutes, and the exit does not wait for it. To turn it off, set this in `~/.config/paddock/config.toml`:
+
+```toml
+[storage]
+dedupe = false
+```
+
+paddock reads only files of at least 4 KiB in the sandbox homes. It groups them by size, then by SHA-256. It keeps the hashes in `~/.cache/paddock/dedupe/index`, so it reads each file once. It never follows a symlink, never leaves the file system of the homes, and skips a file that changes while it reads it. On ext4, tmpfs and other file systems that cannot share data, paddock skips this step, and `paddock du` says so.
+
 ## Network
 
 | Mode | Behavior |
