@@ -17,6 +17,8 @@
 //! never define a credential, and `from = "command"` runs on the host, like
 //! `[exec]`. Values are read when they are needed, never written to disk.
 
+pub mod gateway;
+
 use crate::env::HostEnv;
 use anyhow::{bail, Context as _, Result};
 use serde::{Deserialize, Serialize};
@@ -42,7 +44,7 @@ impl Via {
     }
     /// Whether this paddock can use the credential this way.
     pub fn available(self) -> bool {
-        self == Via::Deliver
+        matches!(self, Via::Deliver | Via::Gateway)
     }
 }
 
@@ -89,6 +91,25 @@ pub struct Credential {
     /// gateway: the variable in the sandbox that names the gateway.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_url_env: Option<String>,
+    /// gateway: a known API that fills hosts, header, prefix, base_path and
+    /// base_url_env (`anthropic`, `openai`, `github`). Fields set here win.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preset: Option<String>,
+    /// gateway: the request header that carries the value. Default:
+    /// `Authorization`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub header: Option<String>,
+    /// gateway: text before the value in that header. Default: `Bearer `
+    /// for Authorization, nothing for other headers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefix: Option<String>,
+    /// gateway: a query parameter that carries the value instead of a header.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub query: Option<String>,
+    /// gateway: the path that the sandbox's base URL ends with, such as
+    /// `/v1`. Requests keep their own paths.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_path: Option<String>,
     /// deliver: the variable in the sandbox that holds the value. Default:
     /// the name.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -112,6 +133,46 @@ impl Credential {
     pub fn host_var<'a>(&'a self, name: &'a str) -> &'a str {
         self.var.as_deref().unwrap_or(name)
     }
+    /// The credential with its preset filled in.
+    pub fn resolved(&self) -> Result<Credential> {
+        let mut c = self.clone();
+        let Some(p) = &self.preset else {
+            return Ok(c);
+        };
+        let (host, header, prefix, base_path, base_env) = match p.as_str() {
+            "anthropic" => (
+                "api.anthropic.com",
+                "x-api-key",
+                "",
+                "",
+                "ANTHROPIC_BASE_URL",
+            ),
+            "openai" => (
+                "api.openai.com",
+                "Authorization",
+                "Bearer ",
+                "/v1",
+                "OPENAI_BASE_URL",
+            ),
+            "github" => (
+                "api.github.com",
+                "Authorization",
+                "Bearer ",
+                "",
+                "GITHUB_API_URL",
+            ),
+            other => bail!("unknown preset '{other}': use anthropic, openai or github"),
+        };
+        if c.hosts.is_empty() {
+            c.hosts = vec![host.to_string()];
+        }
+        c.header.get_or_insert_with(|| header.to_string());
+        c.prefix.get_or_insert_with(|| prefix.to_string());
+        c.base_path.get_or_insert_with(|| base_path.to_string());
+        c.base_url_env.get_or_insert_with(|| base_env.to_string());
+        Ok(c)
+    }
+
     pub fn applies_to(&self, harness: &str) -> bool {
         self.harnesses.is_empty() || self.harnesses.iter().any(|h| h == harness)
     }
@@ -166,14 +227,55 @@ pub fn parse(text: &str) -> Result<BTreeMap<String, Credential>> {
         if c.via == Via::Deliver && c.env.is_none() && !valid_var(name) {
             bail!("[credentials.{name}]: name the variable for the sandbox with env = \"...\"");
         }
+        let c = c
+            .resolved()
+            .with_context(|| format!("[credentials.{name}]"))?;
         if matches!(c.via, Via::Gateway | Via::Intercept) && c.hosts.is_empty() {
             bail!(
-                "[credentials.{name}]: via = \"{}\" needs hosts",
+                "[credentials.{name}]: via = \"{}\" needs hosts or a preset",
                 c.via.name()
             );
         }
+        if c.via == Via::Gateway {
+            if c.base_url_env.is_none() {
+                bail!("[credentials.{name}]: via = \"gateway\" needs base_url_env, the variable that points the tool at the gateway");
+            }
+            if c.env.is_none() && !valid_var(name) {
+                bail!(
+                    "[credentials.{name}]: name the variable for the stand-in with env = \"...\""
+                );
+            }
+            for h in &c.hosts {
+                let (host, port) = match h.split_once(':') {
+                    Some((h, p)) => (h, Some(p)),
+                    None => (h.as_str(), None),
+                };
+                if host.is_empty()
+                    || host.contains(['/', ':', '@', ' '])
+                    || port.is_some_and(|p| p.parse::<u16>().is_err())
+                {
+                    bail!("[credentials.{name}]: '{h}' is not a host name (HOST or HOST:PORT)");
+                }
+            }
+            for p in c
+                .paths
+                .iter()
+                .chain(c.base_path.iter().filter(|p| !p.is_empty()))
+            {
+                if !p.starts_with('/') {
+                    bail!("[credentials.{name}]: the path '{p}' must start with /");
+                }
+            }
+            if let Some(h) = &c.header {
+                if h.is_empty() || !h.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-') {
+                    bail!("[credentials.{name}]: '{h}' is not a header name");
+                }
+            }
+        }
     }
-    Ok(all)
+    all.into_iter()
+        .map(|(n, c)| Ok((n, c.resolved()?)))
+        .collect()
 }
 
 pub fn load(env: &HostEnv) -> Result<BTreeMap<String, Credential>> {
@@ -263,10 +365,21 @@ fn describe(name: &str, c: &Credential) -> String {
         Source::Env => format!("from the host variable {}", c.host_var(name)),
         Source::Command => format!("from the command `{}`", c.command.join(" ")),
     };
-    format!(
-        "{name}: {from}, as the variable {} in the sandbox",
-        c.sandbox_var(name)
-    )
+    match c.via {
+        Via::Gateway => format!(
+            "{name}: {from}. It stays on the host: the sandbox gets a stand-in, and paddock adds the real value to requests for {}{}",
+            c.hosts.join(", "),
+            if c.paths.is_empty() {
+                String::new()
+            } else {
+                format!(" under {}", c.paths.join(", "))
+            }
+        ),
+        _ => format!(
+            "{name}: {from}. The value enters the sandbox as the variable {}; the agent can read it, and it cannot be taken back",
+            c.sandbox_var(name)
+        ),
+    }
 }
 
 /// Ask the user twice: allow, then confirm. Only both answers deliver.
@@ -302,7 +415,7 @@ pub fn ask(
         "allow",
         format!("give {} to this sandbox", names.join(", ")),
         format!(
-            "{}\n\nThe values enter the sandbox, and the agent can read them. They cannot be taken back. The harness starts after your answer.",
+            "{}\n\nThe harness starts after your answer.",
             list.join("\n")
         ),
     );
@@ -431,18 +544,37 @@ pub struct Row {
     pub harnesses: Vec<String>,
     pub delivered: u64,
     pub last_delivered: Option<u64>,
+    /// Requests that the gateway forwarded with it.
+    pub used: u64,
 }
 
 pub fn rows(env: &HostEnv) -> Result<Vec<Row>> {
     let all = load(env)?;
     // Deliveries from the audit log of host requests.
     let mut used: BTreeMap<String, (u64, u64)> = BTreeMap::new();
+    let mut forwarded: BTreeMap<String, u64> = BTreeMap::new();
     if let Ok(text) = std::fs::read_to_string(crate::broker::audit_file(env)) {
         for line in text.lines() {
             let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
                 continue;
             };
-            if v["capability"] != CAPABILITY || v["decision"] != "delivered" {
+            if v["capability"] != CAPABILITY {
+                continue;
+            }
+            if v["decision"]
+                .as_str()
+                .is_some_and(|d| d.starts_with("forwarded"))
+            {
+                if let Some(name) = v["detail"]
+                    .as_str()
+                    .and_then(|d| d.strip_prefix("gateway "))
+                    .and_then(|d| d.split(' ').next())
+                {
+                    *forwarded.entry(name.to_string()).or_default() += 1;
+                }
+                continue;
+            }
+            if v["decision"] != "delivered" {
                 continue;
             }
             if let Some(name) = v["detail"]
@@ -471,9 +603,80 @@ pub fn rows(env: &HostEnv) -> Result<Vec<Row>> {
                 harnesses: c.harnesses.clone(),
                 delivered: n,
                 last_delivered: (last > 0).then_some(last),
+                used: forwarded.get(name).copied().unwrap_or(0),
             }
         })
         .collect())
+}
+
+/// One request through the gateway, in the audit log of host requests:
+/// the name, the method, the host and the path without its query.
+pub fn audit_use(
+    env: &HostEnv,
+    spec: &crate::spec::SandboxSpec,
+    name: &str,
+    method: &str,
+    host: &str,
+    path: &str,
+    result: &str,
+) {
+    crate::broker::audit_line(
+        env,
+        &serde_json::json!({
+            "time": crate::state::now(),
+            "sandbox": spec.id,
+            "harness": spec.harness,
+            "project": spec.project,
+            "capability": CAPABILITY,
+            "detail": format!("gateway {name} {method} {host}{path}"),
+            "decision": result,
+        }),
+    );
+}
+
+/// The file of a running sandbox whose lines name revoked credentials
+/// (`*`: all). The gateway reads it at each request. It is in the run
+/// folder, which the sandbox cannot see.
+pub fn revoked_file(env: &HostEnv, sandbox: &str) -> std::path::PathBuf {
+    env.paddock_run().join(sandbox).join("credentials-revoked")
+}
+
+/// Revoke a credential (or all, with None) of a running sandbox. The next
+/// request through the gateway gets 403; the sandbox keeps running.
+pub fn revoke(env: &HostEnv, sandbox: &str, name: Option<&str>) -> Result<Vec<String>> {
+    let r = crate::state::Running::list(env)
+        .into_iter()
+        .find(|r| r.id == sandbox)
+        .with_context(|| format!("no running sandbox with id {sandbox}"))?;
+    let names: Vec<String> = match name {
+        Some(n) if r.gateway.iter().any(|g| g == n) => vec![n.to_string()],
+        Some(n) if r.credentials.iter().any(|c| c == n) => bail!(
+            "{n} was delivered: its value is in the sandbox and cannot be taken back. Stop the sandbox to end it: paddock stop {sandbox}"
+        ),
+        Some(n) => bail!("sandbox {sandbox} does not use the credential {n}"),
+        None if r.gateway.is_empty() => bail!("sandbox {sandbox} uses no credential through the gateway"),
+        None => r.gateway.clone(),
+    };
+    let mut f = crate::privfs::append(&revoked_file(env, sandbox))?;
+    use std::io::Write as _;
+    for n in &names {
+        writeln!(f, "{n}")?;
+    }
+    for n in &names {
+        crate::broker::audit_line(
+            env,
+            &serde_json::json!({
+                "time": crate::state::now(),
+                "sandbox": r.id,
+                "harness": r.harness,
+                "project": r.project,
+                "capability": CAPABILITY,
+                "detail": format!("gateway {n}"),
+                "decision": "revoked by the user",
+            }),
+        );
+    }
+    Ok(names)
 }
 
 #[cfg(test)]
@@ -510,7 +713,8 @@ confirm = "each"
         assert_eq!(all["DB_PASSWORD"].from, Source::Command);
         assert_eq!(all["DB_PASSWORD"].sandbox_var("DB_PASSWORD"), "DB_PASSWORD");
         assert_eq!(all["ssh"].confirm, Confirm::Each);
-        assert!(Via::Deliver.available() && !Via::Gateway.available());
+        assert!(Via::Deliver.available() && Via::Gateway.available());
+        assert!(!Via::Agent.available() && !Via::Intercept.available());
         assert!(parse("").unwrap().is_empty());
     }
 
@@ -529,6 +733,24 @@ confirm = "each"
             assert!(parse(bad).is_err(), "{bad}");
         }
         parse("[credentials.my-db]\nvia = \"deliver\"\nenv = \"DB\"\n").unwrap();
+        for bad in [
+            "[credentials.x]\nvia = \"gateway\"\nhosts = [\"a.example\"]\n",
+            "[credentials.x]\nvia = \"gateway\"\npreset = \"nope\"\n",
+            "[credentials.x]\nvia = \"gateway\"\nhosts = [\"a.example/x\"]\nbase_url_env = \"B\"\n",
+            "[credentials.x]\nvia = \"gateway\"\nhosts = [\"a.example:http\"]\nbase_url_env = \"B\"\n",
+            "[credentials.x]\nvia = \"gateway\"\npreset = \"github\"\npaths = [\"repos\"]\n",
+        ] {
+            assert!(parse(bad).is_err(), "{bad}");
+        }
+        let all = parse("[credentials.ANTHROPIC_API_KEY]\nvia = \"gateway\"\npreset = \"anthropic\"\n\n[credentials.OPENAI_API_KEY]\nvia = \"gateway\"\npreset = \"openai\"\nhosts = [\"proxy.example:8443\"]\n").unwrap();
+        let a = &all["ANTHROPIC_API_KEY"];
+        assert_eq!(a.hosts, ["api.anthropic.com"]);
+        assert_eq!(a.header.as_deref(), Some("x-api-key"));
+        assert_eq!(a.base_url_env.as_deref(), Some("ANTHROPIC_BASE_URL"));
+        // Fields set by the user win over the preset.
+        let o = &all["OPENAI_API_KEY"];
+        assert_eq!(o.hosts, ["proxy.example:8443"]);
+        assert_eq!(o.base_path.as_deref(), Some("/v1"));
     }
 
     struct Answers(
@@ -591,7 +813,7 @@ via = "deliver"
 harnesses = ["codex"]
 
 [credentials.LATER]
-via = "gateway"
+via = "intercept"
 hosts = ["api.example.com"]
 
 [credentials.MISSING]

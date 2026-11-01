@@ -571,9 +571,9 @@ pub fn build_with(env: &HostEnv, opts: &Options, harness: Harness) -> Result<Bui
         if c.from == crate::credentials::Source::Env {
             spec.env.remove(c.host_var(&name));
         }
-        if c.via == crate::credentials::Via::Deliver {
-            spec.env.remove(c.sandbox_var(&name));
-        }
+        // Its name in the sandbox too: a deliver value or a gateway
+        // stand-in replaces it only after the start card.
+        spec.env.remove(c.sandbox_var(&name));
     }
     // The `env` prefix of a `paddock wrap` command, as the agent gets it on
     // the host.

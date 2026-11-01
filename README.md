@@ -389,7 +389,28 @@ pass = ["MY_TOOL_TOKEN"]
 
 ### Credentials
 
-A variable in `[env] pass` reaches the sandbox at every start, without a question. For a credential that you want to hand over only when you agree, register it in `~/.config/paddock/config.toml`:
+A variable in `[env] pass` reaches the sandbox at every start, without a question. For a credential that you want to control, register it in `~/.config/paddock/config.toml`. There are two ways to give it to a sandbox.
+
+`via = "gateway"` keeps the value on the host. The sandbox gets a stand-in with the same start and length, and a base URL that points at a local gateway. For each request, paddock removes every credential that the sandbox sent, adds the real one, and sends the request over HTTPS to the host that you bound it to: from your computer, through your proxy settings, with your system's certificates. No TLS is decrypted and no certificate authority is made. Answers stream back as they come, so model APIs work.
+
+```toml
+[credentials.ANTHROPIC_API_KEY]
+via = "gateway"
+preset = "anthropic"        # api.anthropic.com, x-api-key, ANTHROPIC_BASE_URL
+
+[credentials.OPENAI_API_KEY]
+via = "gateway"
+preset = "openai"           # api.openai.com, Authorization: Bearer, OPENAI_BASE_URL (/v1)
+
+[credentials.GITHUB_TOKEN]
+via = "gateway"
+preset = "github"           # api.github.com, Authorization: Bearer, GITHUB_API_URL
+paths = ["/repos/my-org/"]  # optional: only these path prefixes
+```
+
+Without a preset, name `hosts` (`HOST` or `HOST:PORT`), `base_url_env` (the variable that points the tool at the gateway), and how the value goes: `header` (default `Authorization`) with `prefix` (default `Bearer ` for Authorization), or `query` for an API that takes the key as a query parameter. `env` names the variable for the stand-in (default: the name), and `base_path` is added to the base URL. A request to another path gets 403, and nothing leaves your computer. After 20 refused requests, paddock freezes the sandbox and tells you. The gateway works in every network mode, also `none`: the sandbox can then reach the model API and nothing else. It needs the bwrap, docker or podman backend; srt cannot reach it. A tool must accept a base URL: the `gh` command does not, because it talks only HTTPS to its host.
+
+`via = "deliver"` hands the value over. It enters the sandbox as a variable, the agent can read it, and it cannot be taken back. Use it only for a tool that can do nothing else, such as a database password:
 
 ```toml
 [credentials.DB_PASSWORD]
@@ -399,15 +420,15 @@ command = ["secret-tool", "lookup", "service", "mydb"]
 harnesses = ["claude"]              # optional: only these harnesses
 ```
 
-- When a sandbox starts, the approval card asks twice: first whether to give the credential, then to confirm. The harness starts only after the second answer. With "No" at either step, or no answer, the sandbox starts without it.
-- paddock reads the value only after both answers. A command runs on the host. The value then exists only in the environment of the sandbox. It is never written to disk by paddock.
-- The value enters the sandbox, and the agent can read it. It cannot be taken back: to end it, stop the sandbox. The bar panel marks a sandbox that holds a credential.
-- A registered credential never passes in any other way: not with the inherited environment, not as a harness login variable, not through `[env] pass`.
-- A sandbox that another one started gets no credentials.
-- A project `paddock.toml` cannot register a credential.
-- `paddock credentials list` shows the registered credentials, whether their source is there, and how often each was delivered. The audit log (`paddock log`) records each question, answer and delivery by name, never a value.
+For both ways:
 
-`via = "deliver"` is the only way so far. A later version adds `gateway` (a local gateway adds the value to requests for the hosts that you bind it to, and the sandbox sees only a stand-in) and `agent` (ssh-agent and git credential helpers on the host).
+- When a sandbox starts, the approval card asks twice: first whether to give the credentials, then to confirm. The harness starts only after the second answer. With "No" at either step, or no answer, the sandbox starts without them.
+- paddock reads the value only after both answers. A command runs on the host. paddock never writes the value to disk.
+- A registered credential never passes in any other way: not with the inherited environment, not as a harness login variable, not through `[env] pass`. To keep a harness login key such as `ANTHROPIC_API_KEY` on the host, register it with its preset.
+- A sandbox that another one started gets no credentials. A project `paddock.toml` cannot register one.
+- `paddock credentials revoke ID [NAME]` stops a sandbox from using a gateway credential at once; the sandbox keeps running. The bar panel has a button for it. A delivered value cannot be revoked: stop the sandbox.
+- The bar panel marks a sandbox that holds a delivered value, and names the gateway credentials that it uses.
+- `paddock credentials list` shows the registered credentials, whether their source is there, how often each was delivered, and how many requests went through the gateway. The audit log (`paddock log`) records each question, answer, request (method, host, path without its query) and revocation by name, never a value.
 
 ## Privacy defaults
 
