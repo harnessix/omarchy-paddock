@@ -18,6 +18,7 @@
 //! `[exec]`. Values are read when they are needed, never written to disk.
 
 pub mod gateway;
+pub mod sshagent;
 
 use crate::env::HostEnv;
 use anyhow::{bail, Context as _, Result};
