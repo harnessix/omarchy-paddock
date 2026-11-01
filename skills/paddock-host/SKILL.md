@@ -120,7 +120,7 @@ A timer lives on the host, so it outlasts your context. Use it for any task that
 
 Timers in `--scope pasture` or `--scope tree` show the other agents there how long a shared task has run.
 
-Before you hand out a long task, run `paddock-host forage --refresh`. It shows how much of each account's limits is left, how fast it goes, and OVERGRAZING when a window runs out before it resets. Give the task to the account with room, and keep tasks smaller when every account is overgrazing.
+`paddock-host status` shows your timers and limits in a few lines. In Claude Code, paddock adds it as a hook, so you see it after a compaction and when something needs attention. Before you hand out a long task, run `paddock-host forage --refresh`. It shows how much of each account's limits is left, how fast it goes, and OVERGRAZING when a window runs out before it resets. Give the task to the account with room, and keep tasks smaller when every account is overgrazing.
 
 ## Devices
 
