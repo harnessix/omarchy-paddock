@@ -333,6 +333,18 @@ Who talks to the host proxy depends on the backend. On docker and podman, the pa
 
 `paddock doctor --escape --network egress --online` checks all of this: DNS and HTTPS work, and the host loopback, the other host addresses, and direct connections that bypass the proxy do not.
 
+### Tunnel watch
+
+A tunnel lets a machine outside reach into the sandbox, or lets the sandbox reach past its network rules. While a bwrap or srt sandbox runs in its scope (a systemd user instance), paddock looks at the command lines of its processes every 10 seconds. It reports `ssh` with `-R`, `-L` or `-D`, and `ngrok`, `cloudflared`, `frpc`, `frps`, `bore`, `chisel`, `lt` (localtunnel) and `tailscale funnel`.
+
+- paddock tells you once per sandbox and tool: one desktop notification and one line in the audit log (`paddock log`, capability `monitor`), with the tool and its tunnel flags. It never records hosts or other arguments.
+- `paddock ps --json` lists the reported tools of each sandbox in `tunnels`.
+- paddock reads command lines only. It never reads what goes through a tunnel and contacts no vendor service.
+- It does not stop the tunnel. `paddock stop <id>` or `paddock freeze <id>` does.
+- It is a notice, not a barrier: a process can rename itself or rewrite its command line. The network rules of the sandbox still hold either way.
+- docker and podman sandboxes, and sandboxes without a scope, are not watched.
+- In `~/.config/paddock/config.toml`, `[monitor] tunnels = false` turns the watch off, and `[monitor] notify = false` keeps the audit line but shows no notification. A project `paddock.toml` cannot change either.
+
 ## Logins and MCP
 
 By default, a sandbox uses your existing login (auth mode `shared`). paddock copies the credential files of the harness from your home directory into the sandbox at start. If the harness refreshes a token in the sandbox, paddock writes it back when the sandbox exits. If the file also changed on the host in the meantime, the host version stays, and paddock tells you.

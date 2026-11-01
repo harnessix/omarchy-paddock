@@ -1813,6 +1813,10 @@ fn real_main() -> Result<i32> {
                                 serde_json::to_value(timers).unwrap_or_default(),
                             );
                         }
+                        let tunnels = paddock::monitor::read_seen(&env, &r.id);
+                        if let (Some(o), false) = (v.as_object_mut(), tunnels.is_empty()) {
+                            o.insert("tunnels".into(), tunnels.into());
+                        }
                         v
                     })
                     .collect();

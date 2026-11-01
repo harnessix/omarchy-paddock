@@ -30,6 +30,7 @@ pub mod login;
 pub mod manifest;
 pub mod mcp;
 pub mod mise;
+pub mod monitor;
 pub mod omarchy;
 pub mod omarchy_usage;
 pub mod pasture;
