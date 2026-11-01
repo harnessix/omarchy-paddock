@@ -176,10 +176,31 @@ pub fn detect(env: &HostEnv) -> Result<Isolation> {
     if systemd {
         return Ok(Isolation::Systemd);
     }
-    if env.which("bwrap").is_some() {
-        return Ok(Isolation::Bwrap);
+    let msg = "exec needs a systemd user instance or bwrap to run a command in isolation";
+    match env.which("bwrap") {
+        Some(bwrap) if bwrap_starts(&bwrap) => Ok(Isolation::Bwrap),
+        Some(bwrap) => bail!(
+            "{msg}: {} is on PATH but cannot start a sandbox here (for example inside another sandbox)",
+            bwrap.display()
+        ),
+        None => bail!("{msg}"),
     }
-    bail!("exec needs a systemd user instance or bwrap to run a command in isolation")
+}
+
+/// bwrap can start a sandbox with a user namespace. It cannot inside a
+/// sandbox that allows no nested namespace. paddock probes each bwrap once.
+fn bwrap_starts(bwrap: &Path) -> bool {
+    static SEEN: std::sync::Mutex<BTreeMap<PathBuf, bool>> = std::sync::Mutex::new(BTreeMap::new());
+    let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    *seen.entry(bwrap.to_path_buf()).or_insert_with(|| {
+        Command::new(bwrap)
+            .args(["--unshare-user", "--ro-bind", "/", "/", "true"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success())
+    })
 }
 
 /// The command that runs `argv` in `project` with `cfg`, isolated.
@@ -313,6 +334,39 @@ pub fn setup_failure(how: Isolation, code: i32, stderr: &str) -> Option<String> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A host whose PATH holds only `bwrap`, a script with this body.
+    fn fake_bwrap(dir: &Path, body: &str) -> HostEnv {
+        use std::os::unix::fs::PermissionsExt;
+        let bin = dir.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let f = bin.join("bwrap");
+        std::fs::write(&f, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let vars = [("PATH".to_string(), bin.display().to_string())].into();
+        HostEnv::from_parts(dir.join("home"), "demo".into(), 1, 1, vars)
+    }
+
+    #[test]
+    fn a_bwrap_that_cannot_start_gives_no_isolation() {
+        let dir = tempfile::tempdir().unwrap();
+        let e = detect(&fake_bwrap(dir.path(), "exit 1")).unwrap_err();
+        let m = format!("{e:#}");
+        assert!(m.contains("run a command in isolation"), "{m}");
+        assert!(m.contains("cannot start a sandbox"), "{m}");
+        let ok = tempfile::tempdir().unwrap();
+        assert_eq!(
+            detect(&fake_bwrap(ok.path(), "exit 0")).unwrap(),
+            Isolation::Bwrap
+        );
+        // No bwrap at all: the same message, without the probe.
+        let none = HostEnv::from_parts("/nowhere".into(), "demo".into(), 1, 1, Default::default());
+        let m = format!("{:#}", detect(&none).unwrap_err());
+        assert!(
+            m.contains("run a command in isolation") && !m.contains("cannot start"),
+            "{m}"
+        );
+    }
 
     fn env() -> HostEnv {
         HostEnv::from_parts("/home/demo".into(), "demo".into(), 1, 1, Default::default())
