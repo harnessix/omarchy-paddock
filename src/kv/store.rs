@@ -172,6 +172,34 @@ CREATE TABLE IF NOT EXISTS grants (
 /// How many sandboxes above one another `ancestors` follows at most.
 const MAX_CHAIN: usize = 32;
 
+/// The column `paused` of `entries`: the seconds that a lease of a frozen
+/// holder has left (`[suspend] leases = "keep"`). Its `expires` is NULL
+/// meanwhile, so it does not expire. Files of older versions get the column
+/// when they open.
+fn add_paused(conn: &Connection) -> Result<()> {
+    let has = |c: &Connection| -> rusqlite::Result<bool> {
+        c.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('entries') WHERE name = 'paused'",
+            [],
+            |r| r.get::<_, u64>(0),
+        )
+        .map(|n| n > 0)
+    };
+    if has(conn)? {
+        return Ok(());
+    }
+    // Another process can add it at the same moment.
+    if let Err(e) = conn.execute_batch("ALTER TABLE entries ADD COLUMN paused INTEGER") {
+        if !has(conn)? {
+            return Err(e.into());
+        }
+    }
+    Ok(())
+}
+
+/// The keys of leases: `claim` writes them.
+const LEASE_KEYS: &str = "substr(key, 1, 6) = 'lease:'";
+
 fn live(expires: Option<u64>, now: u64) -> bool {
     expires.is_none_or(|e| e > now)
 }
@@ -290,6 +318,7 @@ impl Store {
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         conn.execute_batch(SCHEMA)?;
+        add_paused(&conn)?;
         Ok(Self { conn })
     }
 
@@ -298,6 +327,7 @@ impl Store {
     pub fn empty() -> Result<Self> {
         let conn = Connection::open_in_memory()?;
         conn.execute_batch(SCHEMA)?;
+        add_paused(&conn)?;
         Ok(Self { conn })
     }
 
@@ -753,6 +783,79 @@ impl Store {
         let n = expire_rows(&tx, Some(ns), now, u64::MAX)?;
         tx.commit()?;
         Ok(n)
+    }
+
+    /// Pause the leases that `sandbox` holds, in every namespace of this
+    /// file: each keeps the seconds it has left and does not expire until
+    /// `resume_leases`. Returns how many it paused.
+    pub fn pause_leases(&mut self, sandbox: &str, now: u64) -> Result<u64> {
+        let n = self.conn.execute(
+            &format!(
+                "UPDATE entries SET paused = MAX(expires - ?2, 1), expires = NULL
+                 WHERE writer = ?1 AND {LEASE_KEYS} AND paused IS NULL
+                 AND expires IS NOT NULL AND expires > ?2"
+            ),
+            params![sandbox, now],
+        )?;
+        Ok(n as u64)
+    }
+
+    /// The paused leases of `sandbox` run again from `now`, with the time
+    /// that they had left. Returns how many.
+    pub fn resume_leases(&mut self, sandbox: &str, now: u64) -> Result<u64> {
+        let n = self.conn.execute(
+            "UPDATE entries SET expires = ?2 + paused, paused = NULL
+             WHERE writer = ?1 AND paused IS NOT NULL",
+            params![sandbox, now],
+        )?;
+        Ok(n as u64)
+    }
+
+    /// Whether this lease waits for its frozen holder.
+    pub fn is_paused(&self, ns: &str, key: &str) -> Result<bool> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT paused IS NOT NULL FROM entries WHERE ns = ?1 AND key = ?2",
+                params![ns, key],
+                |r| r.get::<_, bool>(0),
+            )
+            .optional()?
+            .unwrap_or(false))
+    }
+
+    /// Delete the live leases that `sandbox` holds, in every namespace of
+    /// this file. Each delete goes to the history with `writer`. Returns
+    /// the namespaces and keys.
+    pub fn release_leases(
+        &mut self,
+        sandbox: &str,
+        writer: &Writer,
+        quota: Quota,
+        now: u64,
+    ) -> Result<Vec<(String, String)>> {
+        let rows: Vec<(String, String, u64)> = {
+            let mut st = self.conn.prepare(&format!(
+                "SELECT ns, key, version FROM entries
+                 WHERE writer = ?1 AND {LEASE_KEYS}
+                 AND (paused IS NOT NULL OR expires IS NULL OR expires > ?2)
+                 ORDER BY ns, key"
+            ))?;
+            let it = st.query_map(params![sandbox, now], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })?;
+            it.collect::<rusqlite::Result<_>>()?
+        };
+        let mut out = Vec::new();
+        for (ns, key, version) in rows {
+            match self.delete(&ns, &key, Some(version), writer, quota, now) {
+                Ok(()) => out.push((ns, key)),
+                // Changed or expired at the same moment: not ours to free.
+                Err(WriteError::Conflict { .. }) | Err(WriteError::Missing) => {}
+                Err(e) => anyhow::bail!("cannot release {key}: {e:?}"),
+            }
+        }
+        Ok(out)
     }
 
     /// Registry: forget the records of sandboxes that ended before

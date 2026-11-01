@@ -1275,10 +1275,19 @@ impl Service {
         let cur = st.get(ns, &key, now)?;
         if let Some(e) = &cur {
             if e.writer != self.id.sandbox {
+                // A frozen holder keeps its lease (`[suspend] leases = "keep"`).
+                let suspended = st.is_paused(ns, &key)?;
                 return Ok(Response {
                     status: Status::Conflict,
-                    message: format!("sandbox {} holds the lease", e.writer),
-                    result: serde_json::json!({ "lease": key, "owner": e.writer, "expires": e.expires }),
+                    message: if suspended {
+                        format!("sandbox {} holds the lease; it is suspended", e.writer)
+                    } else {
+                        format!("sandbox {} holds the lease", e.writer)
+                    },
+                    result: serde_json::json!({
+                        "lease": key, "owner": e.writer, "expires": e.expires,
+                        "owner_state": if suspended { "suspended" } else { "running" },
+                    }),
                 });
             }
         }
@@ -1659,6 +1668,11 @@ impl Served {
         if let Some(m) = &self.monitor {
             m.finish();
         }
+        // A sandbox that ends while it is frozen: its kept leases expire
+        // again, with the time that they had left.
+        if let Err(e) = resume_leases(&self.root, &self.sandbox, crate::state::now()) {
+            log::debug!("cannot resume the leases of {}: {e:#}", self.sandbox);
+        }
         if let Err(e) = Store::open(&shard::registry(&self.root))
             .and_then(|s| s.finish(&self.sandbox, crate::state::now()))
         {
@@ -1815,6 +1829,53 @@ fn shard_files(root: &Path) -> Vec<PathBuf> {
     }
     out.retain(|p| p.is_file());
     out
+}
+
+/// A frozen sandbox keeps its leases: their time to live stops in every
+/// store file until `resume_leases`. Returns how many leases it paused.
+pub fn pause_leases(root: &Path, sandbox: &str, now: u64) -> Result<u64> {
+    let mut n = 0;
+    for f in shard_files(root) {
+        n += Store::open(&f)?.pause_leases(sandbox, now)?;
+    }
+    Ok(n)
+}
+
+/// A thawed or ended sandbox: its paused leases run again with the time
+/// that they had left. Returns how many.
+pub fn resume_leases(root: &Path, sandbox: &str, now: u64) -> Result<u64> {
+    let mut n = 0;
+    for f in shard_files(root) {
+        n += Store::open(&f)?.resume_leases(sandbox, now)?;
+    }
+    Ok(n)
+}
+
+/// A frozen sandbox frees its leases at once. paddock is the writer of each
+/// release. Returns the kind of each scope (`pasture`, `tree`, `self`,
+/// `user`) and the key: no project path, no value.
+pub fn release_leases(
+    root: &Path,
+    sandbox: &str,
+    cfg: &KvCfg,
+    now: u64,
+) -> Result<Vec<(String, String)>> {
+    let w = Writer {
+        sandbox: "paddock",
+        harness: "paddock",
+    };
+    let q = Quota {
+        bytes: cfg.project_bytes,
+        keys: cfg.max_keys,
+    };
+    let mut out = Vec::new();
+    for f in shard_files(root) {
+        for (ns, key) in Store::open(&f)?.release_leases(sandbox, &w, q, now)? {
+            let kind = ns.split(':').next().unwrap_or_default().to_string();
+            out.push((kind, key));
+        }
+    }
+    Ok(out)
 }
 
 pub fn gc_plan(env: &HostEnv, running: &[String], now: u64) -> Result<GcPlan> {
