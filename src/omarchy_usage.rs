@@ -755,6 +755,7 @@ mod tests {
             kv_project: None,
             pasture: None,
             credentials: Vec::new(),
+            gateway: Vec::new(),
         }
     }
 

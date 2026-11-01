@@ -147,6 +147,7 @@ impl World {
             kv_project: None,
             pasture: None,
             credentials: Vec::new(),
+            gateway: Vec::new(),
         }
         .register(&self.env())
         .unwrap();

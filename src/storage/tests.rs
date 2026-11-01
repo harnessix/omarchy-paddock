@@ -570,6 +570,7 @@ fn gc_yes_removes_only_the_automatic_tier_and_spares_running_homes() {
         kv_project: None,
         pasture: None,
         credentials: Vec::new(),
+        gateway: Vec::new(),
     }
     .register(&env)
     .unwrap();

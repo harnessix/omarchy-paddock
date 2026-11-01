@@ -109,6 +109,7 @@ Panel {
     var a = ["folder", "copy"]
     if (s && s.windowPid > 0) a.push("display")
     if (s && s.canFreeze) a.push("freeze")
+    if (s && s.gateway !== "") a.push("revoke")
     a.push("stop")
     return a
   }
@@ -336,6 +337,13 @@ Panel {
       root.refresh()
     })
   }
+  // The gateway refuses the sandbox's next request with its credentials.
+  function revokeCredentials(s) {
+    runPaddock(["credentials", "revoke", s.id], function(code) {
+      root.say(code === 0 ? strings.t("msg.revoked") : strings.t("msg.revokeFailed"))
+      root.refresh()
+    })
+  }
   // Freeze a running sandbox, or thaw a frozen one.
   function toggleFreeze(s) {
     var verb = s.frozenSince > 0 ? "thaw" : "freeze"
@@ -351,6 +359,7 @@ Panel {
     else if (name === "freeze") toggleFreeze(s)
     else if (name === "copy") copyPath(s)
     else if (name === "display") showDisplay(s)
+    else if (name === "revoke") revokeCredentials(s)
     else if (name === "stop") stop(s)
   }
 
@@ -678,6 +687,8 @@ Panel {
             pasture: root.plain(r.pasture || "", 32),
             // Credentials whose values the sandbox holds (deliver).
             credentials: Array.isArray(r.credentials) ? r.credentials.slice(0, 8).map(function(c) { return root.plain(c, 64) }).join(", ") : "",
+            // Credentials it uses through the gateway: it holds stand-ins.
+            gateway: Array.isArray(r.gateway) ? r.gateway.slice(0, 8).map(function(c) { return root.plain(c, 64) }).join(", ") : "",
             parentHarness: "",
             depth: 0,
             children: 0
@@ -1253,6 +1264,7 @@ Panel {
                 caption2: modelData.frozenSince > 0 ? strings.t("row.frozen").arg(root.uptime(modelData.frozenSince))
                   : modelData.warning !== "" ? modelData.warning
                   : modelData.credentials !== "" ? strings.t("row.holdsCredentials").arg(modelData.credentials)
+                  : modelData.gateway !== "" ? strings.t("row.gateway").arg(modelData.gateway)
                   : (modelData.parent !== "" ? strings.t("row.startedBy").arg(modelData.parent)
                   : (modelData.auth !== "" && modelData.auth !== "shared" ? strings.t("row.auth").arg(modelData.auth)
                   : (modelData.pasture !== "" ? strings.t("row.pasture").arg(modelData.pasture) : "")))
@@ -1286,6 +1298,13 @@ Panel {
                 ActionButton {
                   sandboxIndex: index + root.approvals.length
                   position: (modelData.windowPid > 0 ? 3 : 2) + (modelData.canFreeze ? 1 : 0)
+                  visible: modelData.gateway !== ""
+                  iconText: "󰌿"; tooltipText: strings.t("action.revoke")
+                  onClicked: root.revokeCredentials(modelData)
+                }
+                ActionButton {
+                  sandboxIndex: index + root.approvals.length
+                  position: (modelData.windowPid > 0 ? 3 : 2) + (modelData.canFreeze ? 1 : 0) + (modelData.gateway !== "" ? 1 : 0)
                   iconText: root.confirmId === modelData.id ? "󰗖" : "󰓛"
                   tooltipText: root.confirmId === modelData.id ? strings.t("action.confirmStop") : strings.t("action.stop")
                   foreground: root.confirmId === modelData.id ? root.urgent : root.fg

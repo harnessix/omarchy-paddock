@@ -19,7 +19,7 @@ You configure a security boundary for the user. Some changes make it weaker. For
 - Setting a capability to `allow` in `[host]`, `network = "host"`, `--gui host`, `[mcp] allow`, `[network] host_ports`, or `[env] pass` for a secret.
 - Turning on a device: `[devices] NAME = true`. A device runs on the host and can cost money or reach a host service.
 - Opening the paddock kv `user` scope: `[kv] user = "allow"`. What one agent writes there, agents of other projects read.
-- Registering a credential (`[credentials.NAME]`) or answering its start card. The agent can read a delivered value, and it cannot be taken back. Never answer the card for the user.
+- Registering a credential (`[credentials.NAME]`) or answering its start card. Prefer `via = "gateway"` with a preset (`anthropic`, `openai`, `github`): the value stays on the host. The agent can read a `deliver` value, and it cannot be taken back. Never answer the card for the user. `paddock credentials revoke ID` ends the gateway use at once.
 - Defining a pasture (`[pastures.NAME] members`) or starting an agent with `--pasture NAME`. The members share state, so what one of them writes, the others read.
 - Keeping vendor telemetry: `[privacy] telemetry = "vendor"`. paddock turns telemetry off in every sandbox by default.
 - Widening `[exec]`: `home = "read-only"` or `"full"`, more `paths`, or more `env` names. An approved `exec` then sees more of the host.

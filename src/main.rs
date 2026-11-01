@@ -507,6 +507,9 @@ enum CredentialsCmd {
         #[arg(long)]
         json: bool,
     },
+    /// Stop a running sandbox from using a credential through the gateway.
+    /// Without NAME: every one. Its next request gets 403; it keeps running.
+    Revoke { id: String, name: Option<String> },
 }
 
 #[derive(Subcommand)]
@@ -1806,6 +1809,16 @@ fn real_main() -> Result<i32> {
         Cmd::Discard { id, paths, all } => discard_cmd(&env, &id, paths, all),
         Cmd::Pasture { cmd } => pasture_cmd(&env, cmd),
         Cmd::Credentials {
+            cmd: CredentialsCmd::Revoke { id, name },
+        } => {
+            let names = paddock::credentials::revoke(&env, &id, name.as_deref())?;
+            println!(
+                "Revoked for {id}: {}. Its next request with them gets 403.",
+                names.join(", ")
+            );
+            Ok(0)
+        }
+        Cmd::Credentials {
             cmd: CredentialsCmd::List { json },
         } => {
             let rows = paddock::credentials::rows(&env)?;
@@ -1844,8 +1857,11 @@ fn real_main() -> Result<i32> {
                             paddock::storage::date(t)
                         ),
                         None => String::new(),
-                    }
+                    },
                 );
+                if r.used > 0 {
+                    println!("{:<24} {} requests through the gateway", "", r.used);
+                }
             }
             Ok(0)
         }

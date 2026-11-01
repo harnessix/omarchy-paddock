@@ -686,6 +686,10 @@ pub struct Running {
     /// The credentials whose values the sandbox holds (`deliver`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub credentials: Vec<String>,
+    /// The credentials that the sandbox uses through the gateway: it holds
+    /// only stand-ins.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub gateway: Vec<String>,
 }
 
 /// A host login file and the sandbox's copy of it.

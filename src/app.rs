@@ -690,6 +690,7 @@ fn run_flatpak(
         kv_project: None,
         pasture: None,
         credentials: Vec::new(),
+        gateway: Vec::new(),
     };
     if let Err(e) = running.register(env) {
         log::warn!("cannot list the app with the running sandboxes: {e:#}");

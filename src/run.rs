@@ -118,26 +118,52 @@ fn help_text(exe: &Path, args: &[String]) -> Result<String> {
     Ok(text)
 }
 
-/// Ask for the registered `deliver` credentials and add the ones that the
-/// user allowed twice. Returns their names, for `paddock ps` and the panel.
-fn deliver_credentials(env: &HostEnv, built: &mut Built, quiet: bool) -> Result<Vec<String>> {
+/// The credentials that a run uses.
+#[derive(Default)]
+struct RunCredentials {
+    delivered: Vec<String>,
+    gateway: Vec<String>,
+}
+
+/// Ask for the registered credentials and set up the ones that the user
+/// allowed twice: `deliver` values go into the environment; a `gateway`
+/// credential gets a gateway on a socket (alive as long as this process),
+/// a stand-in and a base URL.
+fn setup_credentials(
+    env: &HostEnv,
+    built: &mut Built,
+    backend: &str,
+    quiet: bool,
+) -> Result<RunCredentials> {
+    use crate::credentials::{gateway, Via};
     let say = |m: &str| {
         if !quiet {
             eprintln!("paddock: {m}");
         }
     };
-    let plan = match crate::credentials::plan(env, &built.spec.harness, built.spawn.is_some()) {
+    let mut plan = match crate::credentials::plan(env, &built.spec.harness, built.spawn.is_some()) {
         Ok(p) => p,
         Err(e) => {
             say(&format!("no credentials are delivered: {e:#}"));
-            return Ok(Vec::new());
+            return Ok(RunCredentials::default());
         }
     };
+    if backend == "srt" {
+        plan.deliver.retain(|(n, c)| {
+            let keep = c.via != Via::Gateway;
+            if !keep {
+                say(&format!(
+                    "credential {n}: the srt backend cannot reach the gateway; use the bwrap, docker or podman backend"
+                ));
+            }
+            keep
+        });
+    }
     for n in &plan.notices {
         say(n);
     }
     if plan.deliver.is_empty() {
-        return Ok(Vec::new());
+        return Ok(RunCredentials::default());
     }
     let approver: std::sync::Arc<dyn crate::broker::Approver> = built
         .approver
@@ -155,21 +181,107 @@ fn deliver_credentials(env: &HostEnv, built: &mut Built, quiet: bool) -> Result<
         &plan,
     ) {
         say("the sandbox starts without the credentials");
-        return Ok(Vec::new());
+        return Ok(RunCredentials::default());
     }
     let (values, notices) = crate::credentials::read(env, &plan);
     for n in &notices {
         say(n);
     }
-    let mut names = Vec::new();
+    let mut out = RunCredentials::default();
+    let mut routes = std::collections::BTreeMap::new();
     for (name, var, value) in values {
+        let Some((_, c)) = plan.deliver.iter().find(|(n, _)| *n == name) else {
+            continue;
+        };
+        if c.via == Via::Gateway {
+            let mark = gateway::new_mark();
+            built.spec.set_env(
+                &var,
+                gateway::stand_in(&value, &mark),
+                &format!("credentials: stand-in for {name}"),
+            );
+            built.spec.set_env(
+                c.base_url_env.as_deref().unwrap_or_default(),
+                format!(
+                    "http://127.0.0.1:{}/s/{name}{}",
+                    gateway::PORT,
+                    c.base_path.as_deref().unwrap_or("")
+                ),
+                &format!("credentials: gateway for {name}"),
+            );
+            crate::credentials::audit(
+                env,
+                &built.spec,
+                &name,
+                &format!("gateway ready, stand-in mark {mark}"),
+            );
+            routes.insert(name.clone(), gateway::Route::new(c, value));
+            out.gateway.push(name);
+        } else {
+            built
+                .spec
+                .set_secret_env(&var, value, &format!("credentials: deliver {name}"));
+            crate::credentials::audit(env, &built.spec, &name, "delivered");
+            out.delivered.push(name);
+        }
+    }
+    if !routes.is_empty() {
+        let run_dir = env.paddock_run().join(&built.spec.id);
+        crate::privfs::dir(&run_dir)?;
+        let sock = run_dir.join("credentials.sock");
+        let (e1, e2, spec) = (env.clone(), env.clone(), built.spec.clone());
+        let id = built.spec.id.clone();
+        let hosts: Vec<String> = routes.values().map(|r| r.host.clone()).collect();
+        let g = gateway::Gateway::new(
+            routes,
+            gateway::host_connector(env, &hosts),
+            crate::credentials::revoked_file(env, &built.spec.id),
+            std::sync::Arc::new(
+                move |name: &str, method: &str, host: &str, path: &str, result: &str| {
+                    crate::credentials::audit_use(&e1, &spec, name, method, host, path, result);
+                },
+            ),
+            std::sync::Arc::new(move || {
+                let reason = "the credential gateway refused too many requests";
+                if let Err(e) = crate::freeze::freeze(&e2, &id, false, reason) {
+                    log::warn!("cannot freeze {id}: {e:#}");
+                }
+                let _ = crate::broker::notify::show(
+                    &e2,
+                    &crate::broker::notify::Note {
+                        summary: "paddock froze a sandbox".into(),
+                        body: format!(
+                            "{id}: {reason}. Read paddock log, then run paddock thaw {id} or paddock stop {id}."
+                        ),
+                        actions: Vec::new(),
+                        critical: true,
+                    },
+                );
+            }),
+        );
+        g.serve(&sock)?;
+        built.spec.add_mount(crate::spec::Mount::bind(
+            &sock,
+            gateway::SOCKET_IN_SANDBOX,
+            false,
+            "credentials: gateway",
+        ));
+        let me = std::env::current_exe()
+            .and_then(std::fs::canonicalize)
+            .context("cannot find the paddock executable")?;
         built
             .spec
-            .set_secret_env(&var, value, &format!("credentials: deliver {name}"));
-        crate::credentials::audit(env, &built.spec, &name, "delivered");
-        names.push(name);
+            .add_tool("paddock", me, "credentials: gateway relay");
+        built.spec.setup.insert(
+            0,
+            format!(
+                "paddock relay --listen 127.0.0.1:{port} --socket {sock} --ready-file /tmp/.paddock-credentials >/dev/null 2>&1 &\ni=0; while [ ! -e /tmp/.paddock-credentials ] && [ $i -lt 100 ]; do sleep 0.05; i=$((i+1)); done",
+                port = gateway::PORT,
+                sock = gateway::SOCKET_IN_SANDBOX
+            ),
+        );
     }
-    Ok(names)
+    Ok(out)
 }
 
 pub struct Outcome {
@@ -309,7 +421,7 @@ pub fn run(
     // Registered credentials (credentials.rs): after the install steps,
     // which never get them, and before the harness starts, which waits for
     // the user's two answers.
-    let delivered = deliver_credentials(env, &mut built, quiet)?;
+    let creds = setup_credentials(env, &mut built, backend.name(), quiet)?;
     let launch = backend.render(env, &built.spec, interactive)?;
     write_files(&launch)?;
 
@@ -460,7 +572,8 @@ pub fn run(
         unit,
         kv_project: Some(kv_project_path),
         pasture: kv_pasture,
-        credentials: delivered,
+        credentials: creds.delivered,
+        gateway: creds.gateway,
     };
     running.register(env)?;
     // Kept after exit, so `paddock files` can list what the sandbox left.
