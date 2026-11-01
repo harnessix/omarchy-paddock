@@ -1663,6 +1663,7 @@ pub fn start(
         chain: lineage.chain,
     };
     watch_timers(env.clone(), id.clone(), kv_root(env), cfg.clone());
+    crate::monitor::watch(env.clone(), id.clone());
     let svc = Service::new(env.clone(), id, cfg, approver, Duration::from_secs(wait));
     let sock = env.paddock_run().join(&spec.id).join("kv.sock");
     match serve(&sock, svc) {

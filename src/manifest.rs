@@ -28,6 +28,7 @@ pub const USER_ONLY: &[&str] = &[
     "credentials",
     "logins",
     "status",
+    "monitor",
 ];
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
