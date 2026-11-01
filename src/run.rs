@@ -680,6 +680,20 @@ pub fn run(
         agent: creds.agent,
     };
     running.register(env)?;
+    // The ration of a pasture member: after the registration, so that its
+    // quota counts from the start.
+    if let Some(p) = &running.pasture {
+        let ration = crate::pasture::load(env)
+            .ok()
+            .and_then(|all| all.get(p)?.rations.get(&spec.harness).cloned());
+        if let Some(r) = ration {
+            match crate::pasture::apply_ration(env, &spec.id, &spec.harness, &r) {
+                Ok(notes) if !quiet => notes.iter().for_each(|n| eprintln!("paddock: {n}")),
+                Ok(_) => {}
+                Err(e) => log::warn!("cannot set the ration of {}: {e:#}", spec.harness),
+            }
+        }
+    }
     // Kept after exit, so `paddock files` can list what the sandbox left.
     if let Err(e) =
         crate::recover::Session::begin(env, &spec.id, &spec.harness, &spec.project, &spec.home_src)

@@ -653,6 +653,21 @@ impl Service {
             .any(|a| st.granted(a, USER_CAPABILITY).unwrap_or(false))
     }
 
+    /// The rations of the members of this pasture, by sandbox id, for
+    /// `paddock-host pasture members`. Read on the host side.
+    fn rations(&self) -> serde_json::Value {
+        let (Some(p), false) = (self.id.pasture.as_deref(), self.id.is_child()) else {
+            return serde_json::Value::Null;
+        };
+        let mut out = serde_json::Map::new();
+        for r in crate::pasture::bridge::members(&self.env, &self.id.project, p) {
+            if let Some(u) = crate::pasture::ration_use(&self.env, &r.id) {
+                out.insert(r.id, serde_json::to_value(u).unwrap_or_default());
+            }
+        }
+        out.into()
+    }
+
     fn info(&self) -> serde_json::Value {
         serde_json::json!({
             "protocol": PROTOCOL,
@@ -663,6 +678,7 @@ impl Service {
             "parent": self.id.parent,
             "started_by": self.id.chain,
             "tree_root": self.id.tree,
+            "rations": self.rations(),
             "bridge": self.id.pasture.as_deref().is_some_and(|p| !self.id.is_child() && crate::pasture::bridge::enabled(&self.env, p)),
             "scopes": {
                 "self": "read-write; this sandbox only",

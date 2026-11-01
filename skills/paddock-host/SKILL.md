@@ -122,6 +122,7 @@ A timer lives on the host, so it outlasts your context. Use it for any task that
 3. A timer that someone else set (the user, or the agent that started you) is not yours: you cannot stop it. `paddock-host timer extend NAME --by 30m --reason TEXT` asks the user for more time; say why in the reason.
 4. A hard deadline freezes your sandbox when it ends. Save your work and report before that.
 5. A timer can also limit how much of the account's limits a task uses: `paddock-host timer start NAME --quota weekly=1%` (the window names come from `paddock-host forage`). It counts everything that the account uses meanwhile. `--by 1%` asks for more quota, as `--by 30m` asks for more time. Keep each task to about 1% of the weekly limit. If a piece of work needs more, split it into several small tasks, each with its own timer, instead of one large task.
+6. In a pasture, the user can give you a ration: the timer `ration`. Check it with `paddock-host timer status`. When it is used up, other members cannot ask you questions.
 
 Timers in `--scope pasture` or `--scope tree` show the other agents there how long a shared task has run.
 

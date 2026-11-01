@@ -573,6 +573,16 @@ fn ask_inner(
             format!("{who} is frozen; it answers after the user resumes it"),
         );
     }
+    if let Some(r) = crate::pasture::ration_status(env, &t.id).filter(|r| r.over) {
+        line["result"] = "ration over".into();
+        return resp(
+            Status::Denied,
+            format!(
+                "{who} used up its ration ({}); it answers no more questions until the user extends it",
+                crate::timer::describe(&r)
+            ),
+        );
+    }
     let base = dir(env, &id.project, pasture);
     match read_record(&base, &t.id) {
         None => {

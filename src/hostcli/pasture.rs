@@ -25,7 +25,8 @@ member. Nothing else leaves this sandbox: only the ports that you name.
   unshare PORT   Stop sharing PORT. The share also ends when this sandbox
                  ends (within 30 seconds).
   members        The members of the pasture, their harness, the ports
-                 that each one shares, and whether the bridge is on.
+                 that each one shares, whether the bridge is on, and the
+                 ration of each member and how much of it is used.
   ask MEMBER     Ask another member a question. MEMBER is its harness, or
                  its sandbox id when two members run the same harness. The
                  member answers with one run of its own harness, in its own
@@ -38,7 +39,8 @@ member. Nothing else leaves this sandbox: only the ports that you name.
                  [pastures.NAME] of the user configuration. One question at
                  a time per member, answers up to 256 KiB (the end of a
                  longer one). When an answer holds a piece of a login secret
-                 of a member, paddock withholds it and says so.
+                 of a member, paddock withholds it and says so. A member
+                 that used up its ration answers no questions (exit 3).
 
 When a member already has its own server on PORT, it skips that port and
 members shows why. Limits: TCP only, ports 1024 to 65535, at most 16 shared
@@ -46,7 +48,8 @@ ports per pasture.
 
 EXIT CODES
   0 done   1 not shared by this sandbox, or no such member   2 wrong usage
-  3 the bridge is off, or paddock withheld the answer   4 the member has
+  3 the bridge is off, paddock withheld the answer, or the member used
+  up its ration   4 the member has
   no [oneshot] command   5 no answer in time   6 no host connection or no
   pasture   7 the member's harness failed   8 invalid request   9 another
   member shares the port, or the member is busy or frozen   10 the pasture
@@ -343,14 +346,18 @@ fn ask(args: &[String]) -> i32 {
     resp.status.exit_code()
 }
 
-/// Whether the bridge of this pasture is on, from paddock kv.
-fn bridge_on() -> bool {
+/// Whether the bridge of this pasture is on, and the rations of its
+/// members by sandbox id, from paddock kv.
+fn info() -> (bool, serde_json::Value) {
     let r = super::kv::send(&crate::kv::Request {
         v: crate::kv::PROTOCOL,
         op: "info".into(),
         ..Default::default()
     });
-    r.is_ok_and(|r| r.result["bridge"] == true)
+    match r {
+        Ok(r) => (r.result["bridge"] == true, r.result["rations"].clone()),
+        Err(_) => (false, serde_json::Value::Null),
+    }
 }
 
 fn members(json: bool) -> i32 {
@@ -358,7 +365,7 @@ fn members(json: bool) -> i32 {
         Ok(m) => m,
         Err(code) => return code,
     };
-    let bridge = bridge_on();
+    let (bridge, rations) = info();
     let shared = match ports::shared() {
         Ok(s) => s,
         Err(e) => return no_host(&e),
@@ -392,6 +399,7 @@ fn members(json: bool) -> i32 {
                 serde_json::json!({
                     "sandbox": id, "harness": harness, "you": *id == me,
                     "ports": ports_of(id), "skipped": skipped,
+                    "ration": rations[id.as_str()],
                 })
             })
             .collect();
@@ -419,6 +427,18 @@ fn members(json: bool) -> i32 {
         };
         let you = if *id == me { "  (you)" } else { "" };
         println!("{id:<28} {harness:<10} ports: {p}{you}");
+        let r = &rations[id.as_str()];
+        if let Some(used) = r["used"].as_str() {
+            println!(
+                "  ration: {used}{}{}",
+                if r["hard"] == true { ", hard" } else { "" },
+                if r["over"] == true {
+                    ", over: it answers no questions"
+                } else {
+                    ""
+                }
+            );
+        }
         for (port, why) in skipped.as_object().into_iter().flatten() {
             println!("  skips {port}: {}", why.as_str().unwrap_or(""));
         }
