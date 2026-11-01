@@ -358,6 +358,7 @@ So for Codex, paddock keeps the refresh token out of the sandbox:
 - The keeper writes the new login back where it lives (your `~/.codex/auth.json`, or the isolated store), and the new access token, without the refresh token, into every running sandbox that uses the login. Codex reads the file again before it would refresh, so it takes the new token.
 - Several sandboxes of one login share one keeper. When the sandbox whose paddock runs it ends, another one takes over. If a refresh fails three times in a row, paddock shows a notification.
 - The sandbox's copy is never written back at exit. A login that you make inside the sandbox, when it started logged out, is saved as before.
+- The limits in the Omarchy agents panel keep working while a sandbox uses your Codex login. Omarchy's own Codex collector runs in a keeper sandbox, with your home read-only and the full login. It waits for the keeper, so the two never refresh at the same time. If it refreshes the login, the result goes back to `~/.codex/auth.json` and into the sandboxes, as after the keeper's own refresh.
 
 In `~/.config/paddock/config.toml`:
 
@@ -368,7 +369,7 @@ refresh_margin = 1800    # seconds before the access token expires; at least 360
 check_interval = 60      # seconds between two looks
 ```
 
-`paddock logins refresh codex [--auth isolated:NAME]` refreshes a login at once, in a keeper sandbox, and updates the running sandboxes that use it. It refuses while a running sandbox's keeper holds the login.
+`paddock logins refresh codex [--auth isolated:NAME]` refreshes a login at once, in a keeper sandbox, and updates the running sandboxes that use it. It waits while another run with the login (the keeper, or the usage collector) finishes.
 
 An API-key login is not touched. Claude Code and Grok Build logins are copied whole, as before.
 

@@ -223,6 +223,9 @@ pub fn refresh(
     auth: &AuthMode,
     store: &Path,
 ) -> Result<bool> {
+    // Every run that can refresh this login waits for this lock: the
+    // keeper, `paddock logins refresh` and the usage collector.
+    let _lock = refresh_lock(env, store)?;
     let before =
         std::fs::read(store).with_context(|| format!("cannot read {}", store.display()))?;
     if !keepable(&before) {
@@ -234,12 +237,19 @@ pub fn refresh(
     crate::privfs::dir(&login_dir)?;
     let inside = home.join(kind.file);
     crate::privfs::write(&inside, &before)?;
-    let mut child = keeper_command(env, harness, kind, auth, &dir, &home)?
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .context("cannot start the keeper sandbox")?;
+    let mut child = keeper_command(
+        env,
+        harness,
+        kind,
+        auth,
+        &dir,
+        Layout::Login { home: &home },
+    )?
+    .stdin(Stdio::piped())
+    .stdout(Stdio::piped())
+    .stderr(Stdio::null())
+    .spawn()
+    .context("cannot start the keeper sandbox")?;
     let talked = talk(&mut child);
     let _ = child.kill();
     let _ = child.wait();
@@ -350,13 +360,29 @@ fn talk(child: &mut Child) -> Result<()> {
 /// The keeper sandbox: bwrap with the system read-only, an empty home but
 /// for the login folder, the harness's install read-only, the login's
 /// machine identity, the host name `paddock`, and network mode egress.
+/// How the home looks in a keeper sandbox, and what runs there.
+enum Layout<'a> {
+    /// Refresh: an empty home with the keeper's login folder in it, and
+    /// the harness's refresh server.
+    Login { home: &'a Path },
+    /// Omarchy's usage collector: the host home read-only (local stats),
+    /// the login folder as an overlay whose writes go to `upper`, Omarchy's
+    /// cache folder writable.
+    Collector {
+        upper: &'a Path,
+        work: &'a Path,
+        program: &'a Path,
+        args: &'a [String],
+    },
+}
+
 fn keeper_command(
     env: &HostEnv,
     harness: &Harness,
     kind: &Kind,
     auth: &AuthMode,
     dir: &Path,
-    home: &Path,
+    layout: Layout,
 ) -> Result<Command> {
     use crate::backend::bwrap::{resolv_target, DNS_FORWARD, ROOT_LINKS};
     let bwrap = env.which("bwrap").context("bwrap not found")?;
@@ -416,20 +442,44 @@ fn keeper_command(
             "/proc/sys/kernel/random/boot_id".into(),
         ]);
     }
-    // An empty home with the login folder in it, at the host home's path.
-    a.extend(["--tmpfs".into(), s(&env.home)]);
-    a.extend([
-        "--bind".into(),
-        s(&home.join(kind.home_dir)),
-        s(&env.home.join(kind.home_dir)),
-    ]);
+    let login_dir = env.home.join(kind.home_dir);
+    match &layout {
+        Layout::Login { home } => {
+            // An empty home with the login folder in it, at the host
+            // home's path.
+            a.extend(["--tmpfs".into(), s(&env.home)]);
+            a.extend(["--bind".into(), s(&home.join(kind.home_dir)), s(&login_dir)]);
+        }
+        Layout::Collector { upper, work, .. } => {
+            a.extend(["--ro-bind".into(), s(&env.home), s(&env.home)]);
+            a.extend([
+                "--overlay-src".into(),
+                s(&login_dir),
+                "--overlay".into(),
+                s(upper),
+                s(work),
+                s(&login_dir),
+            ]);
+            let cache = env.cache_dir.join("omarchy").join("agent-usage");
+            std::fs::create_dir_all(&cache)?;
+            a.extend(["--bind".into(), s(&cache), s(&cache)]);
+        }
+    }
     for m in &harness.install_mounts {
         a.extend(["--ro-bind".into(), s(m), s(m)]);
     }
     a.extend(["--ro-bind".into(), s(&harness.exe), s(&harness.exe)]);
     a.push("--".into());
-    a.push(s(&harness.exe));
-    a.extend(kind.args.iter().map(|x| x.to_string()));
+    match &layout {
+        Layout::Login { .. } => {
+            a.push(s(&harness.exe));
+            a.extend(kind.args.iter().map(|x| x.to_string()));
+        }
+        Layout::Collector { program, args, .. } => {
+            a.push(s(program));
+            a.extend(args.iter().cloned());
+        }
+    }
 
     let spec = crate::spec::SandboxSpec::new(
         format!("keeper-{}", std::process::id()),
@@ -446,7 +496,9 @@ fn keeper_command(
     pa.extend(a);
     let mut cmd = Command::new(pasta);
     cmd.args(pa).env_clear();
-    let mut path: Vec<String> = harness.path_dirs.iter().map(|p| s(p)).collect();
+    // The harness's own folder first: Omarchy's collector finds it by name.
+    let mut path: Vec<String> = harness.exe.parent().map(s).into_iter().collect();
+    path.extend(harness.path_dirs.iter().map(|p| s(p)));
     path.extend(["/usr/local/bin", "/usr/bin", "/bin"].map(String::from));
     cmd.env("HOME", &env.home)
         .env("PATH", path.join(":"))
@@ -458,6 +510,12 @@ fn keeper_command(
         "TZ",
         "SSL_CERT_FILE",
         "SSL_CERT_DIR",
+        // Omarchy's collector finds its own files and folders with these.
+        "OMARCHY_PATH",
+        "XDG_CONFIG_HOME",
+        "XDG_DATA_HOME",
+        "XDG_STATE_HOME",
+        "XDG_CACHE_HOME",
     ] {
         if let Some(v) = env.var(k) {
             cmd.env(k, v);
@@ -574,8 +632,8 @@ pub fn start(env: &HostEnv, harness: &str, kind: &'static Kind, auth: &AuthMode,
 }
 
 /// `paddock logins refresh`: refresh a login now, in a keeper sandbox, and
-/// bring the running sandboxes of that login up to date. Refused while a
-/// keeper holds the login: two refreshers are what this avoids.
+/// bring the running sandboxes of that login up to date. It waits for the
+/// refresh lock, so it never runs beside the keeper's own refresh.
 pub fn refresh_now(env: &HostEnv, harness: &str, auth: &AuthMode) -> Result<String> {
     let kind = kind_for(harness).with_context(|| {
         format!(
@@ -589,13 +647,6 @@ pub fn refresh_now(env: &HostEnv, harness: &str, auth: &AuthMode) -> Result<Stri
     })?;
     let h = crate::profile::HarnessFactory::new(env)?.create(harness)?;
     let store = crate::state::auth_file(env, &h.profile, auth, kind.file);
-    let lock = env
-        .paddock_run()
-        .join("keepers")
-        .join(format!("{}.lock", key(&store)));
-    let Some(_held) = try_lock(&lock) else {
-        bail!("a running sandbox keeps this login; its keeper refreshes it when it is due");
-    };
     let before =
         std::fs::read(&store).with_context(|| format!("no login in {}", store.display()))?;
     if !keepable(&before) {
@@ -621,6 +672,126 @@ pub fn refresh_now(env: &HostEnv, harness: &str, auth: &AuthMode) -> Result<Stri
             String::new()
         }
     ))
+}
+
+/// The lock that every run with the full login holds while it runs: at
+/// most one of them can spend the refresh token. Waits up to two minutes.
+fn refresh_lock(env: &HostEnv, store: &Path) -> Result<std::fs::File> {
+    let path = env
+        .paddock_run()
+        .join("keepers")
+        .join(format!("{}.refresh.lock", key(store)));
+    let start = Instant::now();
+    loop {
+        if let Some(f) = try_lock(&path) {
+            return Ok(f);
+        }
+        if start.elapsed() > Duration::from_secs(120) {
+            bail!("another run with this login did not finish in two minutes");
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
+/// Omarchy's usage collector for a kept login, in a keeper sandbox, with the
+/// full login. The collector starts the harness's own server, which can
+/// refresh the login; then the result goes back where the login lives and
+/// into the running sandboxes, as after a refresh. Returns its output.
+pub fn collect_usage(
+    env: &HostEnv,
+    harness: &str,
+    store: &Path,
+    collector: &Path,
+    args: &[String],
+) -> Result<Vec<u8>> {
+    let kind = kind_for(harness).context("not a kept login")?;
+    let h = crate::profile::HarnessFactory::new(env)?.create(harness)?;
+    let _lock = refresh_lock(env, store)?;
+    let before = std::fs::read(store)?;
+    if !keepable(&before) {
+        bail!("{} holds no login with a refresh token", store.display());
+    }
+    let dir = keeper_dir(env, store);
+    let (upper, work) = (dir.join("usage-upper"), dir.join("usage-work"));
+    for d in [&upper, &work] {
+        let _ = std::fs::remove_dir_all(d);
+        crate::privfs::dir(d)?;
+    }
+    let login = upper.join(Path::new(kind.file).file_name().context("no file name")?);
+    crate::privfs::write(&login, &before)?;
+    // A shared login only: the overlay's lower layer is the host's folder.
+    let mut cmd = keeper_command(
+        env,
+        &h,
+        kind,
+        &AuthMode::Shared,
+        &dir,
+        Layout::Collector {
+            upper: &upper,
+            work: &work,
+            program: collector,
+            args,
+        },
+    )?;
+    cmd.env_remove(kind.home_var);
+    let out = run_capped(&mut cmd, Duration::from_secs(120))?;
+    let after = std::fs::read(&login).unwrap_or_default();
+    if after != before && keepable(&after) {
+        let now = std::fs::read(store).unwrap_or_default();
+        if hash(&now) == hash(&before) {
+            write_store(store, &after)?;
+        }
+        push(env, store)?;
+    }
+    let _ = std::fs::remove_dir_all(&work);
+    Ok(out)
+}
+
+/// Run a command, return its standard output (at most 4 MiB), and stop it
+/// after `wait`.
+fn run_capped(cmd: &mut Command, wait: Duration) -> Result<Vec<u8>> {
+    use std::io::Read as _;
+    let mut child = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("cannot start the keeper sandbox")?;
+    let mut out = child.stdout.take().context("no stdout")?;
+    let mut err = child.stderr.take().context("no stderr")?;
+    let err_reader = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = (&mut err).take(64 << 10).read_to_end(&mut buf);
+        buf
+    });
+    let reader = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = (&mut out).take(4 << 20).read_to_end(&mut buf);
+        buf
+    });
+    let start = Instant::now();
+    loop {
+        if child.try_wait()?.is_some() {
+            break;
+        }
+        if start.elapsed() > wait {
+            let _ = child.kill();
+            let _ = child.wait();
+            bail!("the collector did not finish in {} seconds", wait.as_secs());
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let out = reader.join().unwrap_or_default();
+    let err = err_reader.join().unwrap_or_default();
+    if out.is_empty() && !err.is_empty() {
+        // The collector's own words, for `PADDOCK_LOG=debug`. Never a token:
+        // a collector does not print one.
+        log::debug!(
+            "the collector printed nothing; its errors: {}",
+            String::from_utf8_lossy(&err).trim()
+        );
+    }
+    Ok(out)
 }
 
 fn try_lock(path: &Path) -> Option<std::fs::File> {
