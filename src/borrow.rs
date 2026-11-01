@@ -886,7 +886,7 @@ impl ReturnPlan {
                 shown(&c.skipped)
             ));
         }
-        t.push_str("\nNew files get no execute bit. The original did not change since the borrow; paddock checks it again before it writes.");
+        t.push_str("\nNew files get no execute bit. The original did not change since the borrow. paddock checks it again before it writes.");
         if let Some(w) = &self.warning {
             t.push_str(&format!("\n{w}"));
         }

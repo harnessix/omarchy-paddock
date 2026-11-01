@@ -55,7 +55,7 @@ pub const CAPABILITIES: &[(&str, &str)] = &[
     ),
     (
         "borrow",
-        "copy a host folder into /run/paddock/borrow to change it; the original stays as it is",
+        "copy a host folder into /run/paddock/borrow to change it, and keep the original as it is",
     ),
     (
         "return",
@@ -1499,7 +1499,7 @@ fn prepare(env: &HostEnv, ctx: &Context, req: &Request) -> Result<Prepared> {
                 crate::borrow::plan_borrow(env, &asked, |a, r| check_fetch(env, a, r, true))?;
             let real = plan.real.display().to_string();
             let mut detail = format!(
-                "Copy the host folder {real} ({}) into {} in the sandbox. The agent changes the copy; the original stays as it is. A return asks again and shows every change.",
+                "Copy the host folder {real} ({}) into {} in the sandbox. The agent changes the copy, and the original stays as it is. A return asks again and shows every change.",
                 crate::storage::human(plan.bytes),
                 crate::borrow::MOUNT
             );

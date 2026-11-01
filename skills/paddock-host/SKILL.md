@@ -23,6 +23,7 @@ When a task needs the host, use `paddock-host`. Each request goes to paddock on 
 | Run one command on the host | `paddock-host exec --reason "..." -- COMMAND ARG...` |
 | Run a named host tool that the user defined | `paddock-host tool NAME ARG...` (`paddock-host tool --list` shows the tools and their argument shapes) |
 | A file outside the project | `paddock-host fetch /absolute/path --reason "..."` |
+| Change a host folder outside the project | `paddock-host borrow /absolute/folder --reason "..."`, change the copy in `/run/paddock/borrow/NAME`, then `paddock-host return NAME --reason "..."` |
 | The host clipboard | `paddock-host clipboard get` or `paddock-host clipboard set TEXT` |
 | Open a page in the host browser | `paddock-host open https://...` |
 | Tell the user that work is done | `paddock-host notify "Title" "Body"` |

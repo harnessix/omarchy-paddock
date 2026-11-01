@@ -660,6 +660,8 @@ Sometimes the agent needs one thing from your computer: a screenshot of the real
 | `exec` | Runs one command in the project folder, without a shell, isolated (see below) | ask, and never allow |
 | `tool` | Runs a named host tool of `[host.tools]` with allowed arguments only (see [Named host tools](#named-host-tools)) | the mode of each tool |
 | `fetch` | Copies one host file or folder into the project, at most 64 MiB | ask |
+| `borrow` | Copies a host folder to `/run/paddock/borrow/` for changes (see [Borrow a host folder](#borrow-a-host-folder)) | ask |
+| `return` | Writes the changes of a borrowed copy back to its host folder | ask, and once per return |
 | `clipboard-read`, `clipboard-write` | Reads or sets the host clipboard | ask |
 | `open-url` | Opens an http or https link in your browser, for example a harness login page | ask |
 | `notify` | Shows a desktop notification | allow |
@@ -710,6 +712,25 @@ Set the mode of each capability in `~/.config/paddock/config.toml`. A project `p
 screenshot = "allow"   # deny | ask | allow
 clipboard-read = "deny"
 wait = 60              # seconds to wait for an answer
+```
+
+### Borrow a host folder
+
+A task sometimes needs to change a folder outside the project, for example a sibling library or another repository. `fetch` gives a copy with no way back, and `[mounts]` needs a restart. `borrow` and `return` fill the gap:
+
+```sh
+paddock-host borrow /srv/shared-lib --reason "fix the parser bug there"
+# prints /run/paddock/borrow/shared-lib. The agent changes that copy.
+paddock-host return shared-lib --reason "the parser fix, tests pass"
+```
+
+Every sandbox gets an empty folder of its own at `/run/paddock/borrow/` (on the host `$XDG_DATA_HOME/paddock/borrow/<sandbox id>/`). `borrow` opens the path first. Its last part must not be a symlink, and the card shows where the path really leads. paddock refuses the protected paths of `fetch` and every folder that holds one. It copies the folder with reflinks where the file system has them. Without reflinks the limit is `[borrow] max` (default `"1G"`). paddock records the state of the original in a manifest that the sandbox cannot see: path, size and time of each file, and a hash of each file up to 8 MiB. The original does not change.
+
+`return` compares the copy with the manifest. The card lists the added, changed and deleted files, at most 30 names per list with "+N more". paddock refuses the return when the original changed after the borrow, so it never overwrites a change of yours or of another agent. It checks again after your answer, just before it writes. A return never writes `.git/config`, the hooks or the other git files that paddock binds read-only in a project. New files get no execute bit. Symlinks that point outside the folder stop the return. A folder that host programs read or run, for example under `~/.config`, gets a warning on the card. After a return the copy is gone, and a new `borrow` starts again. When the sandbox ends, paddock deletes the copies that were not returned. `paddock du` shows the borrow folders, and `paddock gc` removes the ones of sandboxes that ended without that step. The audit log records the path, the size and the counts of each borrow and return, never the content. A spawned child cannot borrow from its parent yet.
+
+```toml
+[borrow]
+max = "1G"   # without reflinks: the most a borrow copies, and the most changed bytes a return takes
 ```
 
 ### Named host tools

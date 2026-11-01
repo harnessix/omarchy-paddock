@@ -196,7 +196,7 @@ allow them."#
   paddock-host return NAME          write the changes of the copy back
 
 HOST_FOLDER must be absolute, and its last part is no symlink. borrow prints
-the path of the copy. Change the copy as you like; the original does not
+the path of the copy. Change the copy as you like. The original does not
 change. return shows the user every added, changed and deleted file, and
 writes them back on approval. It refuses when the original changed after the
 borrow: borrow it again and redo the changes. A return never writes git
