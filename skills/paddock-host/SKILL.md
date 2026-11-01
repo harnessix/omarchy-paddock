@@ -120,6 +120,8 @@ A timer lives on the host, so it outlasts your context. Use it for any task that
 
 Timers in `--scope pasture` or `--scope tree` show the other agents there how long a shared task has run.
 
+Before you hand out a long task, run `paddock-host forage --refresh`. It shows how much of each account's limits is left, how fast it goes, and OVERGRAZING when a window runs out before it resets. Give the task to the account with room, and keep tasks smaller when every account is overgrazing.
+
 ## Devices
 
 The user can turn on host devices. Each device is a file in `/dev/paddock` (on srt: in `$PADDOCK_DEVICES`). Read `/dev/paddock/.catalog` first. One open is one request: open the device read-write, write the request, then read the response.

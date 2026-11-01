@@ -298,6 +298,17 @@ enum Cmd {
         #[command(subcommand)]
         cmd: PastureCmd,
     },
+    /// How much of each account's limits is used, how fast, and whether it
+    /// runs out before it resets.
+    Forage {
+        /// Agents to show (claude, codex, ...). Default: all with numbers.
+        agents: Vec<String>,
+        /// Ask for fresh numbers first (at most once in 5 minutes each).
+        #[arg(long)]
+        refresh: bool,
+        #[arg(long)]
+        json: bool,
+    },
     /// Timers of the running sandboxes: how long a task has run, and how
     /// long it may.
     Timer {
@@ -1867,6 +1878,35 @@ fn real_main() -> Result<i32> {
         } => recover_cmd(&env, &id, paths, all, to.as_deref(), keep),
         Cmd::Discard { id, paths, all } => discard_cmd(&env, &id, paths, all),
         Cmd::Pasture { cmd } => pasture_cmd(&env, cmd),
+        Cmd::Forage {
+            agents,
+            refresh,
+            json,
+        } => {
+            let agents = if agents.is_empty() {
+                paddock::forage::known_agents(&env)
+            } else {
+                agents
+            };
+            if refresh {
+                paddock::forage::refresh(&env, &agents)?;
+            }
+            for a in &agents {
+                paddock::forage::record(&env, a)?;
+            }
+            let windows: Vec<paddock::forage::Window> = agents
+                .iter()
+                .flat_map(|a| paddock::forage::windows(&env, a))
+                .filter(|w| w.used > 0.0 || w.resets.is_some())
+                .collect();
+            let v = serde_json::json!({"api_version": "paddock.forage/v1", "windows": windows});
+            if json {
+                println!("{}", serde_json::to_string_pretty(&v)?);
+            } else {
+                print!("{}", paddock::hostcli::forage::render(&v, state::now()));
+            }
+            Ok(0)
+        }
         Cmd::Timer { cmd } => {
             use paddock::timer;
             let show = |s: &timer::Status| {
