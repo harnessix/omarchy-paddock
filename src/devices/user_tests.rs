@@ -510,3 +510,46 @@ fn an_off_device_answers_disabled_and_the_catalog_shows_it() {
         .unwrap()
         .contains("echo = true"));
 }
+
+#[test]
+fn an_http_device_answers_through_the_mount() {
+    let Ok(host) = HostEnv::detect() else { return };
+    if let Err(why) = crate::devices::fuse_available(&host) {
+        eprintln!("skipped: {why}");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, seen, _l) = server(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+    let (ctx, _) = ctx(dir.path(), Answer::Session);
+    let cfg =
+        DevicesCfg::parse("[devices.off]\nkind = \"command\"\ncommand = [\"cat\"]\n").unwrap();
+    let mut devs = vec![http_dev(addr, "1K").build(&ctx, true)];
+    devs.extend(crate::devices::disabled(&cfg, &devs, &ctx));
+    let root = dir.path().join("dev");
+    let _m = match crate::devices::mount(&root, crate::devices::DeviceFs::new("box1", devs)) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("skipped: {e:#}");
+            return;
+        }
+    };
+    let ask = |name: &str, req: &[u8]| {
+        let mut h = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(root.join(name))
+            .unwrap();
+        h.write_all(req).unwrap();
+        let mut out = String::new();
+        h.read_to_string(&mut out).unwrap();
+        out
+    };
+    assert_eq!(
+        ask("svc", b"GET /api/tags\n"),
+        "HTTP/1.1 200 OK\nContent-Length: 2\n\nok"
+    );
+    assert_eq!(seen.lock().unwrap().len(), 1);
+    assert!(ask("off", b"x").starts_with("status: disabled\n"));
+    let cat = std::fs::read_to_string(root.join(".catalog")).unwrap();
+    assert!(cat.contains("\"/dev/paddock/svc\"") && cat.contains("\"/dev/paddock/off\""));
+}

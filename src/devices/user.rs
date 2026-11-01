@@ -921,4 +921,4 @@ impl Device for Http {
 
 #[cfg(test)]
 #[path = "user_tests.rs"]
-mod tests;
+pub(crate) mod tests;
