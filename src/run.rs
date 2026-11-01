@@ -122,6 +122,9 @@ fn help_text(exe: &Path, args: &[String]) -> Result<String> {
 #[derive(Default)]
 struct RunCredentials {
     delivered: Vec<String>,
+    /// The marks of the delivered values, for the login guard of the
+    /// pasture bridge. Never the values.
+    marks: std::collections::BTreeMap<String, Vec<u64>>,
     gateway: Vec<String>,
     agent: Vec<String>,
 }
@@ -228,6 +231,8 @@ fn setup_credentials(
             routes.insert(name.clone(), gateway::Route::new(c, value));
             out.gateway.push(name);
         } else {
+            out.marks
+                .insert(name.clone(), crate::pasture::bridge::marks(&value));
             built
                 .spec
                 .set_secret_env(&var, value, &format!("credentials: deliver {name}"));
@@ -416,6 +421,7 @@ pub fn run(
         built.pasture.clone(),
         kv_approver,
         lineage,
+        built.bridge.clone(),
     );
     let mut devices = crate::devices::start(
         env,
@@ -517,6 +523,29 @@ pub fn run(
     if let Some(k) = &kv {
         k.watch_credentials(spec.home_src.clone(), built.profile.state.auth.clone());
     }
+    // The bridge of the pasture: what the login guard of the other
+    // members checks, outside every sandbox.
+    let bridge_dir = match (&kv, &kv_pasture) {
+        (Some(_), Some(p)) => {
+            let base = crate::pasture::bridge::dir(env, &kv_project_path, p);
+            let rec = crate::pasture::bridge::MemberRecord {
+                harness: spec.harness.clone(),
+                home: spec.home_src.clone(),
+                login: built.profile.state.auth.clone(),
+                stores: auth.host_logins().into_iter().map(|l| l.store).collect(),
+                delivered: creds.marks.clone(),
+                oneshot: built.bridge.is_some(),
+            };
+            match crate::pasture::bridge::record_member(&base, &spec.id, &rec) {
+                Ok(()) => Some(base),
+                Err(e) => {
+                    log::warn!("the pasture bridge is off for this sandbox: {e:#}");
+                    None
+                }
+            }
+        }
+        _ => None,
+    };
 
     if !quiet {
         eprintln!(
@@ -776,6 +805,9 @@ pub fn run(
     drop(devices);
     if let Some(k) = kv {
         k.finish();
+    }
+    if let Some(base) = &bridge_dir {
+        crate::pasture::bridge::forget_member(base, &spec.id);
     }
     let _ = std::fs::remove_dir_all(env.paddock_run().join(&spec.id));
     crate::recover::Session::end(env, &spec.id);
