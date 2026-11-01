@@ -1391,7 +1391,9 @@ paddock app run vscode --worktree ~/src/api
 
 To use a worktree on every start, set `worktree = true` in `[apps.NAME]` of `~/.config/paddock/config.toml`. When you start an app from the menu without saved folders, the folder dialog asks whether to open a git repository in a new worktree. "New worktree" is the default button.
 
-When the app exits, paddock prints the commits and the uncommitted changes in the worktree, and the commands to review, merge or remove it. If no terminal shows that text, for example after a start from the menu, a notification gives the branch and the number of commits and changes, with a Merge and a Remove button where the notification server supports buttons. paddock never removes a worktree without your action. Flatpak apps cannot use worktrees yet.
+When the app exits, paddock prints the commits and the uncommitted changes in the worktree, and the commands to review, merge or remove it. If no terminal shows that text, for example after a start from the menu, a notification gives the branch and the number of commits and changes, with a Merge and a Remove button where the notification server supports buttons. paddock never removes a worktree without your action.
+
+Flatpak apps use worktrees too. paddock gives the app the worktree folder and the repository's `.git` folder read-write, so git in the app can commit there. The `.git` file of the worktree, the `config`, `config.worktree`, `commondir`, `gitdir` and `hooks` of the repository and of the worktree stay read-only.
 
 Later, the commands and the "Worktrees" row of the bar panel do the same:
 
