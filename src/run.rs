@@ -579,6 +579,14 @@ pub fn run(
         .then(|| crate::history::CopyBack::new(env, &built.profile, &built.auth, &spec.home_src));
     state::write_gitconfig(env, &spec.home_src, repo.as_ref())?;
     let watched = state::snapshot(&spec.watch);
+    // `paddock undo`: a copy of the project files. A worktree run has its
+    // own branch, and a spawned child shares the project of its parent,
+    // whose snapshot covers it.
+    let project_snapshot =
+        built.worktree.is_none() && built.spawn.is_none() && built.parent.is_none();
+    if project_snapshot {
+        crate::snapshot::before_start(env, &spec.project, &spec.id, &spec.harness, quiet);
+    }
     // After paddock filled the home: its own files are not news.
     if let Some(k) = &kv {
         k.watch_credentials(spec.home_src.clone(), built.profile.state.auth.clone());
@@ -856,6 +864,9 @@ pub fn run(
         ),
         Ok(_) => {}
         Err(e) => log::warn!("cannot copy the session history back: {e:#}"),
+    }
+    if project_snapshot {
+        crate::snapshot::after_end(env, &spec.project, &spec.id, quiet);
     }
     if !quiet {
         for f in &synced.saved {

@@ -49,6 +49,7 @@ pub mod run;
 pub mod safefs;
 pub mod setup;
 pub mod shims;
+pub mod snapshot;
 pub mod spawn;
 pub mod spec;
 pub mod state;
