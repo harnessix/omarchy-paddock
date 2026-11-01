@@ -13,7 +13,7 @@
 use crate::env::HostEnv;
 use crate::spec::{sandbox_runtime_dir, SandboxSpec};
 use anyhow::{bail, Context as _, Result};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -376,7 +376,49 @@ fn report_worktree(env: &HostEnv, name: &str, w: &build::Worktree) {
         return;
     }
     let (commits, changed) = build::worktree_counts(env, w);
-    desktop_notice(env, &worktree_note(name, w, commits, changed));
+    let note = worktree_note(name, w, commits, changed);
+    // The Merge and Remove buttons. A server without actions shows the text
+    // only, and the notification closes without an answer.
+    let (tx, rx) = std::sync::mpsc::channel::<String>();
+    let shown = crate::broker::notify::ask(env, &note, move |key| {
+        let _ = tx.send(key.to_string());
+    });
+    match shown {
+        Ok(_handle) => {
+            if let Ok(key) = rx.recv_timeout(std::time::Duration::from_secs(WORKTREE_ANSWER_SECS)) {
+                desktop_notice(env, &worktree_action(env, &w.path, &key));
+            }
+        }
+        Err(e) => log::debug!("no desktop notification: {e:#}"),
+    }
+}
+
+/// How long paddock waits for a button of the worktree notification.
+const WORKTREE_ANSWER_SECS: u64 = 30 * 60;
+
+/// Run the button that the user picked on the worktree notification, the
+/// same as `paddock worktree merge` or `paddock worktree remove` (without
+/// --force), and give back a notification with the result.
+pub fn worktree_action(env: &HostEnv, path: &Path, key: &str) -> crate::broker::notify::Note {
+    use crate::worktree;
+    let all = worktree::list(env);
+    let r = worktree::find(&all, &path.display().to_string()).and_then(|w| match key {
+        "merge" => worktree::merge(env, &w),
+        "remove" => worktree::remove(env, &w, false),
+        _ => anyhow::bail!("unknown action {key}"),
+    });
+    match r {
+        Ok(t) => crate::broker::notify::Note {
+            summary: "paddock worktree".into(),
+            body: t,
+            ..Default::default()
+        },
+        Err(e) => crate::broker::notify::Note {
+            summary: format!("paddock could not {key} the worktree"),
+            body: format!("{e:#}"),
+            ..Default::default()
+        },
+    }
 }
 
 /// The notification after an app worked in a worktree. The branch name and
@@ -400,6 +442,10 @@ pub fn worktree_note(
             w.repo.display(),
             w.branch
         ),
+        actions: vec![
+            ("merge".into(), "Merge".into()),
+            ("remove".into(), "Remove".into()),
+        ],
         ..Default::default()
     }
 }
@@ -1241,6 +1287,11 @@ mod tests {
         assert_eq!(n.summary, "-x worked on branch --version");
         assert!(n.body.contains("worktrees/--help"), "{}", n.body);
         assert!(n.body.ends_with("log --version"), "{}", n.body);
+        let keys: Vec<&str> = n.actions.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(keys, ["merge", "remove"]);
+        // A button for a worktree that paddock does not know changes nothing.
+        let a = worktree_action(&env, &w.path, "remove");
+        assert!(a.summary.contains("could not remove"), "{}", a.summary);
         let e = start_error_note("app", &anyhow::anyhow!("--icon=/home/demo/x"));
         assert_eq!(e.body, "--icon=/home/demo/x");
 

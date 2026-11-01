@@ -171,7 +171,7 @@ Then ask your agent, for example: "Install paddock and make the sandbox the defa
 
 6. Optional: if you used the docker or podman backend, run `paddock gc --yes` before you remove the command. It removes the old paddock images and paddock's build cache. To remove the current images too, run `docker image rm $(docker image ls -q paddock-base)`, and the same command with `podman`.
 
-paddock does not change any file outside these directories, except the files that you name in `paddock env hide` (in `~/.config/paddock/config.toml`), the git worktrees that `--worktree` creates, the files that `paddock shims install` and `paddock launchers install` change (also through `paddock setup`), and the paddock binary that `paddock update` replaces. Step 2 undoes the shell commands and launchers. To remove a worktree, use the commands that paddock prints when the sandbox exits.
+paddock does not change any file outside these directories, except the files that you name in `paddock env hide` (in `~/.config/paddock/config.toml`), the git worktrees that `--worktree` creates, the files that `paddock shims install` and `paddock launchers install` change (also through `paddock setup`), and the paddock binary that `paddock update` replaces. Step 2 undoes the shell commands and launchers. To remove a worktree, use `paddock worktree remove`.
 
 ## Use
 
@@ -180,6 +180,7 @@ paddock claude                 # Claude Code in the current project
 paddock codex ~/src/api        # Codex in another project
 paddock claude -- -p "fix the failing test"   # arguments after -- go to the harness
 paddock claude --worktree      # work on a new branch in a new worktree, review the diff at exit
+paddock worktree list          # the worktrees of --worktree runs and apps; merge or remove them
 paddock shell claude           # a shell in the sandbox that claude gets
 paddock explain claude         # every mount, variable and rule, and why it is there
 paddock ps                     # running sandboxes
@@ -1272,7 +1273,22 @@ paddock app run vscode --worktree ~/src/api
 
 To use a worktree on every start, set `worktree = true` in `[apps.NAME]` of `~/.config/paddock/config.toml`. When you start an app from the menu without saved folders, the folder dialog asks whether to open a git repository in a new worktree. "New worktree" is the default button.
 
-When the app exits, paddock prints the commits and the uncommitted changes in the worktree, and the commands to review, merge or remove it. If no terminal shows that text, for example after a start from the menu, a notification gives the branch and the number of commits and changes. paddock never removes a worktree itself. Flatpak apps cannot use worktrees yet.
+When the app exits, paddock prints the commits and the uncommitted changes in the worktree, and the commands to review, merge or remove it. If no terminal shows that text, for example after a start from the menu, a notification gives the branch and the number of commits and changes, with a Merge and a Remove button where the notification server supports buttons. paddock never removes a worktree without your action. Flatpak apps cannot use worktrees yet.
+
+Later, the commands and the "Worktrees" row of the bar panel do the same:
+
+```sh
+paddock worktree list                       # branch, unmerged commits, uncommitted changes, in use
+paddock worktree merge paddock/vscode-20261102-1a2b
+paddock worktree remove ~/.local/share/paddock/worktrees/api/wt-api-1a2b3c [--force]
+```
+
+- `list` shows each worktree that paddock made, for apps and for `--worktree` runs. `--json` gives data.
+- `merge` merges the branch into the current branch of the repository. It uses paddock's hardened host git, so no hook and no program from the repository configuration runs. It refuses when the repository has uncommitted changes. On a conflict it aborts the merge, and the repository stays as it was. Uncommitted changes in the worktree are not part of the merge.
+- `remove` removes the worktree and deletes its branch. It refuses while a sandbox works in it. Without `--force`, it refuses when the branch has commits that no other branch has, or when the worktree has uncommitted changes.
+- To keep a worktree, do nothing.
+
+The panel row lists the worktrees with Merge, Remove (press twice) and Open folder buttons.
 
 A flatpak app becomes an app profile with `[app] flatpak = "ID"`. paddock drops every permission that the app asks for, also those from `flatpak override`, and adds back only the workspace folders, the Wayland socket, the portals and, with `--gpu`, the GPU. Many flatpak apps ask for your whole home directory and the host bus, so their own sandbox is not enough. The network is `egress` or `none`, and the host passthrough (`paddock-host`) is not available.
 

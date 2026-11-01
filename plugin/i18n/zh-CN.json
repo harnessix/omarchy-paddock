@@ -228,5 +228,32 @@
   "forage.overgrazing": "%1 %2：已用 %3%，按现在的速度 %4 后用完，%5 后才重置",
   "row.boundary": {
     "other": "已拒绝 %1 次 · 查看：paddock boundary %2"
-  }
+  },
+  "wt.row": "工作树",
+  "wt.title": "工作树",
+  "wt.count": {
+    "other": "%1 个工作树"
+  },
+  "wt.unmergedCount": {
+    "other": "%1 个有未合并的提交"
+  },
+  "wt.intro": "应用和 --worktree 运行所用的分支。把它合并到仓库的当前分支，或者删除它。要保留它，什么都不用做。",
+  "wt.empty": "没有工作树。",
+  "wt.noBranch": "没有分支",
+  "wt.commits": {
+    "other": "%1 个未合并的提交"
+  },
+  "wt.commitsUnknown": "未合并的提交数未知",
+  "wt.dirty": "有未提交的更改",
+  "wt.running": "有沙箱在里面工作",
+  "wt.merge": "合并到当前分支",
+  "wt.remove": "删除工作树和它的分支",
+  "wt.open": "打开文件夹",
+  "wt.confirmRemove": "删除 %1 和它的分支？再按一次删除。",
+  "wt.merged": "已合并。",
+  "wt.mergeFailed": "paddock 无法合并。paddock worktree merge %1 会说明原因。",
+  "wt.removed": "工作树已删除。",
+  "wt.removeFailed": "paddock 无法删除。paddock worktree remove %1 会说明原因。",
+  "keys.wt": "↵ 打开文件夹 · ←→ 合并、删除 · Del 删除 · Esc 返回",
+  "keys.wtRow": "↵ 或 W 查看工作树"
 }

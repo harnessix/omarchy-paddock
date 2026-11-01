@@ -974,6 +974,66 @@ fn scan_images(host: &Host, cli: &str, notes: &mut Vec<String>) -> Vec<Image> {
     out
 }
 
+/// The worktrees that paddock made (`--worktree` runs and apps), without
+/// sizes. For `paddock worktree list` and the panel.
+pub fn worktrees(env: &HostEnv) -> Vec<Worktree> {
+    let running = Running::list(env);
+    let running_projects: BTreeSet<&Path> = running.iter().map(|r| r.project.as_path()).collect();
+    let candidates: Vec<PathBuf> = state::recent(env)
+        .into_iter()
+        .map(|r| r.project)
+        .chain(Session::all(env).into_iter().map(|s| s.project))
+        .chain(running.iter().filter_map(|r| r.kv_project.clone()))
+        .collect();
+    scan_worktrees(env, candidates, &running_projects)
+}
+
+/// The worktrees below paddock's folder. The repository of each comes from
+/// host-side records and verified origins (`candidates`), matched by the
+/// slug of the worktree folder.
+fn scan_worktrees(
+    env: &HostEnv,
+    candidates: Vec<PathBuf>,
+    running_projects: &BTreeSet<&Path>,
+) -> Vec<Worktree> {
+    let mut repos: BTreeMap<String, PathBuf> = BTreeMap::new();
+    for p in candidates {
+        if p.is_dir() {
+            repos.entry(state::slug(&p)).or_insert(p);
+        }
+    }
+    let mut listed: BTreeMap<PathBuf, Vec<ListedWorktree>> = BTreeMap::new();
+    let mut worktrees = Vec::new();
+    for sdir in subdirs(&worktrees_root(env)) {
+        let repo = repos.get(&name(&sdir)).cloned();
+        for path in subdirs(&sdir) {
+            let mut w = Worktree {
+                running: running_projects.contains(path.as_path()),
+                path: path.clone(),
+                repo: None,
+                branch: None,
+                unmerged: None,
+                dirty: None,
+                bytes: 0,
+            };
+            if let Some(repo) = &repo {
+                let list = listed
+                    .entry(repo.clone())
+                    .or_insert_with(|| list_worktrees(repo));
+                if let Some(l) = list.iter().find(|l| l.path == path) {
+                    let (unmerged, dirty) = worktree_facts(env, repo, l);
+                    w.repo = Some(repo.clone());
+                    w.branch = l.branch.clone();
+                    w.unmerged = unmerged;
+                    w.dirty = dirty;
+                }
+            }
+            worktrees.push(w);
+        }
+    }
+    worktrees
+}
+
 /// Look at every piece of paddock data. With `with_sizes`, measure homes and
 /// worktrees too, which can take some seconds.
 pub fn scan(env: &HostEnv, host: &Host, with_sizes: bool) -> Inventory {
@@ -1072,48 +1132,13 @@ pub fn scan(env: &HostEnv, host: &Host, with_sizes: bool) -> Inventory {
         notes.push("cannot read the harness profiles; no home counts as orphaned".into());
     }
 
-    // Worktrees. The repository of each comes from host-side records and
-    // verified origins, matched by the slug of the worktree folder.
-    let mut repos: BTreeMap<String, PathBuf> = BTreeMap::new();
-    let candidates = state::recent(env)
+    let candidates: Vec<PathBuf> = state::recent(env)
         .into_iter()
         .map(|r| r.project)
         .chain(sessions.iter().map(|s| s.project.clone()))
-        .chain(homes.iter().filter_map(|h| h.project.clone()));
-    for p in candidates {
-        if p.is_dir() {
-            repos.entry(state::slug(&p)).or_insert(p);
-        }
-    }
-    let mut listed: BTreeMap<PathBuf, Vec<ListedWorktree>> = BTreeMap::new();
-    let mut worktrees = Vec::new();
-    for sdir in subdirs(&worktrees_root(env)) {
-        let repo = repos.get(&name(&sdir)).cloned();
-        for path in subdirs(&sdir) {
-            let mut w = Worktree {
-                running: running_projects.contains(path.as_path()),
-                path: path.clone(),
-                repo: None,
-                branch: None,
-                unmerged: None,
-                dirty: None,
-                bytes: 0,
-            };
-            if let Some(repo) = &repo {
-                let list = listed
-                    .entry(repo.clone())
-                    .or_insert_with(|| list_worktrees(repo));
-                if let Some(l) = list.iter().find(|l| l.path == path) {
-                    let (unmerged, dirty) = worktree_facts(env, repo, l);
-                    w.repo = Some(repo.clone());
-                    w.branch = l.branch.clone();
-                    w.unmerged = unmerged;
-                    w.dirty = dirty;
-                }
-            }
-            worktrees.push(w);
-        }
-    }
+        .chain(homes.iter().filter_map(|h| h.project.clone()))
+        .collect();
+    let worktrees = scan_worktrees(env, candidates, &running_projects);
 
     // Session records.
     let session_records = sessions
@@ -1826,6 +1851,48 @@ fn git_write(repo: &Path, args: &[&str]) -> Result<()> {
     crate::hostgit::Checkout::open(repo)?.run(args).map(|_| ())
 }
 
+/// Remove a worktree that paddock made, and its branch with `delete_branch`.
+/// Gives back a note when it kept the branch.
+pub fn remove_worktree(
+    env: &HostEnv,
+    path: &Path,
+    repo: Option<&Path>,
+    branch: Option<&str>,
+    delete_branch: bool,
+    force: bool,
+) -> Result<Option<String>> {
+    check_removable(env, path)?;
+    let mut note = None;
+    match repo {
+        Some(repo) => {
+            let p = path.display().to_string();
+            let mut a = vec!["worktree", "remove"];
+            if force {
+                a.push("--force");
+            }
+            a.push(&p);
+            // The worktree itself is sandbox-written: its own
+            // configuration must be harmless too, because the
+            // removal reads that work tree.
+            if let Ok(Some(l)) = crate::hostgit::Layout::discover(path) {
+                l.guard()?;
+            }
+            git_write(repo, &a)?;
+            match branch {
+                Some(b) if delete_branch => git_write(repo, &["branch", "-D", b])?,
+                Some(b) => note = Some(format!("kept the branch {b}")),
+                None => {}
+            }
+        }
+        None => remove_path(env, path)?,
+    }
+    // The per-repository folder, when it is empty now.
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::remove_dir(parent);
+    }
+    Ok(note)
+}
+
 /// The result of one removal.
 #[derive(Debug, Clone, Serialize)]
 pub struct Removed {
@@ -1902,37 +1969,15 @@ pub fn apply(env: &HostEnv, containers: &dyn Containers, items: &[Item]) -> Vec<
                 branch,
                 delete_branch,
                 force,
-            } => (|| {
-                check_removable(env, path)?;
-                match repo {
-                    Some(repo) => {
-                        let p = path.display().to_string();
-                        let mut a = vec!["worktree", "remove"];
-                        if *force {
-                            a.push("--force");
-                        }
-                        a.push(&p);
-                        // The worktree itself is sandbox-written: its own
-                        // configuration must be harmless too, because the
-                        // removal reads that work tree.
-                        if let Ok(Some(l)) = crate::hostgit::Layout::discover(path) {
-                            l.guard()?;
-                        }
-                        git_write(repo, &a)?;
-                        match branch {
-                            Some(b) if *delete_branch => git_write(repo, &["branch", "-D", b])?,
-                            Some(b) => note = Some(format!("kept the branch {b}")),
-                            None => {}
-                        }
-                    }
-                    None => remove_path(env, path)?,
-                }
-                // The per-repository folder, when it is empty now.
-                if let Some(parent) = path.parent() {
-                    let _ = std::fs::remove_dir(parent);
-                }
-                Ok(())
-            })(),
+            } => remove_worktree(
+                env,
+                path,
+                repo.as_deref(),
+                branch.as_deref(),
+                *delete_branch,
+                *force,
+            )
+            .map(|n| note = n),
         };
         out.push(Removed {
             what: i.what.clone(),

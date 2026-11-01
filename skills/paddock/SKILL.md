@@ -142,6 +142,7 @@ An agent in a sandbox can also start an agent of another harness in a second san
 A sandbox writes the project directly, but files that it saves elsewhere, for example in `~/Downloads` of its own home, stay in the sandbox.
 
 - `paddock files [ID]` lists those files and the project changes since the sandbox started.
+- `paddock worktree list` lists the worktrees of `--worktree` runs and apps. `paddock worktree merge PATH|BRANCH` merges a branch into the current branch of its repository, with no hook. `paddock worktree remove PATH|BRANCH` removes the worktree and its branch, and refuses unmerged commits without `--force`.
 - `paddock undo [SESSION]` brings the project back to its snapshot from before a sandbox started. It lists the changes and asks first. Added files go to the undo trash. `paddock undo --list` lists the snapshots.
 - `paddock recover ID PATH` copies a file to the same place in the real home, or `--to DIR`. It never overwrites a file and never writes into hidden folders such as `~/.ssh`. Ask the user before you recover a file, and say where it goes.
 - `paddock discard ID PATH` deletes a file in the sandbox.

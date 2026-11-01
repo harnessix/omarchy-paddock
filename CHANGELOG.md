@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- New: `paddock worktree list`, `paddock worktree merge PATH|BRANCH` and `paddock worktree remove PATH|BRANCH [--force]` for the worktrees of apps and `--worktree` runs. `merge` uses the hardened host git, runs no hook and refuses a repository with uncommitted changes. `remove` deletes the branch too and refuses unmerged commits without `--force`. The bar panel has a "Worktrees" row with Merge, Remove and Open folder buttons, and the notification after an app ends has Merge and Remove buttons.
 - The bar panel lists the secret files of a sandbox ("secret file: NAME", `as = "file"` credentials), and its revoke button covers them.
 - `paddock undo --list` and `paddock undo` show the snapshot time in the local time zone. Before, they showed it in UTC.
 - New: the boundary log. paddock writes each denial of the sandbox boundary to `boundary.jsonl` in the run folder of the sandbox: refused host requests, refused network targets of the host proxy (LAN, host loopback, network mode `api`), withheld environment variables (names only) and MCP servers that do not start. The same denial within a minute raises a count. `paddock boundary ID [--json] [--follow]` shows the log by kind and target, `paddock ps --json` has `boundary_count`, the bar panel shows the count on the row, and `paddock-host boundary` reads the log inside the sandbox.

@@ -112,3 +112,35 @@ fn a_kv_value_never_reaches_a_command_line() {
     // Every value shown passes through plain().
     assert!(qml.contains("shown: root.plain(value, 4096)"));
 }
+
+#[test]
+fn the_worktree_commands_of_the_panel_parse() {
+    let t = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(t.path().join("home")).unwrap();
+    std::fs::create_dir_all(t.path().join("run")).unwrap();
+    let run = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_paddock"))
+            .args(args)
+            .env_clear()
+            .env("HOME", t.path().join("home"))
+            .env("USER", "demo")
+            .env("PATH", "/usr/bin:/bin")
+            .env("XDG_RUNTIME_DIR", t.path().join("run"))
+            .current_dir(t.path())
+            .output()
+            .unwrap()
+    };
+    let out = run(&["worktree", "list", "--json"]);
+    assert!(out.status.success(), "{out:?}");
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["api_version"], "paddock.worktrees/v1");
+    assert_eq!(v["worktrees"], serde_json::json!([]));
+    // The shapes that Panel.qml builds: the verb, then an absolute path.
+    for verb in ["merge", "remove"] {
+        let out = run(&["worktree", verb, "/no/such/worktree"]);
+        // The arguments parse, and paddock looks for the worktree.
+        assert!(!out.status.success(), "{verb}: {out:?}");
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(err.contains("no paddock worktree"), "{verb}: {err}");
+    }
+}

@@ -61,4 +61,5 @@ pub mod timer;
 pub mod update;
 pub mod waiting;
 pub mod wlsec;
+pub mod worktree;
 pub mod wrap;
