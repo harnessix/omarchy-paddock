@@ -54,6 +54,10 @@ pub struct ExecCfg {
     pub paths: Vec<PathBuf>,
     pub ro_paths: Vec<PathBuf>,
     pub env: Vec<String>,
+    /// Keep the command line of an allowed exec of plain words in the audit
+    /// log, for `paddock tools suggest`. Off by default: arguments can hold
+    /// private text that no filter finds.
+    pub remember_allowed: bool,
 }
 
 impl Default for ExecCfg {
@@ -64,6 +68,7 @@ impl Default for ExecCfg {
             paths: Vec::new(),
             ro_paths: Vec::new(),
             env: Vec::new(),
+            remember_allowed: false,
         }
     }
 }
@@ -115,6 +120,11 @@ impl ExecCfg {
                     }
                 }
                 "network" => c.network = v.as_bool().context("network must be true or false")?,
+                "remember_allowed" => {
+                    c.remember_allowed = v
+                        .as_bool()
+                        .context("remember_allowed must be true or false")?
+                }
                 "paths" => c.paths = paths("paths")?,
                 "ro_paths" => c.ro_paths = paths("ro_paths")?,
                 "env" => {

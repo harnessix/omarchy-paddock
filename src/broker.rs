@@ -623,8 +623,12 @@ fn audit(
         line["tool"] = arg_str(req, "name").unwrap_or("").into();
         line["args"] = serde_json::json!(tool_args(req).unwrap_or_default());
     }
-    // A plain exec line that the user allowed, for `paddock tools suggest`.
-    if req.cap == "exec" && decision.starts_with("allowed") {
+    // A plain exec line that the user allowed, for `paddock tools suggest`,
+    // only when the user asked for it (`[exec] remember_allowed = true`).
+    if req.cap == "exec"
+        && decision.starts_with("allowed")
+        && crate::execbox::ExecCfg::load(env).is_ok_and(|c| c.remember_allowed)
+    {
         if let Some(a) = crate::hosttools::loggable_argv(&argv(req)) {
             line["argv"] = serde_json::json!(a);
         }

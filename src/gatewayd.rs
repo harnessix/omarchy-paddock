@@ -164,6 +164,7 @@ fn run(
                     .iter()
                     .map(|s| s.to_string())
                     .collect(),
+                remember_allowed: false,
             };
             let unit = format!(
                 "paddock-push-{}",
@@ -214,6 +215,7 @@ fn run(
                     .iter()
                     .map(|s| s.to_string())
                     .collect(),
+                remember_allowed: false,
             };
             let mut vars = cfg.pass_env(&job.env);
             vars.extend(crate::broker::forge::forge_vars());
@@ -301,6 +303,7 @@ fn desktop_cfg(job: &Job, workdir: &Path) -> crate::execbox::ExecCfg {
         paths: vec![workdir.to_path_buf()],
         ro_paths: ro.into_iter().filter(|p| p.exists()).collect(),
         env: DESKTOP_ENV.iter().map(|s| s.to_string()).collect(),
+        remember_allowed: false,
     }
 }
 

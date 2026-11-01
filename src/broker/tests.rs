@@ -1066,12 +1066,18 @@ fn capabilities_list_the_tools() {
 }
 
 #[test]
-fn an_allowed_plain_exec_line_is_logged_for_suggest() {
+fn an_allowed_plain_exec_line_is_logged_for_suggest_only_when_asked() {
     let (_t, b, _) = setup(Some(Answer::Once), HostPolicy::default());
+    // Off by default: no command line in the log.
+    b.handle(&exec(&["echo", "a"]));
+    let cfg = b.env.paddock_config();
+    std::fs::create_dir_all(&cfg).unwrap();
+    std::fs::write(cfg.join("config.toml"), "[exec]\nremember_allowed = true\n").unwrap();
     b.handle(&exec(&["echo", "a"]));
     b.handle(&exec(&["echo", "--token", "x"]));
     let lines = audit_lines(&b);
-    assert_eq!(lines[0]["argv"], serde_json::json!(["echo", "a"]));
+    assert!(lines[0].get("argv").is_none(), "{}", lines[0]);
     assert_eq!(lines[0]["exit_code"], 0);
-    assert!(lines[1].get("argv").is_none());
+    assert_eq!(lines[1]["argv"], serde_json::json!(["echo", "a"]));
+    assert!(lines[2].get("argv").is_none());
 }
