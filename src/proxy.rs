@@ -194,6 +194,28 @@ pub struct HostProxy {
     /// system trust store. Tests use it for a local CA.
     #[cfg(test)]
     pub tls: Option<Arc<rustls::ClientConfig>>,
+    /// Gets each refused target ("host:port") and the rule, for the boundary
+    /// log of the sandbox.
+    pub boundary: Option<Boundary>,
+}
+
+/// The sink of the boundary log: target and rule, never content.
+#[derive(Clone)]
+pub struct Boundary(pub Arc<dyn Fn(&str, &str) + Send + Sync>);
+
+impl std::fmt::Debug for Boundary {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Boundary")
+    }
+}
+
+impl HostProxy {
+    /// Note a refused target in the boundary log.
+    fn refused(&self, host: &str, port: u16, rule: &str) {
+        if let Some(b) = &self.boundary {
+            (b.0)(&authority(host, port), rule);
+        }
+    }
 }
 
 impl Default for HostProxy {
@@ -209,6 +231,7 @@ impl Default for HostProxy {
             api: None,
             #[cfg(test)]
             tls: None,
+            boundary: None,
         }
     }
 }
@@ -375,11 +398,14 @@ fn check_target(cfg: &HostProxy, host: &str, port: u16) -> Result<Vec<std::net::
         let ip = canonical(a.ip());
         if ip.is_loopback() {
             if !cfg.allow_loopback.contains(&port) {
+                cfg.refused(host, port, "host loopback port not in [network] host_ports");
                 bail!("refused: {host}:{port} is a host loopback port that is not allowed");
             }
         } else if ip.is_unspecified() || local.contains(&ip) {
+            cfg.refused(host, port, "an address of this host");
             bail!("refused: {host}:{port} is an address of this host");
         } else if !cfg.allow_lan && is_lan(&ip) {
+            cfg.refused(host, port, "private network ([network] lan = false)");
             bail!("refused: {host}:{port} is on a private network; set [network] lan = true to allow it");
         }
     }
@@ -681,6 +707,7 @@ fn handle(cfg: &HostProxy, mut client: UnixStream) -> Result<()> {
         if let Some(api) = &cfg.api {
             if let Err(why) = api.list.check(&host, port) {
                 api.refuse(&host, &why);
+                cfg.refused(&host, port, &format!("network mode api: {why}"));
                 respond(&mut client, 403, "Forbidden");
                 bail!("refused: {host}:{port}: {why}");
             }
@@ -698,6 +725,7 @@ fn handle(cfg: &HostProxy, mut client: UnixStream) -> Result<()> {
                 Ok(bytes) => bytes,
                 Err(why) => {
                     api.refuse(&host, &why);
+                    cfg.refused(&host, port, &format!("network mode api: {why}"));
                     let _ = client.shutdown(Shutdown::Both);
                     bail!("refused: {host}:{port}: {why}");
                 }
@@ -718,6 +746,11 @@ fn handle(cfg: &HostProxy, mut client: UnixStream) -> Result<()> {
             .and_then(host_of)
             .unwrap_or_default();
         api.refuse(&host, "plain HTTP");
+        let port = Url::parse(&target)
+            .ok()
+            .and_then(|u| u.port_or_known_default())
+            .unwrap_or(80);
+        cfg.refused(&host, port, "network mode api: plain HTTP");
         respond(&mut client, 403, "Forbidden");
         bail!("refused: plain HTTP to {host} in network mode api");
     }

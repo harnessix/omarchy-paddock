@@ -1158,3 +1158,58 @@ fn borrow_refuses_protected_paths_and_relative_paths() {
     assert!(crate::borrow::list(&b2.env, "t-1").is_empty());
     drop(t);
 }
+
+#[test]
+fn refusals_write_the_boundary_log() {
+    let mut p = HostPolicy::default();
+    p.modes.insert("exec".into(), Mode::Deny);
+    let (_t, b, _) = setup(Some(Answer::Deny), p);
+    let secret = "hunter2-do-not-log";
+    assert_eq!(
+        b.handle(&exec(&["curl", "-H", secret])).status,
+        Status::Disabled
+    );
+    assert_eq!(b.handle(&exec(&["true"])).status, Status::Disabled);
+    // A protected path: refused before anyone is asked.
+    std::fs::create_dir_all(b.env.home.join(".ssh")).unwrap();
+    let r = b.handle(&req(
+        "fetch",
+        serde_json::json!({ "path": b.env.home.join(".ssh") }),
+    ));
+    assert_eq!(r.status, Status::Invalid, "{}", r.message);
+    let lines = crate::boundary::read(&b.env, "t-1");
+    assert!(lines.iter().all(|l| l.kind == "host"));
+    let exec_lines: Vec<_> = lines
+        .iter()
+        .filter(|l| l.target.starts_with("exec"))
+        .collect();
+    assert!(
+        exec_lines.iter().all(|l| l.rule.starts_with("disabled")),
+        "{exec_lines:?}"
+    );
+    assert!(lines
+        .iter()
+        .any(|l| l.target.starts_with("fetch") && l.rule.starts_with("invalid")));
+    let raw = std::fs::read_to_string(crate::boundary::file(&b.env, "t-1")).unwrap();
+    assert!(!raw.contains(secret), "{raw}");
+    // The sandbox reads its own log through the broker.
+    let r = b.handle(&req("boundary", serde_json::json!({})));
+    assert_eq!(r.status, Status::Done);
+    assert!(r.result["count"].as_u64().unwrap() >= 3);
+}
+
+#[test]
+fn allowed_requests_leave_the_boundary_log_empty() {
+    let (_t, b, _) = setup(Some(Answer::Once), HostPolicy::default());
+    assert_eq!(b.handle(&exec(&["true"])).status, Status::Done);
+    assert!(crate::boundary::read(&b.env, "t-1").is_empty());
+}
+
+#[test]
+fn a_user_denial_writes_the_boundary_log_without_the_note() {
+    let (_t, b, _) = setup(Some(Answer::Deny), HostPolicy::default());
+    assert_eq!(b.handle(&exec(&["true"])).status, Status::Denied);
+    let lines = crate::boundary::read(&b.env, "t-1");
+    assert_eq!(lines.len(), 1);
+    assert_eq!(lines[0].rule, "denied");
+}

@@ -820,3 +820,64 @@ fn api_mode_refuses_other_hosts_ports_ip_literals_and_plain_http() {
     );
     assert!(srv.raw.lock().unwrap().is_empty());
 }
+
+#[test]
+fn refusals_reach_the_boundary_log() {
+    let dir = tempfile::tempdir().unwrap();
+    let log = dir.path().join("run").join(crate::boundary::FILE);
+    let l2 = log.clone();
+    let sink = Boundary(Arc::new(move |target: &str, rule: &str| {
+        let e = crate::boundary::Entry::new(crate::boundary::NETWORK, target, rule);
+        crate::boundary::record_at(&l2, e).unwrap();
+    }));
+    let port = echo_server();
+    let (_d, sock) = start(HostProxy {
+        boundary: Some(sink.clone()),
+        ..Default::default()
+    });
+    assert_eq!(connect(&sock, &format!("127.0.0.1:{port}")).0, 403);
+    assert_eq!(connect(&sock, &format!("127.0.0.1:{port}")).0, 403);
+    let cfg = HostProxy {
+        boundary: Some(sink),
+        ..Default::default()
+    };
+    assert!(check_target(&cfg, "192.168.1.1", 22).is_err());
+    let lines = crate::boundary::read_at(&log);
+    assert_eq!(lines.len(), 2, "{lines:?}");
+    assert_eq!(lines[0].target, format!("127.0.0.1:{port}"));
+    assert_eq!(lines[0].count, 2);
+    assert!(lines[0].rule.contains("loopback"));
+    assert_eq!(lines[1].target, "192.168.1.1:22");
+    assert!(lines[1].rule.contains("lan"));
+}
+
+#[test]
+fn api_refusals_reach_the_boundary_log() {
+    let dir = tempfile::tempdir().unwrap();
+    let log = dir.path().join(crate::boundary::FILE);
+    let l2 = log.clone();
+    let (list, _) = allow::Allowlist::parse(&["api.example.com"]);
+    let (_d, sock) = start(HostProxy {
+        api: Some(allow::ApiPolicy {
+            list,
+            refusals: None,
+        }),
+        boundary: Some(Boundary(Arc::new(move |t: &str, r: &str| {
+            let e = crate::boundary::Entry::new(crate::boundary::NETWORK, t, r);
+            crate::boundary::record_at(&l2, e).unwrap();
+        }))),
+        ..Default::default()
+    });
+    assert_eq!(connect(&sock, "other.example.com:443").0, 403);
+    let (code, _) = request(
+        &sock,
+        "GET http://api.example.com/x HTTP/1.1\r\nHost: api.example.com\r\n\r\n",
+    );
+    assert_eq!(code, 403);
+    let lines = crate::boundary::read_at(&log);
+    assert_eq!(lines.len(), 2, "{lines:?}");
+    assert_eq!(lines[0].target, "other.example.com:443");
+    assert!(lines[0].rule.starts_with("network mode api"));
+    assert_eq!(lines[1].target, "api.example.com:80");
+    assert_eq!(lines[1].rule, "network mode api: plain HTTP");
+}

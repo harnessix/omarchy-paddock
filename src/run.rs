@@ -344,6 +344,7 @@ fn start_api_proxy(env: &HostEnv, built: &mut Built, backend: &str) -> Result<()
     }));
     let mut cfg = crate::proxy::HostProxy::from_vars(|k| env.var(k).map(str::to_string));
     cfg.allow_lan = built.spec.lan;
+    cfg.boundary = Some(crate::boundary::proxy_sink(env, &built.spec.id));
     cfg.api = Some(allow::ApiPolicy {
         list,
         refusals: Some(refusals),
@@ -505,6 +506,7 @@ pub fn run(
         let mut cfg = crate::proxy::HostProxy::from_vars(|k| env.var(k).map(str::to_string));
         cfg.allow_loopback = built.spec.host_ports.iter().map(|(p, _)| *p).collect();
         cfg.allow_lan = built.spec.lan;
+        cfg.boundary = Some(crate::boundary::proxy_sink(env, &built.spec.id));
         for w in cfg.cleartext_warnings() {
             log::warn!("{w}");
         }
