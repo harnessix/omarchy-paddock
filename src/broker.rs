@@ -1471,7 +1471,11 @@ fn prepare(env: &HostEnv, ctx: &Context, req: &Request) -> Result<Prepared> {
                 .as_ref()
                 .map(|r| r.remotes.as_slice())
                 .unwrap_or_default();
-            let call = forge::check(t, &argv(req), arg_str(req, "branch"), remotes)?;
+            // tea picks the host by its login: the host's own login for the
+            // repository's host, never one that the sandbox names.
+            let call = forge::check_with(t, &argv(req), arg_str(req, "branch"), remotes, &|r| {
+                forge::tea_login(env, &r.host)
+            })?;
             let line = std::iter::once(call.tool.to_string())
                 .chain(call.argv.iter().cloned())
                 .map(|a| shell_quote(&a))

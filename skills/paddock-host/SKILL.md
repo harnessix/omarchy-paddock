@@ -46,6 +46,7 @@ Rules that you can rely on:
 - Do not add remotes. A remote that the sandbox names itself is shown to the user as suspicious.
 - `--force-with-lease`, `--dry-run` and push options are not supported.
 - `gh` allows only `pr create|view|list|checks|diff|comment`, `issue view|list|comment`, `run view|watch|list` and `repo view`, on the project's own repository. `gh api`, `gh auth`, `--web` and `--editor` are refused.
+- `tea` (Gitea, Forgejo) and `glab` (GitLab) work the same way when the user has them on the host: `tea pulls list|create`, `tea pulls|issues INDEX`, `tea issues list`, `tea comment INDEX TEXT`, `tea releases list`, and `glab mr list|view|create|diff|note`, `glab issue list|view|note`, `glab ci view|list|status`, `glab repo view`. `tea --login` and `glab --hostname` are refused. Run `paddock-host help forge` for the rules.
 - Reads run at once. `pr create` and the comment commands wait for the user.
 
 `paddock-host help git-push` and `paddock-host help forge` give the details.

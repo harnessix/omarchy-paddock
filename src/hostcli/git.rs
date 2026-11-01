@@ -205,6 +205,12 @@ fn one_line(s: &str) -> String {
 /// `paddock-host gh ARGS`: one allowed gh command, run on the host.
 /// `--body-file` is read here, in the sandbox, and sent as `--body`.
 pub fn gh_main(args: &[String]) -> i32 {
+    forge_main("gh", args)
+}
+
+/// `paddock-host TOOL ARGS` for a forge tool (gh, tea, glab). For gh,
+/// `--body-file` is read here, in the sandbox, and sent as `--body`.
+pub fn forge_main(tool: &str, args: &[String]) -> i32 {
     let mut argv = Vec::new();
     let mut reason = String::new();
     let mut json = false;
@@ -228,7 +234,7 @@ pub fn gh_main(args: &[String]) -> i32 {
             "--paddock-reason" => reason = value().unwrap_or_default(),
             "--paddock-json" => json = true,
             "--paddock-timeout" => timeout = value().and_then(|v| v.parse::<u64>().ok()),
-            "-F" | "--body-file" => {
+            "-F" | "--body-file" if tool == "gh" => {
                 let Some(path) = value() else {
                     eprintln!("paddock-host: {flag} needs a file");
                     return EXIT_USAGE;
@@ -256,7 +262,7 @@ pub fn gh_main(args: &[String]) -> i32 {
         return 0;
     }
     let mut a = BTreeMap::new();
-    a.insert("tool".to_string(), serde_json::json!("gh"));
+    a.insert("tool".to_string(), serde_json::json!(tool));
     a.insert("argv".to_string(), serde_json::json!(argv));
     if let Some(b) = git_out(&["symbolic-ref", "--short", "-q", "HEAD"]) {
         a.insert("branch".to_string(), serde_json::json!(b));

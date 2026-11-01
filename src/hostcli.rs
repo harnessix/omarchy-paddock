@@ -40,6 +40,7 @@ USAGE
   paddock-host notify TITLE [BODY]
   paddock-host git push [REMOTE] [REFSPEC...]   (plain `git push` works too)
   paddock-host gh COMMAND [ARG...]              (plain `gh` works too)
+  paddock-host tea|glab COMMAND [ARG...]        (plain `tea` and `glab` too, when the host has them)
   paddock-host spawn HARNESS --prompt-file FILE [--role ROLE] [--from-head] [--reason TEXT]
   paddock-host status [ID]
   paddock-host wait ID [--timeout SECONDS]
@@ -251,7 +252,7 @@ Set PADDOCK_PUSH_REASON to tell the user why you push. `paddock-host git
 push` exits with the codes below; plain `git push` exits with 1 when the
 host refuses."#
         }
-        "forge" | "gh" => {
+        "forge" | "gh" | "tea" | "glab" => {
             r#"gh: pull requests, issues and CI runs, run on the host.
 
   gh COMMAND [ARG...]
@@ -273,8 +274,29 @@ enters the sandbox. Only these commands exist:
     and --template-file are refused.
   - gh api, gh auth, gh secret and every other command are refused.
 
+tea (Gitea and Forgejo) works the same way when the user has it on the host:
+
+  read (no question):  pulls list, pulls INDEX, issues list, issues INDEX,
+                       releases list
+  write (asks first):  pulls create, comment INDEX TEXT
+
+  - --login, --remote and --web are refused. The host uses its own tea login
+    for the repository's host.
+  - pulls create gets --head with the sandbox's branch.
+
+glab (GitLab) works the same way when the user has it on the host:
+
+  read (no question):  mr list|view|diff, issue list|view, ci view|list|status,
+                       repo view
+  write (asks first):  mr create, mr note, issue note
+
+  - --web, --hostname and the file flags are refused. Pass the text with
+    --description or --message.
+  - mr view, mr diff, mr note, ci view and ci status get the sandbox's branch,
+    mr create gets --source-branch.
+
 Extra options: --paddock-reason TEXT, --paddock-timeout SECONDS (default 120,
-1800 for watch), --paddock-json. The exit code is gh's own."#
+1800 for watch), --paddock-json. The exit code is the tool's own."#
         }
         "spawn" | "status" | "wait" | "kill" => {
             r#"paddock-host spawn: start another harness in its own sandbox with one task.
@@ -457,7 +479,14 @@ pub fn main(args: &[String]) -> i32 {
         "forage" => return forage::main(rest),
         "status" => return status::main(rest),
         "device" => return device::main(rest),
-        "forge" if rest.first().is_some_and(|t| t == "gh") => return git::gh_main(&rest[1..]),
+        "tea" | "glab" => return git::forge_main(cmd, rest),
+        "forge"
+            if rest
+                .first()
+                .is_some_and(|t| crate::broker::forge::tool(t).is_some()) =>
+        {
+            return git::forge_main(&rest[0], &rest[1..])
+        }
         _ => {}
     }
     if matches!(cmd, "-h" | "--help" | "help") {
