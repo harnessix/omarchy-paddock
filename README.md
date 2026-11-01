@@ -609,6 +609,8 @@ The members of a pasture also share a folder, `/pasture` in each sandbox (`$PADD
 - `paddock pasture remove NAME --yes` deletes the data of a pasture: its paddock kv file and its folder. It refuses while a member runs.
 - `paddock ps` lists the members of one pasture together and names the pasture.
 
+The bar panel shows the shared data too. A "Shared data" row opens a list of the pastures, your `user` scope and the data of older versions, with their members and the number of keys and locks. A pasture opens to its keys, grouped by the part before the first `:`, with locks first: who wrote each key, when, and its size. A key opens to its value, shown as plain text. From there you can copy the value, delete the key or free a lock; each delete asks twice. The panel reads a value only when you open its key, and reads paddock kv only while it is open. Bind a key to `omarchy-shell harnessix.paddock.kv open` to open the shared data directly.
+
 In a spawn tree, the parent writes the tasks into the `tree` scope, each child claims one with a lease and writes its result, and the parent waits for `result:`:
 
 ```sh

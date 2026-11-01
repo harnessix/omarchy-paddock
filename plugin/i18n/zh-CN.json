@@ -142,5 +142,63 @@
   "row.frozen": "已冻结 %1",
   "msg.frozen": "已冻结",
   "msg.thawed": "已解冻",
-  "msg.freezeFailed": "paddock 无法冻结或解冻它"
+  "msg.freezeFailed": "paddock 无法冻结或解冻它",
+  "kv.row": "共享数据",
+  "kv.rowPastures": {
+    "other": "%1 片牧场"
+  },
+  "kv.keys": {
+    "other": "%1 个键"
+  },
+  "kv.locks": {
+    "other": "%1 把锁"
+  },
+  "kv.title": "共享数据",
+  "kv.intro": "agent 在这里共享数据。只有同一片牧场里的 agent 能互相看到。",
+  "kv.empty": "还没有 agent 共享数据。",
+  "kv.noKeys": "这片牧场还没有共享数据。agent 用 paddock-host kv put 写入。",
+  "kv.user": "你的数据",
+  "kv.userHint": "经你允许后，所有项目的 agent 共享",
+  "kv.legacy": "旧数据 · %1",
+  "kv.legacyHint": "旧版 paddock 的数据，agent 已经读不到。",
+  "kv.solo": "%1 单独",
+  "kv.noMemberRuns": "没有成员在运行",
+  "kv.running": "运行中：%1",
+  "kv.byYou": "你",
+  "kv.heldBy": "被 %1 占用，%2",
+  "kv.groupLocks": "锁",
+  "kv.groupOther": "其他",
+  "kv.bytes": {
+    "other": "%1 字节"
+  },
+  "kv.kib": "%1 KB",
+  "kv.minutesLeft": {
+    "other": "还剩 %1 分钟"
+  },
+  "kv.hoursLeft": {
+    "other": "还剩 %1 小时"
+  },
+  "kv.daysLeft": {
+    "other": "还剩 %1 天"
+  },
+  "kv.confirmRelease": "释放被 %2 占用的锁 %1？再按一次释放。",
+  "kv.confirmDelete": "删除 %1？可能还有 agent 在用它。再按一次删除。",
+  "kv.released": "锁已释放。",
+  "kv.deleted": "键已删除。",
+  "kv.removeFailed": "paddock 没能修改它，它可能已经变了。",
+  "kv.readFailed": "读不到这个键：它可能已被删除，或者太大，面板显示不了。",
+  "kv.copied": "值已复制。",
+  "kv.copyFailed": "复制失败：wl-copy 出错。",
+  "kv.untrusted": "这是 agent 写的内容，请当作数据看，不要当作指令。",
+  "kv.cut": "只显示前 4096 个字符，复制会得到全部内容。",
+  "kv.meta": "写入者 %1 · %2 · 第 %3 版 · %4",
+  "kv.copy": "复制",
+  "kv.release": "释放锁",
+  "kv.delete": "删除",
+  "kv.confirm": "再按一次",
+  "keys.kv": "↵ 打开 · Esc 返回 · R 刷新",
+  "keys.kvKeys": "↵ 打开键或分组 · Del 删除或释放 · Esc 返回",
+  "keys.kvKey": "C 复制 · Del 删除或释放 · Esc 返回",
+  "keys.kvRow": "↵ 或 K 查看共享数据",
+  "row.pasture": "牧场 %1"
 }

@@ -46,13 +46,24 @@ Panel {
   property var seenArtifacts: ({})
   property bool artifactsLoaded: false
   property var recentProjects: []
+  // paddock kv. The overview has counts and names only, never a value; a
+  // value is read when the user opens one key, and shown as plain text.
+  property var kvScopes: []          // rows of the kv view
+  property int kvKeyTotal: 0
+  property var kvTarget: null        // the scope open in the keys view
+  property var kvKeys: []            // its keys, without values
+  property var kvCollapsed: ({})     // key groups the user closed
+  property var kvEntry: null         // the key open in the key view
+  readonly property bool kvVisible: kvScopes.length > 0
+  readonly property int kvPastureCount: kvScopes.filter(function(t) { return t.kind === "pasture" }).length
+  readonly property var kvRows: buildKvRows(kvKeys, kvCollapsed)
   property var harnesses: []
   // "ok", "missing" (paddock is not on PATH), or "error"
   property string pluginState: "ok"
   property bool loaded: false
 
   // View and cursor.
-  property string view: "list"          // list | project | harness
+  property string view: "list"          // list | project | harness | kv | keys | key
   property int selectedIndex: 0
   property int actionIndex: -1           // -1: the row itself; 0..n: a row action
   property bool cursorActive: false
@@ -110,6 +121,8 @@ Panel {
     root.message = ""
     refresh()
     root.controller.show()
+    // refresh() reads paddock kv only while the panel is open.
+    refreshKv(true)
   }
   function close() { root.confirmId = ""; root.view = "list"; root.controller.hide() }
   function toggle() { if (root.opened) root.close(); else root.open("") }
@@ -146,14 +159,19 @@ Panel {
     // The first row of the project step opens a folder dialog.
     if (view === "project") return recentProjects.length + 1
     if (view === "harness") return installedHarnesses().length
-    return approvals.length + sandboxes.length + artifacts.length
+    if (view === "kv") return kvScopes.length
+    if (view === "keys") return kvRows.length
+    if (view === "key") return 0
+    return approvals.length + sandboxes.length + artifacts.length + (kvVisible ? 1 : 0)
   }
 
   // In the list view, approvals come first, then sandboxes, in one cursor order.
   function isApprovalRow(i) { return view === "list" && i < approvals.length }
   function sandboxAt(i) { return sandboxes[i - approvals.length] }
   // File rows follow the sandboxes.
-  function isArtifactRow(i) { return view === "list" && artifacts.length > 0 && i >= approvals.length + sandboxes.length }
+  function isArtifactRow(i) { return view === "list" && artifacts.length > 0 && i >= approvals.length + sandboxes.length && i < approvals.length + sandboxes.length + artifacts.length }
+  // The shared data row comes last.
+  function isKvRow(i) { return view === "list" && kvVisible && i === approvals.length + sandboxes.length + artifacts.length }
   function artifactAt(i) { return artifacts[i - approvals.length - sandboxes.length] }
   function dirName(path) {
     var p = String(path || "")
@@ -266,6 +284,7 @@ Panel {
   function refresh() {
     if (!psProc.running) { psProc.buffer = ""; psProc.running = true }
     refreshFiles()
+    refreshKv()
   }
 
   function loadStartData() {
@@ -372,9 +391,158 @@ Panel {
     root.close()
   }
   function back() {
+    root.confirmId = ""
+    if (view === "key") { view = "keys"; kvEntry = null; return true }
+    if (view === "keys") { view = "kv"; kvKeys = []; kvTarget = null; selectedIndex = 0; return true }
+    if (view === "kv") { view = "list"; selectedIndex = 0; return true }
     if (view === "harness") { view = "project"; selectedIndex = 0; return true }
     if (view === "project") { view = "list"; selectedIndex = 0; return true }
     return false
+  }
+
+  // paddock kv. Names, paths and keys from paddock go to commands as
+  // separate arguments after a check of their documented shape, and a key
+  // comes after "--". Values never go into a command: a copy goes to wl-copy
+  // on standard input.
+  function kvSafeName(n) { return /^[a-z][a-z0-9-]{0,31}$/.test(n) || /^solo-[A-Za-z0-9_.-]{1,128}$/.test(n) }
+  function kvSafeKey(k) { return typeof k === "string" && k.length > 0 && k.length <= 256 && !/[\u0000-\u001f\u007f]/.test(k) }
+  function kvScopeArgs(t) {
+    if (!t) return null
+    if (t.kind === "user") return ["--user"]
+    if (t.project === "" || t.project.charAt(0) !== "/") return null
+    if (t.kind === "legacy") return ["--legacy", "--project", t.project]
+    if (!kvSafeName(t.name)) return null
+    return ["--pasture", t.name, "--project", t.project]
+  }
+  // Only while the panel is open: the bar shows nothing of paddock kv.
+  function refreshKv(force) {
+    if (!root.opened && !force) return
+    if (!kvOverviewProc.running) { kvOverviewProc.buffer = ""; kvOverviewProc.running = true }
+    if (view === "keys" || view === "key") refreshKvKeys()
+  }
+  function refreshKvKeys() {
+    var args = kvScopeArgs(kvTarget)
+    if (!args || kvListProc.running) return
+    kvListProc.buffer = ""
+    kvListProc.command = ["sh", "-c", root.launcher, "paddock", "kv", "list", "--json"].concat(args)
+    kvListProc.running = true
+  }
+  function openKv() {
+    root.view = "kv"
+    root.selectedIndex = 0
+    root.actionIndex = -1
+    root.confirmId = ""
+    refreshKv()
+  }
+  function openKvScope(t) {
+    root.kvTarget = t
+    root.kvKeys = []
+    root.kvCollapsed = ({})
+    root.view = "keys"
+    root.selectedIndex = 0
+    root.confirmId = ""
+    refreshKvKeys()
+  }
+  function openKvKey(r) {
+    var args = kvScopeArgs(kvTarget)
+    if (!args || !kvSafeKey(r.key) || kvGetProc.running) return
+    kvGetProc.buffer = ""
+    kvGetProc.meta = r
+    kvGetProc.command = ["sh", "-c", root.launcher, "paddock", "kv", "get", "--json"].concat(args, ["--", r.key])
+    kvGetProc.running = true
+  }
+  function toggleKvGroup(prefix) {
+    var c = Object.assign({}, root.kvCollapsed)
+    c[prefix] = !c[prefix]
+    root.kvCollapsed = c
+  }
+  function kvIsLease(key) { return String(key).indexOf("lease:") === 0 }
+  function kvGroupOf(key) {
+    var i = String(key).indexOf(":")
+    return i > 0 ? String(key).slice(0, i + 1) : ""
+  }
+  // Keys by the part before the first ":", locks first, keys without a
+  // prefix last. A closed group keeps its header row.
+  function buildKvRows(keys, collapsed) {
+    var groups = {}
+    var order = []
+    for (var i = 0; i < keys.length; i++) {
+      var g = kvGroupOf(keys[i].key)
+      if (!groups[g]) { groups[g] = []; order.push(g) }
+      groups[g].push(keys[i])
+    }
+    order.sort(function(a, b) {
+      if (a === "lease:") return -1
+      if (b === "lease:") return 1
+      if (a === "") return 1
+      if (b === "") return -1
+      return a < b ? -1 : (a > b ? 1 : 0)
+    })
+    var rows = []
+    for (var j = 0; j < order.length; j++) {
+      rows.push({ group: true, prefix: order[j], count: groups[order[j]].length, closed: collapsed[order[j]] === true })
+      if (!collapsed[order[j]]) rows = rows.concat(groups[order[j]])
+    }
+    return rows
+  }
+  function kvSize(bytes) {
+    var b = Number(bytes || 0)
+    if (b < 1024) return strings.tn("kv.bytes", b).arg(Commons.I18n.formatNumber(b))
+    return strings.t("kv.kib").arg(Commons.I18n.formatNumber(Math.round(b / 102.4) / 10))
+  }
+  function kvLeft(expires) {
+    var secs = Math.max(0, Math.round(Number(expires || 0) - Date.now() / 1000))
+    if (secs < 60) return strings.tn("time.left", secs).arg(Commons.I18n.formatNumber(secs))
+    var mins = Math.round(secs / 60)
+    if (mins < 60) return strings.tn("kv.minutesLeft", mins).arg(Commons.I18n.formatNumber(mins))
+    var hours = Math.round(mins / 60)
+    if (hours < 48) return strings.tn("kv.hoursLeft", hours).arg(Commons.I18n.formatNumber(hours))
+    var days = Math.round(hours / 24)
+    return strings.tn("kv.daysLeft", days).arg(Commons.I18n.formatNumber(days))
+  }
+  function kvWho(r) {
+    return r.writer === "user" ? strings.t("kv.byYou") : r.writerHarness + " · " + r.writer
+  }
+  function kvScopeTitle(t) {
+    if (!t) return ""
+    if (t.kind === "user") return strings.t("kv.user")
+    if (t.kind === "legacy") return strings.t("kv.legacy").arg(t.projectName)
+    if (t.solo) return strings.t("kv.solo").arg(t.members.length ? t.members[0].harness : t.name)
+    return t.name
+  }
+  function kvMembersText(t) {
+    if (t.kind === "user") return strings.t("kv.userHint")
+    if (t.kind === "legacy") return strings.t("kv.legacyHint")
+    var on = t.members.filter(function(m) { return m.running })
+    if (!on.length) return strings.t("kv.noMemberRuns")
+    return strings.t("kv.running").arg(on.map(function(m) { return m.harness + (m.frozen ? " 󰏤" : "") }).join(", "))
+  }
+  // Delete a key, or free a lock. Like stop: the first press asks.
+  function kvRemove(r) {
+    var args = kvScopeArgs(kvTarget)
+    if (!args || !kvSafeKey(r.key)) return
+    var lease = kvIsLease(r.key)
+    if (root.confirmId !== "kv:" + r.key) {
+      root.confirmId = "kv:" + r.key
+      confirmTimer.restart()
+      root.say(lease ? strings.t("kv.confirmRelease").arg(r.key.slice(6)).arg(kvWho(r))
+                     : strings.t("kv.confirmDelete").arg(r.key))
+      return
+    }
+    root.confirmId = ""
+    var cmd = lease ? ["kv", "release"].concat(args, ["--", r.key.slice(6)])
+                    : ["kv", "delete"].concat(args, ["--", r.key])
+    runPaddock(cmd, function(code) {
+      root.say(code === 0 ? strings.t(lease ? "kv.released" : "kv.deleted") : strings.t("kv.removeFailed"))
+      if (root.view === "key") { root.view = "keys"; root.kvEntry = null }
+      root.refreshKvKeys()
+      root.refreshKv()
+    })
+  }
+  function kvCopy() {
+    if (!root.kvEntry || kvCopyProc.running) return
+    kvCopyProc.text = root.kvEntry.value
+    kvCopyProc.running = true
   }
 
   // Footer and state actions.
@@ -402,7 +570,7 @@ Panel {
   function moveAction(dx) {
     if (view !== "list" || rowCount() === 0) return
     root.cursorActive = true
-    if (isApprovalRow(selectedIndex)) return
+    if (isApprovalRow(selectedIndex) || isKvRow(selectedIndex)) return
     var n = isArtifactRow(selectedIndex) ? 2 : actionsFor(sandboxAt(selectedIndex)).length
     root.actionIndex = Math.max(-1, Math.min(n - 1, root.actionIndex + dx))
   }
@@ -417,7 +585,16 @@ Panel {
       if (list.length) launch(list[selectedIndex].name)
       return
     }
+    if (view === "kv") { if (kvScopes.length) openKvScope(kvScopes[selectedIndex]); return }
+    if (view === "keys") {
+      var r = kvRows[selectedIndex]
+      if (!r) return
+      if (r.group) toggleKvGroup(r.prefix); else openKvKey(r)
+      return
+    }
+    if (view === "key") return
     if (isApprovalRow(selectedIndex)) { answerOnCard(); return }
+    if (isKvRow(selectedIndex)) { openKv(); return }
     if (isArtifactRow(selectedIndex)) {
       var f = artifactAt(selectedIndex)
       if (actionIndex === 1) revealFile(f); else recoverFile(f)
@@ -427,6 +604,13 @@ Panel {
     var s = sandboxAt(selectedIndex)
     if (actionIndex < 0) goToTerminal(s)
     else runAction(s, actionsFor(s)[actionIndex])
+  }
+
+  // `omarchy-shell harnessix.paddock.kv open` opens the panel at the shared
+  // data, for a key binding.
+  ShellIpc {
+    target: "harnessix.paddock.kv"
+    function open(): void { root.open(""); root.openKv() }
   }
 
   Component.onCompleted: refresh()
@@ -491,6 +675,7 @@ Panel {
             // A sandbox that another sandbox started (paddock-host spawn).
             // paddock ps lists it right after its parent.
             parent: root.plain(r.parent || "", 64),
+            pasture: root.plain(r.pasture || "", 32),
             parentHarness: "",
             depth: 0,
             children: 0
@@ -679,6 +864,113 @@ Panel {
     onTriggered: root.refreshApprovals()
   }
 
+  JsonProc {
+    id: kvOverviewProc
+    command: ["sh", "-c", root.launcher, "paddock", "kv", "overview", "--json"]
+    onExited: function(exitCode) {
+      // An older paddock has no overview: show nothing.
+      if (exitCode !== 0) { root.kvScopes = []; root.kvKeyTotal = 0; return }
+      try {
+        var p = JSON.parse(buffer)
+        if (!p || p.api_version !== "paddock.kv/v1") throw "version"
+        var rows = []
+        var total = 0
+        var raw = Array.isArray(p.pastures) ? p.pastures.slice(0, 64) : []
+        for (var i = 0; i < raw.length; i++) {
+          var r = raw[i] || {}
+          var members = (Array.isArray(r.members) ? r.members.slice(0, 16) : []).map(function(m) {
+            return { sandbox: root.plain(m.sandbox, 64), harness: root.plain(m.harness, 24),
+                     running: m.running === true, frozen: Number(m.frozen_since || 0) > 0 }
+          })
+          var keys = Number(r.keys || 0)
+          total += keys
+          rows.push({ kind: "pasture", name: root.plain(r.name, 140), solo: r.solo === true,
+                      project: root.plain(r.project, 1024), projectName: root.plain(root.baseName(r.project), 48),
+                      keys: keys, leases: Number(r.leases || 0), members: members })
+        }
+        var userKeys = Number((p.user || {}).keys || 0)
+        if (userKeys > 0) {
+          total += userKeys
+          rows.push({ kind: "user", name: "", solo: false, project: "", projectName: "", keys: userKeys,
+                      leases: Number((p.user || {}).leases || 0), members: [] })
+        }
+        var legacy = Array.isArray(p.legacy) ? p.legacy.slice(0, 16) : []
+        for (var j = 0; j < legacy.length; j++) {
+          var l = legacy[j] || {}
+          rows.push({ kind: "legacy", name: "", solo: false, project: root.plain(l.project, 1024),
+                      projectName: root.plain(root.baseName(l.project), 48), keys: Number(l.keys || 0), leases: 0, members: [] })
+        }
+        root.kvScopes = rows
+        root.kvKeyTotal = total
+        if (root.view === "kv" && root.selectedIndex >= rows.length) root.selectedIndex = Math.max(0, rows.length - 1)
+      } catch (e) {
+        root.debugLog("cannot read paddock kv overview: " + e)
+        root.kvScopes = []
+      }
+    }
+  }
+
+  JsonProc {
+    id: kvListProc
+    onExited: function(exitCode) {
+      if (exitCode !== 0) { root.kvKeys = []; return }
+      try {
+        var p = JSON.parse(buffer)
+        var raw = p && Array.isArray(p.entries) ? p.entries.slice(0, 500) : []
+        var clean = []
+        for (var i = 0; i < raw.length; i++) {
+          var e = raw[i] || {}
+          if (!root.kvSafeKey(e.key)) continue
+          clean.push({ group: false, key: String(e.key), version: Number(e.version || 0), bytes: Number(e.bytes || 0),
+                       writer: root.plain(e.writer, 64), writerHarness: root.plain(e.writer_harness, 24),
+                       updated: Number(e.updated || 0), expires: Number(e.expires || 0) })
+        }
+        root.kvKeys = clean
+        if (root.view === "keys" && root.selectedIndex >= root.rowCount()) root.selectedIndex = Math.max(0, root.rowCount() - 1)
+      } catch (e2) {
+        root.kvKeys = []
+      }
+    }
+  }
+
+  // One value, read when the user opens its key. The debug log never names it.
+  JsonProc {
+    id: kvGetProc
+    property var meta: null
+    onExited: function(exitCode) {
+      if (exitCode !== 0) { root.say(strings.t("kv.readFailed")); root.refreshKvKeys(); return }
+      try {
+        var e = JSON.parse(buffer)
+        var value = String(e.value === undefined || e.value === null ? "" : e.value)
+        root.kvEntry = { key: String(e.key || meta.key), value: value, shown: root.plain(value, 4096),
+                         cut: value.length > 4096, version: Number(e.version || 0), bytes: value.length,
+                         writer: root.plain(e.writer, 64), writerHarness: root.plain(e.writer_harness, 24),
+                         updated: Number(e.updated || 0), expires: Number(e.expires || 0) }
+        root.view = "key"
+        root.confirmId = ""
+      } catch (e2) {
+        root.say(strings.t("kv.readFailed"))
+      }
+      buffer = ""
+    }
+  }
+
+  Process {
+    id: kvCopyProc
+    property string text: ""
+    command: ["wl-copy"]
+    stdinEnabled: true
+    onStarted: {
+      write(text)
+      stdinEnabled = false
+    }
+    onExited: function(exitCode) {
+      text = ""
+      stdinEnabled = true
+      root.say(exitCode === 0 ? strings.t("kv.copied") : strings.t("kv.copyFailed"))
+    }
+  }
+
   Process {
     id: actionProc
     property var doneCallback: null
@@ -743,6 +1035,10 @@ Panel {
         text: row.glyph
         color: row.glyphColor
         font.pixelSize: Style.font.heading
+        // One column for all glyphs, so that the titles line up.
+        width: Math.round(Style.font.heading * 1.4)
+        horizontalAlignment: Text.AlignHCenter
+        elide: Text.ElideNone
         anchors.left: parent.left
         anchors.verticalCenter: parent.verticalCenter
       }
@@ -801,14 +1097,23 @@ Panel {
       onActivateRequested: root.activate()
       onCloseRequested: if (!root.back()) root.close()
       onDeleteRequested: {
+        if (root.view === "key") { if (root.kvEntry) root.kvRemove(root.kvEntry); return }
+        if (root.view === "keys") {
+          var kr = root.kvRows[root.selectedIndex]
+          if (kr && !kr.group) root.kvRemove(kr)
+          return
+        }
         if (root.view !== "list" || root.rowCount() === 0) return
+        if (root.isKvRow(root.selectedIndex)) return
         if (root.isApprovalRow(root.selectedIndex)) root.answer(root.approvals[root.selectedIndex], "deny")
         else if (root.isArtifactRow(root.selectedIndex)) return
         else root.stop(root.sandboxAt(root.selectedIndex))
       }
       onTextKey: function(text, modifiers) {
         if (root.view === "list" && (text === "n" || text === "N")) root.startNew()
-        else if (root.view === "list" && (text === "r" || text === "R")) root.refresh()
+        else if (text === "r" || text === "R") root.refresh()
+        else if (root.view === "list" && root.kvVisible && (text === "k" || text === "K")) root.openKv()
+        else if (root.view === "key" && (text === "c" || text === "C")) root.kvCopy()
       }
 
       ScrollView {
@@ -830,10 +1135,20 @@ Panel {
             iconComponent: Component { PlainText { text: "󱞚"; font.pixelSize: Style.font.display } }
             title: root.view === "project" ? strings.t("new.chooseProject")
               : root.view === "harness" ? strings.t("new.chooseHarness")
+              : root.view === "kv" ? strings.t("kv.title")
+              : root.view === "keys" ? root.kvScopeTitle(root.kvTarget)
+              : root.view === "key" && root.kvEntry ? root.kvEntry.key
               : strings.t("panel.title")
             meta: {
               if (root.view === "project") return strings.t("new.stepProject")
               if (root.view === "harness") return strings.t("new.stepHarness")
+              if (root.view === "kv")
+                return (root.kvPastureCount > 0 ? strings.tn("kv.rowPastures", root.kvPastureCount).arg(Commons.I18n.formatNumber(root.kvPastureCount)) + " · " : "")
+                  + strings.tn("kv.keys", root.kvKeyTotal).arg(Commons.I18n.formatNumber(root.kvKeyTotal))
+              if (root.view === "keys" && root.kvTarget)
+                return (root.kvTarget.projectName !== "" ? root.kvTarget.projectName + " · " : "")
+                  + strings.tn("kv.keys", root.kvKeys.length).arg(Commons.I18n.formatNumber(root.kvKeys.length))
+              if (root.view === "key" && root.kvEntry) return root.kvScopeTitle(root.kvTarget)
               if (root.pluginState === "missing") return strings.t("state.missingShort")
               if (root.pluginState === "error") return strings.t("state.errorShort")
               if (!root.loaded) return strings.t("state.loading")
@@ -936,7 +1251,8 @@ Panel {
                 caption2: modelData.frozenSince > 0 ? strings.t("row.frozen").arg(root.uptime(modelData.frozenSince))
                   : modelData.warning !== "" ? modelData.warning
                   : (modelData.parent !== "" ? strings.t("row.startedBy").arg(modelData.parent)
-                  : (modelData.auth !== "" && modelData.auth !== "shared" ? strings.t("row.auth").arg(modelData.auth) : ""))
+                  : (modelData.auth !== "" && modelData.auth !== "shared" ? strings.t("row.auth").arg(modelData.auth)
+                  : (modelData.pasture !== "" ? strings.t("row.pasture").arg(modelData.pasture) : "")))
                 caption2Color: modelData.warning !== "" ? root.urgent : root.dim
                 showActions: true
                 onActivated: root.goToTerminal(modelData)
@@ -1014,6 +1330,150 @@ Panel {
                   iconText: "󰉋"; tooltipText: strings.t("action.reveal")
                   onClicked: root.revealFile(modelData)
                 }
+              }
+            }
+          }
+
+          // Shared data in paddock kv: one row that opens the kv view.
+          Column {
+            width: parent.width
+            spacing: Style.space(2)
+            visible: root.view === "list" && root.kvVisible
+            ListRow {
+              rowIndex: root.approvals.length + root.sandboxes.length + root.artifacts.length
+              glyph: "󰆼"
+              title: strings.t("kv.row")
+              caption: (root.kvPastureCount > 0 ? strings.tn("kv.rowPastures", root.kvPastureCount).arg(Commons.I18n.formatNumber(root.kvPastureCount)) + " · " : "")
+                + strings.tn("kv.keys", root.kvKeyTotal).arg(Commons.I18n.formatNumber(root.kvKeyTotal))
+              onActivated: root.openKv()
+            }
+          }
+
+          // The kv view: pastures, your own data, and data of older versions.
+          Column {
+            width: parent.width
+            spacing: Style.space(2)
+            visible: root.view === "kv"
+            PlainText {
+              width: parent.width
+              wrapMode: Text.WordWrap
+              color: root.dim
+              font.pixelSize: Style.font.caption
+              bottomPadding: Style.space(6)
+              text: root.kvScopes.length === 0 ? strings.t("kv.empty") : strings.t("kv.intro")
+            }
+            Repeater {
+              model: root.view === "kv" ? root.kvScopes : []
+              delegate: ListRow {
+                required property var modelData
+                required property int index
+                rowIndex: index
+                glyph: modelData.kind === "user" ? "󰀄" : modelData.kind === "legacy" ? "󰁯" : (modelData.solo ? "󰆍" : "󰡉")
+                glyphColor: modelData.kind === "legacy" ? root.dim : root.fg
+                title: root.kvScopeTitle(modelData)
+                caption: (modelData.projectName !== "" ? modelData.projectName + " · " : "")
+                  + strings.tn("kv.keys", modelData.keys).arg(Commons.I18n.formatNumber(modelData.keys))
+                  + (modelData.leases > 0 ? " · " + strings.tn("kv.locks", modelData.leases).arg(Commons.I18n.formatNumber(modelData.leases)) : "")
+                caption2: root.kvMembersText(modelData)
+                onActivated: root.openKvScope(modelData)
+              }
+            }
+          }
+
+          // The keys of one scope, by group. No value is read here.
+          Column {
+            width: parent.width
+            spacing: Style.space(2)
+            visible: root.view === "keys"
+            PlainText {
+              width: parent.width
+              visible: root.kvKeys.length === 0
+              wrapMode: Text.WordWrap
+              color: root.dim
+              text: strings.t("kv.noKeys")
+            }
+            Repeater {
+              model: root.view === "keys" ? root.kvRows : []
+              delegate: ListRow {
+                required property var modelData
+                required property int index
+                rowIndex: index
+                readonly property bool lease: !modelData.group && root.kvIsLease(modelData.key)
+                glyph: modelData.group ? (modelData.closed ? "󰅂" : "󰅀") : (lease ? "󰌾" : "󰌆")
+                glyphColor: root.confirmId === "kv:" + modelData.key ? root.urgent : root.fg
+                title: modelData.group
+                  ? (modelData.prefix === "lease:" ? strings.t("kv.groupLocks")
+                     : modelData.prefix === "" ? strings.t("kv.groupOther") : modelData.prefix)
+                    + "  " + Commons.I18n.formatNumber(modelData.count)
+                  : (lease ? modelData.key.slice(6) : modelData.key)
+                caption: modelData.group ? ""
+                  : lease ? strings.t("kv.heldBy").arg(root.kvWho(modelData)).arg(root.kvLeft(modelData.expires))
+                  : root.kvWho(modelData) + " · " + root.ago(modelData.updated) + " · " + root.kvSize(modelData.bytes)
+                caption2: !modelData.group && !lease && modelData.expires > 0 ? root.kvLeft(modelData.expires) : ""
+                onActivated: modelData.group ? root.toggleKvGroup(modelData.prefix) : root.openKvKey(modelData)
+              }
+            }
+          }
+
+          // One key: its value as plain text, and who wrote it.
+          Column {
+            width: parent.width
+            spacing: Style.space(8)
+            visible: root.view === "key" && root.kvEntry !== null
+            PlainText {
+              width: parent.width
+              wrapMode: Text.WordWrap
+              color: root.dim
+              font.pixelSize: Style.font.caption
+              text: root.kvEntry ? strings.t("kv.untrusted") : ""
+            }
+            PlainText {
+              width: parent.width
+              text: root.kvEntry ? root.kvEntry.shown : ""
+              font.family: "monospace"
+              font.pixelSize: Style.font.caption
+              wrapMode: Text.WrapAnywhere
+              elide: Text.ElideNone
+              maximumLineCount: 40
+            }
+            PlainText {
+              width: parent.width
+              visible: root.kvEntry !== null && root.kvEntry.cut
+              color: root.dim
+              font.pixelSize: Style.font.caption
+              text: strings.t("kv.cut")
+            }
+            PanelSeparator { width: parent.width; foreground: root.fg }
+            PlainText {
+              width: parent.width
+              wrapMode: Text.WordWrap
+              color: root.dim
+              font.pixelSize: Style.font.caption
+              text: root.kvEntry
+                ? strings.t("kv.meta").arg(root.kvWho(root.kvEntry)).arg(root.ago(root.kvEntry.updated))
+                    .arg(Commons.I18n.formatNumber(root.kvEntry.version)).arg(root.kvSize(root.kvEntry.bytes))
+                  + (root.kvEntry.expires > 0 ? " · " + root.kvLeft(root.kvEntry.expires) : "")
+                : ""
+            }
+            RowLayout {
+              spacing: Style.space(6)
+              Button {
+                visible: root.kvEntry !== null && !root.kvIsLease(root.kvEntry.key)
+                text: strings.t("kv.copy")
+                iconText: "󰆏"
+                foreground: root.fg
+                fontFamily: root.fontFamily
+                onClicked: root.kvCopy()
+              }
+              Button {
+                visible: root.kvEntry !== null
+                readonly property bool lease: root.kvEntry !== null && root.kvIsLease(root.kvEntry.key)
+                readonly property bool asking: root.kvEntry !== null && root.confirmId === "kv:" + root.kvEntry.key
+                text: asking ? strings.t("kv.confirm") : strings.t(lease ? "kv.release" : "kv.delete")
+                iconText: lease ? "󰌿" : "󰆴"
+                foreground: asking ? root.urgent : root.fg
+                fontFamily: root.fontFamily
+                onClicked: root.kvRemove(root.kvEntry)
               }
             }
           }
@@ -1126,9 +1586,13 @@ Panel {
               color: root.dim
               font.pixelSize: Style.font.caption
               wrapMode: Text.WordWrap
-              text: root.view !== "list" ? strings.t("keys.new")
+              text: root.view === "kv" ? strings.t("keys.kv")
+                : root.view === "keys" ? strings.t("keys.kvKeys")
+                : root.view === "key" ? strings.t("keys.kvKey")
+                : root.view !== "list" ? strings.t("keys.new")
                 : root.isApprovalRow(root.selectedIndex) && root.approvals.length > 0 ? strings.t("keys.toCard")
                 : root.isArtifactRow(root.selectedIndex) && root.artifacts.length > 0 ? strings.t("keys.files")
+                : root.isKvRow(root.selectedIndex) ? strings.t("keys.kvRow")
                 : strings.t("keys.list")
             }
             Button {

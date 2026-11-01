@@ -1284,3 +1284,47 @@ fn the_project_scope_of_older_versions_stays_out_of_reach() {
     gc_apply(&w.env, &[], far).unwrap();
     assert!(!shard::legacy(&w.root).exists());
 }
+
+#[test]
+fn the_overview_counts_keys_and_never_shows_a_value() {
+    let w = world();
+    let (a, _) = in_pasture(
+        &w,
+        "a",
+        &[],
+        false,
+        KvCfg::default(),
+        None,
+        Some("review".into()),
+        "/src/my:app",
+    );
+    a.handle(&put(Scope::Pasture, "task:1", "secret-value-1"), None);
+    a.handle(&claim(Scope::Pasture, "task-1", 60), None);
+    let legacy = Ns::Legacy("/src/app".into());
+    w.open(&legacy)
+        .put(
+            &legacy.key(),
+            "note",
+            "secret-value-2",
+            None,
+            None,
+            &W,
+            Q,
+            10,
+        )
+        .unwrap();
+    // The registry forgets ended sandboxes; the pasture file still names
+    // its project.
+    w.reg().forget_sandbox("a").unwrap();
+    let v = crate::kv::host::overview(&w.env).unwrap();
+    let text = v.to_string();
+    assert!(!text.contains("secret-value"), "{text}");
+    let p = &v["pastures"][0];
+    assert_eq!(p["name"], "review");
+    assert_eq!(p["project"], "/src/my:app");
+    assert_eq!(p["keys"], 2);
+    assert_eq!(p["leases"], 1);
+    assert_eq!(v["legacy"][0]["project"], "/src/app");
+    assert_eq!(v["legacy"][0]["keys"], 1);
+    assert_eq!(v["user"]["keys"], 0);
+}
