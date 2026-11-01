@@ -1817,6 +1817,15 @@ fn real_main() -> Result<i32> {
                         if let (Some(o), false) = (v.as_object_mut(), tunnels.is_empty()) {
                             o.insert("tunnels".into(), tunnels.into());
                         }
+                        if let (Some(o), Some(t)) = (
+                            v.as_object_mut(),
+                            paddock::monitor::read_traffic(&env, &r.id),
+                        ) {
+                            o.insert(
+                                "traffic".into(),
+                                serde_json::json!({ "sent": t.sent, "received": t.received }),
+                            );
+                        }
                         v
                     })
                     .collect();
