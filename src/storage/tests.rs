@@ -935,3 +935,19 @@ fn gc_clears_pure_caches_in_the_automatic_tier_and_never_a_login() {
     inv.homes[0].running = true;
     assert!(find(&plan(&inv, &opts(), state::now()), "pure caches").is_none());
 }
+
+#[test]
+fn clock_shows_the_time_at_an_offset() {
+    // 2026-11-02 14:05:30 UTC.
+    let t = 1_793_628_330;
+    assert_eq!(clock(t, 0), "2026-11-02 14:05");
+    assert_eq!(clock(t, 3600), "2026-11-02 15:05");
+    assert_eq!(clock(t, 10 * 3600), "2026-11-03 00:05");
+    assert_eq!(clock(t, -15 * 3600), "2026-11-01 23:05");
+    // The local form has the same shape, whatever the zone.
+    let l = local_time(t);
+    assert_eq!(l.len(), 16, "{l}");
+    assert_eq!(&l[4..5], "-");
+    assert_eq!(&l[10..11], " ");
+    assert_eq!(&l[13..14], ":");
+}

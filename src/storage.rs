@@ -1996,6 +1996,29 @@ pub fn date(unix: u64) -> String {
     format!("{}-{}-{}", &d[..4], &d[4..6], &d[6..])
 }
 
+/// "2026-11-02 15:05" in the local time zone (`TZ` or /etc/localtime).
+pub fn local_time(unix: u64) -> String {
+    clock(unix, utc_offset(unix))
+}
+
+/// "YYYY-MM-DD HH:MM" at `offset` seconds east of UTC.
+pub fn clock(unix: u64, offset: i64) -> String {
+    let t = (unix as i64 + offset).max(0) as u64;
+    let secs = t % 86_400;
+    format!("{} {:02}:{:02}", date(t), secs / 3600, (secs % 3600) / 60)
+}
+
+/// The offset of the local time zone from UTC at `unix`, in seconds.
+fn utc_offset(unix: u64) -> i64 {
+    let t = unix as libc::time_t;
+    // SAFETY: localtime_r writes into `tm` only and reads TZ.
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    if unsafe { libc::localtime_r(&t, &mut tm) }.is_null() {
+        return 0;
+    }
+    tm.tm_gmtoff as i64
+}
+
 fn ago(now: u64, t: u64) -> String {
     let days = now.saturating_sub(t) / DAY;
     match days {
