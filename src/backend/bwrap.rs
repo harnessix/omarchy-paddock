@@ -144,6 +144,22 @@ impl Backend for Bwrap {
         }
         a.extend(["--ro-bind".into(), p(&passwd_f), "/etc/passwd".into()]);
         a.extend(["--ro-bind".into(), p(&group_f), "/etc/group".into()]);
+        // An isolated login is another machine (identity.rs). /var is empty
+        // here, so /var/lib/dbus/machine-id does not exist.
+        if let Some(id) = &spec.identity.machine_id {
+            let f = run_dir.join("machine-id");
+            files.push((f.clone(), id.clone(), 0o444));
+            a.extend(["--ro-bind".into(), p(&f), "/etc/machine-id".into()]);
+        }
+        if let Some(id) = &spec.identity.boot_id {
+            let f = run_dir.join("boot_id");
+            files.push((f.clone(), id.clone(), 0o444));
+            a.extend([
+                "--ro-bind".into(),
+                p(&f),
+                "/proc/sys/kernel/random/boot_id".into(),
+            ]);
+        }
 
         // The sandbox home, then everything else in parent-before-child order.
         a.extend(["--bind".into(), p(&spec.home_src), p(&spec.home)]);
@@ -218,6 +234,14 @@ impl Backend for Bwrap {
                         "/sys/devices",
                     ],
                 );
+                // Not the hardware's identity: the board and firmware
+                // names and serials, and the MAC address of each network
+                // interface. Mesa needs neither.
+                let mut hide = vec![PathBuf::from("/sys/devices/virtual/dmi")];
+                hide.extend(crate::identity::sys_net_dirs());
+                for d in hide.iter().filter(|d| d.is_dir()) {
+                    a.extend(["--tmpfs".into(), p(d), "--remount-ro".into(), p(d)]);
+                }
             }
         }
         // Nothing outside the explicit mounts is writable.

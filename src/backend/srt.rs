@@ -135,6 +135,19 @@ pub fn bridge_dir(env: &HostEnv, spec: &SandboxSpec) -> PathBuf {
 /// The srt settings for a spec.
 pub fn settings(env: &HostEnv, spec: &SandboxSpec) -> Result<serde_json::Value> {
     let mut deny_read: Vec<String> = denied_areas(env).iter().map(|p| s(p)).collect();
+    // The host's identity (identity.rs). srt reads the host's /sys, so the
+    // MAC addresses and the board names are denied for every login, as the
+    // other backends never show them. srt cannot put another file at
+    // /etc/machine-id, so an isolated login reads no machine ID; a host
+    // login keeps the host's. srt mounts /proc itself, so a denied boot ID
+    // would still be readable: srt shows the host's.
+    deny_read.push("/sys/class/net".into());
+    deny_read.push("/sys/devices/virtual/dmi".into());
+    deny_read.extend(crate::identity::sys_net_dirs().iter().map(|p| s(p)));
+    if spec.identity.machine_id.is_some() {
+        deny_read.push("/etc/machine-id".into());
+        deny_read.push("/var/lib/dbus/machine-id".into());
+    }
     let mut allow_read: Vec<String> = vec![s(&spec.home_src), s(&env.paddock_run().join(&spec.id))];
     if let Some(root) = package_root(env) {
         allow_read.push(s(&root));
@@ -505,5 +518,18 @@ mod tests {
         let v = settings(&env, &s).unwrap();
         assert!(list(&v, "allowWrite").contains(&ground.to_str().unwrap()));
         assert!(!list(&v, "allowWrite").contains(&crate::pasture::MOUNT));
+    }
+
+    #[test]
+    fn host_identity_is_denied() {
+        let (env, mut s) = spec();
+        let v = settings(&env, &s).unwrap();
+        assert!(list(&v, "denyRead").contains(&"/sys/class/net"));
+        assert!(!list(&v, "denyRead").contains(&"/etc/machine-id"));
+        s.identity.machine_id = Some("0123456789abcdef0123456789abcdef\n".into());
+        let v = settings(&env, &s).unwrap();
+        for p in ["/etc/machine-id", "/var/lib/dbus/machine-id"] {
+            assert!(list(&v, "denyRead").contains(&p), "{p}");
+        }
     }
 }

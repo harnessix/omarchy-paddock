@@ -263,6 +263,10 @@ pub struct SandboxSpec {
     /// The key-value socket of this sandbox on the host (kv.rs). Backends
     /// make it reachable inside and set PADDOCK_KV_SOCKET.
     pub kv_socket: Option<PathBuf>,
+    /// The machine ID and boot ID that the sandbox sees instead of the
+    /// host's (identity.rs). Empty: the host's. Left out of `explain`.
+    #[serde(skip)]
+    pub identity: crate::identity::MachineIdentity,
     /// The host folder where the device file system of this sandbox is
     /// mounted (devices.rs). Backends bind it to `/dev/paddock`.
     pub devices: Option<PathBuf>,
@@ -320,6 +324,7 @@ impl SandboxSpec {
             bus_socket: None,
             host_socket: None,
             kv_socket: None,
+            identity: Default::default(),
             devices: None,
             notices: Vec::new(),
             inherit_path: Vec::new(),
