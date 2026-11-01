@@ -28,7 +28,7 @@ struct Fake {
 
 impl Fake {
     fn new(version: &str, tarball: Vec<u8>, sums: Vec<u8>) -> Self {
-        let release = Release::for_tag(&format!("v{version}")).unwrap();
+        let release = Release::for_tag(&format!("v{version}"), "x86_64").unwrap();
         let mut files = BTreeMap::new();
         files.insert(release.tarball_url(), tarball);
         files.insert(release.checksum_url(), sums);
@@ -135,7 +135,7 @@ fn versions_compare_like_semver() {
 
 #[test]
 fn release_names_follow_the_release_workflow() {
-    let r = Release::for_tag("v0.1.8").unwrap();
+    let r = Release::for_tag("v0.1.8", "x86_64").unwrap();
     assert_eq!(r.tarball(), "paddock-0.1.8-x86_64-linux.tar.gz");
     assert_eq!(r.checksum(), "paddock-0.1.8-x86_64-linux.tar.gz.sha256");
     assert_eq!(r.member(), "paddock-0.1.8-x86_64-linux/paddock");
@@ -144,8 +144,51 @@ fn release_names_follow_the_release_workflow() {
         "https://github.com/harnessix/omarchy-paddock/releases/download/v0.1.8/paddock-0.1.8-x86_64-linux.tar.gz"
     );
     assert!(check_url(&r.tarball_url()).is_ok());
-    assert!(Release::for_tag("v0.1.8/../../x").is_err());
-    assert!(Release::for_tag("nightly").is_err());
+    assert!(Release::for_tag("v0.1.8/../../x", "x86_64").is_err());
+    assert!(Release::for_tag("nightly", "x86_64").is_err());
+}
+
+#[test]
+fn aarch64_release_names_follow_the_release_workflow() {
+    let r = Release::for_tag("v0.1.8", "aarch64").unwrap();
+    assert_eq!(r.arch, "aarch64");
+    assert_eq!(r.tarball(), "paddock-0.1.8-aarch64-linux.tar.gz");
+    assert_eq!(r.checksum(), "paddock-0.1.8-aarch64-linux.tar.gz.sha256");
+    assert_eq!(r.member(), "paddock-0.1.8-aarch64-linux/paddock");
+    assert_eq!(
+        r.tarball_url(),
+        "https://github.com/harnessix/omarchy-paddock/releases/download/v0.1.8/paddock-0.1.8-aarch64-linux.tar.gz"
+    );
+    assert_eq!(
+        r.checksum_url(),
+        "https://github.com/harnessix/omarchy-paddock/releases/download/v0.1.8/paddock-0.1.8-aarch64-linux.tar.gz.sha256"
+    );
+    assert!(check_url(&r.checksum_url()).is_ok());
+}
+
+#[test]
+fn other_architectures_have_no_release() {
+    for arch in ["riscv64", "x86", "arm", "powerpc64", "", "x86_64 "] {
+        let e = Release::for_tag("v0.1.8", arch).unwrap_err().to_string();
+        assert!(e.contains("no release binary"), "{arch}: {e}");
+        assert!(e.contains("x86_64 and aarch64"), "{arch}: {e}");
+    }
+    assert_eq!(release_arch("x86_64").unwrap(), "x86_64");
+    assert_eq!(release_arch("aarch64").unwrap(), "aarch64");
+}
+
+/// The release workflow builds every architecture in [`ARCHS`] with the
+/// asset names that [`Release`] downloads.
+#[test]
+fn release_workflow_builds_every_architecture() {
+    let yml = include_str!("../../.github/workflows/release.yml");
+    for arch in ARCHS {
+        assert!(
+            yml.contains(&format!("arch: {arch}")),
+            "release.yml has no matrix entry for {arch}"
+        );
+    }
+    assert!(yml.contains(r#"name="paddock-${TAG#v}-${{ matrix.arch }}-linux""#));
 }
 
 #[test]
@@ -265,7 +308,7 @@ fn update_replaces_the_binary_after_every_check() {
     let t = tempfile::tempdir().unwrap();
     let env = env_in(t.path(), false);
     let tb = tarball(t.path(), "9.9.9", "paddock 9.9.9");
-    let rel = Release::for_tag("v9.9.9").unwrap();
+    let rel = Release::for_tag("v9.9.9", "x86_64").unwrap();
     let src = Fake::new("9.9.9", tb.clone(), sums_for(&rel, &tb));
     let bin = old_binary(t.path());
     install(&env, &src, &rel, &bin, None, &tar()).unwrap();
@@ -289,7 +332,7 @@ fn a_binary_with_the_wrong_version_is_refused() {
     let t = tempfile::tempdir().unwrap();
     let env = env_in(t.path(), false);
     let tb = tarball(t.path(), "9.9.9", "paddock 0.0.1");
-    let rel = Release::for_tag("v9.9.9").unwrap();
+    let rel = Release::for_tag("v9.9.9", "x86_64").unwrap();
     let src = Fake::new("9.9.9", tb.clone(), sums_for(&rel, &tb));
     let bin = old_binary(t.path());
     let e = install(&env, &src, &rel, &bin, None, &tar()).unwrap_err();

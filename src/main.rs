@@ -286,6 +286,9 @@ enum Cmd {
         apps: Vec<String>,
     },
     /// Update paddock to the latest GitHub release, and the bar widget.
+    ///
+    /// Release binaries exist for Linux on x86_64 and aarch64. On another
+    /// architecture, build paddock from source with cargo.
     Update {
         /// Only show whether a newer release exists, and what an update does.
         #[arg(long)]
