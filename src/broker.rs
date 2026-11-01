@@ -216,14 +216,14 @@ pub struct Response {
 }
 
 impl Response {
-    fn new(status: Status, message: impl Into<String>) -> Self {
+    pub(crate) fn new(status: Status, message: impl Into<String>) -> Self {
         Self {
             status,
             message: message.into(),
             result: serde_json::Value::Null,
         }
     }
-    fn done(result: serde_json::Value) -> Self {
+    pub(crate) fn done(result: serde_json::Value) -> Self {
         Self {
             status: Status::Done,
             message: String::new(),
@@ -1606,6 +1606,9 @@ pub struct Broker {
     /// Where approved work runs that this process does not run itself: the
     /// executor (`paddock gatewayd`). The tests run it in this process.
     pub dispatch: Option<Arc<dyn crate::gatewayd::Dispatch>>,
+    /// The docker and aws credential channels of the run, set when the
+    /// user allowed them on the start card.
+    pub channels: std::sync::OnceLock<Arc<crate::credentials::channels::Channels>>,
     grants: Mutex<Vec<String>>,
     /// "Deny for this session": the keys of the request and the user's note.
     denials: Mutex<Vec<(String, Option<String>)>>,
@@ -1625,6 +1628,7 @@ impl Broker {
             approver,
             spawner: None,
             dispatch: None,
+            channels: std::sync::OnceLock::new(),
             grants: Mutex::new(Vec::new()),
             denials: Mutex::new(Vec::new()),
         }
@@ -2098,6 +2102,22 @@ impl Broker {
     pub fn handle(&self, req: &Request) -> Response {
         if req.cap == "capabilities" {
             return Response::done(self.capabilities());
+        }
+        // A docker or aws credential: the channel checks, asks and audits.
+        if req.cap == crate::credentials::channels::CAPABILITY {
+            if req.v != PROTOCOL {
+                return Response::new(Status::Invalid, "unsupported protocol version");
+            }
+            return match self.channels.get() {
+                Some(c) => match c.handle(&req.args) {
+                    Ok(v) => Response::done(v),
+                    Err((s, m)) => Response::new(s, m),
+                },
+                None => Response::new(
+                    Status::Disabled,
+                    "this sandbox has no docker or aws credential: the user registers them in [credentials] and allows them when the sandbox starts",
+                ),
+            };
         }
         // The sandbox reads its own boundary log: a read, never asked.
         if req.cap == "boundary" {

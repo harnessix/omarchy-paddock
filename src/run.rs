@@ -174,6 +174,7 @@ fn setup_credentials(
     backend: &str,
     quiet: bool,
     secrets: &crate::credentials::secret::SecretFiles,
+    broker: Option<&std::sync::Arc<crate::broker::Broker>>,
 ) -> Result<RunCredentials> {
     use crate::credentials::{gateway, DeliverAs, Via};
     let say = |m: &str| {
@@ -241,12 +242,15 @@ fn setup_credentials(
     let mut out = RunCredentials::default();
     let mut routes = std::collections::BTreeMap::new();
     let mut agents = Vec::new();
+    let mut channels = Vec::new();
     let mut git = Vec::new();
     for (name, var, value) in values {
         let Some((_, c)) = plan.deliver.iter().find(|(n, _)| *n == name) else {
             continue;
         };
-        if c.via == Via::Agent {
+        if c.via == Via::Agent && c.kind() != crate::credentials::Kind::Ssh {
+            channels.push((name, c.clone()));
+        } else if c.via == Via::Agent {
             agents.push((name, c.clone()));
         } else if c.via == Via::Gateway {
             let mark = gateway::new_mark();
@@ -287,6 +291,21 @@ fn setup_credentials(
             Ok(()) => out.agent = agents.into_iter().map(|(n, _)| n).collect(),
             Err(e) => say(&format!(
                 "the sandbox starts without the ssh agent socket: {e:#}"
+            )),
+        }
+    }
+    if !channels.is_empty() {
+        match start_channels(
+            env,
+            built,
+            broker,
+            &approver,
+            Duration::from_secs(wait),
+            &channels,
+        ) {
+            Ok(()) => out.agent.extend(channels.into_iter().map(|(n, _)| n)),
+            Err(e) => say(&format!(
+                "the sandbox starts without the docker and aws credentials: {e:#}"
             )),
         }
     }
@@ -453,6 +472,81 @@ fn start_ssh_agent(
     Ok(())
 }
 
+/// The docker and aws credential channels (credentials/channels.rs): the
+/// broker serves them, and the sandbox gets a docker configuration with
+/// the paddock credential helper and an AWS configuration whose profiles
+/// run `paddock-host credential aws`.
+fn start_channels(
+    env: &HostEnv,
+    built: &mut Built,
+    broker: Option<&std::sync::Arc<crate::broker::Broker>>,
+    approver: &std::sync::Arc<dyn crate::broker::Approver>,
+    wait: Duration,
+    creds: &[(String, crate::credentials::Credential)],
+) -> Result<()> {
+    use crate::credentials::{channels, Kind};
+    let broker = broker.context("the host passthrough is not running")?;
+    let run_dir = env.paddock_run().join(&built.spec.id);
+    crate::privfs::dir(&run_dir)?;
+    let registries: Vec<String> = creds
+        .iter()
+        .filter(|(_, c)| c.kind() == Kind::Docker)
+        .flat_map(|(_, c)| c.registries.iter().cloned())
+        .collect();
+    if !registries.is_empty() {
+        // Its own folder: docker and buildx write next to config.json.
+        let dir = run_dir.join("docker-config");
+        crate::privfs::dir(&dir)?;
+        gui::write_file(
+            &dir.join("config.json"),
+            &channels::sandbox_docker_config(&registries),
+            0o644,
+        )?;
+        built.spec.add_mount(crate::spec::Mount::bind(
+            &dir,
+            channels::DOCKER_CONFIG_IN_SANDBOX,
+            true,
+            "credentials: docker configuration",
+        ));
+        built.spec.set_env(
+            "DOCKER_CONFIG",
+            channels::DOCKER_CONFIG_IN_SANDBOX,
+            "credentials: docker credential helper",
+        );
+        let helper = run_dir.join("docker-credential-paddock");
+        gui::write_file(
+            &helper,
+            "#!/bin/sh\nexec paddock host credential docker \"$@\"\n",
+            0o755,
+        )?;
+        built.spec.add_tool(
+            "docker-credential-paddock",
+            helper,
+            "credentials: docker credential helper",
+        );
+    }
+    channels::setup_aws(&mut built.spec, &run_dir, creds)?;
+    let ch = channels::Channels::new(
+        env.clone(),
+        built.spec.clone(),
+        creds.to_vec(),
+        crate::credentials::revoked_file(env, &built.spec.id),
+        channels::approver_ask(env.clone(), built.spec.clone(), approver.clone(), wait),
+    );
+    if broker.channels.set(std::sync::Arc::new(ch)).is_err() {
+        bail!("the credential channels are set already");
+    }
+    for (name, c) in creds {
+        crate::credentials::audit(
+            env,
+            &built.spec,
+            name,
+            &format!("{} channel ready", c.kind().name()),
+        );
+    }
+    Ok(())
+}
+
 pub struct Outcome {
     pub code: i32,
     pub stdout: Option<String>,
@@ -548,7 +642,9 @@ pub fn run(
             .as_ref()
             .map(|c| c.chain.clone())
             .unwrap_or_default(),
-        broker.map(|b| -> crate::gateway::Handler { std::sync::Arc::new(move |r| b.handle(&r)) }),
+        broker
+            .clone()
+            .map(|b| -> crate::gateway::Handler { std::sync::Arc::new(move |r| b.handle(&r)) }),
         secrets.clone(),
     );
     // Terminal harnesses that log in through a browser and a localhost callback.
@@ -605,7 +701,14 @@ pub fn run(
     // Registered credentials (credentials.rs): after the install steps,
     // which never get them, and before the harness starts, which waits for
     // the user's two answers.
-    let creds = setup_credentials(env, &mut built, backend.name(), quiet, &secrets)?;
+    let creds = setup_credentials(
+        env,
+        &mut built,
+        backend.name(),
+        quiet,
+        &secrets,
+        broker.as_ref(),
+    )?;
     start_api_proxy(env, &mut built, backend.name())?;
     let launch = backend.render(env, &built.spec, interactive)?;
     write_files(&launch)?;

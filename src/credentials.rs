@@ -12,12 +12,13 @@
 //!   the value on the host.
 //! - `intercept`: TLS interception for tools that can do neither.
 //!
-//! `deliver`, `gateway` and `agent` for ssh (with `keys`, sshagent.rs) are
-//! built. The others are accepted in the configuration and named as not
+//! `deliver`, `gateway`, and `agent` for ssh (with `keys`, sshagent.rs),
+//! docker registries and AWS profiles (`kind`, channels.rs) are built. The others are accepted in the configuration and named as not
 //! available. A project `paddock.toml` can
 //! never define a credential, and `from = "command"` runs on the host, like
 //! `[exec]`. Values are read when they are needed, never written to disk.
 
+pub mod channels;
 pub mod gateway;
 pub mod secret;
 pub mod sshagent;
@@ -34,6 +35,16 @@ pub enum Via {
     Gateway,
     Deliver,
     Intercept,
+}
+
+impl Kind {
+    pub fn name(self) -> &'static str {
+        match self {
+            Kind::Ssh => "ssh",
+            Kind::Docker => "docker",
+            Kind::Aws => "aws",
+        }
+    }
 }
 
 impl Via {
@@ -72,6 +83,20 @@ pub enum Confirm {
     /// At every use (ssh signatures).
     Each,
 }
+
+/// What an `agent` credential speaks to: the ssh agent (the default), a
+/// docker credential helper, or the AWS `credential_process`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum Kind {
+    #[default]
+    Ssh,
+    Docker,
+    Aws,
+}
+
+/// The shortest and longest life of AWS session credentials, in seconds.
+pub const AWS_DURATION: (u64, u64) = (900, 3600);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
@@ -148,6 +173,18 @@ pub struct Credential {
     /// agent (ssh): the public keys whose private keys the sandbox may use.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub keys: Vec<String>,
+    /// agent: `ssh` (the default), `docker` or `aws`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<Kind>,
+    /// agent, kind docker: the registries that the sandbox may log in to.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub registries: Vec<String>,
+    /// agent, kind aws: a profile of the user's own AWS configuration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<String>,
+    /// agent, kind aws: the life of the session credentials, in seconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration: Option<u64>,
     #[serde(default)]
     pub confirm: Confirm,
 }
@@ -216,9 +253,25 @@ impl Credential {
         Ok(c)
     }
 
-    /// Whether this paddock can use it: `agent` only for ssh keys.
+    /// The kind of an `agent` credential.
+    pub fn kind(&self) -> Kind {
+        self.kind.unwrap_or_default()
+    }
+
+    /// The life of AWS session credentials.
+    pub fn aws_duration(&self) -> u64 {
+        self.duration.unwrap_or(AWS_DURATION.0)
+    }
+
+    /// Whether this paddock can use it: `agent` for ssh needs keys.
     pub fn available(&self) -> bool {
-        self.via.available() && (self.via != Via::Agent || !self.keys.is_empty())
+        self.via.available()
+            && (self.via != Via::Agent
+                || match self.kind() {
+                    Kind::Ssh => !self.keys.is_empty(),
+                    Kind::Docker => !self.registries.is_empty(),
+                    Kind::Aws => self.profile.is_some(),
+                })
     }
 
     /// git smart HTTP through the gateway (`preset = "github-git"`): git in
@@ -299,8 +352,56 @@ pub fn parse(text: &str) -> Result<BTreeMap<String, Credential>> {
                 bail!("[credentials.{name}]: '{v}' is not an environment variable name");
             }
         }
-        if !c.keys.is_empty() && c.via != Via::Agent {
-            bail!("[credentials.{name}]: keys are only for via = \"agent\"");
+        if !c.keys.is_empty() && (c.via != Via::Agent || c.kind() != Kind::Ssh) {
+            bail!("[credentials.{name}]: keys are only for via = \"agent\" with kind = \"ssh\"");
+        }
+        if c.kind.is_some() && c.via != Via::Agent {
+            bail!("[credentials.{name}]: kind is only for via = \"agent\"");
+        }
+        if !c.registries.is_empty() && c.kind() != Kind::Docker {
+            bail!("[credentials.{name}]: registries are only for kind = \"docker\"");
+        }
+        if (c.profile.is_some() || c.duration.is_some()) && c.kind() != Kind::Aws {
+            bail!("[credentials.{name}]: profile and duration are only for kind = \"aws\"");
+        }
+        if c.via == Via::Agent && c.kind() != Kind::Ssh {
+            if c.from != Source::Env || c.var.is_some() || c.env.is_some() {
+                bail!("[credentials.{name}]: kind = \"{}\" reads the login of the host tool; it takes no from, var, command or env", c.kind().name());
+            }
+            if c.confirm == Confirm::Each {
+                bail!("[credentials.{name}]: kind = \"{}\" asks at the first use in each run; confirm = \"each\" is only for ssh", c.kind().name());
+            }
+        }
+        if c.kind() == Kind::Docker {
+            if c.registries.is_empty() {
+                bail!("[credentials.{name}]: kind = \"docker\" needs registries, such as [\"ghcr.io\"]");
+            }
+            for r in &c.registries {
+                if r.contains(['/', ' ']) || channels::registry_host(r).is_none() {
+                    bail!("[credentials.{name}]: '{r}' is not a registry (HOST or HOST:PORT)");
+                }
+            }
+        }
+        if c.kind() == Kind::Aws {
+            let Some(p) = &c.profile else {
+                bail!("[credentials.{name}]: kind = \"aws\" needs profile, a profile of your ~/.aws/config");
+            };
+            if !channels::valid_profile(p) {
+                bail!("[credentials.{name}]: '{p}' is not an AWS profile name");
+            }
+            let d = c.aws_duration();
+            if d < AWS_DURATION.0 || d > AWS_DURATION.1 {
+                bail!(
+                    "[credentials.{name}]: duration is {d}; use {} to {} seconds",
+                    AWS_DURATION.0,
+                    AWS_DURATION.1
+                );
+            }
+            if let Some((other, _)) = all.iter().find(|(n, o)| {
+                n.as_str() < name.as_str() && o.kind == Some(Kind::Aws) && o.profile == c.profile
+            }) {
+                bail!("[credentials.{name}]: the profile {p} is in [credentials.{other}] already");
+            }
         }
         if c.as_ == DeliverAs::File && c.via != Via::Deliver {
             bail!("[credentials.{name}]: as = \"file\" is only for via = \"deliver\"");
@@ -382,7 +483,13 @@ pub fn load(env: &HostEnv) -> Result<BTreeMap<String, Credential>> {
 /// from a command: an env source must be set, a command must exist.
 pub fn source_ready(env: &HostEnv, name: &str, c: &Credential) -> bool {
     if c.via == Via::Agent {
-        return !c.keys.is_empty() && c.keys.iter().all(|k| sshagent::key_path(env, k).is_file());
+        return match c.kind() {
+            Kind::Ssh => {
+                !c.keys.is_empty() && c.keys.iter().all(|k| sshagent::key_path(env, k).is_file())
+            }
+            Kind::Docker => channels::docker_config_file(env).is_file(),
+            Kind::Aws => env.which("aws").is_some(),
+        };
     }
     match c.from {
         Source::Env => env.var(c.host_var(name)).is_some_and(|v| !v.is_empty()),
@@ -442,6 +549,20 @@ pub fn plan(env: &HostEnv, harness: &str, spawned: bool) -> Result<Plan> {
             ));
             continue;
         }
+        if c.via == Via::Agent && c.kind() != Kind::Ssh {
+            if !source_ready(env, &name, &c) {
+                p.notices.push(match c.kind() {
+                    Kind::Docker => format!(
+                        "credential {name}: there is no docker configuration at {}; the sandbox does not get it",
+                        channels::docker_config_file(env).display()
+                    ),
+                    _ => format!("credential {name}: the program aws is not there; the sandbox does not get it"),
+                });
+                continue;
+            }
+            p.deliver.push((name, c));
+            continue;
+        }
         if c.via == Via::Agent {
             let ready = sshagent::load_keys(env, &[(name.clone(), c.clone())]).and_then(|keys| {
                 sshagent::check_host(env.var("SSH_AUTH_SOCK").map(std::path::Path::new), &keys)
@@ -479,6 +600,15 @@ fn describe(name: &str, c: &Credential) -> String {
         Source::Command => format!("from the command `{}`", c.command.join(" ")),
     };
     match c.via {
+        Via::Agent if c.kind() == Kind::Docker => format!(
+            "{name}: your docker login for {}. The sandbox's docker client asks paddock for it at each use, and you allow the first use of each registry in this run. The login stays in your docker credential store, but its value reaches the docker client in the sandbox for that request",
+            c.registries.join(", ")
+        ),
+        Via::Agent if c.kind() == Kind::Aws => format!(
+            "{name}: AWS credentials of your profile {} that end after {} seconds. The long-lived keys stay on the host, and you allow the first use in this run. The sandbox gets a new short-lived set at each later use",
+            c.profile.as_deref().unwrap_or(""),
+            c.aws_duration()
+        ),
         Via::Agent => format!(
             "{name}: the ssh keys {} in your ssh agent. The private keys stay on the host: the sandbox gets an agent socket that lists only these keys and signs only with them{}",
             c.keys.join(", "),
@@ -749,6 +879,14 @@ pub fn rows(env: &HostEnv) -> Result<Vec<Row>> {
                 via: c.via.name(),
                 available: c.available(),
                 source: match (c.via, c.from) {
+                    (Via::Agent, _) if c.kind() == Kind::Docker => {
+                        format!("docker login, registries {}", c.registries.join(" "))
+                    }
+                    (Via::Agent, _) if c.kind() == Kind::Aws => format!(
+                        "aws profile {}, {} seconds",
+                        c.profile.as_deref().unwrap_or(""),
+                        c.aws_duration()
+                    ),
                     (Via::Agent, _) => format!("ssh agent, keys {}", c.keys.join(" ")),
                     (_, Source::Env) => format!("env {}", c.host_var(name)),
                     (_, Source::Command) => format!("command {}", c.command[0]),
@@ -818,7 +956,8 @@ pub fn revoked_file(env: &HostEnv, sandbox: &str) -> std::path::PathBuf {
 
 /// Revoke a credential (or all, with None) of a running sandbox. The next
 /// request through the gateway gets 403, the ssh agent channel signs no
-/// more, and a secret file fails to open or read; the sandbox keeps running.
+/// more, the docker and aws channels give nothing, and a secret file fails
+/// to open or read; the sandbox keeps running.
 pub fn revoke(env: &HostEnv, sandbox: &str, name: Option<&str>) -> Result<Vec<String>> {
     let r = crate::state::Running::list(env)
         .into_iter()
@@ -838,7 +977,7 @@ pub fn revoke(env: &HostEnv, sandbox: &str, name: Option<&str>) -> Result<Vec<St
         ),
         Some(n) => bail!("sandbox {sandbox} does not use the credential {n}"),
         None if held.is_empty() => {
-            bail!("sandbox {sandbox} uses no credential through the gateway, the ssh agent channel or a secret file")
+            bail!("sandbox {sandbox} uses no credential through the gateway, an agent channel or a secret file")
         }
         None => held,
     };
