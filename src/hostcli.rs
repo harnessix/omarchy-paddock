@@ -260,8 +260,10 @@ and stops when the task is done.
     worktree, and you cannot see them.
   - --role sets fixed limits. implementer (the default): its own writable
     worktree. reviewer: the files are read-only, and it cannot push or change
-    anything with gh; use it to review or compare. Both roles get a clean
-    environment: only the allowlist and the harness's own variables.
+    anything with gh; use it to review or compare. Under a parent with
+    network egress, a reviewer gets network mode api: only its model API.
+    Both roles get a clean environment: only the allowlist and the
+    harness's own variables.
   - --timeout (600, 30m, 2h), --mem (512M, 4G) and --cpus (2, 0.5) can only
     lower the limits in the user's configuration. A systemd scope enforces
     them when the host has `systemd-run --user`; without it, paddock enforces
