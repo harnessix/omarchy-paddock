@@ -24,6 +24,7 @@ pub fn all() -> Vec<Box<dyn Detector>> {
         Box::new(Git),
         Box::new(Mise),
         Box::new(Cache::rust()),
+        Box::new(Rustup),
         Box::new(Cache::node()),
         Box::new(Cache::python()),
         Box::new(Cache::go()),
@@ -298,6 +299,47 @@ impl Detector for Cache {
         for (cache, rel) in self.caches {
             spec.add_mount(cache_mount(cx.env, cache, spec.home.join(rel), &origin)?);
         }
+        Ok(())
+    }
+}
+
+/// The host's rustup toolchains, for a Rust project: `~/.rustup` and the
+/// proxies in `~/.cargo/bin`, read-only. Not the rest of `~/.cargo`, which
+/// holds `credentials.toml`. Read-only, so a project's `rust-toolchain.toml`
+/// cannot install or change the toolchains that every project shares.
+pub struct Rustup;
+
+impl Detector for Rustup {
+    fn name(&self) -> &'static str {
+        "rustup"
+    }
+    fn apply(&self, cx: &Context, spec: &mut SandboxSpec) -> Result<()> {
+        if !cx.project.join("Cargo.toml").is_file() {
+            return Ok(());
+        }
+        let (rustup, bin) = (cx.env.home.join(".rustup"), cx.env.home.join(".cargo/bin"));
+        if !rustup.join("toolchains").is_dir() || !bin.join("cargo").is_file() {
+            return Ok(());
+        }
+        let origin = "detector rustup: toolchains (read-only)";
+        spec.add_mount(Mount::bind(
+            &rustup,
+            spec.home.join(".rustup"),
+            false,
+            origin,
+        ));
+        spec.add_mount(Mount::bind(
+            &bin,
+            spec.home.join(".cargo/bin"),
+            false,
+            origin,
+        ));
+        spec.set_env(
+            "RUSTUP_HOME",
+            spec.home.join(".rustup").display().to_string(),
+            origin,
+        );
+        spec.tool_path.push(spec.home.join(".cargo/bin"));
         Ok(())
     }
 }
@@ -601,6 +643,62 @@ mod tests {
         assert_eq!(kind(&data.join(".env")), Some(MountKind::MaskFile));
         assert_eq!(kind(&data.join("sub/tls.key")), None);
         assert_eq!(kind(&data.join("notes.txt")), None);
+    }
+
+    #[test]
+    fn a_rust_project_gets_the_rustup_toolchains_read_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("proj");
+        std::fs::create_dir_all(&project).unwrap();
+        let env = HostEnv::from_parts(
+            tmp.path().join("home"),
+            "t".into(),
+            1000,
+            1000,
+            Default::default(),
+        );
+        let spec_for = |env: &HostEnv| {
+            let mut spec = SandboxSpec::new(
+                "t".into(),
+                "x",
+                &project,
+                env.home.join("sandbox"),
+                &env.home,
+                1000,
+                1000,
+                "t",
+            );
+            let manifest = crate::manifest::Manifest::default();
+            let cx = Context {
+                env,
+                project: &project,
+                manifest: &manifest,
+            };
+            Rustup.apply(&cx, &mut spec).unwrap();
+            spec
+        };
+        // No Cargo.toml, or no rustup on the host: nothing.
+        assert!(spec_for(&env).mounts.is_empty());
+        std::fs::write(project.join("Cargo.toml"), "").unwrap();
+        assert!(spec_for(&env).mounts.is_empty());
+        std::fs::create_dir_all(env.home.join(".rustup/toolchains/stable")).unwrap();
+        std::fs::create_dir_all(env.home.join(".cargo/bin")).unwrap();
+        std::fs::write(env.home.join(".cargo/bin/cargo"), "").unwrap();
+        std::fs::write(env.home.join(".cargo/credentials.toml"), "token").unwrap();
+        let spec = spec_for(&env);
+        let home = &spec.home;
+        let kind = |p: &Path| spec.mounts.iter().find(|m| m.dst == p).map(|m| m.kind);
+        assert_eq!(kind(&home.join(".rustup")), Some(MountKind::Ro));
+        assert_eq!(kind(&home.join(".cargo/bin")), Some(MountKind::Ro));
+        // Never the credentials beside them.
+        assert!(spec.mounts.iter().all(|m| m.dst != home.join(".cargo")));
+        assert!(spec.path_value().contains(".cargo/bin"));
+        // After paddock's own tools: a cargo-installed `gh` cannot hide paddock's.
+        let path = spec.path_value();
+        assert!(
+            path.find(crate::spec::TOOL_DIR) < path.find(".cargo/bin"),
+            "{path}"
+        );
     }
 
     #[test]
