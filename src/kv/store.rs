@@ -809,6 +809,24 @@ impl Store {
             .optional()?)
     }
 
+    /// The namespaces that hold keys in this file.
+    pub fn namespaces(&self) -> Result<Vec<String>> {
+        let mut st = self
+            .conn
+            .prepare("SELECT DISTINCT ns FROM entries ORDER BY ns")?;
+        let rows = st.query_map([], |r| r.get::<_, String>(0))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Registry: every project that a sandbox was recorded for.
+    pub fn projects(&self) -> Result<Vec<String>> {
+        let mut st = self
+            .conn
+            .prepare("SELECT DISTINCT project FROM sandboxes ORDER BY project")?;
+        let rows = st.query_map([], |r| r.get::<_, String>(0))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
     /// All keys of this file that have not expired: count and bytes.
     pub fn totals(&self) -> Result<(u64, u64)> {
         Ok(self.conn.query_row(

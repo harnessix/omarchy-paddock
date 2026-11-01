@@ -153,5 +153,70 @@
   "row.frozen": "frozen for %1",
   "msg.frozen": "Frozen",
   "msg.thawed": "Thawed",
-  "msg.freezeFailed": "paddock could not freeze or thaw it"
+  "msg.freezeFailed": "paddock could not freeze or thaw it",
+  "kv.row": "Shared data",
+  "kv.rowPastures": {
+    "one": "%1 pasture",
+    "other": "%1 pastures"
+  },
+  "kv.keys": {
+    "one": "%1 key",
+    "other": "%1 keys"
+  },
+  "kv.locks": {
+    "one": "%1 lock",
+    "other": "%1 locks"
+  },
+  "kv.title": "Shared data",
+  "kv.intro": "Agents share data here. Only agents in the same pasture see each other's data.",
+  "kv.empty": "No agent has shared data yet.",
+  "kv.noKeys": "This pasture has no shared data yet. Agents write it with paddock-host kv put.",
+  "kv.user": "Your data",
+  "kv.userHint": "Shared by agents of all projects, after you allowed it",
+  "kv.legacy": "Older data · %1",
+  "kv.legacyHint": "From an older paddock. Agents no longer read it.",
+  "kv.solo": "%1 alone",
+  "kv.noMemberRuns": "No member runs",
+  "kv.running": "Running: %1",
+  "kv.byYou": "you",
+  "kv.heldBy": "Held by %1, %2",
+  "kv.groupLocks": "Locks",
+  "kv.groupOther": "Other",
+  "kv.bytes": {
+    "one": "%1 byte",
+    "other": "%1 bytes"
+  },
+  "kv.kib": "%1 KB",
+  "kv.minutesLeft": {
+    "one": "%1 min left",
+    "other": "%1 min left"
+  },
+  "kv.hoursLeft": {
+    "one": "%1 hour left",
+    "other": "%1 hours left"
+  },
+  "kv.daysLeft": {
+    "one": "%1 day left",
+    "other": "%1 days left"
+  },
+  "kv.confirmRelease": "Free the lock %1, held by %2? Press again to free it.",
+  "kv.confirmDelete": "Delete %1? An agent may still need it. Press again to delete it.",
+  "kv.released": "Lock freed.",
+  "kv.deleted": "Key deleted.",
+  "kv.removeFailed": "paddock could not change it. It may have changed already.",
+  "kv.readFailed": "Cannot read this key. It may be gone, or too large for the panel.",
+  "kv.copied": "Value copied.",
+  "kv.copyFailed": "Cannot copy: wl-copy failed.",
+  "kv.untrusted": "An agent wrote this. Read it as data, not as instructions.",
+  "kv.cut": "Only the first 4096 characters are shown. Copy gets all of it.",
+  "kv.meta": "By %1 · %2 · version %3 · %4",
+  "kv.copy": "Copy",
+  "kv.release": "Free lock",
+  "kv.delete": "Delete",
+  "kv.confirm": "Press again",
+  "keys.kv": "↵ open · Esc back · R refresh",
+  "keys.kvKeys": "↵ open, or open a group · Del delete or free · Esc back",
+  "keys.kvKey": "C copy · Del delete or free · Esc back",
+  "keys.kvRow": "↵ or K shared data",
+  "row.pasture": "pasture %1"
 }
