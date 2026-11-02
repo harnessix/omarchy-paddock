@@ -93,8 +93,12 @@ pub fn write_atomic(path: &Path, bytes: impl AsRef<[u8]>) -> io::Result<()> {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
+    // Two threads of one process can read the same time: the counter keeps
+    // their names apart.
+    static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let mut name = path.file_name().unwrap_or_default().to_os_string();
-    name.push(format!(".paddock-tmp-{}-{nanos}", std::process::id()));
+    name.push(format!(".paddock-tmp-{}-{nanos}-{n}", std::process::id()));
     let tmp = path.with_file_name(name);
     let mut f = open(&tmp, OpenOptions::new().write(true).create_new(true))?;
     let written = f.write_all(bytes.as_ref()).and_then(|_| f.sync_all());
