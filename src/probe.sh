@@ -123,7 +123,12 @@ if [ -n "$PADDOCK_PROBE_VIEWSOCK" ] && [ -e "$PADDOCK_PROBE_VIEWSOCK" ]; then se
 for s in /tmp/tmux-*/* "${TMUX_TMPDIR:-/nonexistent}"/tmux-*/* /run/user/*/tmux-*/* /run/user/*/paddock/view.sock; do
   [ -S "$s" ] && seen="$seen $s"
 done
+# The jobs and prompts of detached runs wait in the same hidden folder.
+for f in /run/user/*/paddock/detach/*; do
+  [ -e "$f" ] && seen="$seen $f"
+done
 [ -n "$TMUX" ] && seen="$seen TMUX=$TMUX"
+[ -n "$TMUX_PANE" ] && seen="$seen TMUX_PANE=$TMUX_PANE"
 if [ -z "$seen" ]; then ok view-socket-hidden; else fail view-socket-hidden "visible:$seen"; fi
 
 if has sudo; then

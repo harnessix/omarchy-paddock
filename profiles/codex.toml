@@ -74,3 +74,10 @@ url = "https://chatgpt.com/#settings/DataControls"
 args = ["exec", "--dangerously-bypass-approvals-and-sandbox", "-"]
 prompt = "stdin"
 probe_args = ["exec", "--help"]
+
+# `paddock run --detach`: the interactive interface with a first prompt.
+# `codex --help` and the CLI reference: PROMPT is an "Optional text
+# instruction to start the session".
+# https://developers.openai.com/codex/cli/reference
+[detach]
+args = ["Read the file {prompt_file} and do the task that it describes."]

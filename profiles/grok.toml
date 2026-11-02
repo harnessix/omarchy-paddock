@@ -80,3 +80,10 @@ endpoints = ["api.x.ai", "x.ai", "grok.com"]
 [oneshot]
 args = ["--always-approve", "--prompt-file", "{prompt_file}"]
 prompt = "file"
+
+# `paddock run --detach`: the interactive interface with a first prompt. The
+# user guide, Getting started: a positional prompt launches the interactive
+# TUI and submits it as the first turn.
+# https://github.com/xai-org/grok-build/blob/main/crates/codegen/xai-grok-pager/docs/user-guide/01-getting-started.md
+[detach]
+args = ["Read the file {prompt_file} and do the task that it describes."]

@@ -45,6 +45,7 @@ USAGE
   paddock-host status [ID]
   paddock-host wait ID [--timeout SECONDS]
   paddock-host kill ID
+  paddock-host done [--status ok|failed] [TEXT]   (a detached run: the task ended)
   paddock-host kv COMMAND [ARG...]              (key-value store, see `paddock-host kv --help`)
   paddock-host timer COMMAND [ARG...]           (task timers, see `paddock-host timer --help`)
   paddock-host pasture share|unshare PORT       (ports for your pasture, see `paddock-host pasture --help`)
@@ -297,6 +298,19 @@ glab (GitLab) works the same way when the user has it on the host:
 
 Extra options: --paddock-reason TEXT, --paddock-timeout SECONDS (default 120,
 1800 for watch), --paddock-json. The exit code is the tool's own."#
+        }
+        "done" => {
+            r#"paddock-host done [--status ok|failed] [TEXT]: the task of a detached run ended.
+
+In a run that the user started with `paddock run --detach`, you work in an
+interactive interface that does not end by itself. Call this once, when the
+task is finished or cannot be finished. TEXT is a short summary (at most
+4 KiB) that `paddock wait` prints on the host. --status failed says that the
+task did not succeed.
+
+paddock then ends the run, unless the user is attached to it with write
+access: then the user gets a notice and the run stays open until they close
+the view. In a run that is not detached, done fails with exit code 4."#
         }
         "spawn" | "status" | "wait" | "kill" => {
             r#"paddock-host spawn: start another harness in its own sandbox with one task.
@@ -736,6 +750,23 @@ pub fn main(args: &[String]) -> i32 {
                 }
                 (req("spawn", p.reason, a), p.json)
             }
+            "done" => {
+                let p = parse(rest, &["status"])?;
+                let mut a = BTreeMap::new();
+                let status = p.opts.get("status").map(String::as_str).unwrap_or("ok");
+                if !matches!(status, "ok" | "failed") {
+                    return Err("--status is ok or failed".into());
+                }
+                a.insert("status".into(), serde_json::json!(status));
+                match p.rest.as_slice() {
+                    [] => {}
+                    [t] => {
+                        a.insert("text".into(), serde_json::json!(t));
+                    }
+                    _ => return Err("done takes one TEXT; quote it".into()),
+                }
+                (req("done", p.reason, a), p.json)
+            }
             other => return Err(format!("unknown command '{other}'")),
         })
     })();
@@ -968,6 +999,7 @@ fn print_human(req: &Request, resp: &Response) {
             }
             _ => print_child(r),
         },
+        "done" => println!("paddock-host: done {}", r["message"].as_str().unwrap_or("")),
         _ => {
             if let Some(p) = r["path"].as_str() {
                 println!("{p}");

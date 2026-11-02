@@ -186,15 +186,25 @@ impl Tmux {
     /// follows `log` until the process `pid` (the paddock that runs the
     /// sandbox) ends, then prints `end`. The pane stays after that.
     pub fn start(&self, id: &str, header: &str, log: &Path, pid: u32, end: &Path) -> Result<()> {
+        let script = "printf '%s\\n\\n' \"$1\"; tail -n +1 --pid=\"$3\" -f -- \"$2\"; \
+                      cat -- \"$4\" 2>/dev/null";
+        let mut cmd: Vec<OsString> = ["sh", "-c", script, "paddock-view", header]
+            .iter()
+            .map(OsString::from)
+            .collect();
+        cmd.extend([log.into(), pid.to_string().into(), end.into()]);
+        self.new_session(id, &cmd)
+    }
+
+    /// Start the session `id` with one pane that runs `cmd` (no shell in
+    /// between). The pane stays after `cmd` ends.
+    pub fn new_session(&self, id: &str, cmd: &[OsString]) -> Result<()> {
         if !valid_id(id) {
             bail!("{id} is not a sandbox id");
         }
         if let Some(d) = self.sock.parent() {
             crate::privfs::dir(d)?;
         }
-        let script = "printf '%s\\n\\n' \"$1\"; tail -n +1 --pid=\"$3\" -f -- \"$2\"; \
-                      cat -- \"$4\" 2>/dev/null";
-        let pid = pid.to_string();
         let mut args: Vec<OsString> = [
             "start-server",
             ";",
@@ -216,16 +226,11 @@ impl Tmux {
             "160",
             "-y",
             "48",
-            "sh",
-            "-c",
-            script,
-            "paddock-view",
-            header,
         ]
         .iter()
         .map(OsString::from)
         .collect();
-        args.extend([log.into(), pid.into(), end.into()]);
+        args.extend(cmd.iter().cloned());
         // A new server goes into a scope of its own when it can.
         let running = self.run(&["list-sessions"]);
         if let (false, Some((run, vars))) = (running, &self.scope) {
@@ -257,6 +262,45 @@ impl Tmux {
             bail!("tmux new-session failed ({status})");
         }
         Ok(())
+    }
+
+    /// The clients attached to session `id` that can type into it (not
+    /// read-only): `paddock view --write`.
+    pub fn write_clients(&self, id: &str) -> usize {
+        if !valid_id(id) || !self.sock.exists() {
+            return 0;
+        }
+        let out = self
+            .cmd()
+            .args([
+                "list-clients",
+                "-t",
+                &format!("={id}"),
+                "-F",
+                "#{client_readonly}",
+            ])
+            .stdout(Stdio::piped())
+            .output();
+        match out {
+            Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .filter(|l| l.trim() == "0")
+                .count(),
+            _ => 0,
+        }
+    }
+
+    /// Show `text` to the clients of session `id`, on their status line.
+    pub fn message(&self, id: &str, text: &str) -> bool {
+        valid_id(id)
+            && self.run(&[
+                "display-message",
+                "-t",
+                &format!("={id}"),
+                "-d",
+                "10000",
+                text,
+            ])
     }
 }
 

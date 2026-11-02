@@ -38,6 +38,29 @@ pub struct Profile {
     /// The non-interactive mode that runs one task and exits. `paddock-host
     /// spawn` starts a harness only with this command.
     pub oneshot: Option<OneShot>,
+    /// The interactive command with a first prompt, for `paddock run
+    /// --detach`. Without it, paddock refuses `--detach`.
+    pub detach: Option<Detach>,
+}
+
+/// `[detach]`: the arguments that give the interactive interface its first
+/// prompt. `{prompt_file}` becomes the path of a read-only copy of the
+/// prompt inside the sandbox; the prompt itself never goes into argv.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Detach {
+    pub args: Vec<String>,
+}
+
+impl Detach {
+    /// The arguments with the prompt file path filled in.
+    pub fn render(&self, prompt_file: &Path) -> Vec<String> {
+        let f = prompt_file.display().to_string();
+        self.args
+            .iter()
+            .map(|a| a.replace(PROMPT_FILE, &f))
+            .collect()
+    }
 }
 
 /// How a prompt reaches a one-shot run. Never in the arguments: the
@@ -732,6 +755,21 @@ mod tests {
             let secret = "PROMPT-TEXT-THAT-MUST-NOT-LEAK";
             let argv = o.render(Path::new("/home/demo/.paddock-spawn/prompt.md"));
             assert!(argv.iter().all(|a| !a.contains(secret)), "{name}");
+        }
+    }
+
+    #[test]
+    fn detach_args_name_the_prompt_file_once() {
+        let mut with = vec![];
+        for (name, text) in BUILTIN {
+            let p: Profile = toml::from_str(text).unwrap();
+            let Some(d) = p.detach else { continue };
+            with.push(p.name.clone());
+            let n: usize = d.args.iter().map(|a| a.matches(PROMPT_FILE).count()).sum();
+            assert_eq!(n, 1, "{name} must name the prompt file once");
+        }
+        for h in ["claude", "codex", "grok"] {
+            assert!(with.iter().any(|w| w == h), "{h} has no [detach]");
         }
     }
 

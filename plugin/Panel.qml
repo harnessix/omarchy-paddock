@@ -120,7 +120,7 @@ Panel {
     if (s && s.canFreeze) a.push("freeze")
     if (s && s.revocable) a.push("revoke")
     if (s && s.monitor !== "") a.push("ack")
-    if (s && s.viewTmux) a.push("takeover")
+    if (s && s.viewTmux && s.detached) a.push("takeover")
     a.push("stop")
     return a
   }
@@ -823,6 +823,9 @@ Panel {
             // A live view (paddock view): a tmux session or a run log.
             view: r.view === true,
             viewTmux: r.view_tmux === true,
+            // A detached run (paddock run --detach): the view pane is the
+            // terminal of the agent, so keys from the view reach it.
+            detached: r.detached === true,
             // Its own scope (bwrap, srt), or a container that can pause.
             canFreeze: (typeof r.unit === "string" && r.unit !== "") || r.backend === "docker" || r.backend === "podman",
             windowPid: Number.isInteger(r.window_pid) && r.window_pid > 0 ? r.window_pid : 0,
@@ -1567,13 +1570,13 @@ Panel {
                 ActionButton {
                   sandboxIndex: index + root.approvals.length
                   position: (modelData.windowPid > 0 ? 3 : 2) + (modelData.canFreeze ? 1 : 0) + (modelData.revocable ? 1 : 0) + (modelData.monitor !== "" ? 1 : 0)
-                  visible: modelData.viewTmux
+                  visible: modelData.viewTmux && modelData.detached
                   iconText: "󰆍"; tooltipText: strings.t("action.takeOver")
                   onClicked: root.openView(modelData, true)
                 }
                 ActionButton {
                   sandboxIndex: index + root.approvals.length
-                  position: (modelData.windowPid > 0 ? 3 : 2) + (modelData.canFreeze ? 1 : 0) + (modelData.revocable ? 1 : 0) + (modelData.monitor !== "" ? 1 : 0) + (modelData.viewTmux ? 1 : 0)
+                  position: (modelData.windowPid > 0 ? 3 : 2) + (modelData.canFreeze ? 1 : 0) + (modelData.revocable ? 1 : 0) + (modelData.monitor !== "" ? 1 : 0) + (modelData.viewTmux && modelData.detached ? 1 : 0)
                   iconText: root.confirmId === modelData.id ? "󰗖" : "󰓛"
                   tooltipText: root.confirmId === modelData.id ? strings.t("action.confirmStop") : strings.t("action.stop")
                   foreground: root.confirmId === modelData.id ? root.urgent : root.fg

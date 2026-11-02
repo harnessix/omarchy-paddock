@@ -974,16 +974,33 @@ A sandbox that starts without a terminal, such as `paddock run claude -- -p < ti
 
 ```sh
 paddock view <id>           # a new terminal with a read-only live view
-paddock view <id> --write   # the same with keys: scroll with the tmux copy mode, or close the view
+paddock view <id> --write   # the same with keys
 ```
 
 - paddock copies the output of the harness byte for byte to the caller and to a run log, and the session shows that log. The script that started the sandbox gets the same output, exit code and input as without tmux.
 - The session uses paddock's own tmux server on `$XDG_RUNTIME_DIR/paddock/view.sock`, never your tmux server or your tmux configuration. No sandbox sees the socket or the logs. `paddock doctor --escape` checks this (`view-socket-hidden`).
-- The keys of the view do not reach the harness. The harness reads its input from the caller.
+- In a run like this, the keys of `--write` only scroll the view (tmux copy mode) or close it. They do not reach the harness, which reads its input from the caller.
 - The session stays after the sandbox ends, with the exit code on the last line. `paddock stop <id>` ends it. `paddock gc --yes` removes sessions and logs of sandboxes that ended more than a day ago.
 - Without tmux, `paddock view` opens `tail -f` of the run log. It uses `xdg-terminal-exec`, or `$TERMINAL -e` without it.
 - One-shot modes such as `claude -p` print nothing until the end, so the view shows little until then.
 - `[view] tmux = false` in `~/.config/paddock/config.toml` turns the tmux session off.
+
+#### Detached runs: watch and take over
+
+`--detach` starts the harness in the background with its normal interactive interface, on the terminal of a tmux session. The task is its first prompt:
+
+```sh
+paddock run codex ~/src/app --detach --prompt-file task.md --worktree
+paddock run claude --detach --prompt "Fix the failing test in src/parser.rs"
+```
+
+paddock starts the run as if you typed `paddock run codex ~/src/app` in that session, and returns at once. It prints the sandbox id and `paddock view <id> --write`. The other flags (`--worktree`, `--pasture`, `--env`, `--auth`, ...) work as without `--detach`.
+
+- `paddock view <id> --write` attaches to the terminal of the agent: your keys go to the agent, and you take over. Without `--write`, the view is read-only. In the bar panel, the take-over button shows only for detached runs.
+- The agent calls `paddock-host done [--status ok|failed] [TEXT]` when the task ends. paddock then ends the run as `paddock stop` does. When you are attached with `--write`, paddock tells you once and leaves the run to you: it ends when you close the view. The status and the first 4 KiB of the text go into the run record.
+- `paddock wait <id> [--timeout 30m]` blocks until the run ends and prints the `done` status and text. It exits with 0 for ok, 1 for failed or no `done`, and 124 when the time runs out. Scripts that start detached workers use it.
+- A task timer (`paddock timer`) works as for any other run.
+- The harness profile says how the interface takes a first prompt, in a `[detach]` table. claude, codex and grok have one. Other harnesses refuse `--detach`. `--detach` needs tmux.
 
 You can let an agent on the host answer requests for you (`paddock approver`). paddock trusts that setting only from a root-owned file (`sudo paddock approver enable --system`) or from a file signed with a password that you type when a sandbox starts, so that a process on your computer cannot turn it on for itself. The agent approver can only answer the capabilities that you list, the rules above still hold, and if it does not answer clearly, the request comes to you.
 
@@ -1615,6 +1632,10 @@ url = "https://example.com/settings/data"
 args = ["run", "--yes-to-everything", "--task-file", "{prompt_file}"]
 prompt = "file"          # or "stdin"
 probe_args = ["run", "--help"]
+
+# The first prompt of the interactive interface, for `paddock run --detach`. Optional.
+[detach]
+args = ["Read the file {prompt_file} and do the task that it describes."]
 ```
 
 More entries, for harnesses that need them:

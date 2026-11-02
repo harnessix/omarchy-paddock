@@ -48,6 +48,9 @@ pub struct Options {
     /// The workbench of the pasture (pasture/workbench.rs): its socket
     /// folder is writable.
     pub workbench: bool,
+    /// `paddock run --detach`: the sandbox id that the caller chose. The
+    /// harness gets its interactive command with the `[detach]` args.
+    pub detach: Option<String>,
 }
 
 /// A worktree that paddock created for one run.
@@ -254,6 +257,8 @@ pub fn worktree_counts(env: &HostEnv, w: &Worktree) -> (usize, Option<usize>) {
 }
 
 pub struct Built {
+    /// A detached run (`paddock run --detach`): `paddock-host done` ends it.
+    pub detach: bool,
     /// For a child sandbox: where it came from. Its broker takes the depth
     /// and the host modes from here.
     pub spawn: Option<crate::spawn::ChildInfo>,
@@ -426,9 +431,19 @@ pub fn build_with(env: &HostEnv, opts: &Options, harness: Harness) -> Result<Bui
             bail!("the account mode is only for `paddock wrap`; use shared or isolated:NAME");
         }
     }
-    let id = match &opts.child {
-        Some(c) => c.id.clone(),
-        None => state::new_id(&profile.name, &project),
+    let id = match (&opts.child, &opts.detach) {
+        (Some(c), _) => c.id.clone(),
+        (None, Some(id)) => id.clone(),
+        (None, None) => state::new_id(&profile.name, &project),
+    };
+    let detach = match &opts.detach {
+        Some(_) => Some(profile.detach.clone().with_context(|| {
+            format!(
+                "the {} profile has no [detach] table, so paddock does not know how to give its interactive interface a first prompt. Run it without --detach",
+                profile.name
+            )
+        })?),
+        None => None,
     };
     let home_src = state::sandbox_home(env, &profile.name, &auth, &home_key)?;
     // For `paddock du` and `paddock gc`. The sandbox can rewrite it, so they
@@ -808,6 +823,10 @@ pub fn build_with(env: &HostEnv, opts: &Options, harness: Harness) -> Result<Bui
             Some(w) if *a == repo_arg => w.path.display().to_string(),
             _ => a.clone(),
         }));
+        // `--detach`: the first prompt names a read-only copy of the task.
+        if let Some(d) = &detach {
+            c.extend(d.render(&spec.home.join(crate::spawn::PROMPT_IN_HOME)));
+        }
         c
     };
 
@@ -986,6 +1005,7 @@ pub fn build_with(env: &HostEnv, opts: &Options, harness: Harness) -> Result<Bui
         test_devices: false,
         shared_history,
         view: true,
+        detach: opts.detach.is_some(),
         worktree: pending.keep(),
         pasture: opts.pasture.clone(),
         bridge,

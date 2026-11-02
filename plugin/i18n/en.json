@@ -34,7 +34,7 @@
   "action.copy": "Copy the project path",
   "action.display": "Show the sandbox display window",
   "action.stop": "Stop this sandbox",
-  "action.takeOver": "Open the live view with keys to scroll (the agent gets no keys)",
+  "action.takeOver": "Take over: open the agent's terminal (your keys go to the agent)",
   "action.confirmStop": "Press again to stop",
   "msg.noTerminal": "No window was found for this sandbox.",
   "msg.noView": "Cannot open the live view of this sandbox. Run paddock view with its id in a terminal to see why.",
