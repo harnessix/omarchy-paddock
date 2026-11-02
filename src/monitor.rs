@@ -675,6 +675,22 @@ fn scan(home: &Path, keep: &dyn Fn(&str) -> bool) -> BTreeMap<String, Stamp> {
                         mtime: st.mtime,
                     },
                 );
+            } else if st.kind == Kind::Symlink && keep(&r) {
+                // A credential file can be a link (for example into a
+                // password store). One stat of its target, never a walk into
+                // a linked folder.
+                use std::os::unix::fs::MetadataExt as _;
+                if let Ok(m) = std::fs::metadata(home.join(&r)) {
+                    if m.is_file() {
+                        out.insert(
+                            r,
+                            Stamp {
+                                size: m.len(),
+                                mtime: (m.mtime(), m.mtime_nsec()),
+                            },
+                        );
+                    }
+                }
             }
         }
     }
@@ -1698,7 +1714,7 @@ Inter-|   Receive                                                |  Transmit
         let mut c = Creds::new(home.clone(), vec![]);
         std::os::unix::fs::symlink(outside.join(".ssh"), home.join(".ssh")).unwrap();
         std::os::unix::fs::symlink(outside.join("token"), home.join("token")).unwrap();
-        assert_eq!(c.check(), (vec![], 0));
+        assert_eq!(paths(&c.check().0), ["token"]);
     }
 
     #[test]
