@@ -668,7 +668,7 @@ pub fn main(env: &HostEnv, idle: Duration) -> Result<i32> {
                 });
             }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                let quiet = start.elapsed().as_secs() - last.load(Ordering::SeqCst);
+                let quiet = quiet(start.elapsed().as_secs(), last.load(Ordering::SeqCst));
                 if running.load(Ordering::SeqCst) == 0 && quiet >= idle.as_secs() {
                     return Ok(0);
                 }
@@ -677,6 +677,13 @@ pub fn main(env: &HostEnv, idle: Duration) -> Result<i32> {
             Err(e) => return Err(e.into()),
         }
     }
+}
+
+/// Seconds without a request. A request can end between reading the clock
+/// and reading `last`, so `last` can be ahead of `now`: that is no quiet
+/// time, not an underflow.
+fn quiet(now: u64, last: u64) -> u64 {
+    now.saturating_sub(last)
 }
 
 /// Where the broker sends signed jobs.
@@ -926,6 +933,13 @@ pub fn status_line(env: &HostEnv) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_request_that_ends_while_the_clock_is_read_is_no_quiet_time() {
+        // The clock said 5, then a request ended at 6.
+        assert_eq!(quiet(5, 6), 0);
+        assert_eq!(quiet(130, 10), 120);
+    }
     use super::*;
 
     #[test]
