@@ -352,3 +352,96 @@ fn rand_suffix() -> u64 {
     static N: AtomicUsize = AtomicUsize::new(0);
     N.fetch_add(1, Ordering::SeqCst) as u64
 }
+
+// ---- With a fake host agent that signs everything ----
+
+/// A host agent that answers every request with a signature.
+fn fake_host(dir: &Path) -> std::path::PathBuf {
+    let sock = dir.join("host.sock");
+    let l = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+    std::thread::spawn(move || {
+        for mut c in l.incoming().flatten() {
+            std::thread::spawn(move || {
+                while let Ok(Some(_)) = read_message(&mut c) {
+                    let mut out = vec![SIGN_RESPONSE];
+                    put_string(&mut out, b"sig");
+                    if write_message(&mut c, &out).is_err() {
+                        return;
+                    }
+                }
+            });
+        }
+    });
+    sock
+}
+
+fn key(name: &str, confirm: Confirm) -> Key {
+    Key {
+        name: name.into(),
+        blob: b"the-key".to_vec(),
+        fingerprint: fingerprint(b"the-key"),
+        comment: String::new(),
+        confirm,
+    }
+}
+
+fn sign(p: &Proxy) -> u8 {
+    let r = Request::Sign {
+        blob: b"the-key".to_vec(),
+        data: b"data".to_vec(),
+        flags: 0,
+    };
+    p.answer(r, &mut None).unwrap()[0]
+}
+
+#[test]
+fn a_revoke_while_the_card_is_open_wins_over_allow() {
+    let t = tempfile::tempdir().unwrap();
+    let revoked = t.path().join("credentials-revoked");
+    let r2 = revoked.clone();
+    let reports = Arc::new(Mutex::new(Vec::<String>::new()));
+    let rep = reports.clone();
+    let p = Proxy::new(
+        vec![key("a", Confirm::Each)],
+        fake_host(t.path()),
+        revoked,
+        // The user revokes, then clicks Allow on the card still open.
+        Arc::new(move |_: &Key| {
+            std::fs::write(&r2, "a\n").unwrap();
+            true
+        }),
+        Arc::new(move |k: &Key, res: &str| rep.lock().unwrap().push(format!("{} {res}", k.name))),
+    );
+    assert_eq!(sign(&p), FAILURE);
+    assert_eq!(*reports.lock().unwrap(), ["a denied: revoked"]);
+}
+
+#[test]
+fn the_strictest_live_credential_of_a_shared_key_decides() {
+    let t = tempfile::tempdir().unwrap();
+    let revoked = t.path().join("credentials-revoked");
+    let asked = Arc::new(AtomicUsize::new(0));
+    let a2 = asked.clone();
+    let p = Proxy::new(
+        vec![key("a", Confirm::Session), key("b", Confirm::Each)],
+        fake_host(t.path()),
+        revoked.clone(),
+        Arc::new(move |k: &Key| {
+            assert_eq!(k.name, "b");
+            a2.fetch_add(1, Ordering::SeqCst);
+            true
+        }),
+        Arc::new(|_: &Key, _: &str| {}),
+    );
+    // b's "each" asks, although a names the key first.
+    assert_eq!(sign(&p), SIGN_RESPONSE);
+    assert_eq!(asked.load(Ordering::SeqCst), 1);
+    // a revoked: b is still live and signs, after its card.
+    std::fs::write(&revoked, "a\n").unwrap();
+    assert_eq!(sign(&p), SIGN_RESPONSE);
+    assert_eq!(asked.load(Ordering::SeqCst), 2);
+    // Both revoked: no signature.
+    std::fs::write(&revoked, "a\nb\n").unwrap();
+    assert_eq!(sign(&p), FAILURE);
+    assert_eq!(asked.load(Ordering::SeqCst), 2);
+}

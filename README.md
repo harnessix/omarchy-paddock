@@ -658,7 +658,7 @@ keys = ["~/.ssh/id_ed25519.pub"]   # the public keys; only these keys
 confirm = "each"                   # each: a card for every signature; session: once on the start card
 ```
 
-With `confirm = "each"`, the approval card asks for every signature and shows the key's fingerprint and comment, never the data to sign. The audit log records each signature with the sandbox, the credential name, the key fingerprint and the answer. When your agent is not there, or does not hold a key, paddock says so at start, and the sandbox starts without the socket.
+With `confirm = "each"`, the approval card asks for every signature and shows the key's fingerprint and comment, never the data to sign. When two credentials name the same key, the stricter one that is not revoked decides, and a revoke while the card is open wins over Allow. The audit log records each signature with the sandbox, the credential name, the key fingerprint and the answer. When your agent is not there, or does not hold a key, paddock says so at start, and the sandbox starts without the socket.
 
 What it protects: the private key never enters the sandbox, so the agent cannot copy it, and the sandbox cannot add, remove or use other keys. What it does not protect: while the run is allowed, the sandbox can ask for signatures with the named keys, for example to push or to log in to a server that trusts them. Use `confirm = "each"` to see each one, and revoke the credential to end it.
 
