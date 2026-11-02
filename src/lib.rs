@@ -9,6 +9,7 @@ pub mod boundary;
 pub mod broker;
 pub mod build;
 pub mod credentials;
+pub mod detach;
 pub mod detect;
 pub mod devices;
 pub mod doctor;

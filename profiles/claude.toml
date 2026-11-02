@@ -82,3 +82,8 @@ url = "https://claude.ai/settings/data-privacy-controls"
 [oneshot]
 args = ["-p", "--dangerously-skip-permissions"]
 prompt = "stdin"
+
+# `paddock run --detach`: the interactive interface with a first prompt.
+# `claude --help`: "Usage: claude [options] [command] [prompt]".
+[detach]
+args = ["Read the file {prompt_file} and do the task that it describes."]

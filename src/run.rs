@@ -1282,6 +1282,12 @@ fn start_broker(
     };
     let mut broker = crate::broker::Broker::new(env.clone(), ctx, policy, approver);
     broker.spawner = spawner.clone();
+    if built.detach {
+        broker.detach = Some(std::sync::Arc::new(crate::detach::Ctl::new(
+            env.clone(),
+            built.spec.id.clone(),
+        )));
+    }
     // One broker for the socket and the gateway device: the same policy,
     // session grants, approvals and audit.
     let broker = std::sync::Arc::new(broker);

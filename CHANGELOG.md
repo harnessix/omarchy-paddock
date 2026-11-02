@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- New: `paddock run HARNESS --detach --prompt-file FILE` runs the interactive interface of the harness in the background, in a tmux session, with the task as its first prompt. `paddock view ID --write` takes over, `paddock-host done` ends the task from inside, and `paddock wait ID` waits for the end. claude, codex and grok support it (`[detach]` in the profile).
 - New: `[state] done_flags` lists JSON keys that only go from false to true. paddock carries a true value between the login store and the sandbox, in both directions. agy uses it for its finished onboarding, so the onboarding screen, with its data-use box checked by default, no longer comes back in each new project. `paddock doctor` says when agy will show it.
 - New: `paddock view ID` opens a live view of a sandbox that runs without a terminal (a script or a spawned child). paddock shows its output in a session of its own tmux server, and the bar panel opens it with a click. `[view] tmux = false` turns it off.
 - Fix: `paddock worktree list`, `merge` and `remove` act on the branch that paddock made for the worktree. paddock records it on the host when it creates the worktree. Before, a `git switch feature-x` in the worktree made `remove` delete `feature-x` and keep the `paddock/` branch. A worktree without a record counts only a `paddock/` branch.

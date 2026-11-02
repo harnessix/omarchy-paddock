@@ -37,4 +37,6 @@ Before you add a harness there, ask the user and explain: the child uses the use
 
 `paddock ps` shows children under their parent, and `paddock stop PARENT` stops them too.
 
-`paddock view ID` opens a terminal with a read-only live view of a sandbox without a terminal, such as a spawned child (`--write` lets you scroll and close it with keys, the agent never gets them). It needs tmux for a live session and shows the run log without it.
+`paddock view ID` opens a terminal with a read-only live view of a sandbox without a terminal, such as a spawned child (there, `--write` only scrolls and closes the view). It needs tmux for a live session and shows the run log without it.
+
+`paddock run HARNESS PATH --detach --prompt-file FILE` starts the interactive interface in a tmux session in the background (claude, codex, grok), `paddock view ID --write` types into the agent, and `paddock wait ID [--timeout 30m]` waits for its end (exit 0 ok, 1 failed or no `paddock-host done`, 124 timeout).

@@ -9,6 +9,8 @@ A timer lives on the host, so it outlasts your context. `paddock-host timer --he
 - A hard timer freezes your sandbox when its budget is used up. Save your work and report before that.
 - Timers in `--scope pasture` or `--scope tree` show the other agents there how long a shared task has run.
 
+In a detached run (`paddock run --detach`), call `paddock-host done [--status ok|failed] "summary"` when the task is finished: the interactive interface does not end by itself.
+
 `paddock-host status` shows your timers and limits in a few lines. In Claude Code, paddock adds it as a hook, so you see it after a compaction and when something needs attention.
 
 ## Forage

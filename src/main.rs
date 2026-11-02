@@ -113,11 +113,21 @@ enum Cmd {
     },
     /// Stop a running sandbox.
     Stop { id: String },
+    /// Wait until a sandbox ends. Prints what `paddock-host done` said.
+    /// Exit code 0 for ok, 1 for failed or no `done`, 124 for a timeout.
+    Wait {
+        id: String,
+        /// The longest wait, for example 90s, 30m or 2h.
+        #[arg(long, value_name = "DURATION")]
+        timeout: Option<String>,
+    },
     /// Open a live view of a sandbox that runs without a terminal, in a new
     /// terminal window. Read-only unless --write.
     View {
         id: String,
-        /// Attach with the keyboard: scroll the view, or close it.
+        /// Attach with the keyboard. In a detached run (`run --detach`) the
+        /// keys go to the agent: you take over. In a logged one-shot run,
+        /// they only scroll the view.
         #[arg(long)]
         write: bool,
     },
@@ -426,6 +436,10 @@ enum Cmd {
     /// (`paddock-host spawn`). The parent's paddock starts this.
     #[command(hide = true)]
     SpawnChild { job: PathBuf },
+    /// The pane of a detached run (`paddock run --detach`). paddock starts
+    /// this in its tmux session.
+    #[command(hide = true)]
+    DetachRun { job: PathBuf },
     /// After a sandbox ends: share the data of identical files of its home
     /// with the other homes, within a time limit. paddock starts this.
     #[command(hide = true)]
@@ -1132,7 +1146,7 @@ enum AuthCmd {
     },
 }
 
-#[derive(Args, Clone)]
+#[derive(Args, Clone, serde::Serialize, serde::Deserialize)]
 struct RunArgs {
     /// Harness name, for example claude or codex. Defaults to default_harness in paddock.toml.
     harness: Option<String>,
@@ -1175,6 +1189,26 @@ struct RunArgs {
     /// Approve the project's paddock.toml without asking.
     #[arg(long, short = 'y')]
     yes: bool,
+    /// Start the run in the background, in a session of paddock's own tmux
+    /// server: the harness runs its interactive interface with the task as
+    /// its first prompt. `paddock view ID --write` takes over, `paddock
+    /// wait ID` waits for the end. Needs --prompt-file or --prompt.
+    #[arg(long)]
+    #[serde(skip)]
+    detach: bool,
+    /// With --detach: the file with the task.
+    #[arg(
+        long,
+        value_name = "FILE",
+        requires = "detach",
+        conflicts_with = "prompt"
+    )]
+    #[serde(skip)]
+    prompt_file: Option<PathBuf>,
+    /// With --detach: the task as text.
+    #[arg(long, value_name = "TEXT", requires = "detach")]
+    #[serde(skip)]
+    prompt: Option<String>,
     /// Arguments for the harness, after `--`.
     #[arg(last = true)]
     args: Vec<String>,
@@ -1223,13 +1257,133 @@ impl RunArgs {
             transparent: None,
             pasture: self.pasture.clone(),
             workbench: false,
+            detach: None,
         })
     }
 }
 
+/// `paddock run --detach`: start the run in a session of paddock's tmux
+/// server and return. Prints the sandbox id and how to take over.
+fn start_detached(env: &HostEnv, a: &RunArgs) -> Result<i32> {
+    use anyhow::Context as _;
+    let opts = a.options(env, false)?;
+    let factory = HarnessFactory::new(env)?;
+    let Some(profile) = factory.profile(&opts.harness) else {
+        bail!("unknown harness '{}'", opts.harness)
+    };
+    if profile.detach.is_none() {
+        bail!(
+            "the {} profile has no [detach] table, so paddock does not know how to give its interactive interface a first prompt. Run it without --detach, or add [detach] to the profile",
+            opts.harness
+        );
+    }
+    let Some(tmux) = paddock::view::Tmux::find(env) else {
+        bail!("--detach needs tmux on PATH: paddock runs the harness in a tmux session of its own. Install tmux, or run without --detach")
+    };
+    let prompt: Vec<u8> = match (&a.prompt_file, &a.prompt) {
+        (Some(f), None) => {
+            let len = std::fs::metadata(f)
+                .with_context(|| format!("cannot read {}", f.display()))?
+                .len();
+            if len > paddock::detach::MAX_PROMPT {
+                bail!("{} is larger than 1 MiB", f.display());
+            }
+            std::fs::read(f).with_context(|| format!("cannot read {}", f.display()))?
+        }
+        (None, Some(t)) => t.clone().into_bytes(),
+        _ => bail!("--detach needs the task: --prompt-file FILE or --prompt TEXT"),
+    };
+    if prompt.iter().all(u8::is_ascii_whitespace) {
+        bail!("the prompt is empty");
+    }
+    let project = build::resolve_project(opts.project.as_deref())?;
+    let id = state::new_id(&opts.harness, &project);
+    let job = paddock::detach::Job {
+        id: id.clone(),
+        cwd: std::env::current_dir()?,
+        env: paddock::detach::caller_env(),
+        run: serde_json::to_value(a)?,
+    };
+    paddock::detach::launch(env, &tmux, &job, &opts.harness, &project, &prompt)?;
+    println!("{id}");
+    println!("paddock view {id} --write");
+    Ok(0)
+}
+
+/// The pane of a detached run: `paddock run` as the user typed it, with
+/// the id and the prompt of the job.
+fn detach_run(job: &std::path::Path) -> Result<i32> {
+    use std::io::Write as _;
+    let (job, prompt) = paddock::detach::take_job(job)?;
+    let env = HostEnv::detect()?;
+    paddock::privfs::secure_roots(&env);
+    let id = job.id.clone();
+    let _ = paddock::detach::Record::update(&env, &id, |r| r.pid = Some(std::process::id()));
+    let code = (|| -> Result<i32> {
+        let a: RunArgs = serde_json::from_value(job.run)?;
+        start_with(&env, &a, false, Some((id.clone(), prompt)))
+    })();
+    let code = match code {
+        Ok(c) => c,
+        Err(e) => {
+            let _ = writeln!(std::io::stderr(), "paddock: {e:#}");
+            2
+        }
+    };
+    let _ = paddock::detach::Record::update(&env, &id, |r| {
+        r.ended = Some(state::now());
+        r.exit_code = Some(code);
+    });
+    let _ = writeln!(
+        std::io::stderr(),
+        "\npaddock: the sandbox ended at {} with exit code {code}.",
+        paddock::view::local_time(state::now())
+    );
+    Ok(code)
+}
+
 fn start(env: &HostEnv, a: &RunArgs, shell: bool) -> Result<i32> {
-    let opts = a.options(env, shell)?;
+    if a.detach {
+        if shell {
+            bail!("--detach is for `paddock run`, not for `paddock shell`");
+        }
+        return start_detached(env, a);
+    }
+    start_with(env, a, shell, None)
+}
+
+/// A run. `detach`: the id and the prompt of a detached run (the pane).
+fn start_with(
+    env: &HostEnv,
+    a: &RunArgs,
+    shell: bool,
+    detach: Option<(String, Vec<u8>)>,
+) -> Result<i32> {
+    let mut opts = a.options(env, shell)?;
+    opts.detach = detach.as_ref().map(|(id, _)| id.clone());
     let built = build::build(env, &opts)?;
+    // The first prompt: a read-only copy where the [oneshot] prompt goes.
+    let prompt_home = match &detach {
+        Some((_, prompt)) => {
+            let home = built.spec.home_src.clone();
+            let root = paddock::safefs::Root::open(&home)?;
+            let rel = std::path::Path::new(paddock::spawn::PROMPT_IN_HOME);
+            root.remove(rel)?;
+            root.write(rel, prompt, 0o400)?;
+            Some(home)
+        }
+        None => None,
+    };
+    let code = start_built(env, &opts, built, shell);
+    if let Some(home) = prompt_home {
+        if let Ok(r) = paddock::safefs::Root::open(&home) {
+            let _ = r.remove(std::path::Path::new(paddock::spawn::PROMPT_IN_HOME));
+        }
+    }
+    code
+}
+
+fn start_built(env: &HostEnv, opts: &Options, built: build::Built, shell: bool) -> Result<i32> {
     if !shell && !opts.no_yolo {
         if let Err(e) = run::probe_flags(env, &built) {
             if let Some(w) = &built.worktree {
@@ -1439,6 +1593,10 @@ fn real_main() -> Result<i32> {
     if let Cmd::Host { args } = &cli.cmd {
         return Ok(paddock::hostcli::main(args));
     }
+    // Before HostEnv::detect: the pane takes the caller's environment.
+    if let Cmd::DetachRun { job } = &cli.cmd {
+        return detach_run(job);
+    }
     if let Cmd::Relay {
         listen,
         socket,
@@ -1460,7 +1618,11 @@ fn real_main() -> Result<i32> {
         paddock::refresh::spawn_if_changed(&env);
     }
     match cli.cmd {
-        Cmd::Relay { .. } | Cmd::Host { .. } | Cmd::Inbound | Cmd::Portal => unreachable!(),
+        Cmd::Relay { .. }
+        | Cmd::Host { .. }
+        | Cmd::Inbound
+        | Cmd::Portal
+        | Cmd::DetachRun { .. } => unreachable!(),
         Cmd::SpawnChild { job } => paddock::spawn::child_main(&env, &job),
         Cmd::Approvals { json, cmd } => {
             use paddock::broker;
@@ -2152,6 +2314,10 @@ fn real_main() -> Result<i32> {
                             let (view, tmux) = paddock::view::available(&env, &sessions, &r.id);
                             o.insert("view".into(), view.into());
                             o.insert("view_tmux".into(), tmux.into());
+                            o.insert(
+                                "detached".into(),
+                                paddock::detach::is_detached(&env, &r.id).into(),
+                            );
                         }
                         if let Some(o) = v.as_object_mut() {
                             o.insert(
@@ -2618,6 +2784,15 @@ fn real_main() -> Result<i32> {
         Cmd::Stop { id } => {
             let all = Running::list(&env);
             stop_one(&env, &all, &id)
+        }
+        Cmd::Wait { id, timeout } => {
+            let t = match timeout {
+                Some(t) => Some(std::time::Duration::from_secs(
+                    paddock::timer::parse_duration(&t)?,
+                )),
+                None => None,
+            };
+            paddock::detach::wait(&env, &id, t)
         }
         Cmd::View { id, write } => {
             paddock::view::open(&env, &id, write)?;

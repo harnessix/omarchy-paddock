@@ -1669,6 +1669,8 @@ pub struct Broker {
     /// The docker and aws credential channels of the run, set when the
     /// user allowed them on the start card.
     pub channels: std::sync::OnceLock<Arc<crate::credentials::channels::Channels>>,
+    /// A detached run (`paddock run --detach`): `paddock-host done` ends it.
+    pub detach: Option<Arc<crate::detach::Ctl>>,
     grants: Mutex<Vec<String>>,
     /// "Deny for this session": the keys of the request and the user's note.
     denials: Mutex<Vec<(String, Option<String>)>>,
@@ -1689,6 +1691,7 @@ impl Broker {
             spawner: None,
             dispatch: None,
             channels: std::sync::OnceLock::new(),
+            detach: None,
             grants: Mutex::new(Vec::new()),
             denials: Mutex::new(Vec::new()),
         }
@@ -2159,6 +2162,29 @@ impl Broker {
         v
     }
 
+    /// `paddock-host done [--status ok|failed] [TEXT]`.
+    fn done(&self, req: &Request) -> Response {
+        if req.v != PROTOCOL {
+            return Response::new(Status::Invalid, "unsupported protocol version");
+        }
+        let Some(ctl) = &self.detach else {
+            return Response::new(
+                Status::Disabled,
+                "this sandbox is not a detached run (paddock run --detach), so there is nothing to end: finish your answer, and the user ends the run",
+            );
+        };
+        let status = match arg_str(req, "status").unwrap_or("ok").parse() {
+            Ok(s) => s,
+            Err(e) => return Response::new(Status::Invalid, format!("{e:#}")),
+        };
+        let text = arg_str(req, "text").unwrap_or("");
+        log::info!("sandbox {}: the agent says the task is done", self.ctx.id);
+        match ctl.done(status, text) {
+            Ok(msg) => Response::done(serde_json::json!({ "message": msg })),
+            Err(e) => Response::new(Status::Failed, format!("{e:#}")),
+        }
+    }
+
     pub fn handle(&self, req: &Request) -> Response {
         if req.cap == "capabilities" {
             return Response::done(self.capabilities());
@@ -2178,6 +2204,11 @@ impl Broker {
                     "this sandbox has no docker or aws credential: the user registers them in [credentials] and allows them when the sandbox starts",
                 ),
             };
+        }
+        // The end of the task in a detached run: never asked, it only ends
+        // this sandbox.
+        if req.cap == "done" {
+            return self.done(req);
         }
         // The sandbox reads its own boundary log: a read, never asked.
         if req.cap == "boundary" {
