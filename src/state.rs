@@ -753,9 +753,9 @@ fn missing_true<'a>(keys: &'a [String], from: &JsonMap, to: Option<&JsonMap>) ->
         .collect()
 }
 
-/// `to` with the keys set to true, or a copy of `from` when `to` is missing.
-fn with_true(to: Option<JsonMap>, from: &JsonMap, keys: &[&str]) -> Result<Vec<u8>> {
-    let mut m = to.unwrap_or_else(|| from.clone());
+/// `to` with the keys set to true, or a new object with the keys when `to` is missing.
+fn with_true(to: Option<JsonMap>, keys: &[&str]) -> Result<Vec<u8>> {
+    let mut m = to.unwrap_or_default();
     for k in keys {
         m.insert((*k).to_string(), serde_json::Value::Bool(true));
     }
@@ -775,7 +775,7 @@ impl FlagItem {
     }
 
     /// At start: the keys that are true in the store become true in the
-    /// sandbox copy. A missing copy starts as the store's file.
+    /// sandbox copy.
     fn to_sandbox(&self, home: &crate::safefs::Root) {
         let src = match read_flags(self.read_store()) {
             Ok(Some((_, m))) => m,
@@ -791,7 +791,7 @@ impl FlagItem {
         if keys.is_empty() {
             return;
         }
-        let bytes = match with_true(inside, &src, &keys) {
+        let bytes = match with_true(inside, &keys) {
             Ok(b) => b,
             Err(e) => return self.skip("the sandbox", e),
         };
@@ -804,8 +804,8 @@ impl FlagItem {
         }
     }
 
-    /// The keys that are true in the sandbox become true in the store. A
-    /// missing store file starts as the sandbox copy. True when it wrote.
+    /// The keys that are true in the sandbox become true in the store. True
+    /// when it wrote.
     fn to_store(&self, home: &crate::safefs::Root, locks: &Path) -> bool {
         let inside = match read_flags(home.read(&self.rel, FLAGS_MAX)) {
             Ok(Some((_, m))) => m,
@@ -831,7 +831,7 @@ impl FlagItem {
         if keys.is_empty() {
             return false;
         }
-        let bytes = match with_true(stored, &inside, &keys) {
+        let bytes = match with_true(stored, &keys) {
             Ok(b) => b,
             Err(e) => {
                 self.skip("the store", e);
@@ -1438,7 +1438,7 @@ mod auth_sync_tests {
         AuthSync::copy_in(&env, &p, &AuthMode::Shared, &sb).unwrap();
         assert_eq!(
             get(&sb.join(FLAGS)),
-            serde_json::json!({"done": true, "consumerDone": true, "other": false})
+            serde_json::json!({"consumerDone": true, "done": true})
         );
     }
 
@@ -1486,7 +1486,7 @@ mod auth_sync_tests {
         a.sync_now();
         assert_eq!(
             get(&host.join(FLAGS)),
-            serde_json::json!({"done": true, "consumerDone": false})
+            serde_json::json!({"done": true})
         );
         // Source false, with another key: only the listed true key moves.
         put(
@@ -1502,6 +1502,27 @@ mod auth_sync_tests {
             get(&host.join(FLAGS)),
             serde_json::json!({"done": true, "consumerDone": true, "enterprise": false})
         );
+    }
+
+    #[test]
+    fn a_missing_store_file_does_not_gain_unlisted_keys() {
+        let (_t, env, _, host, sb) = setup();
+        let p = flags_profile();
+        let a = AuthSync::copy_in(&env, &p, &AuthMode::Shared, &sb).unwrap();
+        put(
+            &sb.join(FLAGS),
+            serde_json::json!({
+                "done": true,
+                "consumerDone": false,
+                "token": "secret",
+                "notAFlag": true
+            }),
+        );
+        a.copy_out().unwrap();
+        let got = get(&host.join(FLAGS));
+        assert!(got.get("token").is_none(), "unlisted key reached the host: {got}");
+        assert!(got.get("notAFlag").is_none(), "unlisted key reached the host: {got}");
+        assert_eq!(got["done"], serde_json::json!(true));
     }
 
     #[test]
@@ -1570,7 +1591,7 @@ mod auth_sync_tests {
         let a2 = AuthSync::copy_in(&env, &p, &mode, &sb).unwrap();
         assert_eq!(
             get(&sb.join(FLAGS)),
-            serde_json::json!({"done": true, "consumerDone": false})
+            serde_json::json!({"done": true})
         );
         put(
             &sb.join(FLAGS),
