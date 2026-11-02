@@ -1603,9 +1603,8 @@ pub fn identity_of(r: &crate::state::Running, all: &[crate::state::Running]) -> 
     }
 }
 
-/// The quota timers on one agent and window of all running sandboxes: the
-/// timers that share the rise of the window. A timer whose sandbox ended no
-/// longer counts.
+/// The quota timers on one agent and window of all running sandboxes. The
+/// timers of the sandboxes that ended come from `timer::read_ended`.
 pub fn quota_peers(env: &HostEnv, agent: &str, window: &str, now: u64) -> Vec<crate::timer::Timer> {
     let root = kv_root(env);
     let all = crate::state::Running::list(env);
@@ -1653,6 +1652,7 @@ fn timer_tick(env: &HostEnv, id: &Identity, root: &Path, cfg: &KvCfg) -> Result<
     let mut timed = false;
     // The accounts whose numbers a running timer needs.
     let mut sample: Vec<String> = Vec::new();
+    let mut quota_timers = Vec::new();
     for (ns, scope) in spaces {
         let file = ns.file(root)?;
         if !file.is_file() {
@@ -1662,6 +1662,9 @@ fn timer_tick(env: &HostEnv, id: &Identity, root: &Path, cfg: &KvCfg) -> Result<
         for (mut t, version) in timer::in_store(&st, &ns.key(), now)? {
             if t.subject != id.sandbox {
                 continue;
+            }
+            if t.quota.is_some() {
+                quota_timers.push(t.clone());
             }
             let s = t.status_in(env, now);
             summary.push(s.clone());
@@ -1716,6 +1719,10 @@ fn timer_tick(env: &HostEnv, id: &Identity, root: &Path, cfg: &KvCfg) -> Result<
                 timer_notice(env, id, "paddock froze a sandbox: its time is up", &format!("{reason}. paddock thaw {} lets it continue; paddock timer extend gives it more.", id.sandbox));
             }
         }
+    }
+    // The runs of the quota timers outlive the sandbox (timer::Ended).
+    if let Err(e) = timer::note_runs(env, &id.sandbox, &quota_timers, now) {
+        log::debug!("quota runs of {}: {e:#}", id.sandbox);
     }
     // A timed task: keep the forage ledger fresh for its account.
     if timed {

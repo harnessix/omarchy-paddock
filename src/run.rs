@@ -1070,6 +1070,7 @@ pub fn run(
     if let Some(base) = &bridge_dir {
         crate::pasture::bridge::forget_member(base, &spec.id);
     }
+    crate::timer::end_runs(env, &spec.id, crate::state::now());
     let _ = std::fs::remove_dir_all(env.paddock_run().join(&spec.id));
     crate::borrow::end(env, &spec.id);
     crate::recover::Session::end(env, &spec.id);

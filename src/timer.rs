@@ -20,7 +20,8 @@
 //!   It counts what the account used since the timer started, from the
 //!   forage ledger (forage.rs). The ledger knows the account, not the
 //!   sandbox, so each rise is split among the quota timers on the same
-//!   window that ran meanwhile. Use outside paddock is split the same way.
+//!   window that ran meanwhile, also the timers whose sandbox ended since
+//!   (`Ended`). Use outside paddock is split the same way.
 //!   Over budget is handled as a deadline: soft tells, hard freezes.
 //!
 //! The keys `timer:*` change only through the timer operations, as leases
@@ -347,16 +348,19 @@ impl Timer {
                 samples.retain(|x| x.at <= end);
             }
             let me = Run::of(self, frozen);
-            let others: Vec<Run> = crate::kv::quota_peers(env, &q.agent, &q.window, now)
+            let running: Vec<String> = crate::state::Running::list(env)
                 .into_iter()
-                .filter(|o| {
-                    (&o.subject, &o.name, o.started) != (&self.subject, &self.name, self.started)
-                })
-                .map(|o| {
-                    let frozen = frozen_periods(env, &o.subject, now);
-                    Run::of(&o, frozen)
-                })
+                .map(|r| r.id)
                 .collect();
+            let others = peer_runs(
+                crate::kv::quota_peers(env, &q.agent, &q.window, now),
+                &read_ended(env),
+                &running,
+                self,
+                &q.agent,
+                &q.window,
+                |s| frozen_periods(env, s, now),
+            );
             let qs = q.status(&samples, &me, &others);
             s.over |= qs.over;
             s.quota = Some(qs);
@@ -473,6 +477,171 @@ pub fn record_frozen(env: &HostEnv, sandbox: &str, since: u64, until: u64) {
         }
         Err(e) => log::debug!("cannot record the frozen period of {sandbox}: {e}"),
     }
+}
+
+/// A quota timer as the host keeps it: after its sandbox ended, it still
+/// shares each step that it ran in.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Ended {
+    pub subject: String,
+    pub name: String,
+    pub agent: String,
+    pub window: String,
+    pub started: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stopped: Option<u64>,
+    /// The last time its sandbox ran: the end, when the timer did not stop.
+    pub seen: u64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub frozen: Vec<(u64, u64)>,
+}
+
+impl Ended {
+    /// The end of the run: the stop, or the end of the sandbox.
+    pub fn end(&self) -> u64 {
+        self.stopped.unwrap_or(self.seen).min(self.seen)
+    }
+
+    pub fn run(&self) -> Run {
+        Run {
+            started: self.started,
+            stopped: Some(self.end()),
+            frozen: self.frozen.clone(),
+        }
+    }
+
+    fn is(&self, t: &Timer) -> bool {
+        (&self.subject, &self.name, self.started) == (&t.subject, &t.name, t.started)
+    }
+
+    /// Keep the run while its sandbox runs, or while a timer on the same
+    /// agent and window in a running sandbox started before its end.
+    fn keep(&self, running: &[String], live: &[Timer]) -> bool {
+        running.contains(&self.subject)
+            || live.iter().any(|t| {
+                t.started < self.end()
+                    && t.quota
+                        .as_ref()
+                        .is_some_and(|q| q.agent == self.agent && q.window == self.window)
+            })
+    }
+}
+
+fn ended_file(env: &HostEnv) -> PathBuf {
+    env.paddock_state().join("quota-runs.json")
+}
+
+pub fn read_ended(env: &HostEnv) -> Vec<Ended> {
+    std::fs::read_to_string(ended_file(env))
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or_default()
+}
+
+/// Change the kept runs, one writer at a time.
+fn change_ended(env: &HostEnv, f: impl FnOnce(&mut Vec<Ended>)) -> Result<()> {
+    let file = ended_file(env);
+    if let Some(dir) = file.parent() {
+        crate::privfs::dir(dir)?;
+    }
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(file.with_extension("lock"))?;
+    use std::os::fd::AsRawFd as _;
+    // SAFETY: flock on an open file descriptor; the lock goes with the file.
+    unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) };
+    let mut list = read_ended(env);
+    let before = list.clone();
+    f(&mut list);
+    if list != before {
+        crate::privfs::write_atomic(&file, serde_json::to_string(&list)?)?;
+    }
+    Ok(())
+}
+
+/// The 30-second tick of a running sandbox keeps the runs of its quota
+/// timers, and drops the runs that no running timer shares any more.
+pub fn note_runs(env: &HostEnv, sandbox: &str, timers: &[Timer], now: u64) -> Result<()> {
+    let running: Vec<String> = crate::state::Running::list(env)
+        .into_iter()
+        .map(|r| r.id)
+        .collect();
+    let frozen = frozen_periods(env, sandbox, now);
+    let mut windows: Vec<(String, String)> = Vec::new();
+    change_ended(env, |list| {
+        // A removed timer no longer counts.
+        list.retain(|e| e.subject != sandbox || timers.iter().any(|t| e.is(t)));
+        for t in timers {
+            let Some(q) = &t.quota else { continue };
+            let e = Ended {
+                subject: t.subject.clone(),
+                name: t.name.clone(),
+                agent: q.agent.clone(),
+                window: q.window.clone(),
+                started: t.started,
+                stopped: t.stopped,
+                seen: now,
+                frozen: frozen.clone(),
+            };
+            match list.iter_mut().find(|x| x.is(t)) {
+                Some(x) => *x = e,
+                None => list.push(e),
+            }
+        }
+        for e in list.iter() {
+            let w = (e.agent.clone(), e.window.clone());
+            if !windows.contains(&w) {
+                windows.push(w);
+            }
+        }
+    })?;
+    let live: Vec<Timer> = windows
+        .iter()
+        .flat_map(|(a, w)| crate::kv::quota_peers(env, a, w, now))
+        .collect();
+    change_ended(env, |list| list.retain(|e| e.keep(&running, &live)))
+}
+
+/// The end of a sandbox: its quota timers ran until now.
+pub fn end_runs(env: &HostEnv, sandbox: &str, now: u64) {
+    let frozen = frozen_periods(env, sandbox, now);
+    let r = change_ended(env, |list| {
+        for e in list.iter_mut().filter(|e| e.subject == sandbox) {
+            e.seen = now;
+            e.frozen = frozen.clone();
+        }
+    });
+    if let Err(e) = r {
+        log::debug!("cannot record the end of the quota timers of {sandbox}: {e:#}");
+    }
+}
+
+/// The runs that share the rise of a window with `me`: the quota timers of
+/// the running sandboxes, and the kept runs of the sandboxes that ended.
+pub fn peer_runs(
+    live: Vec<Timer>,
+    ended: &[Ended],
+    running: &[String],
+    me: &Timer,
+    agent: &str,
+    window: &str,
+    frozen_of: impl Fn(&str) -> Vec<(u64, u64)>,
+) -> Vec<Run> {
+    let mut out: Vec<Run> = live
+        .iter()
+        .filter(|o| (&o.subject, &o.name, o.started) != (&me.subject, &me.name, me.started))
+        .map(|o| Run::of(o, frozen_of(&o.subject)))
+        .collect();
+    out.extend(
+        ended
+            .iter()
+            .filter(|e| e.agent == agent && e.window == window)
+            .filter(|e| !running.contains(&e.subject) && !e.is(me))
+            .map(Ended::run),
+    );
+    out
 }
 
 /// The summary for `paddock ps` and the panel: the timers of a sandbox.
