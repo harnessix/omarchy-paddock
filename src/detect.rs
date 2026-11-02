@@ -386,17 +386,9 @@ impl Detector for Rustup {
 /// Hide credential-shaped files in the project.
 pub struct Secrets;
 
-const SKIP_DIRS: &[&str] = &[
-    ".git",
-    "node_modules",
-    "target",
-    ".venv",
-    "venv",
-    "dist",
-    "build",
-    "vendor",
-    ".direnv",
-];
+/// `.git` is already a read-only mount and is large, so the walk leaves it out.
+const SECRET_MAX_DEPTH: usize = 32;
+const SECRET_MAX_ENTRIES: usize = 50_000;
 const SAFE_SUFFIXES: &[&str] = &[".example", ".sample", ".template", ".dist", ".defaults"];
 
 pub fn is_secret_name(name: &str) -> bool {
@@ -415,23 +407,31 @@ pub fn is_secret_name(name: &str) -> bool {
             .any(|e| name.ends_with(e))
 }
 
-fn walk_secrets(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
-    if depth > 3 {
+fn walk_secrets(dir: &Path, depth: usize, left: &mut usize, out: &mut Vec<PathBuf>) {
+    if depth > SECRET_MAX_DEPTH || *left == 0 {
         return;
     }
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
+    let mut dirs = Vec::new();
     for e in entries.flatten() {
-        let name = e.file_name().to_string_lossy().into_owned();
+        if *left == 0 {
+            break;
+        }
+        *left -= 1;
+        let name = e.file_name();
         let Ok(ft) = e.file_type() else { continue };
         if ft.is_dir() {
-            if !SKIP_DIRS.contains(&name.as_str()) {
-                walk_secrets(&e.path(), depth + 1, out);
+            if name != ".git" {
+                dirs.push(e.path());
             }
-        } else if ft.is_file() && is_secret_name(&name) {
+        } else if ft.is_file() && is_secret_name(&name.to_string_lossy()) {
             out.push(e.path());
         }
+    }
+    for d in dirs {
+        walk_secrets(&d, depth + 1, left, out);
     }
 }
 
@@ -444,7 +444,8 @@ pub fn hide_secrets_in(
     origin: &str,
 ) -> usize {
     let mut found = Vec::new();
-    walk_secrets(dir, 0, &mut found);
+    let mut left = SECRET_MAX_ENTRIES;
+    walk_secrets(dir, 0, &mut left, &mut found);
     let mut n = 0;
     for f in found {
         if reveal.contains(&f) || spec.mounts.iter().any(|m| m.dst == f) {
@@ -708,6 +709,39 @@ mod tests {
         assert_eq!(kind(&data.join(".env")), Some(MountKind::MaskFile));
         assert_eq!(kind(&data.join("sub/tls.key")), None);
         assert_eq!(kind(&data.join("notes.txt")), None);
+    }
+
+    #[test]
+    fn deep_and_skipped_secret_files_are_hidden() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("proj");
+        let deep = project.join("a/b/c/d");
+        std::fs::create_dir_all(&deep).unwrap();
+        std::fs::create_dir_all(project.join("build")).unwrap();
+        std::fs::write(deep.join(".env"), "x").unwrap();
+        std::fs::write(project.join("build/.env"), "x").unwrap();
+        let env = HostEnv::from_parts(
+            tmp.path().join("home"),
+            "t".into(),
+            1000,
+            1000,
+            Default::default(),
+        );
+        let mut spec = SandboxSpec::new(
+            "t".into(),
+            "x",
+            &project,
+            env.home.join("sandbox"),
+            &env.home,
+            1000,
+            1000,
+            "t",
+        );
+        let n = hide_secrets_in(&project, &[], &mut spec, "test");
+        assert_eq!(n, 2, "masked {n} files: {:?}", spec.mounts);
+        let kind = |p: &Path| spec.mounts.iter().find(|m| m.dst == p).map(|m| m.kind);
+        assert_eq!(kind(&deep.join(".env")), Some(MountKind::MaskFile));
+        assert_eq!(kind(&project.join("build/.env")), Some(MountKind::MaskFile));
     }
 
     #[test]
