@@ -20,6 +20,21 @@ pub struct Secret {
 
 static MLOCK_FAILED: AtomicBool = AtomicBool::new(false);
 
+/// How many live secrets lock each page. Locks work per page and do not
+/// stack, and small values share heap pages: a page is unlocked only when
+/// the last secret on it goes.
+static PAGES: Mutex<BTreeMap<usize, usize>> = Mutex::new(BTreeMap::new());
+
+/// The size of a page and the first byte of each page that `len > 0`
+/// bytes at `p` touch.
+fn pages(p: *const u8, len: usize) -> (usize, Vec<usize>) {
+    // SAFETY: sysconf has no preconditions.
+    let size = (unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).max(4096) as usize;
+    let first = p as usize / size * size;
+    let last = (p as usize + len - 1) / size * size;
+    (size, (first..=last).step_by(size).collect())
+}
+
 impl Secret {
     pub fn new(buf: Vec<u8>) -> Self {
         let cap = buf.capacity();
@@ -27,7 +42,13 @@ impl Secret {
         if cap > 0 {
             // SAFETY: the range is the allocation of `buf`, which lives as
             // long as `self` and never grows.
+            let mut held = PAGES.lock().unwrap_or_else(|e| e.into_inner());
             locked = unsafe { libc::mlock(buf.as_ptr().cast(), cap) } == 0;
+            if locked {
+                for page in pages(buf.as_ptr(), cap).1 {
+                    *held.entry(page).or_default() += 1;
+                }
+            }
             if !locked && !MLOCK_FAILED.swap(true, Ordering::Relaxed) {
                 log::debug!(
                     "cannot lock a credential value in RAM: {}",
@@ -75,8 +96,18 @@ impl Drop for Secret {
     fn drop(&mut self) {
         self.wipe();
         if self.locked {
-            // SAFETY: the same range that `new` locked.
-            unsafe { libc::munlock(self.buf.as_ptr().cast(), self.buf.capacity()) };
+            let mut held = PAGES.lock().unwrap_or_else(|e| e.into_inner());
+            let (size, pages) = pages(self.buf.as_ptr(), self.buf.capacity());
+            for page in pages {
+                let n = held.entry(page).or_default();
+                *n = n.saturating_sub(1);
+                if *n == 0 {
+                    held.remove(&page);
+                    // SAFETY: a whole page of the range that `new` locked,
+                    // which no other live secret uses.
+                    unsafe { libc::munlock(page as *const libc::c_void, size) };
+                }
+            }
         }
     }
 }
@@ -235,6 +266,36 @@ pub(crate) mod tests {
         drop(Secret::new(v));
         let wiped = WIPED.with(|w| w.borrow().clone());
         assert_eq!(wiped, [vec![0u8; 7]]);
+    }
+
+    /// The locked memory of this process, in kB.
+    fn vm_lck() -> u64 {
+        std::fs::read_to_string("/proc/self/status")
+            .unwrap()
+            .lines()
+            .find_map(|l| l.strip_prefix("VmLck:"))
+            .and_then(|v| v.trim().trim_end_matches("kB").trim().parse().ok())
+            .unwrap()
+    }
+
+    #[test]
+    fn dropping_one_secret_keeps_its_page_neighbours_locked() {
+        let all: Vec<Secret> = (0..8).map(|i| Secret::from(format!("value-{i}"))).collect();
+        if !all.iter().all(|s| s.locked) {
+            eprintln!("skipped: mlock is not allowed here");
+            return;
+        }
+        let page = |s: &Secret| pages(s.buf.as_ptr(), s.buf.capacity()).1;
+        let keep = &all[0];
+        assert!(
+            all[1..].iter().any(|s| page(s) == page(keep)),
+            "small secrets should share a page"
+        );
+        let mut all = all.into_iter();
+        let keep = all.next().unwrap();
+        drop(all.collect::<Vec<_>>());
+        assert!(vm_lck() > 0, "the page of a live secret was unlocked");
+        drop(keep);
     }
 
     #[test]
