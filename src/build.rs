@@ -925,6 +925,34 @@ pub fn build_with(env: &HostEnv, opts: &Options, harness: Harness) -> Result<Bui
             crate::pasture::workbench::MOUNT,
             "pasture",
         );
+        // Port sockets live outside the shared folder. Every member sees
+        // the tree read-only. Only this member can create its own sockets.
+        let ports = crate::pasture::ports::host_dir(env, &kv_project, name);
+        crate::privfs::dir(&ports)?;
+        let own = crate::pasture::ports::member_dir(&ports, &spec.id)?;
+        crate::privfs::dir(&own)?;
+        spec.add_mount(Mount::bind(
+            &ports,
+            crate::pasture::ports::PORTS_MOUNT,
+            false,
+            &format!("pasture {name} ports"),
+        ));
+        spec.add_mount(Mount::bind(
+            &own,
+            crate::pasture::ports::OWN_MOUNT,
+            true,
+            &format!("pasture {name} own ports"),
+        ));
+        spec.set_env(
+            crate::pasture::ports::PORTS_ENV,
+            crate::pasture::ports::PORTS_MOUNT,
+            "pasture",
+        );
+        spec.set_env(
+            crate::pasture::ports::OWN_ENV,
+            crate::pasture::ports::OWN_MOUNT,
+            "pasture",
+        );
         // The helper that relays the ports that members share, and
         // answers the questions of other members.
         spec.setup
@@ -1167,6 +1195,34 @@ mod tests {
             b.spec.env["PADDOCK_WORKBENCH"].value,
             "/run/paddock/workbench"
         );
+        // Port sockets: the tree is read-only, this member's folder is not.
+        let ports = crate::pasture::ports::host_dir(&env, &b.home_key, "team");
+        let tree = b
+            .spec
+            .mounts
+            .iter()
+            .find(|m| m.dst == Path::new(crate::pasture::ports::PORTS_MOUNT))
+            .expect("no ports mount");
+        assert_eq!(tree.kind, crate::spec::MountKind::Ro);
+        assert_eq!(tree.src.as_deref(), Some(ports.as_path()));
+        let own = crate::pasture::ports::member_dir(&ports, &b.spec.id).unwrap();
+        let mine = b
+            .spec
+            .mounts
+            .iter()
+            .find(|m| m.dst == Path::new(crate::pasture::ports::OWN_MOUNT))
+            .expect("no own ports mount");
+        assert_eq!(mine.kind, crate::spec::MountKind::Rw);
+        assert_eq!(mine.src.as_deref(), Some(own.as_path()));
+        assert_eq!(
+            b.spec.env[crate::pasture::ports::PORTS_ENV].value,
+            crate::pasture::ports::PORTS_MOUNT
+        );
+        assert_eq!(
+            b.spec.env[crate::pasture::ports::OWN_ENV].value,
+            crate::pasture::ports::OWN_MOUNT
+        );
+        assert!(!ports.starts_with(&ground));
         // The admission check of `build` comes before this: a configured
         // member only.
         assert!(build(&env, &opts).is_err());

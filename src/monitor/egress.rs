@@ -19,6 +19,8 @@ use std::sync::{Arc, Mutex};
 
 /// The history keeps the hosts of the last 90 days.
 const KEEP_SECS: u64 = 90 * 24 * 3600;
+/// At most this many hosts are kept in the history.
+pub const MAX_HOSTS: usize = 1000;
 /// A harness has history after this many sandbox runs...
 const MIN_RUNS: u64 = 20;
 /// ...or after its first recorded run is this old.
@@ -69,6 +71,23 @@ impl History {
             self.since = 0;
             self.runs = 0;
         }
+        self.cap();
+    }
+
+    fn cap(&mut self) {
+        if self.hosts.len() <= MAX_HOSTS {
+            return;
+        }
+        let excess = self.hosts.len() - MAX_HOSTS;
+        let mut by_age: Vec<_> = self
+            .hosts
+            .iter()
+            .map(|(k, h)| ((h.last, h.count), k.clone()))
+            .collect();
+        by_age.sort_unstable();
+        for (_, k) in by_age.into_iter().take(excess) {
+            self.hosts.remove(&k);
+        }
     }
 
     /// The harness has enough history for alerts.
@@ -85,6 +104,7 @@ impl History {
         });
         h.last = now;
         h.count += 1;
+        self.cap();
         new
     }
 }
@@ -446,5 +466,21 @@ mod tests {
         for i in 0..20u64 {
             assert!(u.connect(&format!("fast{i}.example"), start).is_empty());
         }
+    }
+
+    #[test]
+    fn egress_history_is_capped_at_max_hosts() {
+        let d = tempfile::tempdir().unwrap();
+        let mut t = tracker(d.path(), "a");
+        for i in 0..MAX_HOSTS + 50 {
+            t.connect(&format!("h{i}.example"), 100 + i as u64);
+        }
+        let h = History::load(&d.path().join("egress-h.json"));
+        assert_eq!(h.hosts.len(), MAX_HOSTS);
+        assert!(!h.hosts.contains_key("h0.example"));
+        assert!(!h.hosts.contains_key("h49.example"));
+        assert!(h
+            .hosts
+            .contains_key(&format!("h{}.example", MAX_HOSTS + 49)));
     }
 }

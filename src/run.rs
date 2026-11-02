@@ -605,7 +605,8 @@ pub fn run(
     // device mount, the login and history copies, the session record.
     // Before the sandbox starts, paddock notes it and does not start it;
     // after, it passes SIGTERM to the sandbox, as `paddock stop` does, and
-    // waits. The old handlers come back when `run` returns.
+    // waits. A frozen sandbox is thawed first, so the signal is not left
+    // pending. The old handlers come back when `run` returns.
     let forwarding = Forward::install();
     let interactive = !capture && std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
     let mut end = EndOfRun {
@@ -1049,7 +1050,16 @@ pub fn run(
     if capture && view.is_none() {
         out = Some(read_capped(child.stdout.take().unwrap()));
     }
-    let status = child.wait()?;
+    let sandbox_id = spec.id.clone();
+    let seam = crate::spawn::HostSeam(env.clone());
+    let status = crate::spawn::wait_outliving_parent(
+        &mut child,
+        &STOP_ASKED,
+        env,
+        &sandbox_id,
+        &seam,
+        crate::spawn::STOP_GRACE,
+    )?;
     unsafe {
         libc::signal(libc::SIGINT, old_int);
         libc::signal(libc::SIGQUIT, old_quit);
@@ -1478,6 +1488,9 @@ impl HistorySync {
 /// starts), whether a stop came before it started, and whether a SIGHUP came.
 static FORWARD_PID: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
 static STOP_BEFORE_START: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// A stop arrived after the sandbox started. The wait loop reads it and
+/// thaws a frozen sandbox. The signal handler cannot call the freezer.
+static STOP_ASKED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static HUNG_UP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 extern "C" fn forward_signal(sig: libc::c_int) {
@@ -1485,6 +1498,7 @@ extern "C" fn forward_signal(sig: libc::c_int) {
     if sig == libc::SIGHUP {
         HUNG_UP.store(true, Ordering::SeqCst);
     }
+    STOP_ASKED.store(true, Ordering::SeqCst);
     let pid = FORWARD_PID.load(Ordering::SeqCst);
     if pid > 0 {
         // SAFETY: kill(2) is async-signal-safe.
@@ -1505,6 +1519,7 @@ impl Forward {
         use std::sync::atomic::Ordering;
         HUNG_UP.store(false, Ordering::SeqCst);
         STOP_BEFORE_START.store(false, Ordering::SeqCst);
+        STOP_ASKED.store(false, Ordering::SeqCst);
         FORWARD_PID.store(0, Ordering::SeqCst);
         let mut old = Vec::new();
         for sig in [libc::SIGTERM, libc::SIGHUP] {

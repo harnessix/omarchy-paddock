@@ -35,6 +35,8 @@ use std::time::{Duration, Instant};
 
 /// The largest answer. The helper keeps the end of a longer output.
 pub const MAX_ANSWER: usize = 256 * 1024;
+/// The largest helper error that reaches the asker. A longer one keeps its end.
+pub const MAX_ERROR: usize = 4096;
 /// The largest question.
 pub const MAX_PROMPT: usize = 256 * 1024;
 /// Seconds that the asker waits by default.
@@ -97,6 +99,7 @@ pub struct Answer {
     /// The output was longer than [`MAX_ANSWER`]: `text` is its end.
     #[serde(default)]
     pub truncated: bool,
+    /// A helper error. At most [`MAX_ERROR`] bytes reach the asker.
     #[serde(default)]
     pub error: Option<String>,
 }
@@ -509,6 +512,19 @@ pub fn ask(env: &HostEnv, id: &Identity, req: &Request) -> Response {
     r
 }
 
+/// Login secrets in the answer text or in a helper error.
+fn secret_hits(guard: &Guard, answer: &Answer) -> Vec<String> {
+    let mut hits = guard.find(&answer.text);
+    if let Some(err) = &answer.error {
+        for h in guard.find(err) {
+            if !hits.contains(&h) {
+                hits.push(h);
+            }
+        }
+    }
+    hits
+}
+
 fn ask_inner(
     env: &HostEnv,
     id: &Identity,
@@ -628,7 +644,7 @@ fn ask_inner(
     // The target's helper enforces the timeout too; a few seconds more here
     // let its answer arrive.
     let deadline = Duration::from_secs(timeout + 5);
-    let answer = loop {
+    let mut answer = loop {
         if let Ok(b) = std::fs::read(sp.join("answer.json")) {
             if let Ok(a) = serde_json::from_slice::<Answer>(&b) {
                 if a.id == q.id {
@@ -662,10 +678,16 @@ fn ask_inner(
         std::thread::sleep(Duration::from_millis(100));
     };
     clear(&sp);
+    if let Some(err) = answer.error.as_mut() {
+        if err.len() > MAX_ERROR {
+            let (t, _) = tail(err.as_bytes(), MAX_ERROR);
+            *err = t;
+        }
+    }
     line["answer_bytes"] = answer.text.len().into();
-    // The login guard: every member, the asker too.
+    // The login guard covers the answer and a helper error.
     let guard = Guard::of_members(&base, &all);
-    let hits = guard.find(&answer.text);
+    let hits = secret_hits(&guard, &answer);
     if !hits.is_empty() {
         line["result"] = "intercepted".into();
         line["intercepted"] = hits.clone().into();
@@ -766,6 +788,12 @@ pub fn answer(env: &HostEnv, id: &Identity, req: &Request) -> Response {
         let (t, _) = tail(a.text.as_bytes(), MAX_ANSWER);
         a.text = t;
         a.truncated = true;
+    }
+    if let Some(err) = a.error.as_mut() {
+        if err.len() > MAX_ERROR {
+            let (t, _) = tail(err.as_bytes(), MAX_ERROR);
+            *err = t;
+        }
     }
     let bytes = serde_json::to_vec(&a).unwrap_or_default();
     if let Err(e) = crate::privfs::write_atomic(&sp.join("answer.json"), bytes) {
@@ -1119,6 +1147,158 @@ mod tests {
         assert!(audit.contains("\"result\":\"busy\""), "{audit}");
         assert!(audit.contains("\"target_harness\":\"codex\""), "{audit}");
         assert!(!audit.contains("xxxx"));
+    }
+
+    /// The helper runs in the target sandbox. An error it sends is checked
+    /// like the answer text. A clean error still reaches the asker.
+    #[test]
+    fn the_guard_checks_a_secret_in_the_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let env = HostEnv::from_parts(
+            tmp.path().join("home"),
+            "demo".into(),
+            1000,
+            1000,
+            Default::default(),
+        );
+        std::fs::create_dir_all(env.paddock_config()).unwrap();
+        std::fs::write(
+            env.paddock_config().join("config.toml"),
+            "[pastures.team]\nmembers = [\"sh\"]\nbridge = true\n",
+        )
+        .unwrap();
+        let project = Path::new("/p");
+        let mut b = r("b1", "codex");
+        b.pid = std::process::id();
+        b.kv_project = Some(project.into());
+        b.pasture = Some("team".into());
+        b.register(&env).unwrap();
+        let home = tmp.path().join("b-home");
+        std::fs::create_dir_all(home.join(".fake")).unwrap();
+        std::fs::write(
+            home.join(".fake/auth.json"),
+            format!(r#"{{"token":"{TOKEN}"}}"#),
+        )
+        .unwrap();
+        let base = dir(&env, project, "team");
+        record_member(
+            &base,
+            "b1",
+            &MemberRecord {
+                oneshot: true,
+                home,
+                login: vec![".fake/auth.json".into()],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let id = Identity {
+            sandbox: "a1".into(),
+            harness: "sh".into(),
+            project: project.into(),
+            pasture: Some("team".into()),
+            parent: None,
+            chain: vec![],
+            tree: None,
+        };
+        let sp = spool(&base, "b1");
+        let reply = |error: Option<String>| {
+            let sp = sp.clone();
+            std::thread::spawn(move || {
+                let start = Instant::now();
+                let q = loop {
+                    if let Ok(b) = std::fs::read(sp.join("question.json")) {
+                        if let Ok(q) = serde_json::from_slice::<Question>(&b) {
+                            break q;
+                        }
+                    }
+                    assert!(
+                        start.elapsed() < Duration::from_secs(3),
+                        "the question was not written"
+                    );
+                    std::thread::sleep(Duration::from_millis(20));
+                };
+                let ans = Answer {
+                    id: q.id,
+                    error,
+                    ..Default::default()
+                };
+                std::fs::write(sp.join("answer.json"), serde_json::to_vec(&ans).unwrap()).unwrap();
+            })
+        };
+        let req = |prompt: &str| Request {
+            v: crate::kv::PROTOCOL,
+            op: "ask".into(),
+            key: Some("codex".into()),
+            value: Some(prompt.into()),
+            timeout: Some(8),
+            ..Default::default()
+        };
+        let writer = reply(Some(format!("failed: {TOKEN}")));
+        let r = ask(&env, &id, &req("hello"));
+        writer.join().unwrap();
+        assert_eq!(r.status, Status::Denied, "{}", r.message);
+        assert!(!r.message.contains(TOKEN), "{}", r.message);
+        assert!(!r.result.to_string().contains(TOKEN), "{}", r.result);
+        let audit = std::fs::read_to_string(crate::kv::audit_file(&env)).unwrap();
+        assert!(audit.contains("intercepted"), "{audit}");
+        assert!(!audit.contains(TOKEN), "{audit}");
+
+        let clean = "cannot start the harness";
+        let writer = reply(Some(clean.into()));
+        let r = ask(&env, &id, &req("again"));
+        writer.join().unwrap();
+        assert_eq!(r.status, Status::Failed, "{}", r.message);
+        assert!(r.message.contains(clean), "{}", r.message);
+        assert!(!r.message.contains(TOKEN), "{}", r.message);
+
+        // A long error keeps its end and stays within the cap.
+        let qid = "cap-1";
+        crate::privfs::dir(&sp).unwrap();
+        std::fs::write(
+            sp.join("taken.json"),
+            serde_json::to_vec(&Question {
+                id: qid.into(),
+                from: "a1".into(),
+                from_harness: "sh".into(),
+                prompt: "q".into(),
+                timeout: 5,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        let err = format!("{}END", "e".repeat(MAX_ERROR + 40));
+        let body = serde_json::to_string(&Answer {
+            id: qid.into(),
+            error: Some(err),
+            ..Default::default()
+        })
+        .unwrap();
+        let target = Identity {
+            sandbox: "b1".into(),
+            harness: "codex".into(),
+            project: project.into(),
+            pasture: Some("team".into()),
+            parent: None,
+            chain: vec![],
+            tree: None,
+        };
+        let stored = answer(
+            &env,
+            &target,
+            &Request {
+                v: crate::kv::PROTOCOL,
+                op: "ask".into(),
+                value: Some(body),
+                ..Default::default()
+            },
+        );
+        assert_eq!(stored.status, Status::Done, "{}", stored.message);
+        let got: Answer =
+            serde_json::from_slice(&std::fs::read(sp.join("answer.json")).unwrap()).unwrap();
+        let e = got.error.unwrap();
+        assert!(e.len() <= MAX_ERROR, "{}", e.len());
+        assert!(e.ends_with("END"), "{e}");
     }
 
     #[test]

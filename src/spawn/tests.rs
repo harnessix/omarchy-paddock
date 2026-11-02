@@ -1138,6 +1138,10 @@ struct FakeSeam {
     cards: Mutex<Vec<Pending>>,
     answer: Choice,
     delay: Duration,
+    /// When set, `thaw` writes this file. A frozen stand-in exits then.
+    release: Mutex<Option<PathBuf>>,
+    /// Ids that `freeze` reports as newly frozen. None means this call froze `sandbox`.
+    fresh: Mutex<Option<Vec<String>>>,
 }
 
 impl FakeSeam {
@@ -1147,6 +1151,8 @@ impl FakeSeam {
             cards: Mutex::new(vec![]),
             answer,
             delay,
+            release: Mutex::new(None),
+            fresh: Mutex::new(None),
         })
     }
     fn calls(&self) -> Vec<String> {
@@ -1155,12 +1161,26 @@ impl FakeSeam {
 }
 
 impl TimeoutSeam for FakeSeam {
-    fn freeze(&self, sandbox: &str) -> Result<()> {
+    fn freeze(&self, sandbox: &str) -> Result<Vec<String>> {
         self.calls.lock().unwrap().push(format!("freeze {sandbox}"));
+        Ok(self
+            .fresh
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap_or_else(|| vec![sandbox.to_string()]))
+    }
+    fn thaw_ids(&self, ids: &[String]) -> Result<()> {
+        for id in ids {
+            self.thaw(id)?;
+        }
         Ok(())
     }
     fn thaw(&self, sandbox: &str) -> Result<()> {
         self.calls.lock().unwrap().push(format!("thaw {sandbox}"));
+        if let Some(path) = self.release.lock().unwrap().clone() {
+            std::fs::write(path, b"1").unwrap();
+        }
         Ok(())
     }
     fn ask(&self, card: &Pending, wait: Duration, _: &dyn Fn() -> bool) -> Choice {
@@ -1271,6 +1291,22 @@ fn ask_freezes_the_child_and_more_time_thaws_and_extends_it() {
     assert_eq!(audit_decisions(&s.env), ["more time: 30m"]);
 }
 
+/// The user froze the child before it reached the limit. More time moves
+/// the limit and leaves that freeze in place.
+#[test]
+fn more_time_keeps_a_sandbox_the_user_froze() {
+    let s = setup();
+    let seam = FakeSeam::new(Choice::More("30m".into()), Duration::from_secs(1));
+    *seam.fresh.lock().unwrap() = Some(vec![]);
+    let sp = limit_spawner(&s, OnTimeout::Ask, seam.clone(), child_that_runs("3"));
+    let done = run_with_limit(&sp, 1);
+    assert_eq!(done.state, State::Exited, "{done:?}");
+    assert_eq!(done.limits.timeout, 1 + 1800);
+    let sb = &done.sandbox;
+    assert_eq!(seam.calls(), [format!("freeze {sb}"), "ask".into()]);
+    assert_eq!(audit_decisions(&s.env), ["more time: 30m, stays frozen"]);
+}
+
 #[test]
 fn stop_or_no_answer_stops_the_child_and_thaws_it_to_end() {
     for (answer, decision) in [
@@ -1292,6 +1328,67 @@ fn stop_or_no_answer_stops_the_child_and_thaws_it_to_end() {
         );
         assert_eq!(audit_decisions(&s.env), [decision]);
     }
+}
+
+/// The parent died while the child was frozen at its limit. SIGTERM does not
+/// end a frozen sandbox. The child's paddock thaws it through the freezer
+/// seam, and the sandbox then exits. No systemd freezer runs here.
+#[test]
+fn a_frozen_child_thaws_when_its_parent_dies() {
+    let tmp = tempfile::tempdir().unwrap();
+    let env = env_in(tmp.path());
+    let id = "sb-frozen";
+    let run = env.paddock_run().join(id);
+    std::fs::create_dir_all(&run).unwrap();
+    std::fs::write(
+        run.join("frozen.json"),
+        r#"{"since":1,"reason":"a spawned child reached its time limit"}"#,
+    )
+    .unwrap();
+    let ready = tmp.path().join("ready");
+    let flag = tmp.path().join("thawed");
+    let script = format!(
+        "trap 'true' TERM
+touch '{}'
+while [ ! -f '{}' ]; do sleep 0.05; done
+exit 0
+",
+        ready.display(),
+        flag.display()
+    );
+    let mut child = std::process::Command::new("sh")
+        .args(["-c", &script])
+        .spawn()
+        .unwrap();
+    let start = Instant::now();
+    while !ready.exists() {
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "the stand-in sandbox did not start"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    // SAFETY: the stand-in is this test's child. SIGTERM stays pending in a
+    // real freezer. The trap stands in for that.
+    unsafe { libc::kill(child.id() as i32, libc::SIGTERM) };
+    let seam = FakeSeam::new(Choice::Stop, Duration::ZERO);
+    *seam.release.lock().unwrap() = Some(flag);
+    seam.freeze(id).unwrap();
+    let stop = std::sync::atomic::AtomicBool::new(true);
+    let status = wait_outliving_parent(
+        &mut child,
+        &stop,
+        &env,
+        id,
+        seam.as_ref(),
+        Duration::from_secs(2),
+    )
+    .unwrap();
+    assert!(
+        status.success(),
+        "the frozen child did not exit after the thaw: {status}"
+    );
+    assert_eq!(seam.calls(), [format!("freeze {id}"), format!("thaw {id}")]);
 }
 
 #[test]

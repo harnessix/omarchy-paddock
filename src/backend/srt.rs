@@ -182,6 +182,20 @@ pub fn settings(env: &HostEnv, spec: &SandboxSpec) -> Result<serde_json::Value> 
                     allow_write.push(s(src));
                 }
             }
+            // Port sockets stay at their host paths. The tree is read-only.
+            // Only this member's folder is writable, so another member
+            // cannot replace a socket.
+            MountKind::Ro if m.dst == Path::new(crate::pasture::ports::PORTS_MOUNT) => {
+                if let Some(src) = &m.src {
+                    allow_read.push(s(src));
+                }
+            }
+            MountKind::Rw if m.dst == Path::new(crate::pasture::ports::OWN_MOUNT) => {
+                if let Some(src) = &m.src {
+                    allow_read.push(s(src));
+                    allow_write.push(s(src));
+                }
+            }
             // Shared caches and other remapped mounts cannot be expressed:
             // the sandbox home holds its own caches instead.
             _ => {}
@@ -370,6 +384,22 @@ impl Backend for Srt {
         {
             vars.insert(crate::pasture::workbench::ENV.into(), s(src));
         }
+        if let Some(src) = spec
+            .mounts
+            .iter()
+            .find(|m| m.dst == Path::new(crate::pasture::ports::PORTS_MOUNT))
+            .and_then(|m| m.src.as_ref())
+        {
+            vars.insert(crate::pasture::ports::PORTS_ENV.into(), s(src));
+        }
+        if let Some(src) = spec
+            .mounts
+            .iter()
+            .find(|m| m.dst == Path::new(crate::pasture::ports::OWN_MOUNT))
+            .and_then(|m| m.src.as_ref())
+        {
+            vars.insert(crate::pasture::ports::OWN_ENV.into(), s(src));
+        }
         vars.insert("CLAUDE_CODE_TMPDIR".into(), s(&tmp));
         // Host tools appear in their own directories, not under /run/paddock/bin.
         // paddock's own wrappers in the run folder come first. Other tools,
@@ -545,6 +575,32 @@ mod tests {
         let v = settings(&env, &s).unwrap();
         assert!(list(&v, "allowWrite").contains(&ground.to_str().unwrap()));
         assert!(!list(&v, "allowWrite").contains(&crate::pasture::MOUNT));
+    }
+
+    #[test]
+    fn port_sockets_are_writable_only_in_the_owner_folder() {
+        let (env, mut s) = spec();
+        let ports = crate::pasture::ports::host_dir(&env, Path::new("/h/src/app"), "team");
+        let own = crate::pasture::ports::member_dir(&ports, &s.id).unwrap();
+        s.add_mount(Mount::bind(
+            &ports,
+            crate::pasture::ports::PORTS_MOUNT,
+            false,
+            "ports",
+        ));
+        s.add_mount(Mount::bind(
+            &own,
+            crate::pasture::ports::OWN_MOUNT,
+            true,
+            "own ports",
+        ));
+        let v = settings(&env, &s).unwrap();
+        let ports_s = ports.to_str().unwrap();
+        let own_s = own.to_str().unwrap();
+        assert!(list(&v, "allowRead").contains(&ports_s));
+        assert!(!list(&v, "allowWrite").contains(&ports_s));
+        assert!(list(&v, "allowWrite").contains(&own_s));
+        assert!(!list(&v, "allowWrite").contains(&crate::pasture::ports::PORTS_MOUNT));
     }
 
     #[test]

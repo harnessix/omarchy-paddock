@@ -55,7 +55,7 @@ pub const PROMPT_SHOWN: usize = 1000;
 /// from a file.
 pub const PROMPT_IN_HOME: &str = ".paddock-spawn/prompt.md";
 /// How long a stopped child gets to end before paddock kills it.
-const STOP_GRACE: Duration = Duration::from_secs(15);
+pub(crate) const STOP_GRACE: Duration = Duration::from_secs(15);
 
 /// `[spawn]` in the user configuration.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -742,8 +742,12 @@ pub enum Choice {
 /// Tests fake it, so they need no real freezer and no card.
 pub trait TimeoutSeam: Send + Sync {
     /// Freeze the child's sandbox and its own children.
-    fn freeze(&self, sandbox: &str) -> Result<()>;
+    /// The ids are the ones this call froze. An id that was already frozen is absent.
+    fn freeze(&self, sandbox: &str) -> Result<Vec<String>>;
+    /// Thaw the sandbox and the children this paddock froze, so a stop can land.
     fn thaw(&self, sandbox: &str) -> Result<()>;
+    /// Thaw only these sandboxes. Their children stay as they are.
+    fn thaw_ids(&self, ids: &[String]) -> Result<()>;
     /// Put the card up and wait for the answer, at most `wait`. Stop
     /// waiting when `cancelled` turns true.
     fn ask(
@@ -758,18 +762,24 @@ pub trait TimeoutSeam: Send + Sync {
 pub struct HostSeam(pub HostEnv);
 
 impl TimeoutSeam for HostSeam {
-    fn freeze(&self, sandbox: &str) -> Result<()> {
+    fn freeze(&self, sandbox: &str) -> Result<Vec<String>> {
         crate::freeze::freeze(
             &self.0,
             sandbox,
             true,
             "a spawned child reached its time limit",
         )
-        .map(|_| ())
     }
 
     fn thaw(&self, sandbox: &str) -> Result<()> {
         crate::freeze::thaw(&self.0, sandbox, true).map(|_| ())
+    }
+
+    fn thaw_ids(&self, ids: &[String]) -> Result<()> {
+        for id in ids {
+            crate::freeze::thaw(&self.0, id, false).map(|_| ())?;
+        }
+        Ok(())
     }
 
     fn ask(
@@ -779,6 +789,43 @@ impl TimeoutSeam for HostSeam {
         cancelled: &dyn Fn() -> bool,
     ) -> Choice {
         crate::broker::ask_choice(&self.0, card, wait, cancelled)
+    }
+}
+
+/// Wait for the sandbox process. A stop while it is frozen has to thaw it
+/// first: a frozen task keeps the signal pending, so the wait would not end.
+/// `stop` is set when this paddock is asked to end (its parent died, or a
+/// terminal closed). `seam` is the freezer seam, the same one that froze the
+/// child, so a test needs no systemd freezer.
+pub(crate) fn wait_outliving_parent(
+    child: &mut std::process::Child,
+    stop: &std::sync::atomic::AtomicBool,
+    env: &HostEnv,
+    sandbox: &str,
+    seam: &dyn TimeoutSeam,
+    grace: Duration,
+) -> std::io::Result<std::process::ExitStatus> {
+    use std::sync::atomic::Ordering;
+    let mut thawed = false;
+    let mut since: Option<Instant> = None;
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok(status);
+        }
+        if stop.load(Ordering::SeqCst) {
+            if !thawed {
+                thawed = true;
+                since = Some(Instant::now());
+                if crate::freeze::frozen(env, sandbox).is_some() {
+                    if let Err(e) = seam.thaw(sandbox) {
+                        log::warn!("cannot thaw {sandbox} after a stop: {e:#}");
+                    }
+                }
+            } else if since.is_some_and(|t| t.elapsed() > grace) {
+                let _ = child.kill();
+            }
+        }
+        std::thread::sleep(Duration::from_millis(20));
     }
 }
 
@@ -1067,9 +1114,10 @@ impl Spawner {
             // of the scope, frozen time included, so it would kill a child
             // that waits on the card or got more time. Raising it at each
             // answer needs a second D-Bus call that can fail, and then the
-            // child dies anyway. The backstop is not needed for safety:
-            // paddock's own timer stops the child, and when the parent's
-            // paddock dies, the parent-death signal below ends the child.
+            // child dies anyway. paddock's own timer stops the child. When the
+            // parent's paddock
+            // dies, the child gets the parent-death signal below and thaws
+            // its sandbox, so a freeze at this card cannot keep it alive.
             Some(tool) => {
                 let mut c = std::process::Command::new(tool);
                 c.args(["--user", "--scope", "--quiet", "--collect", "--unit", unit]);
@@ -1255,14 +1303,17 @@ impl Spawner {
             return none;
         };
         let since = Instant::now();
-        if let Err(e) = self.seam.freeze(&status.sandbox) {
-            log::warn!(
-                "spawn {id}: cannot freeze the child at its time limit, so paddock stops it: {e:#}"
-            );
-            self.stop_one(id, State::TimedOut);
-            self.audit_limit(&status, used, "stopped: cannot freeze", "paddock");
-            return none;
-        }
+        let freshly = match self.seam.freeze(&status.sandbox) {
+            Ok(v) => v,
+            Err(e) => {
+                log::warn!(
+                    "spawn {id}: cannot freeze the child at its time limit, so paddock stops it: {e:#}"
+                );
+                self.stop_one(id, State::TimedOut);
+                self.audit_limit(&status, used, "stopped: cannot freeze", "paddock");
+                return none;
+            }
+        };
         self.set_message(id, "frozen at its time limit: waits for the user");
         let card = self.limit_card(&status, used);
         let cancelled = || {
@@ -1286,14 +1337,32 @@ impl Spawner {
             // below lets it end and save its login, as at any other stop.
             self.stop_one(id, State::TimedOut);
         }
-        let thawed = match self.seam.thaw(&status.sandbox) {
-            Ok(()) => true,
-            Err(e) => {
-                log::warn!("spawn {id}: cannot thaw the child: {e:#}");
-                false
+        // More time thaws only what this limit froze. A sandbox the user
+        // froze stays frozen. A stop still thaws the tree so the child can
+        // end and save its login.
+        let thawed = if more.is_some() && freshly.is_empty() {
+            true
+        } else if more.is_some() {
+            match self.seam.thaw_ids(&freshly) {
+                Ok(()) => true,
+                Err(e) => {
+                    log::warn!("spawn {id}: cannot thaw the child: {e:#}");
+                    false
+                }
+            }
+        } else {
+            match self.seam.thaw(&status.sandbox) {
+                Ok(()) => true,
+                Err(e) => {
+                    log::warn!("spawn {id}: cannot thaw the child: {e:#}");
+                    false
+                }
             }
         };
         let (add, decision, by) = match (more, &choice) {
+            (Some(s), Choice::More(c)) if thawed && freshly.is_empty() => {
+                (s, format!("more time: {c}, stays frozen"), "user")
+            }
             (Some(s), Choice::More(c)) if thawed => (s, format!("more time: {c}"), "user"),
             (Some(_), _) => {
                 self.stop_one(id, State::TimedOut);

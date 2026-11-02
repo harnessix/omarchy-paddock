@@ -634,9 +634,40 @@ const SKIP_NAMES: &[&str] = &[
     ".git",
     ".rustup",
     "site-packages",
+    ".m2",
+    ".gradle",
 ];
 /// Folders that the check skips by their path relative to the home.
-const SKIP_PATHS: &[&str] = &[".cargo/registry", ".local/share/mise"];
+const SKIP_PATHS: &[&str] = &[
+    ".cargo/registry",
+    ".cargo/git",
+    "go/pkg/mod",
+    ".local/share/mise",
+];
+/// Extensions of source code files that are not credential files.
+const SOURCE_EXTS: &[&str] = &[
+    "c", "cc", "cpp", "cxx", "h", "hh", "hpp", "rs", "go", "py", "js", "mjs", "cjs", "ts", "tsx",
+    "jsx", "java", "kt", "kts", "scala", "rb", "php", "cs", "swift", "sh", "bash", "zsh", "html",
+    "css", "scss", "sass", "less", "sql",
+];
+
+fn is_skipped(rel: &str) -> bool {
+    let parts: Vec<&str> = rel.split('/').collect();
+    if parts.iter().any(|p| SKIP_NAMES.contains(p)) {
+        return true;
+    }
+    SKIP_PATHS
+        .iter()
+        .any(|p| rel == *p || rel.starts_with(&format!("{p}/")))
+}
+
+fn is_source(name: &str) -> bool {
+    let p = Path::new(name);
+    let Some(ext) = p.extension().and_then(|e| e.to_str()) else {
+        return false;
+    };
+    SOURCE_EXTS.contains(&ext.to_ascii_lowercase().as_str())
+}
 
 /// A new credential file: its path relative to the sandbox home and its size.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -647,10 +678,16 @@ pub struct CredFile {
 
 /// Whether a path relative to the home names a credential file.
 pub fn is_credential(rel: &str) -> bool {
+    if is_skipped(rel) {
+        return false;
+    }
     if rel.starts_with(".ssh/") || CRED_PATHS.contains(&rel) {
         return true;
     }
     let name = base(rel);
+    if is_source(name) {
+        return false;
+    }
     let low = name.to_ascii_lowercase();
     crate::detect::is_secret_name(name) || CRED_WORDS.iter().any(|w| low.contains(w))
 }
@@ -667,20 +704,31 @@ struct Stamp {
 /// component at a time with `openat(O_NOFOLLOW)`, so a folder the sandbox
 /// swaps for a symlink during the walk is skipped.
 fn scan(home: &Path, keep: &dyn Fn(&str) -> bool) -> BTreeMap<String, Stamp> {
+    scan_limit(home, MAX_ENTRIES, keep).0
+}
+
+/// `scan` with an entry budget. Breadth first, so a large folder cannot use
+/// up the budget before the shallow ones. The flag says the budget ran out.
+fn scan_limit(
+    home: &Path,
+    limit: usize,
+    keep: &dyn Fn(&str) -> bool,
+) -> (BTreeMap<String, Stamp>, bool) {
     use crate::safefs::{Kind, Root};
     let mut out = BTreeMap::new();
     let Ok(root) = Root::open(home) else {
-        return out;
+        return (out, false);
     };
-    let mut left = MAX_ENTRIES;
-    let mut stack = vec![(PathBuf::new(), String::new())];
-    while let Some((dir_rel, rel)) = stack.pop() {
+    let mut left = limit;
+    let mut queue = std::collections::VecDeque::from([(PathBuf::new(), String::new())]);
+    while let Some((dir_rel, rel)) = queue.pop_front() {
         let Ok(list) = root.dir(&dir_rel, false).and_then(|d| d.stats()) else {
             continue;
         };
         for (os_name, st) in list {
             if left == 0 {
-                return out;
+                log::warn!("credential scan stopped at {limit} entries");
+                return (out, true);
             }
             left -= 1;
             let name = os_name.to_string_lossy().into_owned();
@@ -691,7 +739,7 @@ fn scan(home: &Path, keep: &dyn Fn(&str) -> bool) -> BTreeMap<String, Stamp> {
             };
             if st.kind == Kind::Dir {
                 if !SKIP_NAMES.contains(&name.as_str()) && !SKIP_PATHS.contains(&r.as_str()) {
-                    stack.push((dir_rel.join(&os_name), r));
+                    queue.push_back((dir_rel.join(&os_name), r));
                 }
             } else if st.kind == Kind::File && keep(&r) {
                 out.insert(
@@ -720,7 +768,7 @@ fn scan(home: &Path, keep: &dyn Fn(&str) -> bool) -> BTreeMap<String, Stamp> {
             }
         }
     }
-    out
+    (out, false)
 }
 
 /// The credential files of a sandbox home, as seen at the last look.
@@ -760,7 +808,12 @@ impl Creds {
     /// Look again. It returns the credential files that are new or changed
     /// since the last look, and the number of login files that changed.
     pub fn check(&mut self) -> (Vec<CredFile>, u64) {
-        let now = self.scan();
+        self.check_with_limit(MAX_ENTRIES)
+    }
+
+    fn check_with_limit(&mut self, limit: usize) -> (Vec<CredFile>, u64) {
+        let (mut now, truncated) =
+            scan_limit(&self.home, limit, &|r| is_credential(r) || self.is_login(r));
         let mut found = Vec::new();
         let mut refreshed = 0;
         for (rel, st) in &now {
@@ -774,6 +827,13 @@ impl Creds {
                     path: rel.clone(),
                     size: st.size,
                 });
+            }
+        }
+        // A scan that stopped early did not see the rest: keep the last look
+        // of it, so those files do not count as new at the next full scan.
+        if truncated {
+            for (rel, st) in std::mem::take(&mut self.snap) {
+                now.entry(rel).or_insert(st);
             }
         }
         self.snap = now;
@@ -1727,7 +1787,15 @@ Inter-|   Receive                                                |  Transmit
         ] {
             assert!(is_credential(yes), "{yes}");
         }
-        for no in [".bashrc", ".config/x/config.json", ".gitconfig"] {
+        for no in [
+            ".bashrc",
+            ".config/x/config.json",
+            ".gitconfig",
+            "go/pkg/mod/golang.org/x/oauth2@v0.21.0/token.go",
+            "token.go",
+            "src/token.rs",
+            "lib/secret.py",
+        ] {
             assert!(!is_credential(no), "{no}");
         }
     }
@@ -1754,6 +1822,14 @@ Inter-|   Receive                                                |  Transmit
         put(&home, ".ssh/authorized_keys", "ssh-ed25519 AAA");
         put(&home, ".cache/x/token", "t");
         put(&home, "proj/node_modules/m/secret.js", "s");
+        put(
+            &home,
+            "go/pkg/mod/golang.org/x/oauth2@v0.21.0/token.go",
+            "package oauth2",
+        );
+        put(&home, ".cargo/git/checkouts/pkg/token.txt", "token");
+        put(&home, ".m2/repository/pkg/secret.txt", "secret");
+        put(&home, ".gradle/caches/secret.txt", "secret");
         let (found, n) = c.check();
         assert_eq!(n, 0);
         assert_eq!(paths(&found), [".ssh/authorized_keys", ".ssh/id_ed25519"]);
@@ -2033,5 +2109,32 @@ Inter-|   Receive                                                |  Transmit
         assert!(edit_mute_text("", Path::new("rel"), true).is_err());
         assert!(edit_mute_text("[monitor]\nmute = 3\n", Path::new("/a"), true).is_err());
         assert!(edit_mute_text("not toml [", Path::new("/a"), true).is_err());
+    }
+
+    #[test]
+    fn credential_scan_walks_breadth_first_and_does_not_drop_entries_on_budget_exhaustion() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+
+        // In LIFO, descending into a large directory exhausts the budget before
+        // shallow credential folders like .ssh are reached.
+        put(&home, "a_deep/d1/d2/d3/f1", "x");
+        put(&home, "a_deep/d1/d2/d3/f2", "x");
+        put(&home, "a_deep/d1/d2/d3/f3", "x");
+        put(&home, "a_deep/d1/d2/d3/f4", "x");
+        put(&home, ".ssh/id_ed25519", "key");
+
+        let (out, _) = scan_limit(&home, 4, &|r| is_credential(r));
+        assert!(out.contains_key(".ssh/id_ed25519"));
+
+        let mut c = Creds::new(home.clone(), vec![]);
+        assert_eq!(c.check(), (vec![], 0));
+
+        // When a subsequent check exhausts its budget early,
+        // previously known entries must not be dropped from the snapshot.
+        let _ = c.check_with_limit(1);
+
+        let (found, _) = c.check();
+        assert!(found.is_empty(), "unexpected false alert: {found:?}");
     }
 }
