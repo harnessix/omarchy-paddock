@@ -15,7 +15,8 @@ use std::time::{Duration, Instant};
 /// The fake harness: `$0` is the prompt file (`[detach] args`). It records
 /// what it got in the project, then acts on the task.
 const SCRIPT: &str = r#"f="$0"
-{ test -t 0 && test -t 1 && echo "tty yes"; test -r "$f" && echo "readable"; echo "task $(cat "$f")"; } > .detach-result
+if test -t 0 && test -t 1; then tty=yes; else tty=no; fi
+{ echo "tty $tty"; test -r "$f" && echo "readable"; echo "task $(cat "$f")"; } > .detach-result
 case "$(cat "$f")" in
   ok) paddock-host done --status ok "all good" ;;
   failed) paddock-host done --status failed "it broke" ;;
