@@ -21,7 +21,7 @@ use super::{secret::Secret, Credential, Kind};
 use crate::broker::Status;
 use crate::env::HostEnv;
 use anyhow::{bail, Context as _, Result};
-use std::collections::BTreeSet;
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -239,7 +239,7 @@ fn run_tool(exe: &Path, args: &[&str], stdin: &[u8], envs: &[(&str, &str)]) -> R
 
 /// Asks the user at the first use: the summary and the detail of the card.
 /// True: allowed for the rest of the run.
-pub type Ask = Arc<dyn Fn(&str, &str) -> bool + Send + Sync>;
+pub type Ask = Arc<dyn Fn(&str, &str) -> Option<bool> + Send + Sync>;
 
 /// The docker and aws credentials of one run, served for the broker.
 pub struct Channels {
@@ -249,8 +249,9 @@ pub struct Channels {
     /// The revoke file of the run (`credentials-revoked`).
     pub revoked: PathBuf,
     pub ask: Ask,
-    /// The uses that the user allowed in this run.
-    allowed: Mutex<BTreeSet<String>>,
+    /// The uses that the user answered in this run: true allowed, false
+    /// denied. A card without an answer is not remembered.
+    answered: Mutex<BTreeMap<String, bool>>,
     /// One card at a time, so that two first uses ask once.
     asking: Mutex<()>,
 }
@@ -269,7 +270,7 @@ impl Channels {
             creds,
             revoked,
             ask,
-            allowed: Mutex::new(BTreeSet::new()),
+            answered: Mutex::new(BTreeMap::new()),
             asking: Mutex::new(()),
         }
     }
@@ -281,19 +282,23 @@ impl Channels {
     }
 
     /// Whether the user allows `key` in this run: asked at the first use.
+    /// Yes and No both hold for the rest of the run, so a sandbox cannot
+    /// raise the card again and again until it gets a Yes.
     fn permit(&self, key: &str, summary: &str, detail: &str) -> bool {
-        if self.allowed.lock().unwrap().contains(key) {
-            return true;
+        if let Some(&a) = self.answered.lock().unwrap().get(key) {
+            return a;
         }
         let _one = self.asking.lock().unwrap();
-        if self.allowed.lock().unwrap().contains(key) {
-            return true;
+        if let Some(&a) = self.answered.lock().unwrap().get(key) {
+            return a;
         }
-        if !(self.ask)(summary, detail) {
-            return false;
+        match (self.ask)(summary, detail) {
+            Some(a) => {
+                self.answered.lock().unwrap().insert(key.to_string(), a);
+                a
+            }
+            None => false,
         }
-        self.allowed.lock().unwrap().insert(key.to_string());
-        true
     }
 
     fn audit(&self, name: &str, what: &str, decision: &str) {
@@ -571,10 +576,7 @@ pub fn approver_ask(
             started_by: Vec::new(),
             choices: Vec::new(),
         };
-        matches!(
-            approver.ask(&env, &p, wait),
-            Some(crate::broker::Answer::Once | crate::broker::Answer::Session)
-        )
+        approver.ask(&env, &p, wait).map(|a| !a.denies())
     })
 }
 

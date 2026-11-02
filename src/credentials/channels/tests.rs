@@ -53,7 +53,7 @@ fn channels(env: &HostEnv, yes: bool) -> (Channels, Arc<AtomicUsize>) {
         crate::credentials::revoked_file(env, "sb-1"),
         Arc::new(move |_: &str, _: &str| {
             a.fetch_add(1, Ordering::SeqCst);
-            yes
+            Some(yes)
         }),
     );
     (ch, asked)
@@ -208,8 +208,32 @@ fn a_denied_card_and_a_missing_login_give_nothing() {
         .handle(&args(&[("kind", "docker"), ("server", "ghcr.io")]))
         .unwrap_err();
     assert_eq!(s, Status::Denied);
-    // A denial is not remembered: the next use asks again.
-    let _ = ch.handle(&args(&[("kind", "docker"), ("server", "ghcr.io")]));
+    // A denial holds for the run: no new card until a Yes.
+    let (s, _) = ch
+        .handle(&args(&[("kind", "docker"), ("server", "ghcr.io")]))
+        .unwrap_err();
+    assert_eq!(s, Status::Denied);
+    assert_eq!(asked.load(Ordering::SeqCst), 1);
+    // A card without an answer is not remembered: the next use asks again.
+    let asked = Arc::new(AtomicUsize::new(0));
+    let a = asked.clone();
+    let creds: Vec<(String, Credential)> = crate::credentials::load(&env)
+        .unwrap()
+        .into_iter()
+        .collect();
+    let ch = Channels::new(
+        env.clone(),
+        spec(&env),
+        creds,
+        crate::credentials::revoked_file(&env, "sb-1"),
+        Arc::new(move |_: &str, _: &str| {
+            a.fetch_add(1, Ordering::SeqCst);
+            None
+        }),
+    );
+    for _ in 0..2 {
+        let _ = ch.handle(&args(&[("kind", "docker"), ("server", "ghcr.io")]));
+    }
     assert_eq!(asked.load(Ordering::SeqCst), 2);
     // The store has no login: a failure, with no value.
     std::fs::write(

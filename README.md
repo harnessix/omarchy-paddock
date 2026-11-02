@@ -671,7 +671,7 @@ kind = "docker"
 registries = ["ghcr.io", "registry.example.com"]
 ```
 
-The sandbox gets `DOCKER_CONFIG=/run/paddock/docker`, whose `config.json` sends only these registries to the helper `docker-credential-paddock`. The host takes the login from your own docker configuration (`credHelpers`, then `credsStore`, then `auths`) and refuses any registry that is not listed. The helper refuses `store`, `erase` and `list`. What it protects: the sandbox never sees your docker configuration or the logins of other registries, each use is asked once per run, audited and can be revoked. What it does not protect: the login of a listed registry reaches the sandbox's docker client for that request.
+The sandbox gets `DOCKER_CONFIG=/run/paddock/docker`, whose `config.json` sends only these registries to the helper `docker-credential-paddock`. The host takes the login from your own docker configuration (`credHelpers`, then `credsStore`, then `auths`) and refuses any registry that is not listed. The helper refuses `store`, `erase` and `list`. What it protects: the sandbox never sees your docker configuration or the logins of other registries, each registry is asked once per run (a Yes or a No holds for the rest of the run), audited and can be revoked. What it does not protect: the login of a listed registry reaches the sandbox's docker client for that request.
 
 `via = "agent"` with `kind = "aws"` gives the sandbox short-lived credentials of one profile of your `~/.aws/config`:
 
