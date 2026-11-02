@@ -1231,6 +1231,33 @@ mod tests {
     }
 
     #[test]
+    fn a_zip_with_a_bad_crc_stays_in_the_project() {
+        let mut bad = MODULE_ZIP.to_vec();
+        let min = bad.len().saturating_sub(22 + 65535);
+        let eocd = (min..bad.len().saturating_sub(21))
+            .rev()
+            .find(|&i| bad[i..].starts_with(&[0x50, 0x4b, 0x05, 0x06]))
+            .unwrap();
+        let cd = u32::from_le_bytes(bad[eocd + 16..eocd + 20].try_into().unwrap()) as usize;
+        assert_eq!(&bad[cd..cd + 4], b"PK\x01\x02");
+        bad[cd + 16] ^= 0xff;
+        assert!(super::super::zip::files(&bad).is_err());
+        let t = tempfile::tempdir().unwrap();
+        let (env, proj) = project(t.path(), "go-mod");
+        let up = upper(&env, &proj, "go-mod");
+        let v = "cache/download/example.com/m/@v";
+        put(&up, &format!("{v}/v1.0.0.zip"), &bad);
+        let srv = serve(HashMap::from([(
+            "/lookup/example.com/m@v1.0.0".to_string(),
+            format!("1\nexample.com/m v1.0.0 {ZIP_H1}\nexample.com/m v1.0.0/go.mod {MOD_H1}\n\nsig\n"),
+        )]));
+        let src = Sources { crates_index: String::new(), sumdb: srv.base.clone() };
+        let r = run(&env, &proj, &src, &http(), later());
+        let zip = lower(&env, "go-mod").join(v).join("v1.0.0.zip");
+        assert!(!zip.exists(), "promoted a zip a strict reader rejects on CRC: {r:?}");
+    }
+
+    #[test]
     fn promotion_follows_only_bwrap_cache_overlays() {
         let t = tempfile::tempdir().unwrap();
         let (env, proj) = project(t.path(), "cargo-registry");
