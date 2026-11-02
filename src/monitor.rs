@@ -1312,28 +1312,39 @@ fn report_creds(env: &HostEnv, id: &Identity, files: &[CredFile], notify: bool) 
         );
     }
     if notify_now(env, &id.project, notify) {
-        let mut names: Vec<String> = files
-            .iter()
-            .take(3)
-            .map(|f| format!("~/{}", f.path))
-            .collect();
-        if files.len() > 3 {
-            names.push(format!("and {} more", files.len() - 3));
-        }
+        let body = cred_notification_body(&id.sandbox, files);
         let _ = crate::broker::notify::show(
             env,
             &crate::broker::notify::Note {
                 summary: "new credential files in a sandbox".into(),
-                body: format!(
-                    "{} wrote {}. A key or token in its home can keep access later. paddock log shows the list.",
-                    id.sandbox,
-                    names.join(", ")
-                ),
+                body,
                 actions: Vec::new(),
                 critical: false,
             },
         );
     }
+}
+
+fn cred_notification_body(sandbox: &str, files: &[CredFile]) -> String {
+    let mut names: Vec<String> = files
+        .iter()
+        .take(3)
+        .map(|f| format!("~/{}", clean_cred_path(&f.path)))
+        .collect();
+    if files.len() > 3 {
+        names.push(format!("and {} more", files.len() - 3));
+    }
+    format!(
+        "{sandbox} wrote {}. A key or token in its home can keep access later. paddock log shows the list.",
+        names.join(", ")
+    )
+}
+
+fn clean_cred_path(path: &str) -> String {
+    crate::broker::clean_text(path)
+        .chars()
+        .map(|c| if c == '\n' || c == '\t' { ' ' } else { c })
+        .collect()
 }
 
 fn report(env: &HostEnv, id: &Identity, t: &Tunnel, notify: bool) {
@@ -1807,6 +1818,19 @@ Inter-|   Receive                                                |  Transmit
         let rec = load_record(&file);
         assert_eq!(rec.credential_files, [key(7)]);
         assert_eq!(rec.login_refreshes, 3);
+    }
+
+    #[test]
+    fn credential_file_names_in_notifications_are_cleaned() {
+        let dirty = CredFile {
+            path: "bad\nname\u{202e}.token\u{1b}[2J".into(),
+            size: 10,
+        };
+        let body = cred_notification_body("s1", &[dirty]);
+        assert!(!body.contains('\n'));
+        assert!(!body.contains('\u{202e}'));
+        assert!(!body.contains('\u{1b}'));
+        assert!(body.contains("~/bad name.token[2J"));
     }
 
     #[test]
