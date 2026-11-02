@@ -1032,13 +1032,13 @@ curl http://127.0.0.1:3000/
 paddock-host pasture unshare 3000
 ```
 
-- A helper in each member relays the streams through a Unix socket in the shared folder (`/pasture/.ports/3000.sock`). paddock starts the helper with the sandbox. It works with every backend and needs no change to the host network.
+- A helper in each member relays the streams through a Unix socket in that member's own folder. The others see the folder read-only, so they can connect and they cannot replace the socket. paddock starts the helper with the sandbox. It works with every backend and needs no change to the host network.
 - The share is the lease `lease:port:3000` in the `pasture` scope. A second member that shares 3000 gets exit code 9 and the name of the owner. The helper of the owner renews the lease, so the port frees itself within 30 seconds after the owner ends.
 - Only the ports that a member names leave its sandbox. The control ports of a harness stay inside.
 - When another member already uses the port itself, it skips the port. `paddock-host pasture members` shows why, with each member, its harness and its ports.
 - Limits: TCP only, ports 1024 to 65535, at most 16 shared ports per pasture.
 - `paddock pasture list` on the host shows the shared ports and their owners.
-- Members trust each other with shared ports, as with the shared folder: every member can write `/pasture`, so a member can replace another member's socket there and receive its traffic. Put only agents that you would let edit each other's files into one pasture.
+- The shared folder `/pasture` stays writable by every member. Port sockets are not in that folder. A member cannot replace another member's socket. Members still share the files in `/pasture`. Put only agents that you would let edit each other's files into one pasture.
 
 A member can also ask another member a question. The other member answers with one run of its own harness, in its own sandbox, with its own login. This is the bridge, and it is off until you turn it on for a pasture:
 

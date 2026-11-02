@@ -1,20 +1,19 @@
-//! Shared ports: a member of a pasture puts a local TCP port "on the
-//! ground", and the other members reach it on their own 127.0.0.1.
+//! Shared ports. A member of a pasture puts a local TCP port on the ground.
+//! The other members reach it on their own `127.0.0.1`.
 //!
-//! Each member keeps its own network namespace. The pasture folder is the
-//! same host folder in every member, and Unix sockets work across those
-//! mounts, so the traffic goes through `/pasture/.ports/PORT.sock`:
-//!
-//! - The owner (A) listens on the socket and connects each stream to its
-//!   own `127.0.0.1:PORT`.
-//! - Every other member (B) listens on its own `127.0.0.1:PORT` and
-//!   connects each stream to the socket.
+//! Each member keeps its own network namespace. Unix sockets cross the
+//! mounts. Each member's sockets live in a host folder that the others
+//! mount read-only at `/run/paddock/ports/<id>/<port>.sock`. The owner
+//! binds the same files through its own read-write mount at
+//! `/run/paddock/own-ports/<port>.sock`. A member cannot replace another
+//! member's socket. The shared pasture folder stays writable and holds
+//! no port sockets.
 //!
 //! The record of a shared port is the lease `lease:port:PORT` in the
 //! `pasture` scope of paddock kv. The host sets its owner, decides
 //! conflicts, and checks the port range and the limit per pasture. The
 //! helper of the owner renews the lease, so the port frees itself when the
-//! owner ends. A helper (`paddock-host pasture serve`) runs in every member:
+//! owner ends. A helper (`paddock-host pasture serve`) runs in every member.
 //! paddock starts it with the sandbox. It watches `lease:port:` and starts
 //! or stops its listeners. It notes what it does in [`log_path`].
 
@@ -125,20 +124,51 @@ pub fn plan(me: &str, shared: &[Shared]) -> BTreeMap<u16, Role> {
     out
 }
 
-/// The folder of the port sockets in the pasture folder.
-pub fn socket_dir(ground: &Path) -> PathBuf {
-    ground.join(".ports")
+/// Where every member sees the port sockets. Read-only in the sandbox.
+pub const PORTS_MOUNT: &str = "/run/paddock/ports";
+/// Where this member creates its own sockets. Read-write in the sandbox.
+pub const OWN_MOUNT: &str = "/run/paddock/own-ports";
+/// The variable that names the read-only socket tree inside a sandbox.
+/// srt cannot bind-mount, so there it is the host folder.
+pub const PORTS_ENV: &str = "PADDOCK_PORTS";
+/// The variable that names this member's own socket folder.
+pub const OWN_ENV: &str = "PADDOCK_OWN_PORTS";
+
+/// The host folder of every member's port sockets, next to the pasture folder.
+pub fn host_dir(env: &crate::env::HostEnv, project: &Path, name: &str) -> PathBuf {
+    super::folder(env, project, name).join("ports")
 }
 
-pub fn socket_path(ground: &Path, port: u16) -> PathBuf {
-    socket_dir(ground).join(format!("{port}.sock"))
+/// One member's socket folder on the host. `id` has to be a sandbox id.
+pub fn member_dir(ports: &Path, id: &str) -> anyhow::Result<PathBuf> {
+    crate::kv::shard::check_id(id)?;
+    Ok(ports.join(id))
 }
 
-/// The pasture folder in this sandbox.
-pub fn ground() -> PathBuf {
-    std::env::var_os("PADDOCK_PASTURE")
+/// The read-only socket tree in this sandbox.
+pub fn ports_dir() -> PathBuf {
+    std::env::var_os(PORTS_ENV)
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(super::MOUNT))
+        .unwrap_or_else(|| PathBuf::from(PORTS_MOUNT))
+}
+
+/// This member's own socket folder in this sandbox.
+pub fn own_dir() -> PathBuf {
+    std::env::var_os(OWN_ENV)
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(OWN_MOUNT))
+}
+
+/// The socket the owner binds for `port`.
+pub fn serve_socket(own: &Path, port: u16) -> PathBuf {
+    own.join(format!("{port}.sock"))
+}
+
+/// The socket a reacher opens for `owner`'s `port`.
+/// None when `owner` is not a sandbox id, so a lease cannot name another path.
+pub fn reach_socket(ports: &Path, owner: &str, port: u16) -> Option<PathBuf> {
+    crate::kv::shard::check_id(owner).ok()?;
+    Some(ports.join(owner).join(format!("{port}.sock")))
 }
 
 // ---- the relay -------------------------------------------------------
@@ -365,31 +395,30 @@ pub fn release(port: u16) -> Result<Response, String> {
 }
 
 /// The lock that keeps one helper per member.
-fn lock_path(ground: &Path, me: &str) -> PathBuf {
-    socket_dir(ground).join(format!(".serve-{me}.lock"))
+fn lock_path(own: &Path, me: &str) -> PathBuf {
+    own.join(format!(".serve-{me}.lock"))
 }
 
 /// Take the helper lock without waiting. None: a helper runs already.
-pub fn try_lock(ground: &Path, me: &str) -> Option<std::fs::File> {
+pub fn try_lock(own: &Path, me: &str) -> Option<std::fs::File> {
     let f = std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
         .write(true)
-        .open(lock_path(ground, me))
+        .open(lock_path(own, me))
         .ok()?;
     let rc = unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
     (rc == 0).then_some(f)
 }
 
-/// Make the socket folder: private to the user, like the pasture folder.
-pub fn make_dir(ground: &Path) -> std::io::Result<()> {
+/// Make this member's socket folder. Mode 0700, like the pasture folder.
+pub fn make_dir(own: &Path) -> std::io::Result<()> {
     use std::os::unix::fs::DirBuilderExt;
-    let d = socket_dir(ground);
-    if !d.is_dir() {
+    if !own.is_dir() {
         std::fs::DirBuilder::new()
             .mode(0o700)
             .recursive(true)
-            .create(&d)?;
+            .create(own)?;
     }
     Ok(())
 }
@@ -424,15 +453,13 @@ pub fn serve() -> i32 {
         eprintln!("paddock-host pasture serve: this sandbox is in no pasture");
         return 1;
     }
-    let ground = ground();
-    if let Err(e) = make_dir(&ground) {
-        eprintln!(
-            "paddock-host pasture serve: {}: {e}",
-            socket_dir(&ground).display()
-        );
+    let own = own_dir();
+    let ports = ports_dir();
+    if let Err(e) = make_dir(&own) {
+        eprintln!("paddock-host pasture serve: {}: {e}", own.display());
         return 1;
     }
-    let Some(_lock) = try_lock(&ground, &me) else {
+    let Some(_lock) = try_lock(&own, &me) else {
         return 0;
     };
     note(&format!(
@@ -495,7 +522,20 @@ pub fn serve() -> i32 {
             if active.contains_key(&port) {
                 continue;
             }
-            let path = socket_path(&ground, port);
+            let path = match role {
+                Role::Serve => Some(serve_socket(&own, port)),
+                Role::Reach => list
+                    .iter()
+                    .rev()
+                    .find(|s| s.port == port)
+                    .and_then(|s| reach_socket(&ports, &s.sandbox, port)),
+            };
+            let Some(path) = path else {
+                let why = "the owner is not a sandbox id".to_string();
+                note(&format!("skip {port}: {why}"));
+                skipped.insert(port, why);
+                continue;
+            };
             let started = match role {
                 Role::Serve => Listener::serve(&path, port),
                 Role::Reach => Listener::reach(port, &path),
@@ -689,6 +729,56 @@ mod tests {
         assert!(sock.exists());
         new.stop();
         assert!(!sock.exists());
+    }
+
+    /// A reacher opens the lease owner's socket. A socket in the shared
+    /// pasture folder, or in another member's folder, is not that socket.
+    #[test]
+    fn a_reacher_uses_the_owner_socket_not_a_planted_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ground = tmp.path().join("ground");
+        let ports = tmp.path().join("ports");
+        let own_a = ports.join("sandbox-a");
+        std::fs::create_dir_all(&own_a).unwrap();
+        std::fs::create_dir_all(ground.join(".ports")).unwrap();
+        std::fs::create_dir_all(ports.join("sandbox-b")).unwrap();
+
+        let owner = serve_socket(&own_a, 3000);
+        let reach = reach_socket(&ports, "sandbox-a", 3000).unwrap();
+        assert_eq!(owner, reach);
+        assert_ne!(reach, ground.join(".ports").join("3000.sock"));
+        assert_ne!(reach, serve_socket(&ports.join("sandbox-b"), 3000));
+        assert!(reach_socket(&ports, "../sandbox-a", 3000).is_none());
+        assert!(reach_socket(&ports, "sandbox-a/../b", 3000).is_none());
+
+        fn plant(path: &Path) {
+            let _ = std::fs::remove_file(path);
+            let l = UnixListener::bind(path).unwrap();
+            std::thread::spawn(move || {
+                for c in l.incoming().flatten() {
+                    let mut c = c;
+                    let _ = c.write_all(b"stolen");
+                    let _ = c.shutdown(Shutdown::Both);
+                }
+            });
+        }
+        plant(&ground.join(".ports").join("3000.sock"));
+        plant(&serve_socket(&ports.join("sandbox-b"), 3000));
+
+        let target = echo();
+        let _kept = Listener::serve(&owner, target).unwrap();
+        let free = TcpListener::bind("127.0.0.1:0").unwrap();
+        let near = free.local_addr().unwrap().port();
+        drop(free);
+        let relay = Listener::reach(near, &reach).unwrap();
+        let mut c = TcpStream::connect(("127.0.0.1", near)).unwrap();
+        c.write_all(b"hi").unwrap();
+        c.shutdown(Shutdown::Write).unwrap();
+        let mut got = Vec::new();
+        c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        c.read_to_end(&mut got).unwrap();
+        assert_eq!(&got, b"echo:hi");
+        relay.stop();
     }
 
     #[test]

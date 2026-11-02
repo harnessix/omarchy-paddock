@@ -143,11 +143,11 @@ fn member() -> Result<String, i32> {
 /// Start the helper of this member when none runs, for example in a
 /// backend that did not start it with the sandbox.
 fn ensure_helper(me: &str) {
-    let ground = ports::ground();
-    if ports::make_dir(&ground).is_err() {
+    let own = ports::own_dir();
+    if ports::make_dir(&own).is_err() {
         return;
     }
-    let Some(lock) = ports::try_lock(&ground, me) else {
+    let Some(lock) = ports::try_lock(&own, me) else {
         return;
     };
     drop(lock);
@@ -162,7 +162,7 @@ fn ensure_helper(me: &str) {
 
 /// Wait until the socket of `port` exists (`present`) or not.
 fn wait_socket(port: u16, present: bool) -> bool {
-    let path = ports::socket_path(&ports::ground(), port);
+    let path = ports::serve_socket(&ports::own_dir(), port);
     let start = Instant::now();
     while start.elapsed() < Duration::from_secs(5) {
         if path.exists() == present {

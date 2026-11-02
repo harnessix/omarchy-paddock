@@ -139,7 +139,12 @@ fn until(what: &str, mut f: impl FnMut() -> bool) {
 
 struct Member {
     sock: std::path::PathBuf,
+    /// The writable shared folder. A socket here is the old, replaceable path.
     ground: std::path::PathBuf,
+    /// Every member's sockets. Others would mount this read-only.
+    ports: std::path::PathBuf,
+    /// This member's own socket folder.
+    own: std::path::PathBuf,
     _served: paddock::kv::Served,
 }
 
@@ -149,7 +154,9 @@ impl Member {
         c.arg("host")
             .args(args)
             .env("PADDOCK_KV_SOCKET", &self.sock)
-            .env("PADDOCK_PASTURE", &self.ground);
+            .env("PADDOCK_PASTURE", &self.ground)
+            .env("PADDOCK_PORTS", &self.ports)
+            .env("PADDOCK_OWN_PORTS", &self.own);
         c
     }
     fn run(&self, args: &[&str]) -> std::process::Output {
@@ -165,18 +172,21 @@ impl Drop for Kill {
     }
 }
 
-/// Two members in one network: the owner side of a shared port works
-/// through the socket in the pasture folder, the other member skips the
-/// port because its own 127.0.0.1 has it already, and the lease decides
-/// conflicts. The far side on 127.0.0.1 needs its own network: see the
-/// bubblewrap test below and the unit tests of the relay.
+/// Two members in one network. The owner binds its socket in its own
+/// folder. A socket planted in the shared pasture folder is not the one
+/// the owner serves. The other member skips the port because its own
+/// 127.0.0.1 has it already, and the lease decides conflicts. The far
+/// side on 127.0.0.1 needs its own network. See the bubblewrap test
+/// below and the unit tests of the relay.
 #[test]
-fn a_member_shares_a_port_through_the_pasture_folder() {
+fn a_member_shares_a_port_in_its_own_socket_folder() {
     let t = tempfile::tempdir().unwrap();
     let home = t.path().join("home");
     let ground = t.path().join("ground");
+    let ports = t.path().join("ports");
     std::fs::create_dir_all(&home).unwrap();
     std::fs::create_dir_all(&ground).unwrap();
+    std::fs::create_dir_all(&ports).unwrap();
     let env = HostEnv::from_parts(home, "demo".into(), 1000, 1000, Default::default());
     let member = |id: &str| {
         let svc = Service::new(
@@ -196,9 +206,13 @@ fn a_member_shares_a_port_through_the_pasture_folder() {
         );
         let sock = t.path().join(format!("{id}.sock"));
         let served = paddock::kv::serve(&sock, svc).unwrap();
+        let own = ports.join(id);
+        std::fs::create_dir_all(&own).unwrap();
         Member {
             sock,
             ground: ground.clone(),
+            ports: ports.clone(),
+            own,
             _served: served,
         }
     };
@@ -213,8 +227,13 @@ fn a_member_shares_a_port_through_the_pasture_folder() {
     let _hb = Kill(b.host(&["pasture", "serve"]).spawn().unwrap());
     let out = a.run(&["pasture", "share", &p]);
     assert!(out.status.success(), "{}", text(&out));
-    let sock = ground.join(".ports").join(format!("{port}.sock"));
-    assert!(sock.exists());
+    let sock = a.own.join(format!("{port}.sock"));
+    let planted = ground.join(".ports").join(format!("{port}.sock"));
+    assert!(sock.exists(), "the owner socket is not in its own folder");
+    assert!(
+        !planted.exists(),
+        "the shared pasture folder still holds the port socket"
+    );
     let mut s = std::os::unix::net::UnixStream::connect(&sock).unwrap();
     s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
     s.write_all(b"hi").unwrap();
@@ -523,9 +542,13 @@ fn a_member_asks_another_and_the_guard_withholds_a_login() {
         .with_bridge(cmd);
         let sock = t.path().join(format!("{id}.sock"));
         let served = paddock::kv::serve(&sock, svc).unwrap();
+        let own = t.path().join("ports").join(id);
+        std::fs::create_dir_all(&own).unwrap();
         Member {
             sock,
             ground: ground.clone(),
+            ports: t.path().join("ports"),
+            own,
             _served: served,
         }
     };
