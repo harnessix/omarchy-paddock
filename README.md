@@ -203,7 +203,7 @@ A sandbox uses your existing login of the harness. See [Logins and MCP](#logins-
 | :--- | :--- |
 | The project (git root), read-write | the project directory |
 | `.git`, read-write, its own mount point | the same directory. A mount point cannot be renamed, so the read-only files below it stay in place. |
-| `.git/hooks`, `.git/config`, `.git/config.worktree`, `.git/commondir`, `.git/objects/info/alternates`, read-only | the same files. Git on the host reads them, and they can name a program or another directory. |
+| `.git/hooks`, `.git/config`, `.git/config.worktree`, `.git/commondir`, `.git/objects/info/alternates`, `.git/modules`, read-only | the same files. Git on the host reads them, and they can name a program or another directory. The git directories of submodules that exist at the start stay writable below `.git/modules`, with the same read-only files. |
 | `$HOME`, read-write | a private directory per harness, login and project, under `$XDG_DATA_HOME/paddock/homes` |
 | Credential files of the harness | copied from your home directory, or from an isolated store |
 | Harness settings and skills, read-only | the files that the harness profile lists in `import_ro` |
@@ -223,6 +223,7 @@ Git takes commands from the repository it reads. `core.fsmonitor`, `core.hooksPa
 - Work-tree state, such as the list of uncommitted changes, comes from a `git status` that runs in a sandbox of its own, with no network. A `filter` driver cannot be turned off with a flag, so it runs in there, where it can do no more than the agent already can. On a host without bubblewrap, paddock says the state is unknown instead of guessing, and `paddock gc` then asks for `--force` before it removes such a worktree.
 - `git worktree add` and `git worktree remove` write a work tree. Before one of them runs, paddock reads the repository configuration as text. If it holds a key that starts a program, paddock stops and prints the file and the key.
 - Your own `git` commands in the project are protected by the read-only binds in the table above, as long as paddock started the sandbox. A repository that the agent creates inside the project is new, so it has no such binds: paddock's own calls stay safe, but take care with your own.
+- `.git/modules` is read-only, so the agent cannot plant the git directory of a new submodule there, whose config your `git status` would read. `git submodule add` and the first `git submodule update --init` of a submodule therefore fail in the sandbox; run them on the host.
 - The first start in a repository creates `.git/commondir` with `.`, and empty `.git/config.worktree` and `.git/objects/info/alternates` files, if they are missing. Git treats all three as no-ops. They exist so that paddock can bind them read-only; otherwise the agent could create them and point git elsewhere. While a repository is bound this way, `git config --worktree` cannot write.
 - `paddock doctor --escape` checks all of this on every backend: that `.git` cannot be renamed in the sandbox, that the pointer files are read-only, and that a planted setting or hook does not run during paddock's host git calls.
 
@@ -1276,7 +1277,7 @@ network = false              # default false
 - Each device is the file `/dev/paddock/NAME`, and `.catalog` shows its format, its limits and whether it is on.
 - A device is off until its table says `enabled = true`. An off device answers with a `disabled` status.
 - The first request of each sandbox puts a card on the host: "allow the device `ollama` for this sandbox". "Allow for this session" lets the later requests of this sandbox through without a card.
-- `http`: the target must be a loopback address (`127.0.0.0/8` or `::1`). paddock refuses any other address when it reads the configuration. The request is the first line `METHOD PATH`, then header lines, an empty line and the body. paddock checks the method and the path prefix and refuses paths with `..`, `//` or an encoded dot or slash. It drops `Authorization`, `Cookie` and hop-by-hop headers, and sets `Host`, `Content-Length` and `Connection` itself. The response is the status line, the headers, an empty line and the body. A `Paddock-Status` header (`disabled`, `refused` or `unreachable`) means that paddock answered itself.
+- `http`: the target must be a loopback address (`127.0.0.0/8` or `::1`). paddock refuses any other address when it reads the configuration. The request is the first line `METHOD PATH`, then header lines, an empty line and the body. paddock checks the method and the path prefix and refuses paths with `..`, `//` or an encoded dot or slash. It drops `Authorization`, `Cookie` and hop-by-hop headers, and sets `Host`, `Content-Length` and `Connection` itself. The response is the status line, the headers, an empty line and the body. A `Paddock-Status` header (`disabled`, `refused`, `unreachable` or `no answer`) means that paddock answered itself.
 - `command`: the request goes to the standard input. The command never gets arguments from the request. It runs like an approved `exec`: a clean environment, the `[exec]` view of the system, an empty working folder, and no network unless the device says `network = true`. `timeout` stops it. The response is header lines (`status: exit 0`, `timeout` or `disabled`, and the first five lines of the standard error as `stderr:`), an empty line, then the standard output.
 - A response over `max_body` fails with `EMSGSIZE`. A declined device fails with `EACCES`.
 - The audit log records the device, the method and path (`http`) or the byte counts (`command`), the status and the duration. It never records a body.
@@ -1301,6 +1302,7 @@ budget = 1.0            # per run
 ```
 
 - A device with `cost` or `cost_header` is paid. paddock does not convert currencies. With `cost_header`, a request costs the larger of `cost` and the header value. paddock ignores a header that is not a number.
+- A request that paddock could not send (the service did not accept the connection) costs nothing. A request that the service got costs at least `cost`, also when the service does not answer in `timeout` seconds or closes the connection early (`Paddock-Status: no answer`).
 - A paid device needs a budget before its first request. Without `budget` in its table, the first-use card asks for one: 0.10, 1 or 5, or deny. No budget, no request.
 - The budget is per run: a sandbox and the sandboxes it started. A spawned child spends the budget of the root sandbox, never a budget of its own.
 - A request that would pass the budget fails with `EDQUOT` (`paddock-host device` says "budget used" and exits with 11). You get one notification with the command to raise it: `paddock devices budget ID DEVICE --add 1.0`. The next request can pass.
@@ -1347,7 +1349,7 @@ With a systemd user instance, every bwrap or srt sandbox runs in a scope of its 
 - Each freeze and thaw goes to the audit log, with the reason.
 - The other members of its pasture see the state in paddock kv: `sandbox:<id>` in the `pasture` scope is `{"state": "suspended", ...}` while it is frozen and `running` after.
 - The clock keeps running while a sandbox is frozen: a harness timeout or a model's prompt cache can run out.
-- Leases in paddock kv follow `[suspend] leases` in the user configuration. With `keep` (the default), the leases of a frozen sandbox stop counting down and run again after the thaw with the time they had left; another agent that claims one gets a conflict with `owner_state: "suspended"`. If the sandbox ends while frozen, its leases count down again. With `release`, paddock frees them when it freezes the sandbox, with one audit line per lease. The rule holds for every freeze: `paddock freeze`, a hard timer, and the gateway.
+- Leases in paddock kv follow `[suspend] leases` in the user configuration. With `keep` (the default), the leases of a frozen sandbox stop counting down and run again after the thaw with the time they had left; another agent that claims one gets a conflict with `owner_state: "suspended"`. If the sandbox ends while frozen, its leases count down again. This holds also when its paddock process was killed or the computer restarted: the next claim of such a lease finds no running holder, and the leases of that holder count down again. With `release`, paddock frees them when it freezes the sandbox, with one audit line per lease. The rule holds for every freeze: `paddock freeze`, a hard timer, and the gateway.
 
 ## App mode
 

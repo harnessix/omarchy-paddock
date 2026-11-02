@@ -11,7 +11,7 @@ use anyhow::{bail, Context, Result};
 use sha2::{Digest, Sha256};
 use std::io::{IsTerminal, Read};
 use std::os::unix::fs::MetadataExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -558,6 +558,40 @@ pub struct Outcome {
     pub stdout: Option<String>,
 }
 
+/// Cleans the run folder, the borrow copies, kv, devices, the pasture
+/// member and the session record, even when `run` returns early.
+struct EndOfRun<'a> {
+    env: &'a HostEnv,
+    id: String,
+    project: PathBuf,
+    snapshot: bool,
+    quiet: bool,
+    kv: Option<crate::kv::Served>,
+    devices: Option<crate::devices::Devices>,
+    bridge: Option<PathBuf>,
+}
+
+impl Drop for EndOfRun<'_> {
+    fn drop(&mut self) {
+        // Unmount first: the removal must not walk into the device mount.
+        self.devices.take();
+        if let Some(k) = self.kv.take() {
+            k.finish();
+        }
+        if let Some(base) = &self.bridge {
+            crate::pasture::bridge::forget_member(base, &self.id);
+        }
+        // Before the run folder goes: quota peers keep the end of this run.
+        crate::timer::end_runs(self.env, &self.id, crate::state::now());
+        let _ = std::fs::remove_dir_all(self.env.paddock_run().join(&self.id));
+        crate::borrow::end(self.env, &self.id);
+        crate::recover::Session::end(self.env, &self.id);
+        if self.snapshot {
+            crate::snapshot::after_end(self.env, &self.project, &self.id, self.quiet);
+        }
+    }
+}
+
 /// Run the sandbox. With `capture`, stdout is collected instead of shown.
 pub fn run(
     env: &HostEnv,
@@ -574,6 +608,16 @@ pub fn run(
     // waits. The old handlers come back when `run` returns.
     let forwarding = Forward::install();
     let interactive = !capture && std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
+    let mut end = EndOfRun {
+        env,
+        id: built.spec.id.clone(),
+        project: built.spec.project.clone(),
+        snapshot: false,
+        quiet,
+        kv: None,
+        devices: None,
+        bridge: None,
+    };
     // App mode: a restricted Wayland socket and a portal-only session bus,
     // both alive until the sandbox exits.
     let _app = if built.spec.gui.mode == GuiMode::App {
@@ -616,7 +660,7 @@ pub fn run(
     };
     let kv_project_path = kv_project.clone();
     let kv_pasture = built.pasture.clone();
-    let kv = crate::kv::start(
+    end.kv = crate::kv::start(
         env,
         &mut built.spec,
         kv_project,
@@ -637,7 +681,7 @@ pub fn run(
         )
     };
     secrets.watch();
-    let mut devices = crate::devices::start(
+    end.devices = crate::devices::start(
         env,
         &mut built.spec,
         backend.name(),
@@ -760,12 +804,12 @@ pub fn run(
         crate::snapshot::before_start(env, &spec.project, &spec.id, &spec.harness, quiet);
     }
     // After paddock filled the home: its own files are not news.
-    if let Some(k) = &kv {
+    if let Some(k) = &end.kv {
         k.watch_credentials(spec.home_src.clone(), built.profile.state.auth.clone());
     }
     // The bridge of the pasture: what the login guard of the other
     // members checks, outside every sandbox.
-    let bridge_dir = match (&kv, &kv_pasture) {
+    let bridge_dir = match (&end.kv, &kv_pasture) {
         (Some(_), Some(p)) => {
             let base = crate::pasture::bridge::dir(env, &kv_project_path, p);
             let rec = crate::pasture::bridge::MemberRecord {
@@ -786,6 +830,8 @@ pub fn run(
         }
         _ => None,
     };
+    end.bridge = bridge_dir;
+    end.snapshot = project_snapshot;
 
     crate::boundary::record_start(env, spec);
     if !quiet {
@@ -882,7 +928,7 @@ pub fn run(
             let _ = std::io::Write::write_all(&mut w, &data);
         });
     }
-    if let Some(d) = devices.as_mut() {
+    if let Some(d) = end.devices.as_mut() {
         d.after_start(env, backend.name(), &spec.id);
     }
     let running = Running {
@@ -921,7 +967,9 @@ pub fn run(
         agent: creds.agent,
         secret_files: creds.secret_files,
     };
-    running.register(env)?;
+    if let Err(e) = running.register(env) {
+        log::warn!("cannot register the running sandbox: {e:#}");
+    }
     // The ration of a pasture member: after the registration, so that its
     // quota counts from the start.
     if let Some(p) = &running.pasture {
@@ -956,45 +1004,9 @@ pub fn run(
     // pasta hides the host addresses that exist at start. Watch for new ones
     // (a VPN that comes up later) and report them: they stay reachable until
     // the next start.
-    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let new_addrs = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
-    let monitor =
-        (backend.name() == "bwrap" && spec.network == crate::spec::Network::Egress).then(|| {
-            let start_addrs = crate::proxy::local_addrs();
-            let (stop, found, env2, mut info) = (
-                stop.clone(),
-                new_addrs.clone(),
-                env.clone(),
-                running.clone(),
-            );
-            std::thread::spawn(move || {
-                while !stop.load(std::sync::atomic::Ordering::SeqCst) {
-                    std::thread::sleep(std::time::Duration::from_secs(3));
-                    let mut f = found.lock().unwrap();
-                    let mut changed = false;
-                    for a in crate::proxy::local_addrs() {
-                        let s = a.to_string();
-                        if !a.is_loopback() && !start_addrs.contains(&a) && !f.contains(&s) {
-                            f.push(s);
-                            changed = true;
-                        }
-                    }
-                    if changed {
-                        // The new addresses go first: they are the bigger risk.
-                        info.warnings
-                            .retain(|w| !w.starts_with("new host addresses"));
-                        info.warnings.insert(
-                            0,
-                            format!(
-                                "new host addresses since start are reachable: {}",
-                                f.join(", ")
-                            ),
-                        );
-                        let _ = info.register(&env2);
-                    }
-                }
-            })
-        });
+    let monitor = (backend.name() == "bwrap" && spec.network == crate::spec::Network::Egress)
+        .then(|| EgressAddrMonitor::start(env.clone(), running.clone(), new_addrs.clone()));
 
     let live = HistorySync::start(history, HISTORY_EVERY);
     let login_sync = LoginSync::start(auth, quiet);
@@ -1021,8 +1033,9 @@ pub fn run(
     if let Some(s) = &spawner {
         s.stop_all(Duration::from_secs(30));
     }
-    stop.store(true, std::sync::atomic::Ordering::SeqCst);
-    drop(monitor);
+    if let Some(m) = monitor {
+        m.finish();
+    }
     let late = new_addrs.lock().unwrap().clone();
     if !late.is_empty() && !quiet {
         eprintln!(
@@ -1032,7 +1045,16 @@ pub fn run(
     }
     let (history, copied) = live.finish();
     let auth = login_sync.finish();
-    let synced = auth.copy_out()?;
+    let synced = match auth.copy_out() {
+        Ok(s) => s,
+        Err(e) => {
+            log::warn!("cannot copy credentials back: {e:#}");
+            state::SyncResult {
+                saved: vec![],
+                conflicts: vec![],
+            }
+        }
+    };
     match history.as_ref().map(|h| h.copy_out()).unwrap_or(Ok(vec![])) {
         Ok(files) if copied + files.len() > 0 => log::info!(
             "copied {} session file(s) back to the host history",
@@ -1040,9 +1062,6 @@ pub fn run(
         ),
         Ok(_) => {}
         Err(e) => log::warn!("cannot copy the session history back: {e:#}"),
-    }
-    if project_snapshot {
-        crate::snapshot::after_end(env, &spec.project, &spec.id, quiet);
     }
     if !quiet {
         for f in &synced.saved {
@@ -1062,18 +1081,6 @@ pub fn run(
             }
         }
     }
-    // Unmount first: the removal must not walk into the device mount.
-    drop(devices);
-    if let Some(k) = kv {
-        k.finish();
-    }
-    if let Some(base) = &bridge_dir {
-        crate::pasture::bridge::forget_member(base, &spec.id);
-    }
-    crate::timer::end_runs(env, &spec.id, crate::state::now());
-    let _ = std::fs::remove_dir_all(env.paddock_run().join(&spec.id));
-    crate::borrow::end(env, &spec.id);
-    crate::recover::Session::end(env, &spec.id);
     // Share identical file data of this home with the other homes, in the
     // background: the exit does not wait for it.
     crate::storage::dedupe::spawn_after_run(env, &spec.home_src);
@@ -1519,6 +1526,110 @@ fn quiet_stdio() {
     }
 }
 
+/// Watches for new host network addresses that become reachable while a sandbox
+/// runs under bwrap with network mode egress. Joined before exit.
+struct EgressAddrMonitor {
+    stop_tx: std::sync::mpsc::Sender<()>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl EgressAddrMonitor {
+    fn start(
+        env: HostEnv,
+        running: crate::state::Running,
+        found: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    ) -> Self {
+        let (stop_tx, stop_rx) = std::sync::mpsc::channel();
+        let start_addrs = crate::proxy::local_addrs();
+        let thread = std::thread::spawn(move || {
+            let mut info = running;
+            let check = |info: &mut crate::state::Running| {
+                let mut f = found.lock().unwrap();
+                let mut changed = false;
+                for a in crate::proxy::local_addrs() {
+                    let s = a.to_string();
+                    if !a.is_loopback() && !start_addrs.contains(&a) && !f.contains(&s) {
+                        f.push(s);
+                        changed = true;
+                    }
+                }
+                if changed {
+                    info.warnings
+                        .retain(|w| !w.starts_with("new host addresses"));
+                    info.warnings.insert(
+                        0,
+                        format!(
+                            "new host addresses since start are reachable: {}",
+                            f.join(", ")
+                        ),
+                    );
+                    let _ = info.register(&env);
+                }
+            };
+            while stop_rx
+                .recv_timeout(std::time::Duration::from_secs(3))
+                .is_err()
+            {
+                check(&mut info);
+            }
+            check(&mut info);
+        });
+        Self {
+            stop_tx,
+            thread: Some(thread),
+        }
+    }
+
+    fn finish(mut self) {
+        let _ = self.stop_tx.send(());
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
+    }
+}
+
+impl Drop for EgressAddrMonitor {
+    fn drop(&mut self) {
+        let _ = self.stop_tx.send(());
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
+    }
+}
+
+#[cfg(test)]
+mod egress_addr_monitor_tests {
+    use super::*;
+
+    #[test]
+    fn egress_addr_monitor_joins_on_finish() {
+        let t = tempfile::tempdir().unwrap();
+        let env = HostEnv::from_parts(
+            t.path().join("host"),
+            "demo".into(),
+            1,
+            1,
+            Default::default(),
+        );
+        let info: crate::state::Running = serde_json::from_value(serde_json::json!({
+            "id": "s-test",
+            "harness": "h",
+            "project": t.path().join("proj"),
+            "backend": "bwrap",
+            "network": "egress",
+            "gui": "off",
+            "pid": 1,
+            "started": 100,
+        }))
+        .unwrap();
+        let found = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let monitor = EgressAddrMonitor::start(env, info, found.clone());
+        let start = std::time::Instant::now();
+        monitor.finish();
+        assert!(start.elapsed() < std::time::Duration::from_secs(1));
+    }
+}
+
 #[cfg(test)]
 mod history_sync_tests {
     use super::*;
@@ -1596,5 +1707,93 @@ mod deliver_tests {
         assert_eq!(out.secret_files, ["GH_TOKEN"]);
         assert_eq!(out.delivered, ["DB"]);
         assert_eq!(out.marks.len(), 2);
+    }
+}
+
+#[cfg(test)]
+mod cleanup_tests {
+    use super::*;
+    use crate::backend::{Backend, Launch};
+    use crate::build::{build_with, Options};
+    use crate::profile::{Harness, Profile};
+    use std::collections::BTreeMap;
+    use std::path::PathBuf;
+
+    struct MissingProgram;
+
+    impl Backend for MissingProgram {
+        fn name(&self) -> &'static str {
+            "test"
+        }
+        fn check(&self, _: &HostEnv, _: &crate::spec::SandboxSpec) -> Result<()> {
+            Ok(())
+        }
+        fn render(
+            &self,
+            env: &HostEnv,
+            spec: &crate::spec::SandboxSpec,
+            _: bool,
+        ) -> Result<Launch> {
+            Ok(Launch {
+                program: PathBuf::from("/no-such-paddock-harness"),
+                args: vec![],
+                env: crate::backend::base_env(env, spec),
+                files: vec![],
+            })
+        }
+    }
+
+    #[test]
+    fn an_early_return_still_removes_the_run_folder() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let project = tmp.path().join("proj");
+        std::fs::create_dir_all(home.join(".config/paddock")).unwrap();
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(
+            home.join(".config/paddock/config.toml"),
+            "[devices]\nmount = false\n[kv]\nenabled = false\n",
+        )
+        .unwrap();
+        let mut vars = BTreeMap::new();
+        vars.insert("PATH".into(), std::env::var("PATH").unwrap_or_default());
+        let env = HostEnv::from_parts(home, "t".into(), 1000, 1000, vars);
+        let profile: Profile = toml::from_str("name = \"t\"\n").unwrap();
+        let h = Harness {
+            profile,
+            exe: PathBuf::from("/usr/bin/true"),
+            install_mounts: vec![],
+            path_dirs: vec![],
+            source: "test".into(),
+        };
+        let opts = Options {
+            harness: "t".into(),
+            project: Some(project),
+            assume_yes: true,
+            inherit_env: Some(false),
+            ..Default::default()
+        };
+        let built = build_with(&env, &opts, h).unwrap();
+        let id = built.spec.id.clone();
+        let run_dir = env.paddock_run().join(&id);
+        let borrow_dir = crate::borrow::dir(&env, &id);
+        let err = match run(&env, built, &MissingProgram, true, true) {
+            Ok(_) => panic!("run succeeded"),
+            Err(e) => e,
+        };
+        assert!(
+            err.to_string().contains("cannot start") || err.to_string().contains("No such file"),
+            "{err:#}"
+        );
+        assert!(
+            !run_dir.exists(),
+            "run folder left behind: {}",
+            run_dir.display()
+        );
+        assert!(
+            !borrow_dir.exists(),
+            "borrow folder left behind: {}",
+            borrow_dir.display()
+        );
     }
 }

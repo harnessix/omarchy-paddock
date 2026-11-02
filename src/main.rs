@@ -1211,9 +1211,22 @@ fn start(env: &HostEnv, a: &RunArgs, shell: bool) -> Result<i32> {
     let opts = a.options(env, shell)?;
     let built = build::build(env, &opts)?;
     if !shell && !opts.no_yolo {
-        run::probe_flags(env, &built)?;
+        if let Err(e) = run::probe_flags(env, &built) {
+            if let Some(w) = &built.worktree {
+                build::discard_worktree(env, w);
+            }
+            return Err(e);
+        }
     }
-    let backend = run::select_backend(env, &built)?;
+    let backend = match run::select_backend(env, &built) {
+        Ok(b) => b,
+        Err(e) => {
+            if let Some(w) = &built.worktree {
+                build::discard_worktree(env, w);
+            }
+            return Err(e);
+        }
+    };
     let wt = built.worktree.clone();
     let code = run::run(env, built, backend.as_ref(), false, false)?.code;
     if let Some(w) = wt {
@@ -1229,6 +1242,10 @@ fn explain(env: &HostEnv, a: &RunArgs, json: bool) -> Result<()> {
     let s = &built.spec;
     let cleanup = || {
         let _ = std::fs::remove_dir_all(env.paddock_run().join(&s.id));
+        paddock::borrow::end(env, &s.id);
+        if let Some(w) = &built.worktree {
+            build::discard_worktree(env, w);
+        }
     };
     if json {
         let mut v = serde_json::to_value(s)?;

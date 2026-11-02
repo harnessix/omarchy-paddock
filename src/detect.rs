@@ -126,6 +126,16 @@ impl Detector for Git {
                 false,
                 "detector git: hooks run on the host",
             ));
+            // Submodule git directories: one that the agent creates here
+            // would get no binds, and the host's `git status` reads its
+            // config when it recurses. The ones that exist now are mounted
+            // read-write above, below this read-only folder.
+            crate::safefs::Root::open(&dir)?.dir(Path::new("modules"), true)?;
+            spec.add_mount(Mount::same(
+                dir.join("modules"),
+                false,
+                "detector git: new submodule git directories steer host git",
+            ));
             let linked = dir.join("commondir").is_file();
             for f in crate::hostgit::PROTECTED_FILES {
                 let p = dir.join(f);
@@ -376,17 +386,9 @@ impl Detector for Rustup {
 /// Hide credential-shaped files in the project.
 pub struct Secrets;
 
-const SKIP_DIRS: &[&str] = &[
-    ".git",
-    "node_modules",
-    "target",
-    ".venv",
-    "venv",
-    "dist",
-    "build",
-    "vendor",
-    ".direnv",
-];
+/// `.git` is already a read-only mount and is large, so the walk leaves it out.
+const SECRET_MAX_DEPTH: usize = 32;
+const SECRET_MAX_ENTRIES: usize = 50_000;
 const SAFE_SUFFIXES: &[&str] = &[".example", ".sample", ".template", ".dist", ".defaults"];
 
 pub fn is_secret_name(name: &str) -> bool {
@@ -405,22 +407,31 @@ pub fn is_secret_name(name: &str) -> bool {
             .any(|e| name.ends_with(e))
 }
 
-fn walk_secrets(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
-    if depth > 3 {
-        return;
-    }
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for e in entries.flatten() {
-        let name = e.file_name().to_string_lossy().into_owned();
-        let Ok(ft) = e.file_type() else { continue };
-        if ft.is_dir() {
-            if !SKIP_DIRS.contains(&name.as_str()) {
-                walk_secrets(&e.path(), depth + 1, out);
+fn walk_secrets(dir: &Path, depth: usize, left: &mut usize, out: &mut Vec<PathBuf>) {
+    // Breadth first: when a large build folder uses up the budget, the
+    // shallow folders next to it are already covered.
+    let mut queue = std::collections::VecDeque::from([(dir.to_path_buf(), depth)]);
+    while let Some((dir, depth)) = queue.pop_front() {
+        if depth > SECRET_MAX_DEPTH || *left == 0 {
+            continue;
+        }
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for e in entries.flatten() {
+            if *left == 0 {
+                return;
             }
-        } else if ft.is_file() && is_secret_name(&name) {
-            out.push(e.path());
+            *left -= 1;
+            let name = e.file_name();
+            let Ok(ft) = e.file_type() else { continue };
+            if ft.is_dir() {
+                if name != ".git" {
+                    queue.push_back((e.path(), depth + 1));
+                }
+            } else if ft.is_file() && is_secret_name(&name.to_string_lossy()) {
+                out.push(e.path());
+            }
         }
     }
 }
@@ -434,7 +445,8 @@ pub fn hide_secrets_in(
     origin: &str,
 ) -> usize {
     let mut found = Vec::new();
-    walk_secrets(dir, 0, &mut found);
+    let mut left = SECRET_MAX_ENTRIES;
+    walk_secrets(dir, 0, &mut left, &mut found);
     let mut n = 0;
     for f in found {
         if reveal.contains(&f) || spec.mounts.iter().any(|m| m.dst == f) {
@@ -582,7 +594,7 @@ mod tests {
         let dot = project.join(".git");
         // Its own mount point, so it cannot be renamed in the sandbox.
         assert_eq!(kind(&dot), Some(MountKind::Rw));
-        for f in ["hooks", "config", "config.worktree", "commondir"] {
+        for f in ["hooks", "config", "config.worktree", "commondir", "modules"] {
             assert_eq!(kind(&dot.join(f)), Some(MountKind::Ro), "{f}");
         }
         assert_eq!(
@@ -600,6 +612,32 @@ mod tests {
             std::fs::read_to_string(dot.join("config.worktree")).unwrap(),
             ""
         );
+    }
+
+    #[test]
+    fn a_new_submodule_git_dir_cannot_be_planted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("repo");
+        std::fs::create_dir_all(project.join(".git/modules/old")).unwrap();
+        run_git(&project, &["init", "-q", "-b", "main"]);
+        // An existing submodule git directory stays writable.
+        let old = project.join(".git/modules/old");
+        run_git(&old, &["init", "-q", "--bare"]);
+        let spec = git_mounts(&project);
+        let kind = |p: &Path| spec.mounts.iter().find(|m| m.dst == p).map(|m| m.kind);
+        let modules = project.join(".git/modules");
+        assert_eq!(kind(&modules), Some(MountKind::Ro));
+        assert_eq!(kind(&old), Some(MountKind::Rw));
+        assert_eq!(kind(&old.join("config")), Some(MountKind::Ro));
+        assert_eq!(kind(&old.join("modules")), Some(MountKind::Ro));
+        // The read-only folder is bound before the one inside it.
+        let order: Vec<&Path> = spec
+            .ordered_mounts()
+            .iter()
+            .map(|m| m.dst.as_path())
+            .collect();
+        let at = |p: &Path| order.iter().position(|d| *d == p).unwrap();
+        assert!(at(&modules) < at(&old));
     }
 
     #[test]
@@ -672,6 +710,56 @@ mod tests {
         assert_eq!(kind(&data.join(".env")), Some(MountKind::MaskFile));
         assert_eq!(kind(&data.join("sub/tls.key")), None);
         assert_eq!(kind(&data.join("notes.txt")), None);
+    }
+
+    #[test]
+    fn a_large_build_folder_does_not_use_up_the_budget_before_a_shallow_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        // "a-target" sorts before "config" in most directory orders, and a
+        // depth-first walk spends the whole budget in it.
+        let big = tmp.path().join("a-target/x/y");
+        std::fs::create_dir_all(&big).unwrap();
+        for i in 0..50 {
+            std::fs::write(big.join(format!("f{i}")), "").unwrap();
+        }
+        std::fs::create_dir_all(tmp.path().join("config")).unwrap();
+        std::fs::write(tmp.path().join("config/.env"), "x").unwrap();
+        let (mut left, mut out) = (10, Vec::new());
+        walk_secrets(tmp.path(), 0, &mut left, &mut out);
+        assert_eq!(out, [tmp.path().join("config/.env")]);
+    }
+
+    #[test]
+    fn deep_and_skipped_secret_files_are_hidden() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("proj");
+        let deep = project.join("a/b/c/d");
+        std::fs::create_dir_all(&deep).unwrap();
+        std::fs::create_dir_all(project.join("build")).unwrap();
+        std::fs::write(deep.join(".env"), "x").unwrap();
+        std::fs::write(project.join("build/.env"), "x").unwrap();
+        let env = HostEnv::from_parts(
+            tmp.path().join("home"),
+            "t".into(),
+            1000,
+            1000,
+            Default::default(),
+        );
+        let mut spec = SandboxSpec::new(
+            "t".into(),
+            "x",
+            &project,
+            env.home.join("sandbox"),
+            &env.home,
+            1000,
+            1000,
+            "t",
+        );
+        let n = hide_secrets_in(&project, &[], &mut spec, "test");
+        assert_eq!(n, 2, "masked {n} files: {:?}", spec.mounts);
+        let kind = |p: &Path| spec.mounts.iter().find(|m| m.dst == p).map(|m| m.kind);
+        assert_eq!(kind(&deep.join(".env")), Some(MountKind::MaskFile));
+        assert_eq!(kind(&project.join("build/.env")), Some(MountKind::MaskFile));
     }
 
     #[test]

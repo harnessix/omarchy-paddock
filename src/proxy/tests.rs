@@ -883,6 +883,38 @@ fn api_refusals_reach_the_boundary_log() {
 }
 
 #[test]
+fn api_refusals_are_rate_limited_across_random_hosts() {
+    let dir = tempfile::tempdir().unwrap();
+    let log = dir.path().join(crate::boundary::FILE);
+    let l2 = log.clone();
+    let reported = Arc::new(Mutex::new(Vec::new()));
+    let rep2 = reported.clone();
+    let (list, _) = allow::Allowlist::parse(&["api.example.com"]);
+    let (_d, sock) = start(HostProxy {
+        api: Some(allow::ApiPolicy {
+            list,
+            refusals: Some(allow::Refusals::new(Arc::new(move |h: &str, why: &str| {
+                rep2.lock().unwrap().push(format!("{h}: {why}"));
+            }))),
+        }),
+        boundary: Some(Boundary(Arc::new(move |t: &str, r: &str| {
+            let e = crate::boundary::Entry::new(crate::boundary::NETWORK, t, r);
+            crate::boundary::record_at(&l2, e).unwrap();
+        }))),
+        ..Default::default()
+    });
+    for i in 0..25 {
+        assert_eq!(connect(&sock, &format!("rand{i}.example.com:443")).0, 403);
+    }
+    assert_eq!(
+        reported.lock().unwrap().len(),
+        allow::Refusals::MAX_PER_WINDOW
+    );
+    let lines = crate::boundary::read_at(&log);
+    assert_eq!(lines.len(), allow::Refusals::MAX_PER_WINDOW);
+}
+
+#[test]
 fn a_connection_records_its_host_for_the_egress_monitor() {
     let port = echo_server();
     let dir = tempfile::tempdir().unwrap();
@@ -909,4 +941,19 @@ fn a_connection_records_its_host_for_the_egress_monitor() {
     assert_eq!(code, 403);
     let h = crate::monitor::egress::History::load(&history);
     assert_eq!(h.hosts.len(), 1);
+}
+
+#[test]
+fn a_connect_target_keeps_port_80() {
+    assert_eq!(connect_target("h:80"), Some(("h".into(), 80)));
+    assert_eq!(
+        connect_target("127.0.0.1:80"),
+        Some(("127.0.0.1".into(), 80))
+    );
+    assert_eq!(
+        connect_target("example.com:443"),
+        Some(("example.com".into(), 443))
+    );
+    assert_eq!(connect_target("example.com"), None);
+    assert_eq!(connect_target("example.com:x"), None);
 }

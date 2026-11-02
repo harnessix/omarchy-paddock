@@ -182,19 +182,16 @@ fn tool(name: &str, args: &[String]) -> Option<Tunnel> {
     }
 }
 
-/// `ssh` with `-R`, `-L` or `-D`, alone or combined (`-NR`). The options
+/// `ssh` with `-R`, `-L`, `-D`, `-W` or `-w`, or `-o RemoteForward`,
+/// `LocalForward` or `DynamicForward`, alone or combined (`-NR`). The options
 /// that take an argument end a combined word; ssh reads options before and
 /// after the host, and the second plain word starts the remote command.
 fn ssh(args: &[String]) -> Option<Tunnel> {
     const WITH_ARG: &str = "BbcDEeFIiJLlmOoPpQRSWw";
     let mut found: Vec<String> = Vec::new();
     let mut plain = 0;
-    let mut skip = false;
-    for a in args {
-        if skip {
-            skip = false;
-            continue;
-        }
+    let mut iter = args.iter().peekable();
+    while let Some(a) = iter.next() {
         if a == "--" {
             break;
         }
@@ -206,14 +203,43 @@ fn ssh(args: &[String]) -> Option<Tunnel> {
             continue;
         };
         for (i, c) in opts.char_indices() {
-            if matches!(c, 'R' | 'L' | 'D') {
+            if matches!(c, 'R' | 'L' | 'D' | 'W' | 'w') {
                 let flag = format!("-{c}");
                 if !found.contains(&flag) {
                     found.push(flag);
                 }
             }
+            if matches!(c, 'o' | 'O') {
+                let opt_arg = if i + c.len_utf8() < opts.len() {
+                    opts[i + c.len_utf8()..].to_string()
+                } else {
+                    iter.next().cloned().unwrap_or_default()
+                };
+                let key = opt_arg
+                    .split(|ch: char| ch == '=' || ch.is_whitespace())
+                    .next()
+                    .unwrap_or("");
+                let flag = if key.eq_ignore_ascii_case("RemoteForward") {
+                    Some("-R")
+                } else if key.eq_ignore_ascii_case("LocalForward") {
+                    Some("-L")
+                } else if key.eq_ignore_ascii_case("DynamicForward") {
+                    Some("-D")
+                } else {
+                    None
+                };
+                if let Some(f) = flag {
+                    let f = f.to_string();
+                    if !found.contains(&f) {
+                        found.push(f);
+                    }
+                }
+                break;
+            }
             if WITH_ARG.contains(c) {
-                skip = i + c.len_utf8() == opts.len();
+                if i + c.len_utf8() == opts.len() {
+                    iter.next();
+                }
                 break;
             }
         }
@@ -637,43 +663,59 @@ struct Stamp {
 }
 
 /// The regular files below `home` that `keep` accepts, by their path
-/// relative to `home`. It never follows a symlink.
+/// relative to `home`. It never follows a symlink: each folder is opened one
+/// component at a time with `openat(O_NOFOLLOW)`, so a folder the sandbox
+/// swaps for a symlink during the walk is skipped.
 fn scan(home: &Path, keep: &dyn Fn(&str) -> bool) -> BTreeMap<String, Stamp> {
-    use std::os::unix::fs::MetadataExt;
+    use crate::safefs::{Kind, Root};
     let mut out = BTreeMap::new();
+    let Ok(root) = Root::open(home) else {
+        return out;
+    };
     let mut left = MAX_ENTRIES;
-    let mut stack = vec![(home.to_path_buf(), String::new())];
-    while let Some((dir, rel)) = stack.pop() {
-        let Ok(rd) = std::fs::read_dir(&dir) else {
+    let mut stack = vec![(PathBuf::new(), String::new())];
+    while let Some((dir_rel, rel)) = stack.pop() {
+        let Ok(list) = root.dir(&dir_rel, false).and_then(|d| d.stats()) else {
             continue;
         };
-        for e in rd.flatten() {
+        for (os_name, st) in list {
             if left == 0 {
                 return out;
             }
             left -= 1;
-            let name = e.file_name().to_string_lossy().into_owned();
+            let name = os_name.to_string_lossy().into_owned();
             let r = if rel.is_empty() {
                 name.clone()
             } else {
                 format!("{rel}/{name}")
             };
-            // The file type of a directory entry is that of the link itself.
-            let Ok(ft) = e.file_type() else { continue };
-            if ft.is_dir() {
+            if st.kind == Kind::Dir {
                 if !SKIP_NAMES.contains(&name.as_str()) && !SKIP_PATHS.contains(&r.as_str()) {
-                    stack.push((e.path(), r));
+                    stack.push((dir_rel.join(&os_name), r));
                 }
-            } else if ft.is_file() && keep(&r) {
-                if let Ok(m) = e.metadata() {
-                    let mtime = (m.mtime(), m.mtime_nsec());
-                    out.insert(
-                        r,
-                        Stamp {
-                            size: m.len(),
-                            mtime,
-                        },
-                    );
+            } else if st.kind == Kind::File && keep(&r) {
+                out.insert(
+                    r,
+                    Stamp {
+                        size: st.size,
+                        mtime: st.mtime,
+                    },
+                );
+            } else if st.kind == Kind::Symlink && keep(&r) {
+                // A credential file can be a link (for example into a
+                // password store). One stat of its target, never a walk into
+                // a linked folder.
+                use std::os::unix::fs::MetadataExt as _;
+                if let Ok(m) = std::fs::metadata(home.join(&r)) {
+                    if m.is_file() {
+                        out.insert(
+                            r,
+                            Stamp {
+                                size: m.len(),
+                                mtime: (m.mtime(), m.mtime_nsec()),
+                            },
+                        );
+                    }
                 }
             }
         }
@@ -1270,28 +1312,39 @@ fn report_creds(env: &HostEnv, id: &Identity, files: &[CredFile], notify: bool) 
         );
     }
     if notify_now(env, &id.project, notify) {
-        let mut names: Vec<String> = files
-            .iter()
-            .take(3)
-            .map(|f| format!("~/{}", f.path))
-            .collect();
-        if files.len() > 3 {
-            names.push(format!("and {} more", files.len() - 3));
-        }
+        let body = cred_notification_body(&id.sandbox, files);
         let _ = crate::broker::notify::show(
             env,
             &crate::broker::notify::Note {
                 summary: "new credential files in a sandbox".into(),
-                body: format!(
-                    "{} wrote {}. A key or token in its home can keep access later. paddock log shows the list.",
-                    id.sandbox,
-                    names.join(", ")
-                ),
+                body,
                 actions: Vec::new(),
                 critical: false,
             },
         );
     }
+}
+
+fn cred_notification_body(sandbox: &str, files: &[CredFile]) -> String {
+    let mut names: Vec<String> = files
+        .iter()
+        .take(3)
+        .map(|f| format!("~/{}", clean_cred_path(&f.path)))
+        .collect();
+    if files.len() > 3 {
+        names.push(format!("and {} more", files.len() - 3));
+    }
+    format!(
+        "{sandbox} wrote {}. A key or token in its home can keep access later. paddock log shows the list.",
+        names.join(", ")
+    )
+}
+
+fn clean_cred_path(path: &str) -> String {
+    crate::broker::clean_text(path)
+        .chars()
+        .map(|c| if c == '\n' || c == '\t' { ' ' } else { c })
+        .collect()
 }
 
 fn report(env: &HostEnv, id: &Identity, t: &Tunnel, notify: bool) {
@@ -1393,6 +1446,30 @@ mod tests {
         );
         // Options after the host count too.
         assert_eq!(tunnel_in(&argv("ssh host -R 1:a:2")).unwrap().flags, ["-R"]);
+        assert!(tunnel_in(&argv("ssh -oRemoteForward=1:a:2 host")).is_some());
+        assert_eq!(
+            tunnel_in(&argv("ssh -o RemoteForward=1:a:2 host"))
+                .unwrap()
+                .flags,
+            ["-R"]
+        );
+        assert_eq!(
+            tunnel_in(&argv("ssh -o LocalForward 1:a:2 host"))
+                .unwrap()
+                .flags,
+            ["-L"]
+        );
+        assert_eq!(
+            tunnel_in(&argv("ssh -o DynamicForward=1080 host"))
+                .unwrap()
+                .flags,
+            ["-D"]
+        );
+        assert_eq!(
+            tunnel_in(&argv("ssh -W host:443 jump")).unwrap().flags,
+            ["-W"]
+        );
+        assert_eq!(tunnel_in(&argv("ssh -w 0:0 host")).unwrap().flags, ["-w"]);
     }
 
     #[test]
@@ -1698,7 +1775,31 @@ Inter-|   Receive                                                |  Transmit
         let mut c = Creds::new(home.clone(), vec![]);
         std::os::unix::fs::symlink(outside.join(".ssh"), home.join(".ssh")).unwrap();
         std::os::unix::fs::symlink(outside.join("token"), home.join("token")).unwrap();
-        assert_eq!(c.check(), (vec![], 0));
+        assert_eq!(paths(&c.check().0), ["token"]);
+    }
+
+    #[test]
+    fn a_folder_swapped_for_a_symlink_during_the_scan_is_not_followed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let outside = tmp.path().join("outside");
+        put(&outside, "token", "t");
+        put(&home, "x/a", "a");
+        put(&home, "trigger", "x");
+        // The folder `x` is listed before it is entered. The sandbox swaps it
+        // for a symlink in between.
+        let swap = || {
+            std::fs::rename(home.join("x"), home.join("x.old")).unwrap();
+            std::os::unix::fs::symlink(&outside, home.join("x")).unwrap();
+        };
+        let keep = |r: &str| {
+            if r == "trigger" {
+                swap();
+            }
+            is_credential(r)
+        };
+        let found = scan(&home, &keep);
+        assert!(found.keys().all(|k| !k.starts_with("x/")), "{found:?}");
     }
 
     #[test]
@@ -1717,6 +1818,19 @@ Inter-|   Receive                                                |  Transmit
         let rec = load_record(&file);
         assert_eq!(rec.credential_files, [key(7)]);
         assert_eq!(rec.login_refreshes, 3);
+    }
+
+    #[test]
+    fn credential_file_names_in_notifications_are_cleaned() {
+        let dirty = CredFile {
+            path: "bad\nname\u{202e}.token\u{1b}[2J".into(),
+            size: 10,
+        };
+        let body = cred_notification_body("s1", &[dirty]);
+        assert!(!body.contains('\n'));
+        assert!(!body.contains('\u{202e}'));
+        assert!(!body.contains('\u{1b}'));
+        assert!(body.contains("~/bad name.token[2J"));
     }
 
     #[test]

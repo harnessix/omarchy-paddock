@@ -137,6 +137,39 @@ pub fn create_worktree(env: &HostEnv, repo: &Path, app: Option<&str>) -> Result<
     })
 }
 
+/// Remove a worktree that paddock created, and its branch. Used when the
+/// build or `explain` ends without a run.
+pub fn discard_worktree(env: &HostEnv, w: &Worktree) {
+    if let Err(e) =
+        crate::storage::remove_worktree(env, &w.path, Some(&w.repo), Some(&w.branch), true, true)
+    {
+        log::warn!(
+            "cannot remove leftover worktree {}: {e:#}",
+            w.path.display()
+        );
+    }
+}
+
+/// Drops the worktree unless `keep` takes it (the build succeeded).
+struct PendingWorktree<'a> {
+    env: &'a HostEnv,
+    wt: Option<Worktree>,
+}
+
+impl PendingWorktree<'_> {
+    fn keep(&mut self) -> Option<Worktree> {
+        self.wt.take()
+    }
+}
+
+impl Drop for PendingWorktree<'_> {
+    fn drop(&mut self) {
+        if let Some(w) = self.wt.take() {
+            discard_worktree(self.env, &w);
+        }
+    }
+}
+
 /// What the run left in its worktree: commits, uncommitted changes and the
 /// commands to review, merge or remove it. Empty lines are dropped.
 pub fn worktree_report(env: &HostEnv, w: &Worktree) -> String {
@@ -332,7 +365,12 @@ pub fn build(env: &HostEnv, opts: &Options) -> Result<Built> {
 
 pub fn build_with(env: &HostEnv, opts: &Options, harness: Harness) -> Result<Built> {
     let project = resolve_project(opts.project.as_deref())?;
-    if project == env.home || env.home.starts_with(&project) {
+    // The project path is resolved, so compare it with the resolved home
+    // too: `$HOME` may name a symlink.
+    if crate::policy::homes(env)
+        .iter()
+        .any(|h| project == *h || h.starts_with(&project))
+    {
         bail!(
             "refusing to use {} as the project: it is the home directory or contains it",
             project.display()
@@ -363,7 +401,12 @@ pub fn build_with(env: &HostEnv, opts: &Options, harness: Harness) -> Result<Bui
     } else {
         None
     };
-    let project = worktree.as_ref().map(|w| w.path.clone()).unwrap_or(project);
+    let mut pending = PendingWorktree { env, wt: worktree };
+    let project = pending
+        .wt
+        .as_ref()
+        .map(|w| w.path.clone())
+        .unwrap_or(project);
 
     let account = opts.transparent.as_ref().and_then(|t| t.account.as_ref());
     let auth: state::AuthMode = match account {
@@ -425,18 +468,20 @@ pub fn build_with(env: &HostEnv, opts: &Options, harness: Harness) -> Result<Bui
     for d in &harness.path_dirs {
         spec.add_path(d.clone());
     }
-    for (k, v) in &profile.launch.env {
-        spec.set_env(k, v.clone(), &porigin);
-    }
-    // The host environment, first, so profile, manifest and detectors override it.
+    // The host environment first, so profile, manifest and detectors override it.
     let inherit = opts.inherit_env.or(m.env.inherit).unwrap_or(true);
     if inherit {
         let mut withheld = Vec::new();
         let mut dropped = Vec::new();
         let mut count = 0;
+        let account_var = profile.state.account.as_ref().map(|a| a.env.as_str());
         for (k, v) in &env.vars {
             if m.env.hide.contains(k) {
                 spec.deny(crate::boundary::ENV, k, "env hide");
+                continue;
+            }
+            if account_var == Some(k.as_str()) {
+                spec.deny(crate::boundary::ENV, k, "account folder of the harness");
                 continue;
             }
             if !policy::inheritable_var(k, v) || k.starts_with("LC_") {
@@ -518,6 +563,9 @@ pub fn build_with(env: &HostEnv, opts: &Options, harness: Harness) -> Result<Bui
             );
             spec.notices.push(note);
         }
+    }
+    for (k, v) in &profile.launch.env {
+        spec.set_env(k, v.clone(), &porigin);
     }
     // The host proxy, in every env mode: sandbox traffic must leave the way host
     // traffic does. A proxy on the host loopback is the one loopback port the
@@ -753,7 +801,7 @@ pub fn build_with(env: &HostEnv, opts: &Options, harness: Harness) -> Result<Bui
         }
         // An editor that opens the repository opens the worktree instead.
         let repo_arg = home_key.display().to_string();
-        c.extend(opts.args.iter().map(|a| match &worktree {
+        c.extend(opts.args.iter().map(|a| match &pending.wt {
             Some(w) if *a == repo_arg => w.path.display().to_string(),
             _ => a.clone(),
         }));
@@ -843,7 +891,8 @@ pub fn build_with(env: &HostEnv, opts: &Options, harness: Harness) -> Result<Bui
     // The shared folder of the pasture. paddock sets the variables last,
     // so that nothing from the host or the project replaces them.
     if let Some(name) = &opts.pasture {
-        let kv_project = worktree
+        let kv_project = pending
+            .wt
             .as_ref()
             .map(|w| w.repo.clone())
             .unwrap_or_else(|| home_key.clone());
@@ -905,7 +954,7 @@ pub fn build_with(env: &HostEnv, opts: &Options, harness: Harness) -> Result<Bui
         device_ceiling: None,
         test_devices: false,
         shared_history,
-        worktree,
+        worktree: pending.keep(),
         pasture: opts.pasture.clone(),
         bridge,
         auth,
@@ -939,6 +988,31 @@ mod tests {
         h.path_dirs.clear();
         h.exe = PathBuf::from("/home/demo/proj/node_modules/.bin/tool");
         assert!(check_harness_install(&h, &writable).is_err());
+    }
+
+    #[test]
+    fn a_symlinked_home_is_refused_as_the_project() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("real");
+        std::fs::create_dir_all(real.join("home")).unwrap();
+        std::os::unix::fs::symlink(&real, tmp.path().join("link")).unwrap();
+        let home = tmp.path().join("link/home");
+        let env = HostEnv::from_parts(home.clone(), "t".into(), 1000, 1000, Default::default());
+        let h = Harness {
+            profile: crate::profile::builtin("codex").unwrap(),
+            exe: PathBuf::from("/usr/bin/true"),
+            install_mounts: vec![],
+            path_dirs: vec![],
+            source: "test".into(),
+        };
+        let opts = Options {
+            harness: "codex".into(),
+            project: Some(home),
+            assume_yes: true,
+            ..Default::default()
+        };
+        let err = build_with(&env, &opts, h).err().expect("refused");
+        assert!(err.to_string().contains("home directory"), "{err}");
     }
 
     /// Build a spec for a built-in profile with a stand-in executable, a
@@ -1324,5 +1398,78 @@ mod tests {
             .output()
             .unwrap();
         assert_eq!(String::from_utf8_lossy(&head.stdout).trim(), "main");
+    }
+
+    #[test]
+    fn a_failed_build_does_not_leave_a_worktree() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("app");
+        std::fs::create_dir_all(&repo).unwrap();
+        let g = |dir: &Path, args: &[&str]| {
+            let ok = std::process::Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(["-c", "user.name=t", "-c", "user.email=t@localhost"])
+                .args(args)
+                .status()
+                .unwrap()
+                .success();
+            assert!(ok, "git {args:?}");
+        };
+        g(&repo, &["init", "-q", "-b", "main"]);
+        g(&repo, &["commit", "-q", "--allow-empty", "-m", "one"]);
+        let missing = tmp.path().join("no-such-mount");
+        std::fs::write(
+            repo.join("paddock.toml"),
+            format!("[mounts]\nro = [\"{}\"]\n", missing.display()),
+        )
+        .unwrap();
+        let repo = std::fs::canonicalize(&repo).unwrap();
+        let mut vars = std::collections::BTreeMap::new();
+        vars.insert(
+            "XDG_DATA_HOME".to_string(),
+            tmp.path().join("data").display().to_string(),
+        );
+        if let Ok(p) = std::env::var("PATH") {
+            vars.insert("PATH".to_string(), p);
+        }
+        let env = HostEnv::from_parts(tmp.path().join("home"), "t".into(), 1000, 1000, vars);
+        let h = Harness {
+            profile: crate::profile::builtin("claude").unwrap(),
+            exe: PathBuf::from("/usr/bin/true"),
+            install_mounts: vec![],
+            path_dirs: vec![],
+            source: "test".into(),
+        };
+        let opts = Options {
+            harness: "claude".into(),
+            project: Some(repo.clone()),
+            assume_yes: true,
+            worktree: true,
+            ..Default::default()
+        };
+        let Err(err) = build_with(&env, &opts, h) else {
+            panic!("build succeeded");
+        };
+        assert!(err.to_string().contains("does not exist"), "{err:#}");
+        let listed = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["worktree", "list", "--porcelain"])
+            .output()
+            .unwrap();
+        let listed = String::from_utf8_lossy(&listed.stdout);
+        assert!(
+            !listed.contains("paddock/wt-"),
+            "leftover worktree:\n{listed}"
+        );
+        let branches = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["branch", "--list", "paddock/wt-*"])
+            .output()
+            .unwrap();
+        let branches = String::from_utf8_lossy(&branches.stdout);
+        assert!(branches.trim().is_empty(), "leftover branch:\n{branches}");
     }
 }

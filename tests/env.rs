@@ -211,3 +211,45 @@ fn withheld_names_go_into_the_boundary_log_without_values() {
     assert_eq!(rule("HIDE_ME").unwrap(), "env hide");
     assert!(rule("PLAIN_SETTING").is_none());
 }
+
+#[test]
+fn profile_env_beats_the_host_and_account_and_cache_vars_stay_out() {
+    let (_t, mut env, project) = setup(&[]);
+    env.vars.insert("DISABLE_AUTOUPDATER".into(), "0".into());
+    env.vars
+        .insert("CLAUDE_CONFIG_DIR".into(), "/elsewhere".into());
+    env.vars.insert("CARGO_HOME".into(), "/host/cargo".into());
+    env.vars.insert("UV_CACHE_DIR".into(), "/host/uv".into());
+    let h = Harness {
+        profile: paddock::profile::builtin("claude").unwrap(),
+        exe: PathBuf::from("/bin/sh"),
+        install_mounts: vec![],
+        path_dirs: vec![],
+        source: "test".into(),
+    };
+    let opts = Options {
+        harness: "claude".into(),
+        project: Some(project),
+        assume_yes: true,
+        ..Default::default()
+    };
+    let b = build_with(&env, &opts, h).unwrap();
+    let e = &b.spec.env;
+    assert_eq!(
+        e.get("DISABLE_AUTOUPDATER").map(|v| v.value.as_str()),
+        Some("1"),
+        "profile launch.env must beat the host"
+    );
+    assert!(
+        !e.contains_key("CLAUDE_CONFIG_DIR"),
+        "account folder variable must stay on the host"
+    );
+    assert!(
+        !e.contains_key("CARGO_HOME"),
+        "CARGO_HOME must not bypass the shared cache"
+    );
+    assert!(
+        !e.contains_key("UV_CACHE_DIR"),
+        "UV_CACHE_DIR must not bypass the shared cache"
+    );
+}

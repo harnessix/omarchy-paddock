@@ -697,6 +697,15 @@ fn fail(client: &mut impl Write, e: &anyhow::Error) {
     }
 }
 
+/// The host and port of a CONNECT target `host:port`. The port must be
+/// written out; `Url::port` alone hides port 80 as the default of http.
+fn connect_target(target: &str) -> Option<(String, u16)> {
+    let (_, port) = target.rsplit_once(':')?;
+    port.parse::<u16>().ok()?;
+    let parsed = Url::parse(&format!("http://{target}")).ok()?;
+    Some((host_of(&parsed)?, parsed.port_or_known_default()?))
+}
+
 /// Hop-by-hop headers that a proxy must not forward.
 const HOP: &[&str] = &[
     "proxy-connection",
@@ -721,18 +730,15 @@ fn handle(cfg: &HostProxy, mut client: UnixStream) -> Result<()> {
     client.set_read_timeout(None)?;
 
     if method.eq_ignore_ascii_case("CONNECT") {
-        let parsed = Url::parse(&format!("http://{target}")).ok();
-        let (Some(host), Some(port)) = (
-            parsed.as_ref().and_then(host_of),
-            parsed.as_ref().and_then(Url::port),
-        ) else {
+        let Some((host, port)) = connect_target(&target) else {
             respond(&mut client, 400, "Bad Request");
             bail!("bad CONNECT target {target}");
         };
         if let Some(api) = &cfg.api {
             if let Err(why) = api.list.check(&host, port) {
-                api.refuse(&host, &why);
-                cfg.refused(&host, port, &format!("network mode api: {why}"));
+                if api.refuse(&host, &why) {
+                    cfg.refused(&host, port, &format!("network mode api: {why}"));
+                }
                 respond(&mut client, 403, "Forbidden");
                 bail!("refused: {host}:{port}: {why}");
             }
@@ -749,8 +755,9 @@ fn handle(cfg: &HostProxy, mut client: UnixStream) -> Result<()> {
             Some(api) => match checked_hello(&mut client, rest, &host) {
                 Ok(bytes) => bytes,
                 Err(why) => {
-                    api.refuse(&host, &why);
-                    cfg.refused(&host, port, &format!("network mode api: {why}"));
+                    if api.refuse(&host, &why) {
+                        cfg.refused(&host, port, &format!("network mode api: {why}"));
+                    }
                     let _ = client.shutdown(Shutdown::Both);
                     bail!("refused: {host}:{port}: {why}");
                 }
@@ -771,12 +778,13 @@ fn handle(cfg: &HostProxy, mut client: UnixStream) -> Result<()> {
             .as_ref()
             .and_then(host_of)
             .unwrap_or_default();
-        api.refuse(&host, "plain HTTP");
         let port = Url::parse(&target)
             .ok()
             .and_then(|u| u.port_or_known_default())
             .unwrap_or(80);
-        cfg.refused(&host, port, "network mode api: plain HTTP");
+        if api.refuse(&host, "plain HTTP") {
+            cfg.refused(&host, port, "network mode api: plain HTTP");
+        }
         respond(&mut client, 403, "Forbidden");
         bail!("refused: plain HTTP to {host} in network mode api");
     }
@@ -851,8 +859,9 @@ fn handle(cfg: &HostProxy, mut client: UnixStream) -> Result<()> {
 }
 
 /// Network mode `api`: read the TLS ClientHello that follows the CONNECT
-/// and check its server name against `host`. Nothing goes upstream before
-/// this check. Returns the bytes to forward: the early bytes and the hello.
+/// and check its server name against `host`. The tunnel opens first, but
+/// no client bytes go upstream before this check. Returns the bytes to
+/// forward: the early bytes and the hello.
 fn checked_hello(
     client: &mut UnixStream,
     early: Vec<u8>,

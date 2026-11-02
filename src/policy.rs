@@ -137,6 +137,23 @@ pub const HOST_ONLY_ENV: &[&str] = &[
     "CLAUDE_CODE_SSE_PORT",
 ];
 
+/// Variables that redirect package caches. Inheritance drops them so the
+/// sandbox uses the shared cache mounts. `[env] pass` can still hand one over.
+pub const CACHE_ENV: &[&str] = &[
+    "CARGO_HOME",
+    "CARGO_TARGET_DIR",
+    "RUSTUP_HOME",
+    "UV_CACHE_DIR",
+    "PIP_CACHE_DIR",
+    "npm_config_cache",
+    "NPM_CONFIG_CACHE",
+    "PNPM_STORE_DIR",
+    "YARN_CACHE_FOLDER",
+    "GOPATH",
+    "GOCACHE",
+    "GOMODCACHE",
+];
+
 /// Whether a host variable can be inherited. Besides the fixed list, any
 /// variable whose value is the path of a socket, or whose name says it holds
 /// one, is a host control channel and stays outside.
@@ -236,6 +253,7 @@ pub fn is_cloud_secret(name: &str) -> bool {
 
 pub fn inheritable(name: &str) -> bool {
     !HOST_ONLY_ENV.contains(&name)
+        && !CACHE_ENV.contains(&name)
         && !name.starts_with("__MISE")
         && !name.starts_with("PADDOCK_")
         && !name.starts_with("BASH_FUNC_")
@@ -260,8 +278,23 @@ pub fn looks_secret(name: &str) -> bool {
     .any(|w| n.contains(w))
 }
 
+/// The home as written in `$HOME`, and its resolved path when `$HOME` goes
+/// through a symlink. Mount sources are compared in both forms.
+pub fn homes(env: &HostEnv) -> Vec<PathBuf> {
+    let mut v = vec![env.home.clone()];
+    if let Ok(real) = std::fs::canonicalize(&env.home) {
+        if real != env.home {
+            v.push(real);
+        }
+    }
+    v
+}
+
 pub fn denied_paths(env: &HostEnv) -> Vec<PathBuf> {
-    let mut v: Vec<PathBuf> = DENIED_HOME.iter().map(|p| env.home.join(p)).collect();
+    let mut v: Vec<PathBuf> = homes(env)
+        .iter()
+        .flat_map(|h| DENIED_HOME.iter().map(move |p| h.join(p)))
+        .collect();
     v.extend(DENIED_ABS.iter().map(PathBuf::from));
     if let Some(rt) = &env.runtime_dir {
         // The whole runtime directory holds the session bus, keyrings and the
@@ -277,6 +310,7 @@ fn overlaps(a: &Path, b: &Path) -> bool {
 
 pub fn enforce(env: &HostEnv, spec: &SandboxSpec) -> Result<()> {
     let denied = denied_paths(env);
+    let homes = homes(env);
     // The display socket is not a mount entry: gui.rs sets it only for the
     // nested compositor (window mode) or the approved host mode.
 
@@ -287,7 +321,7 @@ pub fn enforce(env: &HostEnv, spec: &SandboxSpec) -> Result<()> {
             if cand == Path::new("/") {
                 bail!("policy: refusing to mount / (from {})", m.origin);
             }
-            if env.home.starts_with(cand) {
+            if homes.iter().any(|h| h.starts_with(cand)) {
                 bail!(
                     "policy: refusing to mount {}: it is the home directory or contains it (from {})",
                     cand.display(),
@@ -430,6 +464,22 @@ mod tests {
     }
 
     #[test]
+    fn a_symlinked_home_still_protects_its_paths() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("real");
+        std::fs::create_dir_all(real.join("home/.ssh")).unwrap();
+        std::os::unix::fs::symlink(&real, tmp.path().join("link")).unwrap();
+        let env = fake_env(&tmp.path().join("link/home"));
+        let project = tmp.path().join("p");
+        std::fs::create_dir_all(&project).unwrap();
+        for src in [real.join("home"), real.join("home/.ssh")] {
+            let mut s = spec(&env, &project);
+            s.add_mount(Mount::same(&src, false, "test"));
+            assert!(enforce(&env, &s).is_err(), "{}", src.display());
+        }
+    }
+
+    #[test]
     fn claude_app_control_channel_stays_outside() {
         assert!(!inheritable_var("CLAUDE_CODE_MESSAGING_TOKEN", "abc"));
         assert!(!inheritable_var(
@@ -437,6 +487,8 @@ mod tests {
             "/run/user/1000/cc-socks/1.sock"
         ));
         assert!(inheritable_var("EDITOR", "nvim"));
+        assert!(!inheritable_var("CARGO_HOME", "/host/cargo"));
+        assert!(!inheritable_var("UV_CACHE_DIR", "/host/uv"));
     }
 
     #[test]
