@@ -637,44 +637,44 @@ struct Stamp {
 }
 
 /// The regular files below `home` that `keep` accepts, by their path
-/// relative to `home`. It never follows a symlink.
+/// relative to `home`. It never follows a symlink: each folder is opened one
+/// component at a time with `openat(O_NOFOLLOW)`, so a folder the sandbox
+/// swaps for a symlink during the walk is skipped.
 fn scan(home: &Path, keep: &dyn Fn(&str) -> bool) -> BTreeMap<String, Stamp> {
-    use std::os::unix::fs::MetadataExt;
+    use crate::safefs::{Kind, Root};
     let mut out = BTreeMap::new();
+    let Ok(root) = Root::open(home) else {
+        return out;
+    };
     let mut left = MAX_ENTRIES;
-    let mut stack = vec![(home.to_path_buf(), String::new())];
-    while let Some((dir, rel)) = stack.pop() {
-        let Ok(rd) = std::fs::read_dir(&dir) else {
+    let mut stack = vec![(PathBuf::new(), String::new())];
+    while let Some((dir_rel, rel)) = stack.pop() {
+        let Ok(list) = root.dir(&dir_rel, false).and_then(|d| d.stats()) else {
             continue;
         };
-        for e in rd.flatten() {
+        for (os_name, st) in list {
             if left == 0 {
                 return out;
             }
             left -= 1;
-            let name = e.file_name().to_string_lossy().into_owned();
+            let name = os_name.to_string_lossy().into_owned();
             let r = if rel.is_empty() {
                 name.clone()
             } else {
                 format!("{rel}/{name}")
             };
-            // The file type of a directory entry is that of the link itself.
-            let Ok(ft) = e.file_type() else { continue };
-            if ft.is_dir() {
+            if st.kind == Kind::Dir {
                 if !SKIP_NAMES.contains(&name.as_str()) && !SKIP_PATHS.contains(&r.as_str()) {
-                    stack.push((e.path(), r));
+                    stack.push((dir_rel.join(&os_name), r));
                 }
-            } else if ft.is_file() && keep(&r) {
-                if let Ok(m) = e.metadata() {
-                    let mtime = (m.mtime(), m.mtime_nsec());
-                    out.insert(
-                        r,
-                        Stamp {
-                            size: m.len(),
-                            mtime,
-                        },
-                    );
-                }
+            } else if st.kind == Kind::File && keep(&r) {
+                out.insert(
+                    r,
+                    Stamp {
+                        size: st.size,
+                        mtime: st.mtime,
+                    },
+                );
             }
         }
     }
@@ -1699,6 +1699,30 @@ Inter-|   Receive                                                |  Transmit
         std::os::unix::fs::symlink(outside.join(".ssh"), home.join(".ssh")).unwrap();
         std::os::unix::fs::symlink(outside.join("token"), home.join("token")).unwrap();
         assert_eq!(c.check(), (vec![], 0));
+    }
+
+    #[test]
+    fn a_folder_swapped_for_a_symlink_during_the_scan_is_not_followed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let outside = tmp.path().join("outside");
+        put(&outside, "token", "t");
+        put(&home, "x/a", "a");
+        put(&home, "trigger", "x");
+        // The folder `x` is listed before it is entered. The sandbox swaps it
+        // for a symlink in between.
+        let swap = || {
+            std::fs::rename(home.join("x"), home.join("x.old")).unwrap();
+            std::os::unix::fs::symlink(&outside, home.join("x")).unwrap();
+        };
+        let keep = |r: &str| {
+            if r == "trigger" {
+                swap();
+            }
+            is_credential(r)
+        };
+        let found = scan(&home, &keep);
+        assert!(found.keys().all(|k| !k.starts_with("x/")), "{found:?}");
     }
 
     #[test]

@@ -66,6 +66,14 @@ pub enum Kind {
     Other,
 }
 
+/// Kind, size and change time of an entry, taken without following it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Stat {
+    pub kind: Kind,
+    pub size: u64,
+    pub mtime: (i64, i64),
+}
+
 fn fstat(fd: &OwnedFd) -> std::io::Result<libc::stat> {
     // SAFETY: fstat fills a zeroed stat for an open fd.
     let mut st: libc::stat = unsafe { std::mem::zeroed() };
@@ -598,6 +606,29 @@ impl Dir {
 
     /// What the entry `name` is, without following it. None when missing.
     pub fn kind(&self, name: &OsStr) -> Result<Option<Kind>> {
+        Ok(self.lstat(name)?.map(|st| kind_of(&st)))
+    }
+
+    /// The entries of this folder with their kind, size and change time,
+    /// without following any.
+    pub fn stats(&self) -> Result<Vec<(OsString, Stat)>> {
+        let mut out = Vec::new();
+        for n in list(&self.fd)? {
+            if let Some(st) = self.lstat(&n)? {
+                out.push((
+                    n,
+                    Stat {
+                        kind: kind_of(&st),
+                        size: st.st_size as u64,
+                        mtime: (st.st_mtime, st.st_mtime_nsec),
+                    },
+                ));
+            }
+        }
+        Ok(out)
+    }
+
+    fn lstat(&self, name: &OsStr) -> Result<Option<libc::stat>> {
         let n = cstr(name)?;
         // SAFETY: fstatat fills a zeroed stat; AT_SYMLINK_NOFOLLOW keeps links.
         let mut st: libc::stat = unsafe { std::mem::zeroed() };
@@ -616,7 +647,7 @@ impl Dir {
             }
             return Err(e.into());
         }
-        Ok(Some(kind_of(&st)))
+        Ok(Some(st))
     }
 
     /// Connect to the Unix socket `name`. A symlink there is an error, so a
