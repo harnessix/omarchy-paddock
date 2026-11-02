@@ -40,6 +40,13 @@ Panel {
   // The last answered requests, newest first, from `paddock log --json`.
   property var recent: []
   property var sandboxes: []
+  // Runs that ended in the last minutes, with their done status.
+  property var ended: []
+  // The newest run that ended since paddock last looked: the bar shows it
+  // for a short while ("done", or "failed" in the urgent color).
+  property var endedNotice: null
+  property var endedSeen: ({})
+  property bool endedPrimed: false
   // Files that sandboxes saved outside the project, from `paddock files --json`.
   // One entry per file; paths and names are untrusted text.
   property var artifacts: []
@@ -340,6 +347,86 @@ Panel {
       else root.say(strings.t("msg.noView"))
     })
   }
+  // Sandboxes in groups by the project of their root sandbox: the groups
+  // that need attention first, then the newest. Children stay under their
+  // parent, in the order paddock ps lists them.
+  function groupByProject(list) {
+    var byId = {}
+    list.forEach(function(s) { byId[s.id] = s })
+    var rootOf = function(s) {
+      for (var d = 0; s.parent !== "" && byId[s.parent] && d < 4; d++) s = byId[s.parent]
+      return s
+    }
+    var groups = []
+    var index = {}
+    list.forEach(function(s) {
+      var r = rootOf(s)
+      var key = r.project
+      if (index[key] === undefined) {
+        index[key] = groups.length
+        groups.push({ key: key, name: r.projectName, items: [], attention: false, newest: 0 })
+      }
+      var g = groups[index[key]]
+      g.items.push(s)
+      if (s.warning !== "" || s.monitor !== "" || (s.timer !== null && s.timer.over)) g.attention = true
+      g.newest = Math.max(g.newest, s.started)
+    })
+    groups.sort(function(a, b) {
+      if (a.attention !== b.attention) return a.attention ? -1 : 1
+      return b.newest - a.newest
+    })
+    var out = []
+    groups.forEach(function(g) {
+      g.items.forEach(function(s, i) {
+        s.groupKey = g.key
+        s.groupName = g.name
+        s.groupStart = i === 0
+        out.push(s)
+      })
+    })
+    return out
+  }
+  // Runs that ended in the last minutes (paddock ps: ended).
+  function parseEnded(raw) {
+    if (!Array.isArray(raw)) return []
+    return raw.slice(0, 8).map(function(e) {
+      e = e || {}
+      var status = ["ok", "failed", "stopped"].indexOf(e.status) >= 0 ? e.status : "unknown"
+      return { id: root.plain(e.id, 64), harness: root.plain(e.harness, 24),
+               projectName: root.plain(root.baseName(e.project), 48), ended: Number(e.ended || 0),
+               status: status, text: root.plain(e.text || "", 200) }
+    })
+  }
+  // Remember the ended runs; a run that is new after the first look becomes
+  // the bar's notice. The first look only primes the list, so a restart of
+  // the shell does not announce old runs.
+  function noteEnded(list) {
+    var seen = root.endedSeen
+    var fresh = null
+    list.forEach(function(e) {
+      if (!seen[e.id] && root.endedPrimed && (fresh === null || e.ended > fresh.ended)) fresh = e
+      seen[e.id] = true
+    })
+    root.endedSeen = seen
+    root.endedPrimed = true
+    if (fresh !== null) { root.endedNotice = fresh; endedNoticeTimer.restart() }
+  }
+  // What a row is when it has no activity line: where its output goes.
+  function kindText(s) {
+    if (s.detached) return strings.t("row.kindDetached")
+    if (s.view) return strings.t("row.kindView")
+    if (s.windowPid > 0 || s.gui === "app" || s.gui === "wayland") return strings.t("row.kindWindow")
+    return strings.t("row.kindTerminal")
+  }
+  // The worktrees of a group's project: "2 worktrees · 3 unmerged".
+  function groupWorktrees(key) {
+    var ws = root.worktrees.filter(function(w) { return w.repo === key })
+    if (!ws.length) return ""
+    var unmerged = ws.reduce(function(n, w) { return n + Math.max(0, Number(w.unmerged || 0)) }, 0)
+    return strings.tn("group.worktrees", ws.length).arg(Commons.I18n.formatNumber(ws.length))
+      + (unmerged > 0 ? " · " + strings.tn("group.unmerged", unmerged).arg(Commons.I18n.formatNumber(unmerged)) : "")
+  }
+
   // A click on a sandbox row. A sandbox without its own terminal (a spawned
   // child, a detached or one-shot run) shows its live view. A child without
   // a view has no window of its own: focusing would land on the window of
@@ -779,6 +866,7 @@ Panel {
     onTriggered: root.refresh()
   }
   Timer { id: confirmTimer; interval: 4000; onTriggered: root.confirmId = "" }
+  Timer { id: endedNoticeTimer; interval: 12000; onTriggered: root.endedNotice = null }
   Timer { id: messageTimer; interval: 4000; onTriggered: root.message = "" }
 
   component JsonProc: Process {
@@ -882,9 +970,14 @@ Panel {
               x = x || {}
               return strings.t("row.spent").arg(root.plain(x.spent, 16)).arg(root.plain(x.budget, 16)).arg(root.plain(x.device, 32))
             }).join(" · ") : "",
+            // The last line of its live view (paddock ps: activity).
+            activity: root.plain(r.activity || "", 120),
             parentHarness: "",
             depth: 0,
-            children: 0
+            children: 0,
+            groupKey: "",
+            groupName: "",
+            groupStart: false
           })
         }
         for (var c = 0; c < clean.length; c++) {
@@ -897,7 +990,9 @@ Panel {
             p = up
           }
         }
-        root.sandboxes = clean
+        root.sandboxes = root.groupByProject(clean)
+        root.ended = root.parseEnded(parsed.ended)
+        root.noteEnded(root.ended)
         root.runningCount = clean.length
         root.pluginState = "ok"
         root.lastWarning = ""
@@ -1151,6 +1246,7 @@ Panel {
           var w = raw[i] || {}
           if (!root.wtSafePath(w.path)) continue
           clean.push({ path: String(w.path), branch: root.plain(w.branch, 140),
+                       repo: root.plain(w.repo || "", 512),
                        repoName: root.plain(root.baseName(w.repo), 48),
                        unmerged: w.unmerged === null || w.unmerged === undefined ? -1 : Math.max(0, Math.floor(Number(w.unmerged))),
                        dirty: w.dirty === true, running: w.running === true })
@@ -1308,7 +1404,17 @@ Panel {
         anchors.rightMargin: actionRow.visible ? Style.space(6) : 0
         anchors.verticalCenter: parent.verticalCenter
         PlainText { width: parent.width; text: row.title }
-        PlainText { width: parent.width; visible: text !== ""; text: row.caption; color: root.dim; font.pixelSize: Style.font.caption }
+        PlainText {
+          id: captionText
+          width: parent.width
+          visible: text !== ""
+          text: row.caption
+          color: root.dim
+          font.pixelSize: Style.font.caption
+          // A new activity line fades in, so the eye finds what changed.
+          onTextChanged: if (root.opened) captionFade.restart()
+          NumberAnimation on opacity { id: captionFade; running: false; from: 0.3; to: 1; duration: 260; easing.type: Easing.OutExpo }
+        }
         PlainText { width: parent.width; visible: text !== ""; text: row.caption2; color: row.caption2Color; font.pixelSize: Style.font.caption }
         PlainText { width: parent.width; visible: text !== ""; text: row.caption3; color: root.dim; font.pixelSize: Style.font.caption }
       }
@@ -1342,7 +1448,7 @@ Panel {
     open: root.opened
     focusTarget: panel.loadedContent
     contentWidth: panel.fittedContentWidth(Style.space(400))
-    contentHeight: panel.fittedContentHeight(panel.loadedContentHeight, Style.space(520))
+    contentHeight: panel.fittedContentHeight(panel.loadedContentHeight, Style.space(680))
 
     content: PanelKeyCatcher {
       implicitHeight: col.implicitHeight
@@ -1417,8 +1523,13 @@ Panel {
               if (root.pluginState === "missing") return strings.t("state.missingShort")
               if (root.pluginState === "error") return strings.t("state.errorShort")
               if (!root.loaded) return strings.t("state.loading")
-              return root.runningCount === 0 ? strings.t("state.idle")
-                : strings.tn("panel.running", root.runningCount).arg(Commons.I18n.formatNumber(root.runningCount))
+              var parts = [root.runningCount === 0 ? strings.t("state.idle")
+                : strings.tn("panel.sumRunning", root.runningCount).arg(Commons.I18n.formatNumber(root.runningCount))]
+              if (root.approvals.length > 0)
+                parts.push(strings.tn("panel.waiting", root.approvals.length).arg(Commons.I18n.formatNumber(root.approvals.length)))
+              if (root.ended.length > 0)
+                parts.push(strings.tn("panel.endedCount", root.ended.length).arg(Commons.I18n.formatNumber(root.ended.length)))
+              return parts.join(" · ")
             }
             trailingControl: Component {
               Button {
@@ -1502,17 +1613,50 @@ Panel {
             visible: root.view === "list" && root.sandboxes.length > 0
             Repeater {
               model: root.view === "list" ? root.sandboxes : []
-              delegate: ListRow {
+              delegate: Column {
+                id: entry
                 required property var modelData
                 required property int index
+                width: parent.width
+                spacing: Style.space(2)
+
+              // The project of this group, with its worktrees.
+              Item {
+                visible: entry.modelData.groupStart
+                width: parent.width
+                height: visible ? groupLabel.implicitHeight + Style.space(entry.index === 0 ? 2 : 10) : 0
+                PlainText {
+                  id: groupLabel
+                  anchors.left: parent.left
+                  anchors.leftMargin: Style.space(10)
+                  anchors.bottom: parent.bottom
+                  text: entry.modelData.groupName
+                  font.bold: true
+                }
+                PlainText {
+                  anchors.right: parent.right
+                  anchors.rightMargin: Style.space(8)
+                  anchors.baseline: groupLabel.baseline
+                  text: root.groupWorktrees(entry.modelData.groupKey)
+                  color: root.dim
+                  font.pixelSize: Style.font.caption
+                }
+              }
+
+              ListRow {
+                readonly property var modelData: entry.modelData
+                readonly property int index: entry.index
+                width: parent.width
                 rowIndex: index + root.approvals.length
                 indent: modelData.depth
-                glyph: modelData.warning !== "" ? "󰀦" : (modelData.parent !== "" ? "󰚩" : (modelData.gui === "off" ? "󰆍" : (modelData.gui === "app" ? "󰀻" : "󰍹")))
-                glyphColor: modelData.warning !== "" ? root.urgent : root.fg
+                glyph: modelData.warning !== "" ? "󰀦" : modelData.frozenSince > 0 ? "󰏤"
+                  : modelData.parent !== "" ? "󰚩" : modelData.view ? "󰐊" : (modelData.gui === "off" ? "󰆍" : (modelData.gui === "app" ? "󰀻" : "󰍹"))
+                glyphColor: modelData.warning !== "" ? root.urgent : modelData.frozenSince > 0 ? root.dim : root.fg
                 title: modelData.parent !== ""
                   ? strings.t("row.childTitle").arg(modelData.harness).arg(modelData.parentHarness || modelData.parent)
-                  : strings.t("row.title").arg(modelData.harness).arg(modelData.projectName)
-                caption: strings.t("row.detail").arg(modelData.backend).arg(modelData.network).arg(modelData.gui).arg(root.uptime(modelData.started))
+                  : modelData.harness
+                // What it does now, else where its output goes; then how long it runs.
+                caption: root.uptime(modelData.started) + " · " + (modelData.activity !== "" ? modelData.activity : root.kindText(modelData))
                 // Frozen and warnings first, then monitoring, then timers.
                 caption2: modelData.frozenSince > 0 ? strings.t("row.frozen").arg(root.uptime(modelData.frozenSince))
                   : modelData.warning !== "" ? modelData.warning
@@ -1524,7 +1668,7 @@ Panel {
                       .arg(modelData.timer.name).arg(root.span(modelData.timer.used)).arg(root.span(modelData.timer.budget))
                   : modelData.credentials !== "" ? strings.t("row.holdsCredentials").arg(modelData.credentials)
                   : modelData.gateway !== "" || modelData.agent !== "" || modelData.secretFiles !== "" ? root.usedCredentials(modelData)
-                  : (modelData.parent !== "" ? strings.t("row.startedBy").arg(modelData.parent)
+                  : (modelData.parent !== "" ? ""
                   : (modelData.auth !== "" && modelData.auth !== "shared" ? strings.t("row.auth").arg(modelData.auth)
                   : (modelData.pasture !== "" ? strings.t("row.pasture").arg(modelData.pasture) : "")))
                 caption2Color: modelData.warning !== "" || (modelData.frozenSince === 0 && (modelData.monitor !== "" || modelData.credentials !== "" || (modelData.timer !== null && modelData.timer.over))) ? root.urgent : root.dim
@@ -1588,6 +1732,35 @@ Panel {
                   hoverColor: root.urgent
                   onClicked: root.stop(modelData)
                 }
+              }
+              }
+            }
+          }
+
+          // Runs that just ended: a quiet line each, no cursor. A failed one
+          // keeps the urgent color.
+          Column {
+            width: parent.width
+            spacing: Style.space(2)
+            visible: root.view === "list" && root.ended.length > 0
+            PanelSectionHeader {
+              width: parent.width
+              text: strings.t("ended.header")
+              foreground: root.fg
+              fontFamily: root.fontFamily
+            }
+            Repeater {
+              model: root.view === "list" ? root.ended : []
+              delegate: PlainText {
+                required property var modelData
+                width: parent.width
+                leftPadding: Style.space(10)
+                elide: Text.ElideRight
+                font.pixelSize: Style.font.caption
+                color: modelData.status === "failed" ? root.urgent : root.dim
+                text: strings.t("ended.row").arg(modelData.harness).arg(modelData.projectName)
+                  .arg(strings.t("ended." + modelData.status) + (modelData.text !== "" ? ": " + modelData.text : ""))
+                  + " · " + root.uptime(modelData.ended)
               }
             }
           }
