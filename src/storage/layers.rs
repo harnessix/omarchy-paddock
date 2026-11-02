@@ -192,7 +192,7 @@ mod tests {
         let env = test_env(t.path());
         let proj = t.path().join("proj");
         std::fs::create_dir_all(&proj).unwrap();
-        let dst = PathBuf::from("/home/u/.npm");
+        let dst = PathBuf::from("/home/demo/.npm");
         let m = mount_with(&env, &proj, "npm", dst.clone(), "t", true).unwrap();
         assert_eq!(m.kind, MountKind::Overlay);
         let up = upper(&env, &proj, "npm");

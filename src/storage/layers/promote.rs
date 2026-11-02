@@ -1206,7 +1206,7 @@ mod tests {
             "sh",
             &proj,
             t.path().join("home"),
-            Path::new("/home/u"),
+            Path::new("/home/demo"),
             1000,
             1000,
             "u",
@@ -1217,7 +1217,7 @@ mod tests {
                 &env,
                 &proj,
                 "cargo-registry",
-                "/home/u/.cargo/registry".into(),
+                "/home/demo/.cargo/registry".into(),
                 "t",
                 true,
             )
