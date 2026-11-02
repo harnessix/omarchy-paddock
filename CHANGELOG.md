@@ -4,6 +4,7 @@
 
 - Fix: the live login sync of #118 is safer. Two paddock processes no longer write a login file through the same temporary name (a lock and a unique name with fsync), each write first checks that the target did not change since it was read, only the expiry field that the profile names (`[state] auth_expiry`) decides which side is newer (an MCP login in the same file no longer counts), and files that are not JSON, such as an open SQLite database, wait for the end of the run.
 - Changed: the `paddock` and `paddock-host` skills are shorter, and details moved into reference files next to `SKILL.md`. `paddock skill install` now copies the whole `paddock-host` folder, with its `references/` files.
+- Fix: `gh run list -b BRANCH` through `paddock-host` filters by branch. Before, paddock read `-b` as body text, gh failed, and the audit log showed a body.
 - Fix: a remote with a relative path (`../upstream.git`) pushes to that path from the top of the work tree, as git in the project reads it. Before, the host read it from its scratch repository, so the push failed or went to another folder.
 - Fix: the push card, the audit log and the boundary log show a push URL without its credentials (`https://***@host/...`). The push itself still uses the full URL.
 - Fix: the current branch that the sandbox reports for `gh pr view`, `pr diff`, `pr checks` and `pr comment` must not name another repository. Before, a pull request URL there won over `--repo`, so the sandbox could read or comment on a pull request of any repository the host login sees.

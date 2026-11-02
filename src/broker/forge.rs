@@ -154,7 +154,12 @@ pub const GH: Tool = Tool {
     ],
     branch_flags: &[(("pr", "create"), "--head", "-H")],
     repo_positional: &[("repo", "view")],
-    body_flags: &[(("*", "*"), "--body", "-b")],
+    // Only these commands have a body: `-b` is `--branch` of `run list`.
+    body_flags: &[
+        (("pr", "create"), "--body", "-b"),
+        (("pr", "comment"), "--body", "-b"),
+        (("issue", "comment"), "--body", "-b"),
+    ],
     body_args: &[],
     body_stdin: &["--body-file", "-"],
     needs_body: &[],
@@ -1186,6 +1191,19 @@ mod tests {
                 .access,
             Access::Write
         );
+    }
+
+    #[test]
+    fn b_is_the_branch_of_run_list_not_a_body() {
+        let (rest, body) = split_body(&GH, &w(&["run", "list", "-b", "main"]));
+        assert_eq!(body, None);
+        assert_eq!(rest, w(&["run", "list", "-b", "main"]));
+        let c = run(&["run", "list", "-b", "main"]).unwrap();
+        assert_eq!(c.stdin, None);
+        assert!(!c.argv.contains(&"--body-file".to_string()), "{:?}", c.argv);
+        // A comment still takes -b as its body.
+        let c = run(&["pr", "comment", "3", "-b", "hi"]).unwrap();
+        assert_eq!(c.stdin.as_deref(), Some("hi"));
     }
 
     #[test]
