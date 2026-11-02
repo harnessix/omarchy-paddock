@@ -439,3 +439,34 @@ fn review_e_l1_stderr_keeps_a_grace_period_after_stdout_holds_the_stream() {
         "stderr was dropped before it flushed: {log:?}"
     );
 }
+
+#[test]
+fn review_e_l2_drop_before_finish_ends_the_tmux_session() {
+    let t = tempfile::tempdir().unwrap();
+    let env = env_in(t.path(), &[]);
+    let Some(tmux) = Tmux::find(&env) else {
+        eprintln!("skipped: tmux is not installed");
+        return;
+    };
+    let _server = Server(Some(tmux.clone()));
+    let id = "sbearly";
+    let live = Live::start(&env, id, "fake", true, true, true).expect("a view");
+    assert!(live.session, "the tmux session did not start");
+    assert!(tmux.has(id));
+    drop(live);
+    assert!(
+        !tmux.has(id),
+        "dropping Live before finish left the tmux session"
+    );
+    let end = std::fs::read_to_string(end_file(&env, id)).unwrap();
+    assert!(end.contains("before its view finished"), "{end}");
+
+    // finish still leaves the session. The pane stays so paddock view can open it.
+    let done = "sbdone";
+    let live = Live::start(&env, done, "fake", true, true, true).expect("a view");
+    assert!(live.session);
+    live.finish(7);
+    assert!(tmux.has(done), "finish keeps the session");
+    let end = std::fs::read_to_string(end_file(&env, done)).unwrap();
+    assert!(end.contains("exit code 7"), "{end}");
+}
