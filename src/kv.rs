@@ -1603,6 +1603,35 @@ pub fn identity_of(r: &crate::state::Running, all: &[crate::state::Running]) -> 
     }
 }
 
+/// The quota timers on one agent and window of all running sandboxes: the
+/// timers that share the rise of the window. A timer whose sandbox ended no
+/// longer counts.
+pub fn quota_peers(env: &HostEnv, agent: &str, window: &str, now: u64) -> Vec<crate::timer::Timer> {
+    let root = kv_root(env);
+    let all = crate::state::Running::list(env);
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for r in &all {
+        for (ns, _) in timer_spaces(&identity_of(r, &all)) {
+            let Ok(file) = ns.file(&root) else { continue };
+            if !file.is_file() {
+                continue;
+            }
+            let Ok(st) = Store::open(&file) else { continue };
+            for (t, _) in crate::timer::in_store(&st, &ns.key(), now).unwrap_or_default() {
+                let same = t
+                    .quota
+                    .as_ref()
+                    .is_some_and(|q| q.agent == agent && q.window == window);
+                if same && t.subject == r.id && seen.insert((ns.key(), t.name.clone(), t.started)) {
+                    out.push(t);
+                }
+            }
+        }
+    }
+    out
+}
+
 /// Write the timer summary of the running sandbox `sandbox`, if it runs.
 pub fn refresh_timer_summary(env: &HostEnv, root: &Path, sandbox: &str) -> Result<()> {
     let all = crate::state::Running::list(env);
