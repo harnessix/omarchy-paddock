@@ -121,8 +121,9 @@ impl Run {
             return false;
         }
         let (lo, hi) = (a.max(self.started), b.min(self.stopped.unwrap_or(b)));
+        // A stop on the sample boundary is the next step, not this one.
         if hi <= lo {
-            return true;
+            return false;
         }
         let frozen: u64 = self
             .frozen
@@ -342,11 +343,9 @@ impl Timer {
         let frozen = frozen_periods(env, &self.subject, now);
         let mut s = self.status(now, &frozen);
         if let Some(q) = &self.quota {
-            let mut samples = crate::forage::samples(env, &q.agent, &q.window);
-            // A stopped timer counts up to its stop.
-            if let Some(end) = self.stopped {
-                samples.retain(|x| x.at <= end);
-            }
+            let samples = crate::forage::samples(env, &q.agent, &q.window);
+            // A sample that records the run often arrives after the stop.
+            // Run::ran counts a step only when the timer was active in it.
             let me = Run::of(self, frozen);
             let running: Vec<String> = crate::state::Running::list(env)
                 .into_iter()
@@ -604,10 +603,29 @@ pub fn note_runs(env: &HostEnv, sandbox: &str, timers: &[Timer], now: u64) -> Re
     change_ended(env, |list| list.retain(|e| e.keep(&running, &live)))
 }
 
-/// The end of a sandbox: its quota timers ran until now.
+/// The end of a sandbox. Record its quota timers, including a run that
+/// ended before the 30-second tick, and mark the ones already recorded.
 pub fn end_runs(env: &HostEnv, sandbox: &str, now: u64) {
     let frozen = frozen_periods(env, sandbox, now);
+    let stored = crate::kv::stored_quota_timers(env, sandbox, now);
     let r = change_ended(env, |list| {
+        for t in &stored {
+            let Some(q) = &t.quota else { continue };
+            let e = Ended {
+                subject: t.subject.clone(),
+                name: t.name.clone(),
+                agent: q.agent.clone(),
+                window: q.window.clone(),
+                started: t.started,
+                stopped: t.stopped,
+                seen: now,
+                frozen: frozen.clone(),
+            };
+            match list.iter_mut().find(|x| x.is(t)) {
+                Some(x) => *x = e,
+                None => list.push(e),
+            }
+        }
         for e in list.iter_mut().filter(|e| e.subject == sandbox) {
             e.seen = now;
             e.frozen = frozen.clone();
@@ -1000,6 +1018,16 @@ mod tests {
             stopped,
             frozen: frozen.to_vec(),
         }
+    }
+
+    #[test]
+    fn review_e_a_timer_stopped_at_sample_boundary_does_not_run_in_next_step() {
+        let r = Run {
+            started: 100,
+            stopped: Some(200),
+            frozen: vec![],
+        };
+        assert!(!r.ran(200, 300));
     }
 
     fn quota(share: f64, base: f64, base_at: u64) -> Quota {

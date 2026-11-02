@@ -388,6 +388,17 @@ impl Tee {
         })
     }
 
+    /// A tee with no log and no threads, for moving the real one out of `Live`.
+    fn empty() -> Tee {
+        Tee {
+            log: Arc::new(Mutex::new(LogFile {
+                file: None,
+                written: 0,
+            })),
+            threads: Vec::new(),
+        }
+    }
+
     /// Copy `src` to `sink` and to the log until its end. When the sink
     /// fails (the caller closed its end), the copy stops and closes `src`,
     /// so the harness gets the same EPIPE as without the view.
@@ -430,16 +441,17 @@ impl Tee {
     }
 
     /// Wait for the copies after the harness ended. A capture is read to
-    /// its end, as without the view. The other streams get `grace`: a
-    /// process that the harness left behind can hold them open.
+    /// its end, as without the view. Each other stream gets `grace` of its
+    /// own. A process that the harness left behind can hold one stream open,
+    /// and that wait must not eat the time of the other stream.
     pub fn finish(self, grace: Duration) -> Option<Vec<u8>> {
         let mut out = None;
-        let deadline = Instant::now() + grace;
         for (capture, h) in self.threads {
             if capture {
                 out = h.join().ok().flatten();
                 continue;
             }
+            let deadline = Instant::now() + grace;
             while !h.is_finished() && Instant::now() < deadline {
                 std::thread::sleep(Duration::from_millis(10));
             }
@@ -472,6 +484,16 @@ fn write_fd(fd: i32, mut data: &[u8]) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Which streams the view copies. True means paddock tees that stream into
+/// the run log. A terminal stays the harness's own. Capture mode copies
+/// both streams, so a spawned child does not print on the parent terminal
+/// and the view log keeps stderr.
+pub fn copy_streams(capture: bool, stdout_tty: bool, stderr_tty: bool) -> (bool, bool) {
+    let out_tty = !capture && stdout_tty;
+    let err_tty = !capture && stderr_tty;
+    (!out_tty, !err_tty)
+}
+
 /// The view of one run, from the start of the sandbox to its end.
 pub struct Live {
     pub tee: Tee,
@@ -479,6 +501,11 @@ pub struct Live {
     pub tee_err: bool,
     end: PathBuf,
     pub session: bool,
+    /// The server that holds `session`, so a drop can end it.
+    tmux: Option<Tmux>,
+    id: String,
+    /// `finish` wrote the end line. Drop then leaves the session up.
+    closed: bool,
 }
 
 impl Live {
@@ -513,20 +540,20 @@ impl Live {
             }
             Config::default()
         });
-        let session = match Tmux::find(env).filter(|_| cfg.tmux) {
+        let (session, tmux) = match Tmux::find(env).filter(|_| cfg.tmux) {
             Some(t) => {
                 let h = header(id, harness, crate::state::now());
                 match t.start(id, &h, &log, std::process::id(), &end) {
-                    Ok(()) => true,
+                    Ok(()) => (true, Some(t)),
                     Err(e) => {
                         if !quiet {
                             log::warn!("no tmux view for this sandbox: {e:#}");
                         }
-                        false
+                        (false, None)
                     }
                 }
             }
-            None => false,
+            None => (false, None),
         };
         Some(Live {
             tee,
@@ -534,19 +561,41 @@ impl Live {
             tee_err,
             end,
             session,
+            tmux,
+            id: id.to_string(),
+            closed: false,
         })
     }
 
     /// After the sandbox ended: wait for the copies and write the last
     /// line of the pane. Gives back the capture, if there is one.
-    pub fn finish(self, code: i32) -> Option<Vec<u8>> {
-        let out = self.tee.finish(Duration::from_secs(2));
+    pub fn finish(mut self, code: i32) -> Option<Vec<u8>> {
+        let tee = std::mem::replace(&mut self.tee, Tee::empty());
+        let out = tee.finish(Duration::from_secs(2));
         let line = format!(
             "\npaddock: the sandbox ended at {} with exit code {code}.\n",
             local_time(crate::state::now())
         );
         let _ = crate::privfs::write(&self.end, line.as_bytes());
+        self.closed = true;
         out
+    }
+}
+
+impl Drop for Live {
+    fn drop(&mut self) {
+        if self.closed {
+            return;
+        }
+        if self.session {
+            if let Some(t) = &self.tmux {
+                let _ = t.kill(&self.id);
+            }
+        }
+        if !self.end.exists() {
+            let line = "\npaddock: the sandbox ended before its view finished.\n";
+            let _ = crate::privfs::write(&self.end, line.as_bytes());
+        }
     }
 }
 
