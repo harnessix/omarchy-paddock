@@ -342,11 +342,9 @@ impl Timer {
         let frozen = frozen_periods(env, &self.subject, now);
         let mut s = self.status(now, &frozen);
         if let Some(q) = &self.quota {
-            let mut samples = crate::forage::samples(env, &q.agent, &q.window);
-            // A stopped timer counts up to its stop.
-            if let Some(end) = self.stopped {
-                samples.retain(|x| x.at <= end);
-            }
+            let samples = crate::forage::samples(env, &q.agent, &q.window);
+            // A sample that records the run often arrives after the stop.
+            // Run::ran counts a step only when the timer was active in it.
             let me = Run::of(self, frozen);
             let running: Vec<String> = crate::state::Running::list(env)
                 .into_iter()
