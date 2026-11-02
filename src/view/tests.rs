@@ -184,13 +184,13 @@ fn the_session_lives_while_the_harness_runs_stays_after_and_gc_removes_it() {
     std::thread::sleep(Duration::from_millis(300));
     assert!(tmux.has(id), "remain-on-exit keeps the session");
 
-    // gc: not while it runs, not within a day of its end, after that yes.
+    // gc: not while it runs, not within keep_ended of its end, after that yes.
     let ended = std::fs::metadata(&end).unwrap().mtime() as u64;
     let sessions = tmux.sessions();
-    assert!(stale(&env, &sessions, &[id.to_string()], ended + 2 * MAX_AGE).is_empty());
+    assert!(stale(&env, &sessions, &[id.to_string()], ended + 2 * KEEP_ENDED).is_empty());
     assert!(stale(&env, &sessions, &[], ended + 3600).is_empty());
     assert_eq!(
-        stale(&env, &sessions, &[], ended + MAX_AGE + 1),
+        stale(&env, &sessions, &[], ended + KEEP_ENDED + 1),
         vec![id.to_string()]
     );
     remove(&env, id).unwrap();
@@ -344,8 +344,99 @@ fn the_view_table_parses() {
     assert!(Config::parse("[view]\ntmux = true\n").unwrap().tmux);
     assert!(Config::parse("[view]\nsocket = \"/x\"\n").is_err());
     // The user configuration takes it; a project file does not.
+    assert_eq!(Config::parse("").unwrap().keep_ended, KEEP_ENDED);
+    assert_eq!(
+        Config::parse("[view]\nkeep_ended = \"1h\"\n")
+            .unwrap()
+            .keep_ended,
+        3600
+    );
+    assert!(Config::parse("[view]\nkeep_ended = \"later\"\n").is_err());
     assert!(crate::manifest::Manifest::parse_user("[view]\ntmux = false\n").is_ok());
     assert!(toml::from_str::<crate::manifest::Manifest>("[view]\ntmux = false\n").is_err());
+    assert!(crate::manifest::Manifest::parse_user("[detach]\nidle_after = \"10m\"\n").is_ok());
+    assert!(
+        toml::from_str::<crate::manifest::Manifest>("[detach]\nidle_after = \"10m\"\n").is_err()
+    );
+}
+
+fn age_end(env: &HostEnv, id: &str, age: u64) {
+    let p = end_file(env, id);
+    if let Some(d) = p.parent() {
+        std::fs::create_dir_all(d).unwrap();
+    }
+    std::fs::write(&p, b"ended\n").unwrap();
+    let when = std::time::SystemTime::now() - Duration::from_secs(age);
+    let f = std::fs::OpenOptions::new().write(true).open(&p).unwrap();
+    f.set_times(std::fs::FileTimes::new().set_modified(when))
+        .unwrap();
+}
+
+#[test]
+fn reap_removes_views_older_than_keep_ended_and_keeps_newer_ones() {
+    let t = tempfile::tempdir().unwrap();
+    let env = env_in(t.path(), &[]);
+    let Some(tmux) = Tmux::find(&env) else {
+        eprintln!("skipped: tmux is not installed");
+        return;
+    };
+    let _server = Server(Some(tmux.clone()));
+    let cfg = t.path().join("cfg/paddock");
+    std::fs::create_dir_all(&cfg).unwrap();
+    std::fs::write(cfg.join("config.toml"), "[view]\nkeep_ended = \"1h\"\n").unwrap();
+
+    let old = "sbold111";
+    let young = "sbyoung2";
+    let open = "sbopen33";
+    let rec = "sbrec444";
+    let cmd = ["sleep", "60"].map(std::ffi::OsString::from);
+    for id in [old, young, open, rec] {
+        tmux.new_session(id, &cmd).unwrap();
+    }
+    age_end(&env, old, 2 * 3600);
+    age_end(&env, young, 10 * 60);
+    let now = crate::state::now();
+    crate::detach::Record {
+        id: rec.into(),
+        harness: "fake".into(),
+        started: now.saturating_sub(3 * 3600),
+        ended: Some(now.saturating_sub(2 * 3600)),
+        ..Default::default()
+    }
+    .save(&env)
+    .unwrap();
+    crate::detach::Record {
+        id: open.into(),
+        harness: "fake".into(),
+        started: now.saturating_sub(3 * 3600),
+        ..Default::default()
+    }
+    .save(&env)
+    .unwrap();
+
+    let items = gc_items(&env, now);
+    let ids: Vec<&str> = items
+        .iter()
+        .filter_map(|i| match &i.action {
+            crate::storage::Action::View { id } => Some(id.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert!(ids.contains(&old), "{ids:?}");
+    assert!(ids.contains(&rec), "{ids:?}");
+    assert!(!ids.contains(&young), "{ids:?}");
+    assert!(!ids.contains(&open), "{ids:?}");
+    assert!(items.iter().all(|i| i.reason.contains("keep_ended")));
+
+    let live = Live::start(&env, "sbfresh1", "fake", true, true, true).expect("a new view");
+    assert!(!tmux.has(old), "an old view stayed");
+    assert!(!end_file(&env, old).exists());
+    assert!(tmux.has(young));
+    assert!(end_file(&env, young).exists());
+    assert!(tmux.has(open), "an open detached run was removed");
+    assert!(!tmux.has(rec), "a record that ended long ago stayed");
+    assert!(tmux.has("sbfresh1"));
+    drop(live);
 }
 
 #[test]

@@ -1,0 +1,2 @@
+- New: A detached run that has produced output and then stays quiet becomes idle after `[detach] idle_after`. `paddock ps --json` reports `idle_since`, the bar says waiting for input, and paddock notifies once. After `[detach] idle_timeout` the run ends with status `idle`. A write client keeps the run. `idle_timeout` of 0 never ends it.
+- Changed: A view session of an ended run stays for `[view] keep_ended` (default 2 hours). `paddock gc` and the start of a new view session remove older ones.
