@@ -569,6 +569,9 @@ struct EndOfRun<'a> {
     kv: Option<crate::kv::Served>,
     devices: Option<crate::devices::Devices>,
     bridge: Option<PathBuf>,
+    harness: String,
+    /// This run copied output to a view log.
+    view: bool,
 }
 
 impl Drop for EndOfRun<'_> {
@@ -586,6 +589,9 @@ impl Drop for EndOfRun<'_> {
         let _ = std::fs::remove_dir_all(self.env.paddock_run().join(&self.id));
         crate::borrow::end(self.env, &self.id);
         crate::recover::Session::end(self.env, &self.id);
+        if self.view {
+            crate::detach::record_view_end(self.env, &self.id, &self.harness, &self.project);
+        }
         if self.snapshot {
             crate::snapshot::after_end(self.env, &self.project, &self.id, self.quiet);
         }
@@ -618,6 +624,8 @@ pub fn run(
         kv: None,
         devices: None,
         bridge: None,
+        harness: built.spec.harness.clone(),
+        view: false,
     };
     // App mode: a restricted Wayland socket and a portal-only session bus,
     // both alive until the sandbox exits.
@@ -915,6 +923,7 @@ pub fn run(
     } else {
         None
     };
+    end.view = view.is_some();
     if let Some(l) = &view {
         if l.tee_out {
             cmd.stdout(Stdio::piped());

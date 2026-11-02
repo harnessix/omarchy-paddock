@@ -470,3 +470,68 @@ fn review_e_l2_drop_before_finish_ends_the_tmux_session() {
     let end = std::fs::read_to_string(end_file(&env, done)).unwrap();
     assert!(end.contains("exit code 7"), "{end}");
 }
+
+fn write_log(env: &HostEnv, id: &str, bytes: &[u8]) {
+    let path = log_file(env, id);
+    crate::privfs::dir(path.parent().unwrap()).unwrap();
+    std::fs::write(path, bytes).unwrap();
+}
+
+#[test]
+fn activity_strips_ansi_and_controls_and_skips_blank_lines() {
+    let t = tempfile::tempdir().unwrap();
+    let env = env_in(t.path(), &[]);
+    assert!(activity(&env, "fake-p-none").is_none());
+    write_log(&env, "fake-p-1", b"\n\n   \n\x1b[0m\n");
+    assert!(activity(&env, "fake-p-1").is_none());
+    // The last visible piece wins. `\r` starts the line again, as a pane does.
+    write_log(
+        &env,
+        "fake-p-1",
+        b"earlier\n\x1b[31mhello\x07world\x1b[0m\nold\rvisible\n\n  \n\x1b[0m\n",
+    );
+    assert_eq!(activity(&env, "fake-p-1").as_deref(), Some("visible"));
+    write_log(
+        &env,
+        "fake-p-1",
+        b"\x1b]0;title\x07\x1b[32mcompiling\x1b[0m\n\n",
+    );
+    assert_eq!(activity(&env, "fake-p-1").as_deref(), Some("compiling"));
+}
+
+#[test]
+fn activity_cuts_on_a_character_boundary() {
+    assert_eq!(ACTIVITY_CHARS, 120);
+    let t = tempfile::tempdir().unwrap();
+    let env = env_in(t.path(), &[]);
+    let mut line = "a".repeat(119);
+    line.push('你');
+    line.push_str("extra");
+    line.push('\n');
+    write_log(&env, "fake-p-1", line.as_bytes());
+    let got = activity(&env, "fake-p-1").unwrap();
+    assert_eq!(got.chars().count(), 120);
+    assert!(got.ends_with('你'), "{got}");
+    assert!(!got.contains("extra"), "{got}");
+    assert_eq!(got.len(), 119 + '你'.len_utf8());
+}
+
+#[test]
+fn activity_reads_only_the_tail_of_a_large_log() {
+    assert_eq!(ACTIVITY_TAIL, 8 * 1024);
+    let t = tempfile::tempdir().unwrap();
+    let env = env_in(t.path(), &[]);
+    // One line, longer than the tail. A reader of the whole file would
+    // keep the secret at the start. The tail also begins mid-character.
+    let mut body = b"START_SECRET".to_vec();
+    while body.len() < ACTIVITY_TAIL as usize + 64 {
+        body.extend("你".as_bytes());
+    }
+    body.extend("你".as_bytes());
+    write_log(&env, "fake-p-1", &body);
+    let got = activity(&env, "fake-p-1").unwrap();
+    assert!(!got.contains("START_SECRET"), "{got}");
+    assert!(!got.contains('\u{FFFD}'), "{got}");
+    assert_eq!(got.chars().count(), 120);
+    assert!(got.chars().all(|c| c == '你'), "{got}");
+}

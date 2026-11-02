@@ -304,3 +304,174 @@ fn the_broker_answers_done_only_in_a_detached_run() {
     req.args.insert("status".into(), serde_json::json!("maybe"));
     assert_eq!(b.handle(&req).status, RStatus::Invalid);
 }
+
+fn ended_record(id: &str, project: &std::path::Path, ended_at: u64) -> Record {
+    Record {
+        id: id.into(),
+        harness: "fake".into(),
+        project: project.to_path_buf(),
+        started: 1,
+        ended: Some(ended_at),
+        ..Default::default()
+    }
+}
+
+#[test]
+fn recent_ended_lists_done_stopped_and_drops_old_runs() {
+    assert_eq!(ENDED_WINDOW, 10 * 60);
+    assert_eq!(ENDED_KEEP, 8);
+    assert_eq!(ENDED_TEXT, 200);
+    let t = tempfile::tempdir().unwrap();
+    let env = env_in(t.path());
+    let project = t.path().join("project");
+    let now = crate::state::now();
+
+    record(&env, "fake-p-ok");
+    Record::update(&env, "fake-p-ok", |r| {
+        r.project = project.clone();
+        r.harness = "fake".into();
+    })
+    .unwrap();
+    let (ok, _) = ctl(&env, "fake-p-ok");
+    ok.done(Status::Ok, "all good").unwrap();
+    Record::update(&env, "fake-p-ok", |r| r.ended = Some(now - 2)).unwrap();
+
+    record(&env, "fake-p-bad");
+    let (bad, _) = ctl(&env, "fake-p-bad");
+    bad.done(Status::Failed, "it broke").unwrap();
+    Record::update(&env, "fake-p-bad", |r| {
+        r.project = project.clone();
+        r.ended = Some(now - 1);
+    })
+    .unwrap();
+
+    record(&env, "fake-p-stop");
+    mark_stopped(&env, "fake-p-stop").unwrap();
+    Record::update(&env, "fake-p-stop", |r| {
+        r.project = project.clone();
+        r.ended = Some(now);
+    })
+    .unwrap();
+
+    let unknown = ended_record("fake-p-none", &project, now - 20);
+    unknown.save(&env).unwrap();
+
+    let mut old = ended_record("fake-p-old", &project, now - ENDED_WINDOW - 1);
+    old.done = Some(Done {
+        status: Status::Ok,
+        text: "too old".into(),
+        at: 1,
+    });
+    old.save(&env).unwrap();
+
+    let mut kept = ended_record("fake-p-edge", &project, now - ENDED_WINDOW);
+    kept.done = Some(Done {
+        status: Status::Ok,
+        text: "just inside".into(),
+        at: 1,
+    });
+    kept.save(&env).unwrap();
+
+    let mut long = ended_record("fake-p-long", &project, now - 30);
+    long.done = Some(Done {
+        status: Status::Failed,
+        text: format!("\u{0007}{}", "é".repeat(250)),
+        at: 1,
+    });
+    long.save(&env).unwrap();
+
+    // Still running: no end time.
+    record(&env, "fake-p-live");
+
+    let rows = recent_ended(&env, now);
+    let ids: Vec<&str> = rows.iter().filter_map(|r| r["id"].as_str()).collect();
+    assert_eq!(
+        ids,
+        vec![
+            "fake-p-stop",
+            "fake-p-bad",
+            "fake-p-ok",
+            "fake-p-none",
+            "fake-p-long",
+            "fake-p-edge",
+        ],
+        "{rows:?}"
+    );
+    assert!(!ids.contains(&"fake-p-old"));
+    assert!(!ids.contains(&"fake-p-live"));
+
+    let stop = &rows[0];
+    assert_eq!(stop["status"], "stopped");
+    assert_eq!(stop["text"], "");
+    assert_eq!(stop["harness"], "fake");
+    assert_eq!(stop["project"].as_str(), project.to_str());
+    assert_eq!(stop["ended"].as_u64(), Some(now));
+
+    assert_eq!(rows[1]["status"], "failed");
+    assert_eq!(rows[1]["text"], "it broke");
+    assert_eq!(rows[2]["status"], "ok");
+    assert_eq!(rows[2]["text"], "all good");
+    assert_eq!(rows[3]["status"], "unknown");
+    assert_eq!(rows[3]["text"], "");
+
+    let text = rows[4]["text"].as_str().unwrap();
+    assert_eq!(text.chars().count(), 200);
+    assert!(text.chars().all(|c| c == 'é'), "{text}");
+    assert!(!text.contains('\u{0007}'));
+}
+
+#[test]
+fn recent_ended_keeps_at_most_eight() {
+    let t = tempfile::tempdir().unwrap();
+    let env = env_in(t.path());
+    let project = t.path().join("project");
+    let now = crate::state::now();
+    for i in 0..10 {
+        let mut r = ended_record(&format!("fake-p-{i}"), &project, now - i);
+        r.done = Some(Done {
+            status: Status::Ok,
+            text: "n".into(),
+            at: 1,
+        });
+        r.save(&env).unwrap();
+    }
+    let rows = recent_ended(&env, now);
+    assert_eq!(rows.len(), 8);
+    assert_eq!(rows[0]["id"], "fake-p-0");
+    assert_eq!(rows[7]["id"], "fake-p-7");
+}
+
+#[test]
+fn a_view_run_records_its_end_and_a_stop() {
+    let t = tempfile::tempdir().unwrap();
+    let env = env_in(t.path());
+    let project = t.path().join("project");
+    record_view_end(&env, "fake-p-view", "fake", &project);
+    let rows = recent_ended(&env, crate::state::now());
+    assert_eq!(rows[0]["id"], "fake-p-view");
+    assert_eq!(rows[0]["status"], "unknown");
+    assert_eq!(rows[0]["harness"], "fake");
+
+    mark_stopped(&env, "fake-p-halt").unwrap();
+    record_view_end(&env, "fake-p-halt", "fake", &project);
+    assert!(!stop_file(&env, "fake-p-halt").exists());
+    let rec = Record::load(&env, "fake-p-halt").unwrap();
+    assert!(rec.stopped);
+    assert!(rec.ended.is_some());
+
+    // A detached record keeps its done text.
+    record(&env, "fake-p-det");
+    Record::update(&env, "fake-p-det", |r| {
+        r.done = Some(Done {
+            status: Status::Ok,
+            text: "kept".into(),
+            at: 1,
+        });
+        r.ended = Some(crate::state::now());
+    })
+    .unwrap();
+    record_view_end(&env, "fake-p-det", "other", &project);
+    let rec = Record::load(&env, "fake-p-det").unwrap();
+    assert_eq!(rec.harness, "fake");
+    assert_eq!(rec.done.unwrap().text, "kept");
+}

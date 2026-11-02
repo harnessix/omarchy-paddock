@@ -981,6 +981,8 @@ paddock view <id> --write   # the same with keys
 - The session uses paddock's own tmux server on `$XDG_RUNTIME_DIR/paddock/view.sock`, never your tmux server or your tmux configuration. No sandbox sees the socket or the logs. `paddock doctor --escape` checks this (`view-socket-hidden`).
 - In a run like this, the keys of `--write` only scroll the view (tmux copy mode) or close it. They do not reach the harness, which reads its input from the caller.
 - The session stays after the sandbox ends, with the exit code on the last line. `paddock stop <id>` ends it. `paddock gc --yes` removes sessions and logs of sandboxes that ended more than a day ago.
+- `paddock ps --json` adds `activity` on each sandbox. It is the last line of the view log with terminal control sequences removed, at most 120 characters, or null when that log has no such line. For a detached run it is the last line of the pane.
+- The same JSON adds `ended`. That list holds up to 8 runs that ended in the last 10 minutes, newest first. Each entry has `id`, `harness`, `project`, `ended`, `status` (`ok`, `failed`, `stopped` or `unknown`) and `text` (the `done` text, at most 200 characters). A run with no `done` has status `unknown`. A run that `paddock stop` ended has status `stopped`.
 - Without tmux, `paddock view` opens `tail -f` of the run log. It uses `xdg-terminal-exec`, or `$TERMINAL -e` without it.
 - One-shot modes such as `claude -p` print nothing until the end, so the view shows little until then.
 - `[view] tmux = false` in `~/.config/paddock/config.toml` turns the tmux session off.

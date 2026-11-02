@@ -2318,6 +2318,13 @@ fn real_main() -> Result<i32> {
                                 "detached".into(),
                                 paddock::detach::is_detached(&env, &r.id).into(),
                             );
+                            o.insert(
+                                "activity".into(),
+                                match paddock::view::activity(&env, &r.id) {
+                                    Some(line) => serde_json::Value::String(line),
+                                    None => serde_json::Value::Null,
+                                },
+                            );
                         }
                         if let Some(o) = v.as_object_mut() {
                             o.insert(
@@ -2372,7 +2379,7 @@ fn real_main() -> Result<i32> {
                     .collect();
                 println!(
                     "{}",
-                    serde_json::json!({ "api_version": "paddock.ps/v1", "sandboxes": rows })
+                    serde_json::json!({ "api_version": "paddock.ps/v1", "sandboxes": rows, "ended": paddock::detach::recent_ended(&env, state::now()) })
                 );
             } else if list.is_empty() {
                 println!("No running sandboxes.");
@@ -3273,6 +3280,9 @@ fn stop_one(env: &HostEnv, all: &[Running], id: &str) -> Result<i32> {
     let children = state::descendants(all, id);
     // A frozen process gets SIGTERM only when it thaws.
     let _ = paddock::freeze::thaw(env, id, true);
+    for v in children.iter().map(|c| c.id.as_str()).chain([id]) {
+        let _ = paddock::detach::mark_stopped(env, v);
+    }
     for c in &children {
         unsafe { libc::kill(c.pid as i32, libc::SIGTERM) };
     }
