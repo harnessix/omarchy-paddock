@@ -83,18 +83,30 @@ fn comm_of(pid: u32) -> String {
 /// `windows` is None when there is no Hyprland window list. Any terminal
 /// then counts as watched, which is the rule outside Omarchy.
 ///
-/// With a window list, the chain is visible in these cases:
-/// - a pid in the chain owns a compositor window
-/// - a process in the chain is the tmux server (`tmux: server`). The user
-///   watches that session from a tmux client
-/// - a process in the chain is `screen`
-pub fn terminal_watched(windows: Option<&[u32]>, chain: &[Ancestor]) -> bool {
+/// `master` is the process that holds the other end of this terminal (the
+/// pty master): a terminal emulator, a tmux server, or a background program
+/// that gave the command a pty of its own. The terminal is visible when that
+/// process owns a compositor window itself, or is a tmux server or `screen`.
+/// Its parents do not count: a desktop app with a window can run a
+/// background server that hands out ptys nobody sees (for example the Codex
+/// app-server of the ChatGPT desktop app).
+///
+/// When the holder cannot be found, the parent chain decides as a fallback:
+/// a pid in the chain that owns a window, or a tmux server or `screen`.
+pub fn terminal_watched(
+    windows: Option<&[u32]>,
+    master: Option<&Ancestor>,
+    chain: &[Ancestor],
+) -> bool {
     let Some(windows) = windows else {
         return true;
     };
-    chain
-        .iter()
-        .any(|a| windows.contains(&a.pid) || session_client(&a.comm))
+    match master {
+        Some(m) => windows.contains(&m.pid) || session_client(&m.comm),
+        None => chain
+            .iter()
+            .any(|a| windows.contains(&a.pid) || session_client(&a.comm)),
+    }
 }
 
 /// The tmux server and GNU screen have no window of their own. A chain
@@ -104,11 +116,60 @@ fn session_client(comm: &str) -> bool {
     name == "tmux: server" || name == "screen"
 }
 
-/// The decision for this process: the Hyprland window list and the parent chain.
+/// The pts number of this process's terminal (stdin), if it is a pty.
+fn own_pts_index() -> Option<u32> {
+    let link = std::fs::read_link("/proc/self/fd/0").ok()?;
+    link.to_str()?.strip_prefix("/dev/pts/")?.parse().ok()
+}
+
+/// The process that holds the master side of pts `index`: the one whose
+/// open `/dev/ptmx` reports that index in its fdinfo (`tty-index`). Only
+/// processes of this user are readable, which is where the holder is.
+fn pty_master_holder(index: u32) -> Option<Ancestor> {
+    let want = format!("tty-index:\t{index}");
+    for entry in std::fs::read_dir("/proc").ok()?.flatten() {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|n| n.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        let Ok(fds) = std::fs::read_dir(format!("/proc/{pid}/fd")) else {
+            continue;
+        };
+        for fd in fds.flatten() {
+            let Ok(target) = std::fs::read_link(fd.path()) else {
+                continue;
+            };
+            if target != std::path::Path::new("/dev/ptmx")
+                && target != std::path::Path::new("/dev/pts/ptmx")
+            {
+                continue;
+            }
+            let info = std::fs::read_to_string(format!(
+                "/proc/{pid}/fdinfo/{}",
+                fd.file_name().to_string_lossy()
+            ))
+            .unwrap_or_default();
+            if info.lines().any(|l| l.trim_end() == want) {
+                return Some(Ancestor {
+                    pid,
+                    comm: comm_of(pid),
+                });
+            }
+        }
+    }
+    None
+}
+
+/// The decision for this process: the Hyprland window list, the holder of
+/// its pty master, and the parent chain as a fallback.
 pub fn this_terminal_is_watched() -> bool {
     let windows = hypr_clients().map(|c| c.into_iter().map(|w| w.pid).collect::<Vec<_>>());
+    let master = own_pts_index().and_then(pty_master_holder);
     let chain = parent_chain(std::process::id());
-    terminal_watched(windows.as_deref(), &chain)
+    terminal_watched(windows.as_deref(), master.as_ref(), &chain)
 }
 
 static WINCH: AtomicBool = AtomicBool::new(false);
@@ -603,37 +664,72 @@ mod tests {
     #[test]
     fn a_window_pid_in_the_chain_is_visible() {
         let chain = [anc(10, "sh"), anc(20, "foot"), anc(30, "Hyprland")];
-        assert!(terminal_watched(Some(&[20, 99]), &chain));
+        assert!(terminal_watched(Some(&[20, 99]), None, &chain));
     }
 
     #[test]
     fn a_chain_without_a_window_is_not_visible() {
         let chain = [anc(10, "codex"), anc(11, "chatgpt")];
-        assert!(!terminal_watched(Some(&[50]), &chain));
+        assert!(!terminal_watched(Some(&[50]), None, &chain));
     }
 
     #[test]
     fn an_empty_window_list_hides_a_plain_chain() {
         let chain = [anc(10, "codex"), anc(11, "chatgpt")];
-        assert!(!terminal_watched(Some(&[]), &chain));
+        assert!(!terminal_watched(Some(&[]), None, &chain));
     }
 
     #[test]
     fn without_a_window_list_any_terminal_is_watched() {
         let chain = [anc(10, "codex")];
-        assert!(terminal_watched(None, &chain));
+        assert!(terminal_watched(None, None, &chain));
+    }
+
+    #[test]
+    fn a_background_server_under_an_app_window_is_not_visible() {
+        // The ChatGPT desktop app (pid 30, a window) runs the Codex
+        // app-server (pid 20), which holds the pty of paddock (pid 10).
+        let chain = [anc(10, "paddock"), anc(20, "codex"), anc(30, "ChatGPT")];
+        let server = anc(20, "codex");
+        assert!(!terminal_watched(Some(&[30]), Some(&server), &chain));
+        // A terminal emulator holds the pty and owns its window.
+        let alacritty = anc(40, "alacritty");
+        assert!(terminal_watched(Some(&[40]), Some(&alacritty), &chain));
+        // A tmux server holds the pty of its panes.
+        let tmux = anc(50, "tmux: server");
+        assert!(terminal_watched(Some(&[]), Some(&tmux), &chain));
+    }
+
+    #[test]
+    fn the_holder_of_a_real_pty_is_found() {
+        let (master, slave) = super::open_pty().unwrap();
+        let name = std::fs::read_link(format!("/proc/self/fd/{slave}")).unwrap();
+        let index: u32 = name
+            .to_str()
+            .unwrap()
+            .strip_prefix("/dev/pts/")
+            .unwrap()
+            .parse()
+            .unwrap();
+        let holder = super::pty_master_holder(index).expect("holder");
+        assert_eq!(holder.pid, std::process::id());
+        // SAFETY: closing the two descriptors this test opened.
+        unsafe {
+            libc::close(master);
+            libc::close(slave);
+        }
     }
 
     #[test]
     fn a_tmux_server_in_the_chain_is_visible() {
         let chain = [anc(10, "sh"), anc(11, "tmux: server")];
-        assert!(terminal_watched(Some(&[]), &chain));
+        assert!(terminal_watched(Some(&[]), None, &chain));
     }
 
     #[test]
     fn screen_in_the_chain_is_visible() {
         let chain = [anc(10, "bash"), anc(12, "screen")];
-        assert!(terminal_watched(Some(&[99]), &chain));
+        assert!(terminal_watched(Some(&[99]), None, &chain));
     }
 
     #[test]
