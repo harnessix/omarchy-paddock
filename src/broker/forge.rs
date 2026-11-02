@@ -695,7 +695,10 @@ pub fn split_body(t: &Tool, argv: &[String]) -> (Vec<String>, Option<String>) {
                 i += 1;
                 continue;
             }
-            if let Some(v) = a.strip_prefix(&format!("{long}=")) {
+            if let Some(v) = a.strip_prefix(&format!("{long}=")).or_else(|| {
+                a.strip_prefix(&format!("{short}="))
+                    .filter(|_| !short.is_empty())
+            }) {
                 body = Some(v.to_string());
                 continue;
             }
@@ -1204,6 +1207,21 @@ mod tests {
         // A comment still takes -b as its body.
         let c = run(&["pr", "comment", "3", "-b", "hi"]).unwrap();
         assert_eq!(c.stdin.as_deref(), Some("hi"));
+    }
+
+    #[test]
+    fn tea_short_body_with_equals_is_the_body() {
+        for form in [
+            &["-d=secret text"][..],
+            &["-d", "secret text"],
+            &["--description=secret text"],
+        ] {
+            let mut a = w(&["pulls", "create", "--title", "x"]);
+            a.extend(w(form));
+            let (rest, body) = split_body(&TEA, &a);
+            assert_eq!(body.as_deref(), Some("secret text"), "{form:?}");
+            assert!(!rest.iter().any(|x| x.contains("secret")), "{rest:?}");
+        }
     }
 
     #[test]
