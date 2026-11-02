@@ -472,6 +472,16 @@ fn write_fd(fd: i32, mut data: &[u8]) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Which streams the view copies. True means paddock tees that stream into
+/// the run log. A terminal stays the harness's own. Capture mode copies
+/// both streams, so a spawned child does not print on the parent terminal
+/// and the view log keeps stderr.
+pub fn copy_streams(capture: bool, stdout_tty: bool, stderr_tty: bool) -> (bool, bool) {
+    let out_tty = !capture && stdout_tty;
+    let err_tty = !capture && stderr_tty;
+    (!out_tty, !err_tty)
+}
+
 /// The view of one run, from the start of the sandbox to its end.
 pub struct Live {
     pub tee: Tee,

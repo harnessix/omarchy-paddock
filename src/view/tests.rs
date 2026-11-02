@@ -372,3 +372,13 @@ fn only_plain_ids_name_files_and_sessions() {
         assert!(!valid_id(bad), "{bad}");
     }
 }
+
+#[test]
+fn review_e_spawn_capture_tees_stderr_even_when_stderr_is_terminal() {
+    let (tee_out, tee_err) = copy_streams(true, true, true);
+    assert!(tee_out);
+    assert!(
+        tee_err,
+        "spawned child stderr must be teed into view, not inherited"
+    );
+}

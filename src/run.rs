@@ -904,11 +904,14 @@ pub fn run(
     }
     // The live view of a run without a terminal (view.rs). paddock copies
     // each stream that is not a terminal to the caller and to the run log.
-    // A terminal stays the harness's own.
+    // A terminal stays the harness's own. Capture mode copies both.
     let mut view = if built.view && !interactive {
-        let out_tty = !capture && std::io::stdout().is_terminal();
-        let err_tty = std::io::stderr().is_terminal();
-        crate::view::Live::start(env, &spec.id, &spec.harness, !out_tty, !err_tty, quiet)
+        let (tee_out, tee_err) = crate::view::copy_streams(
+            capture,
+            std::io::stdout().is_terminal(),
+            std::io::stderr().is_terminal(),
+        );
+        crate::view::Live::start(env, &spec.id, &spec.harness, tee_out, tee_err, quiet)
     } else {
         None
     };
