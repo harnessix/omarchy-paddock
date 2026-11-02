@@ -340,8 +340,13 @@ Panel {
       else root.say(strings.t("msg.noView"))
     })
   }
-  function activate(s) {
+  // A click on a sandbox row. A sandbox without its own terminal (a spawned
+  // child, a detached or one-shot run) shows its live view. A child without
+  // a view has no window of its own: focusing would land on the window of
+  // the app that started it.
+  function openSandbox(s) {
     if (s.view) openView(s, false)
+    else if (s.parent !== "") root.say(strings.t("msg.noView"))
     else goToTerminal(s)
   }
   function showDisplay(s) {
@@ -754,7 +759,7 @@ Panel {
     }
     if (sandboxes.length === 0) { startNew(); return }
     var s = sandboxAt(selectedIndex)
-    if (actionIndex < 0) activate(s)
+    if (actionIndex < 0) openSandbox(s)
     else runAction(s, actionsFor(s)[actionIndex])
   }
 
@@ -1528,7 +1533,7 @@ Panel {
                   ? strings.tn("row.boundary", modelData.boundaryCount).arg(Commons.I18n.formatNumber(modelData.boundaryCount)).arg(modelData.id)
                   : "", modelData.spent].filter(function(t) { return t !== "" }).join(" · ")
                 showActions: true
-                onActivated: root.activate(modelData)
+                onActivated: root.openSandbox(modelData)
 
                 ActionButton {
                   sandboxIndex: index + root.approvals.length; position: 0
