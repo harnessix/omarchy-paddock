@@ -19,8 +19,10 @@
 //!   the account that the sandbox uses ("at most 1% of the weekly limit").
 //!   It counts what the account used since the timer started, from the
 //!   forage ledger (forage.rs). The ledger knows the account, not the
-//!   sandbox: what other sandboxes and apps on the same login use counts
-//!   too. Over budget is handled as a deadline: soft tells, hard freezes.
+//!   sandbox, so each rise is split among the quota timers on the same
+//!   window that ran meanwhile, also the timers whose sandbox ended since
+//!   (`Ended`). Use outside paddock is split the same way.
+//!   Over budget is handled as a deadline: soft tells, hard freezes.
 //!
 //! The keys `timer:*` change only through the timer operations, as leases
 //! change only through claim and release.
@@ -83,34 +85,101 @@ pub struct QuotaStatus {
     pub agent: String,
     pub window: String,
     pub share: f64,
-    /// The share that the account used since the start.
+    /// The timer's share of what the account used since the start.
     pub used: f64,
     pub left: f64,
     pub over: bool,
     /// When the newest numbers were fetched.
     pub fetched: u64,
+    /// The account reports whole percents.
+    #[serde(default)]
+    pub whole: bool,
+}
+
+/// When a timer ran: its start, its stop, and its frozen periods. A quota
+/// budget splits each rise of the window among the timers that ran.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Run {
+    pub started: u64,
+    pub stopped: Option<u64>,
+    pub frozen: Vec<(u64, u64)>,
+}
+
+impl Run {
+    pub fn of(t: &Timer, frozen: Vec<(u64, u64)>) -> Run {
+        Run {
+            started: t.started,
+            stopped: t.stopped,
+            frozen,
+        }
+    }
+
+    /// The timer ran during the step from `a` to `b`: it started before the
+    /// end, did not stop before the start, and was not frozen all the time.
+    pub fn ran(&self, a: u64, b: u64) -> bool {
+        if self.started >= b || self.stopped.is_some_and(|s| s < a) {
+            return false;
+        }
+        let (lo, hi) = (a.max(self.started), b.min(self.stopped.unwrap_or(b)));
+        if hi <= lo {
+            return true;
+        }
+        let frozen: u64 = self
+            .frozen
+            .iter()
+            .map(|(x, y)| (*y).min(hi).saturating_sub((*x).max(lo)))
+            .sum();
+        frozen < hi - lo
+    }
+}
+
+/// A share is a whole percent.
+fn whole(x: f64) -> bool {
+    let p = x * 100.0;
+    (p - p.round()).abs() < 1e-6
 }
 
 impl Quota {
-    /// What the account used since the start, from the window's samples.
+    /// What the timer used since the start, from the window's samples.
     /// A window that reset (its reset time moved, or its share went down)
-    /// starts again from 0.
-    pub fn status(&self, samples: &[crate::forage::Sample]) -> QuotaStatus {
+    /// starts again from 0. Each rise is split among the timers that ran
+    /// during it: `me` and the `others` on the same agent and window. A step
+    /// in which `me` was frozen does not count.
+    pub fn status(
+        &self,
+        samples: &[crate::forage::Sample],
+        me: &Run,
+        others: &[Run],
+    ) -> QuotaStatus {
         let (mut used, mut resets, mut eaten, mut fetched) =
             (self.base, self.base_resets, 0.0, self.base_at);
+        let mut whole_pct = whole(self.base);
         for s in samples.iter().filter(|s| s.at > self.base_at) {
             let reset = s.used < used || s.resets.abs_diff(resets) > 60;
-            eaten += if reset { s.used } else { s.used - used };
+            let rise = if reset { s.used } else { s.used - used };
+            if me.ran(fetched, s.at) {
+                let n = 1 + others.iter().filter(|o| o.ran(fetched, s.at)).count();
+                eaten += rise / n as f64;
+            }
+            whole_pct &= whole(s.used);
             (used, resets, fetched) = (s.used, s.resets, s.at);
         }
+        // With whole percents, a 1% budget is "over" at the first tick that
+        // shows 1% more, which can come after almost no work.
+        let over = if whole_pct {
+            eaten > self.share + 1e-9
+        } else {
+            eaten >= self.share - 1e-9
+        };
         QuotaStatus {
             agent: self.agent.clone(),
             window: self.window.clone(),
             share: self.share,
             used: eaten,
             left: (self.share - eaten).max(0.0),
-            over: eaten >= self.share,
+            over,
             fetched,
+            whole: whole_pct,
         }
     }
 }
@@ -270,14 +339,29 @@ impl Timer {
 
     /// The status with the quota budget counted from the forage ledger.
     pub fn status_in(&self, env: &HostEnv, now: u64) -> Status {
-        let mut s = self.status(now, &frozen_periods(env, &self.subject, now));
+        let frozen = frozen_periods(env, &self.subject, now);
+        let mut s = self.status(now, &frozen);
         if let Some(q) = &self.quota {
             let mut samples = crate::forage::samples(env, &q.agent, &q.window);
             // A stopped timer counts up to its stop.
             if let Some(end) = self.stopped {
                 samples.retain(|x| x.at <= end);
             }
-            let qs = q.status(&samples);
+            let me = Run::of(self, frozen);
+            let running: Vec<String> = crate::state::Running::list(env)
+                .into_iter()
+                .map(|r| r.id)
+                .collect();
+            let others = peer_runs(
+                crate::kv::quota_peers(env, &q.agent, &q.window, now),
+                &read_ended(env),
+                &running,
+                self,
+                &q.agent,
+                &q.window,
+                |s| frozen_periods(env, s, now),
+            );
+            let qs = q.status(&samples, &me, &others);
             s.over |= qs.over;
             s.quota = Some(qs);
         }
@@ -393,6 +477,171 @@ pub fn record_frozen(env: &HostEnv, sandbox: &str, since: u64, until: u64) {
         }
         Err(e) => log::debug!("cannot record the frozen period of {sandbox}: {e}"),
     }
+}
+
+/// A quota timer as the host keeps it: after its sandbox ended, it still
+/// shares each step that it ran in.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Ended {
+    pub subject: String,
+    pub name: String,
+    pub agent: String,
+    pub window: String,
+    pub started: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stopped: Option<u64>,
+    /// The last time its sandbox ran: the end, when the timer did not stop.
+    pub seen: u64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub frozen: Vec<(u64, u64)>,
+}
+
+impl Ended {
+    /// The end of the run: the stop, or the end of the sandbox.
+    pub fn end(&self) -> u64 {
+        self.stopped.unwrap_or(self.seen).min(self.seen)
+    }
+
+    pub fn run(&self) -> Run {
+        Run {
+            started: self.started,
+            stopped: Some(self.end()),
+            frozen: self.frozen.clone(),
+        }
+    }
+
+    fn is(&self, t: &Timer) -> bool {
+        (&self.subject, &self.name, self.started) == (&t.subject, &t.name, t.started)
+    }
+
+    /// Keep the run while its sandbox runs, or while a timer on the same
+    /// agent and window in a running sandbox started before its end.
+    fn keep(&self, running: &[String], live: &[Timer]) -> bool {
+        running.contains(&self.subject)
+            || live.iter().any(|t| {
+                t.started < self.end()
+                    && t.quota
+                        .as_ref()
+                        .is_some_and(|q| q.agent == self.agent && q.window == self.window)
+            })
+    }
+}
+
+fn ended_file(env: &HostEnv) -> PathBuf {
+    env.paddock_state().join("quota-runs.json")
+}
+
+pub fn read_ended(env: &HostEnv) -> Vec<Ended> {
+    std::fs::read_to_string(ended_file(env))
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or_default()
+}
+
+/// Change the kept runs, one writer at a time.
+fn change_ended(env: &HostEnv, f: impl FnOnce(&mut Vec<Ended>)) -> Result<()> {
+    let file = ended_file(env);
+    if let Some(dir) = file.parent() {
+        crate::privfs::dir(dir)?;
+    }
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(file.with_extension("lock"))?;
+    use std::os::fd::AsRawFd as _;
+    // SAFETY: flock on an open file descriptor; the lock goes with the file.
+    unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) };
+    let mut list = read_ended(env);
+    let before = list.clone();
+    f(&mut list);
+    if list != before {
+        crate::privfs::write_atomic(&file, serde_json::to_string(&list)?)?;
+    }
+    Ok(())
+}
+
+/// The 30-second tick of a running sandbox keeps the runs of its quota
+/// timers, and drops the runs that no running timer shares any more.
+pub fn note_runs(env: &HostEnv, sandbox: &str, timers: &[Timer], now: u64) -> Result<()> {
+    let running: Vec<String> = crate::state::Running::list(env)
+        .into_iter()
+        .map(|r| r.id)
+        .collect();
+    let frozen = frozen_periods(env, sandbox, now);
+    let mut windows: Vec<(String, String)> = Vec::new();
+    change_ended(env, |list| {
+        // A removed timer no longer counts.
+        list.retain(|e| e.subject != sandbox || timers.iter().any(|t| e.is(t)));
+        for t in timers {
+            let Some(q) = &t.quota else { continue };
+            let e = Ended {
+                subject: t.subject.clone(),
+                name: t.name.clone(),
+                agent: q.agent.clone(),
+                window: q.window.clone(),
+                started: t.started,
+                stopped: t.stopped,
+                seen: now,
+                frozen: frozen.clone(),
+            };
+            match list.iter_mut().find(|x| x.is(t)) {
+                Some(x) => *x = e,
+                None => list.push(e),
+            }
+        }
+        for e in list.iter() {
+            let w = (e.agent.clone(), e.window.clone());
+            if !windows.contains(&w) {
+                windows.push(w);
+            }
+        }
+    })?;
+    let live: Vec<Timer> = windows
+        .iter()
+        .flat_map(|(a, w)| crate::kv::quota_peers(env, a, w, now))
+        .collect();
+    change_ended(env, |list| list.retain(|e| e.keep(&running, &live)))
+}
+
+/// The end of a sandbox: its quota timers ran until now.
+pub fn end_runs(env: &HostEnv, sandbox: &str, now: u64) {
+    let frozen = frozen_periods(env, sandbox, now);
+    let r = change_ended(env, |list| {
+        for e in list.iter_mut().filter(|e| e.subject == sandbox) {
+            e.seen = now;
+            e.frozen = frozen.clone();
+        }
+    });
+    if let Err(e) = r {
+        log::debug!("cannot record the end of the quota timers of {sandbox}: {e:#}");
+    }
+}
+
+/// The runs that share the rise of a window with `me`: the quota timers of
+/// the running sandboxes, and the kept runs of the sandboxes that ended.
+pub fn peer_runs(
+    live: Vec<Timer>,
+    ended: &[Ended],
+    running: &[String],
+    me: &Timer,
+    agent: &str,
+    window: &str,
+    frozen_of: impl Fn(&str) -> Vec<(u64, u64)>,
+) -> Vec<Run> {
+    let mut out: Vec<Run> = live
+        .iter()
+        .filter(|o| (&o.subject, &o.name, o.started) != (&me.subject, &me.name, me.started))
+        .map(|o| Run::of(o, frozen_of(&o.subject)))
+        .collect();
+    out.extend(
+        ended
+            .iter()
+            .filter(|e| e.agent == agent && e.window == window)
+            .filter(|e| !running.contains(&e.subject) && !e.is(me))
+            .map(Ended::run),
+    );
+    out
 }
 
 /// The summary for `paddock ps` and the panel: the timers of a sandbox.
@@ -555,14 +804,25 @@ pub fn describe(s: &Status) -> String {
     }
     if let Some(q) = &s.quota {
         parts.push(format!(
-            "{:.0}% of {:.0}% of {} {}",
-            q.used * 100.0,
-            q.share * 100.0,
+            "{}% of {}% of {} {}{}",
+            pct(q.used),
+            pct(q.share),
             q.agent,
-            q.window
+            q.window,
+            if q.whole {
+                " (the account reports whole percents)"
+            } else {
+                ""
+            }
         ));
     }
     parts.join(", ")
+}
+
+/// A share as a percent: `1`, `0.5`, `0.25`.
+fn pct(x: f64) -> String {
+    let p = format!("{:.2}", x * 100.0);
+    p.trim_end_matches('0').trim_end_matches('.').to_string()
 }
 
 /// What `extend` adds: time, or a share of the quota budget.
@@ -706,25 +966,141 @@ mod tests {
             base_at: 100,
         };
         // Nothing new yet.
-        let s = q.status(&[sample(0.40, 9000, 100)]);
+        let s = q.status_alone(&[sample(0.40, 9000, 100)]);
         assert_eq!((s.used, s.over), (0.0, false));
         // Older samples do not count; 4% since the start.
-        let s = q.status(&[sample(0.10, 9000, 50), sample(0.44, 9000, 200)]);
+        let s = q.status_alone(&[sample(0.10, 9000, 50), sample(0.44, 9000, 200)]);
         assert!(
             (s.used - 0.04).abs() < 1e-9 && (s.left - 0.06).abs() < 1e-9,
             "{s:?}"
         );
         assert_eq!(s.fetched, 200);
         // The window resets: what was used before it, and all after it.
-        let s = q.status(&[
+        let s = q.status_alone(&[
             sample(0.47, 9000, 200),
             sample(0.03, 20000, 300),
             sample(0.05, 20000, 400),
         ]);
         assert!((s.used - 0.12).abs() < 1e-9 && s.over, "{s:?}");
         // A reset time that moves by a few seconds is the same window.
-        let s = q.status(&[sample(0.45, 9030, 200)]);
+        let s = q.status_alone(&[sample(0.45, 9030, 200)]);
         assert!((s.used - 0.05).abs() < 1e-9, "{s:?}");
+    }
+
+    impl Quota {
+        /// The status of a timer that runs alone and is never frozen.
+        fn status_alone(&self, samples: &[crate::forage::Sample]) -> QuotaStatus {
+            self.status(samples, &run(self.base_at, None, &[]), &[])
+        }
+    }
+
+    fn run(started: u64, stopped: Option<u64>, frozen: &[(u64, u64)]) -> Run {
+        Run {
+            started,
+            stopped,
+            frozen: frozen.to_vec(),
+        }
+    }
+
+    fn quota(share: f64, base: f64, base_at: u64) -> Quota {
+        Quota {
+            agent: "codex".into(),
+            window: "Weekly (7-day)".into(),
+            share,
+            base,
+            base_resets: 9000,
+            base_at,
+        }
+    }
+
+    #[test]
+    fn timers_on_one_account_split_the_rise() {
+        let q = quota(0.01, 0.40, 100);
+        let samples = [sample(0.41, 9000, 200), sample(0.42, 9000, 300)];
+        // Alone: the whole rise, as before.
+        let s = q.status(&samples, &run(100, None, &[]), &[]);
+        assert!((s.used - 0.02).abs() < 1e-9 && s.over, "{s:?}");
+        // Four timers at the same time: 0.5% each.
+        let three = vec![run(90, None, &[]); 3];
+        let s = q.status(&samples, &run(100, None, &[]), &three);
+        assert!((s.used - 0.005).abs() < 1e-9 && !s.over, "{s:?}");
+        assert!((s.left - 0.005).abs() < 1e-9);
+        // A timer that stopped before the second step counts only in the first.
+        let s = q.status(&samples, &run(100, None, &[]), &[run(90, Some(150), &[])]);
+        assert!((s.used - 0.015).abs() < 1e-9, "{s:?}");
+    }
+
+    #[test]
+    fn a_timer_that_starts_halfway_counts_only_the_steps_after_its_start() {
+        let samples = [
+            sample(0.42, 9000, 200),
+            sample(0.44, 9000, 300),
+            sample(0.48, 9000, 400),
+        ];
+        let early = run(100, None, &[]);
+        let late = run(250, None, &[]);
+        // The late timer starts at 250 with the numbers of 200.
+        let q = quota(0.10, 0.42, 200);
+        let s = q.status(&samples, &late, std::slice::from_ref(&early));
+        assert!((s.used - 0.03).abs() < 1e-9, "{s:?}");
+        // The early timer: 2% alone, then 2% and 4% split by two.
+        let q = quota(0.10, 0.40, 100);
+        let s = q.status(
+            &[sample(0.40, 9000, 100)]
+                .iter()
+                .chain(&samples)
+                .cloned()
+                .collect::<Vec<_>>(),
+            &early,
+            &[late],
+        );
+        assert!((s.used - 0.05).abs() < 1e-9, "{s:?}");
+    }
+
+    #[test]
+    fn a_frozen_timer_does_not_share_a_step() {
+        let q = quota(0.10, 0.40, 100);
+        let samples = [sample(0.42, 9000, 200), sample(0.46, 9000, 300)];
+        // The other timer was frozen during the second step: it shares only the first.
+        let other = run(90, None, &[(200, 300)]);
+        let s = q.status(&samples, &run(100, None, &[]), &[other]);
+        assert!((s.used - 0.05).abs() < 1e-9, "{s:?}");
+        // The timer itself was frozen during the second step: it counts only the first.
+        let me = run(100, None, &[(190, 320)]);
+        let s = q.status(&samples, &me, &[run(90, None, &[])]);
+        assert!((s.used - 0.01).abs() < 1e-9, "{s:?}");
+        // Frozen during a part of the step: it ran.
+        let me = run(100, None, &[(250, 400)]);
+        assert!((q.status(&samples, &me, &[]).used - 0.06).abs() < 1e-9);
+    }
+
+    #[test]
+    fn whole_percents_end_a_budget_only_above_it() {
+        let q = quota(0.01, 0.40, 100);
+        let s = q.status_alone(&[sample(0.41, 9000, 200)]);
+        assert!(s.whole && !s.over && s.left.abs() < 1e-9, "{s:?}");
+        let t = Status {
+            quota: Some(s),
+            ..timer(1000, 0).status(1000, &[])
+        };
+        assert_eq!(
+            describe(&t),
+            "1% of 1% of codex Weekly (7-day) (the account reports whole percents)"
+        );
+        assert!(q.status_alone(&[sample(0.42, 9000, 200)]).over);
+        // Fractional numbers keep ">=".
+        let q = quota(0.01, 0.405, 100);
+        let s = q.status_alone(&[sample(0.415, 9000, 200)]);
+        assert!(!s.whole && s.over, "{s:?}");
+        let t = Status {
+            quota: Some(q.status(
+                &[sample(0.415, 9000, 200)],
+                &run(100, None, &[]),
+                &[run(0, None, &[])],
+            )),
+            ..timer(1000, 0).status(1000, &[])
+        };
+        assert_eq!(describe(&t), "0.5% of 1% of codex Weekly (7-day)");
     }
 
     #[test]

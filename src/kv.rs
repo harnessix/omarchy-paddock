@@ -1603,6 +1603,34 @@ pub fn identity_of(r: &crate::state::Running, all: &[crate::state::Running]) -> 
     }
 }
 
+/// The quota timers on one agent and window of all running sandboxes. The
+/// timers of the sandboxes that ended come from `timer::read_ended`.
+pub fn quota_peers(env: &HostEnv, agent: &str, window: &str, now: u64) -> Vec<crate::timer::Timer> {
+    let root = kv_root(env);
+    let all = crate::state::Running::list(env);
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for r in &all {
+        for (ns, _) in timer_spaces(&identity_of(r, &all)) {
+            let Ok(file) = ns.file(&root) else { continue };
+            if !file.is_file() {
+                continue;
+            }
+            let Ok(st) = Store::open(&file) else { continue };
+            for (t, _) in crate::timer::in_store(&st, &ns.key(), now).unwrap_or_default() {
+                let same = t
+                    .quota
+                    .as_ref()
+                    .is_some_and(|q| q.agent == agent && q.window == window);
+                if same && t.subject == r.id && seen.insert((ns.key(), t.name.clone(), t.started)) {
+                    out.push(t);
+                }
+            }
+        }
+    }
+    out
+}
+
 /// Write the timer summary of the running sandbox `sandbox`, if it runs.
 pub fn refresh_timer_summary(env: &HostEnv, root: &Path, sandbox: &str) -> Result<()> {
     let all = crate::state::Running::list(env);
@@ -1624,6 +1652,7 @@ fn timer_tick(env: &HostEnv, id: &Identity, root: &Path, cfg: &KvCfg) -> Result<
     let mut timed = false;
     // The accounts whose numbers a running timer needs.
     let mut sample: Vec<String> = Vec::new();
+    let mut quota_timers = Vec::new();
     for (ns, scope) in spaces {
         let file = ns.file(root)?;
         if !file.is_file() {
@@ -1633,6 +1662,9 @@ fn timer_tick(env: &HostEnv, id: &Identity, root: &Path, cfg: &KvCfg) -> Result<
         for (mut t, version) in timer::in_store(&st, &ns.key(), now)? {
             if t.subject != id.sandbox {
                 continue;
+            }
+            if t.quota.is_some() {
+                quota_timers.push(t.clone());
             }
             let s = t.status_in(env, now);
             summary.push(s.clone());
@@ -1687,6 +1719,10 @@ fn timer_tick(env: &HostEnv, id: &Identity, root: &Path, cfg: &KvCfg) -> Result<
                 timer_notice(env, id, "paddock froze a sandbox: its time is up", &format!("{reason}. paddock thaw {} lets it continue; paddock timer extend gives it more.", id.sandbox));
             }
         }
+    }
+    // The runs of the quota timers outlive the sandbox (timer::Ended).
+    if let Err(e) = timer::note_runs(env, &id.sandbox, &quota_timers, now) {
+        log::debug!("quota runs of {}: {e:#}", id.sandbox);
     }
     // A timed task: keep the forage ledger fresh for its account.
     if timed {

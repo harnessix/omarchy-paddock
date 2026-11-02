@@ -2056,3 +2056,77 @@ fn a_principal_frees_its_own_leases_only() {
     let r = ci.handle(&w.env, &cfg, &req("release", Scope::Own, "deploy"));
     assert_eq!(r.status, Status::Done, "{}", r.message);
 }
+
+const HOST_W: Writer = Writer {
+    sandbox: "user",
+    harness: "host",
+};
+
+#[test]
+fn a_quota_peer_that_ended_still_shares_the_steps_it_ran_in() {
+    let w = world();
+    let dir = w.env.state_dir.join("omarchy/agents/usage");
+    std::fs::create_dir_all(&dir).unwrap();
+    let usage = |at: u64, pct: f64| {
+        std::fs::write(
+            dir.join("t.json"),
+            serde_json::json!({"limitsFetchedAt": at * 1000, "limits": [
+                {"label": "Weekly (7-day)", "percent": pct, "resetsAt": "2030-01-05T00:00:00Z"}]})
+            .to_string(),
+        )
+        .unwrap();
+        crate::forage::record(&w.env, "t").unwrap();
+    };
+    let now = crate::state::now();
+    usage(now - 100, 0.40);
+    let timer = |id: &str| crate::timer::Timer {
+        name: "task".into(),
+        owner: "user".into(),
+        subject: id.into(),
+        started: now - 100,
+        budget: 0,
+        hard: false,
+        quota: Some(crate::timer::Quota {
+            agent: "t".into(),
+            window: "Weekly (7-day)".into(),
+            share: 0.10,
+            base: 0.40,
+            base_resets: crate::forage::samples(&w.env, "t", "Weekly (7-day)")[0].resets,
+            base_at: now - 100,
+        }),
+        stopped: None,
+        announced: false,
+        enforced: false,
+        extensions: Vec::new(),
+    };
+    for id in ["a", "b"] {
+        let r: crate::state::Running = serde_json::from_value(serde_json::json!({
+            "id": id, "harness": "t", "project": "/src/app", "backend": "bwrap",
+            "network": "none", "gui": "off", "pid": std::process::id(), "started": now,
+        }))
+        .unwrap();
+        r.register(&w.env).unwrap();
+        let (file, ns) = crate::timer::self_file(&w.env, id).unwrap();
+        let mut st = Store::open(&file).unwrap();
+        crate::timer::save(&mut st, &ns, &timer(id), None, &HOST_W, Q, now).unwrap();
+        // What the 30-second tick of the sandbox does.
+        crate::timer::note_runs(&w.env, id, &[timer(id)], now - 50).unwrap();
+    }
+    // The account rises by 2% while both run: 1% each.
+    usage(now, 0.42);
+    let used = || timer("a").status_in(&w.env, now + 20).quota.unwrap().used;
+    assert!((used() - 0.01).abs() < 1e-9, "{}", used());
+    // b ends: a still counts 1%.
+    crate::timer::end_runs(&w.env, "b", now + 10);
+    std::fs::remove_dir_all(w.env.paddock_run().join("b")).unwrap();
+    crate::timer::note_runs(&w.env, "a", &[timer("a")], now + 20).unwrap();
+    assert!((used() - 0.01).abs() < 1e-9, "{}", used());
+    assert_eq!(crate::timer::read_ended(&w.env).len(), 2);
+    // No running timer started before the end of b: its run goes.
+    let (file, ns) = crate::timer::self_file(&w.env, "a").unwrap();
+    let mut st = Store::open(&file).unwrap();
+    st.delete(&ns, "timer:task", None, &HOST_W, Q, now + 30)
+        .unwrap();
+    crate::timer::note_runs(&w.env, "a", &[], now + 30).unwrap();
+    assert!(crate::timer::read_ended(&w.env).is_empty());
+}

@@ -580,6 +580,49 @@ fn homes_root(env: &HostEnv) -> PathBuf {
 fn worktrees_root(env: &HostEnv) -> PathBuf {
     env.paddock_data().join("worktrees")
 }
+/// The branches that paddock made for its worktrees, one file per worktree,
+/// on the host where no sandbox writes.
+fn worktree_branches_root(env: &HostEnv) -> PathBuf {
+    env.paddock_state().join("worktree-branches")
+}
+
+/// The record of a worktree: `<slug>/<id>` below the worktree folder.
+fn worktree_branch_file(env: &HostEnv, path: &Path) -> Option<PathBuf> {
+    let rel = path.strip_prefix(worktrees_root(env)).ok()?;
+    (rel.components().count() == 2).then(|| worktree_branches_root(env).join(rel))
+}
+
+/// Record the branch that paddock made for the worktree at `path`. The
+/// worktree scan trusts this record, not the branch that the worktree is on
+/// now: a sandbox can switch branches there.
+pub fn record_worktree_branch(env: &HostEnv, path: &Path, branch: &str) {
+    let Some(f) = worktree_branch_file(env, path) else {
+        return;
+    };
+    let r = f
+        .parent()
+        .map_or(Ok(()), crate::privfs::dir)
+        .and_then(|_| crate::privfs::write(&f, branch));
+    if let Err(e) = r {
+        log::warn!("cannot record the branch of {}: {e}", path.display());
+    }
+}
+
+fn recorded_worktree_branch(env: &HostEnv, path: &Path) -> Option<String> {
+    let f = worktree_branch_file(env, path)?;
+    let b = std::fs::read_to_string(f).ok()?.trim().to_string();
+    (!b.is_empty()).then_some(b)
+}
+
+fn forget_worktree_branch(env: &HostEnv, path: &Path) {
+    if let Some(f) = worktree_branch_file(env, path) {
+        let _ = std::fs::remove_file(&f);
+        if let Some(parent) = f.parent() {
+            let _ = std::fs::remove_dir(parent);
+        }
+    }
+}
+
 fn keyring_root(env: &HostEnv) -> PathBuf {
     env.paddock_state().join("keyring")
 }
@@ -748,9 +791,15 @@ fn worktree_facts(
     env: &HostEnv,
     repo: &Path,
     listed: &ListedWorktree,
+    branch: Option<&str>,
 ) -> (Option<usize>, Option<bool>) {
-    let unmerged = listed.head.as_ref().and_then(|head| {
-        let ex = listed.branch.as_ref().map(|b| format!("--exclude={b}"));
+    // The commits of the branch, else of the worktree's HEAD.
+    let head = match branch {
+        Some(b) => Some(format!("refs/heads/{b}")),
+        None => listed.head.clone(),
+    };
+    let unmerged = head.as_ref().and_then(|head| {
+        let ex = branch.map(|b| format!("--exclude={b}"));
         let mut args = vec!["rev-list", "--count", head.as_str(), "--not"];
         if let Some(ex) = &ex {
             args.push(ex);
@@ -1021,9 +1070,19 @@ fn scan_worktrees(
                     .entry(repo.clone())
                     .or_insert_with(|| list_worktrees(repo));
                 if let Some(l) = list.iter().find(|l| l.path == path) {
-                    let (unmerged, dirty) = worktree_facts(env, repo, l);
+                    // The branch that paddock made, not the one the worktree
+                    // is on now. Without a record, only a `paddock/` branch.
+                    let branch = match recorded_worktree_branch(env, &path) {
+                        Some(b) => git(
+                            repo,
+                            &["rev-parse", "--verify", "-q", &format!("refs/heads/{b}")],
+                        )
+                        .map(|_| b),
+                        None => l.branch.clone().filter(|b| b.starts_with("paddock/")),
+                    };
+                    let (unmerged, dirty) = worktree_facts(env, repo, l, branch.as_deref());
                     w.repo = Some(repo.clone());
-                    w.branch = l.branch.clone();
+                    w.branch = branch;
                     w.unmerged = unmerged;
                     w.dirty = dirty;
                 }
@@ -1886,6 +1945,7 @@ pub fn remove_worktree(
         }
         None => remove_path(env, path)?,
     }
+    forget_worktree_branch(env, path);
     // The per-repository folder, when it is empty now.
     if let Some(parent) = path.parent() {
         let _ = std::fs::remove_dir(parent);
