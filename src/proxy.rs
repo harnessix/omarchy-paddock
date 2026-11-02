@@ -736,8 +736,9 @@ fn handle(cfg: &HostProxy, mut client: UnixStream) -> Result<()> {
         };
         if let Some(api) = &cfg.api {
             if let Err(why) = api.list.check(&host, port) {
-                api.refuse(&host, &why);
-                cfg.refused(&host, port, &format!("network mode api: {why}"));
+                if api.refuse(&host, &why) {
+                    cfg.refused(&host, port, &format!("network mode api: {why}"));
+                }
                 respond(&mut client, 403, "Forbidden");
                 bail!("refused: {host}:{port}: {why}");
             }
@@ -754,8 +755,9 @@ fn handle(cfg: &HostProxy, mut client: UnixStream) -> Result<()> {
             Some(api) => match checked_hello(&mut client, rest, &host) {
                 Ok(bytes) => bytes,
                 Err(why) => {
-                    api.refuse(&host, &why);
-                    cfg.refused(&host, port, &format!("network mode api: {why}"));
+                    if api.refuse(&host, &why) {
+                        cfg.refused(&host, port, &format!("network mode api: {why}"));
+                    }
                     let _ = client.shutdown(Shutdown::Both);
                     bail!("refused: {host}:{port}: {why}");
                 }
@@ -776,12 +778,13 @@ fn handle(cfg: &HostProxy, mut client: UnixStream) -> Result<()> {
             .as_ref()
             .and_then(host_of)
             .unwrap_or_default();
-        api.refuse(&host, "plain HTTP");
         let port = Url::parse(&target)
             .ok()
             .and_then(|u| u.port_or_known_default())
             .unwrap_or(80);
-        cfg.refused(&host, port, "network mode api: plain HTTP");
+        if api.refuse(&host, "plain HTTP") {
+            cfg.refused(&host, port, "network mode api: plain HTTP");
+        }
         respond(&mut client, 403, "Forbidden");
         bail!("refused: plain HTTP to {host} in network mode api");
     }

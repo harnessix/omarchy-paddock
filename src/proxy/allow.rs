@@ -222,6 +222,7 @@ pub struct Refusals {
     sink: Sink,
     last: Arc<Mutex<HashMap<String, Instant>>>,
     every: Duration,
+    max: usize,
 }
 
 impl std::fmt::Debug for Refusals {
@@ -231,15 +232,23 @@ impl std::fmt::Debug for Refusals {
 }
 
 impl Refusals {
+    /// At most this many refusal reports are emitted per window across all hosts.
+    pub const MAX_PER_WINDOW: usize = 20;
+
     pub fn new(sink: Sink) -> Self {
+        Self::with_limit(sink, Duration::from_secs(60), Self::MAX_PER_WINDOW)
+    }
+
+    pub fn with_limit(sink: Sink, every: Duration, max: usize) -> Self {
         Self {
             sink,
             last: Arc::new(Mutex::new(HashMap::new())),
-            every: Duration::from_secs(60),
+            every,
+            max,
         }
     }
 
-    pub fn report(&self, host: &str, reason: &str) {
+    pub fn report(&self, host: &str, reason: &str) -> bool {
         let key = norm(host);
         {
             let mut last = self.last.lock().unwrap();
@@ -248,12 +257,16 @@ impl Refusals {
                 .get(&key)
                 .is_some_and(|t| now.duration_since(*t) < self.every)
             {
-                return;
+                return false;
             }
             last.retain(|_, t| now.duration_since(*t) < self.every);
+            if last.len() >= self.max {
+                return false;
+            }
             last.insert(key.clone(), now);
         }
         (self.sink)(&key, reason);
+        true
     }
 }
 
@@ -265,9 +278,10 @@ pub struct ApiPolicy {
 }
 
 impl ApiPolicy {
-    pub fn refuse(&self, host: &str, reason: &str) {
-        if let Some(r) = &self.refusals {
-            r.report(host, reason);
+    pub fn refuse(&self, host: &str, reason: &str) -> bool {
+        match &self.refusals {
+            Some(r) => r.report(host, reason),
+            None => true,
         }
     }
 }
@@ -412,5 +426,18 @@ mod tests {
         r.report("A.example.com", "not on the list");
         r.report("b.example.com", "not on the list");
         assert_eq!(seen.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn refusals_are_bounded_per_window_across_all_hosts() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let s2 = seen.clone();
+        let r = Refusals::new(Arc::new(move |h: &str, why: &str| {
+            s2.lock().unwrap().push(format!("{h}: {why}"));
+        }));
+        for i in 0..30 {
+            r.report(&format!("host{i}.example.com"), "denied");
+        }
+        assert_eq!(seen.lock().unwrap().len(), 20);
     }
 }
