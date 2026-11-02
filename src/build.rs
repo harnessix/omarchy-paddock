@@ -706,9 +706,16 @@ pub fn build_with(env: &HostEnv, opts: &Options, harness: Harness) -> Result<Bui
         }
     }
     crate::mcp::apply(env, &profile, &m, &project, &mut spec);
+    let state_settings: Vec<_> = profile
+        .state
+        .settings
+        .iter()
+        .filter(|s| !s.yolo_only || !opts.no_yolo)
+        .cloned()
+        .collect();
     crate::privacy::push_settings(
         &profile,
-        &profile.state.settings,
+        &state_settings,
         &format!("{porigin} state.settings"),
         &mut spec,
     )?;
@@ -1095,6 +1102,69 @@ mod tests {
         };
         let built = build_with(&env, &opts, h).unwrap();
         (tmp, built)
+    }
+
+    /// A detached Claude Code run has no terminal to answer its own two
+    /// questions: the bypass warning (only with auto-approval) and the
+    /// project trust question.
+    #[test]
+    fn claude_starts_without_its_trust_and_bypass_questions() {
+        let built = |no_yolo: bool| {
+            let tmp = tempfile::tempdir().unwrap();
+            let home = tmp.path().join("home");
+            let proj = tmp.path().join("proj");
+            std::fs::create_dir_all(&proj).unwrap();
+            let env = HostEnv::from_parts(home, "t".into(), 1000, 1000, Default::default());
+            let h = Harness {
+                profile: crate::profile::builtin("claude").unwrap(),
+                exe: PathBuf::from("/usr/bin/true"),
+                install_mounts: vec![],
+                path_dirs: vec![],
+                source: "test".into(),
+            };
+            let opts = Options {
+                harness: "claude".into(),
+                project: Some(proj.clone()),
+                assume_yes: true,
+                no_yolo,
+                ..Default::default()
+            };
+            let b = build_with(&env, &opts, h).unwrap();
+            (tmp, proj, b)
+        };
+        let has = |b: &Built, file: &str, path: &[String]| {
+            b.spec.home_settings.iter().any(|s| {
+                s.file == Path::new(file) && s.path == path && s.value == serde_json::json!(true)
+            })
+        };
+        let bypass = vec!["skipDangerousModePermissionPrompt".to_string()];
+        let (_t, proj, b) = built(false);
+        let trust = vec![
+            "projects".to_string(),
+            proj.display().to_string(),
+            "hasTrustDialogAccepted".to_string(),
+        ];
+        assert!(has(&b, ".claude/settings.json", &bypass));
+        assert!(has(&b, ".claude.json", &trust));
+        let (_t, proj, b) = built(true);
+        let trust = vec![
+            "projects".to_string(),
+            proj.display().to_string(),
+            "hasTrustDialogAccepted".to_string(),
+        ];
+        assert!(
+            !has(&b, ".claude/settings.json", &bypass),
+            "no bypass answer with --no-yolo"
+        );
+        assert!(has(&b, ".claude.json", &trust));
+        // settings.json is a writable copy now, so the answer can be written.
+        let p = crate::profile::builtin("claude").unwrap();
+        assert!(p.state.seed.iter().any(|s| s == ".claude/settings.json"));
+        assert!(!p
+            .state
+            .import_ro
+            .iter()
+            .any(|s| s == ".claude/settings.json"));
     }
 
     #[test]
