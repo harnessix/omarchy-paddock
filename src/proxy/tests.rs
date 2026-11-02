@@ -910,3 +910,18 @@ fn a_connection_records_its_host_for_the_egress_monitor() {
     let h = crate::monitor::egress::History::load(&history);
     assert_eq!(h.hosts.len(), 1);
 }
+
+#[test]
+fn a_connect_target_keeps_port_80() {
+    assert_eq!(connect_target("h:80"), Some(("h".into(), 80)));
+    assert_eq!(
+        connect_target("127.0.0.1:80"),
+        Some(("127.0.0.1".into(), 80))
+    );
+    assert_eq!(
+        connect_target("example.com:443"),
+        Some(("example.com".into(), 443))
+    );
+    assert_eq!(connect_target("example.com"), None);
+    assert_eq!(connect_target("example.com:x"), None);
+}

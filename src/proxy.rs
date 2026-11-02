@@ -697,6 +697,15 @@ fn fail(client: &mut impl Write, e: &anyhow::Error) {
     }
 }
 
+/// The host and port of a CONNECT target `host:port`. The port must be
+/// written out; `Url::port` alone hides port 80 as the default of http.
+fn connect_target(target: &str) -> Option<(String, u16)> {
+    let (_, port) = target.rsplit_once(':')?;
+    port.parse::<u16>().ok()?;
+    let parsed = Url::parse(&format!("http://{target}")).ok()?;
+    Some((host_of(&parsed)?, parsed.port_or_known_default()?))
+}
+
 /// Hop-by-hop headers that a proxy must not forward.
 const HOP: &[&str] = &[
     "proxy-connection",
@@ -721,11 +730,7 @@ fn handle(cfg: &HostProxy, mut client: UnixStream) -> Result<()> {
     client.set_read_timeout(None)?;
 
     if method.eq_ignore_ascii_case("CONNECT") {
-        let parsed = Url::parse(&format!("http://{target}")).ok();
-        let (Some(host), Some(port)) = (
-            parsed.as_ref().and_then(host_of),
-            parsed.as_ref().and_then(Url::port),
-        ) else {
+        let Some((host, port)) = connect_target(&target) else {
             respond(&mut client, 400, "Bad Request");
             bail!("bad CONNECT target {target}");
         };
