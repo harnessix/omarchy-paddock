@@ -1135,6 +1135,9 @@ pub fn run(
     // Share identical file data of this home with the other homes, in the
     // background: the exit does not wait for it.
     crate::storage::dedupe::spawn_after_run(env, &spec.home_src);
+    // Copy the verified new packages of this project's cache layers into
+    // the shared layers, in the background too.
+    crate::storage::layers::promote::spawn_after_run(env, spec, backend.name());
     if !quiet {
         recovery_notice(env, &spec.id, &spec.home_src, running.started);
     }

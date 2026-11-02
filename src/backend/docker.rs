@@ -455,7 +455,10 @@ impl Backend for Docker {
         for m in spec.ordered_mounts() {
             mounts.push(match m.kind {
                 MountKind::Ro => mount_arg("bind", m.src.as_deref(), &m.dst, true)?,
-                MountKind::Rw => mount_arg("bind", m.src.as_deref(), &m.dst, false)?,
+                // No overlay here: the upper folder alone, read-write.
+                MountKind::Rw | MountKind::Overlay => {
+                    mount_arg("bind", m.src.as_deref(), &m.dst, false)?
+                }
                 MountKind::Tmpfs => mount_arg("tmpfs", None, &m.dst, false)?,
                 MountKind::MaskFile => mount_arg("bind", Some(&empty_f), &m.dst, true)?,
                 MountKind::MaskDir => mount_arg("tmpfs", None, &m.dst, true)?,

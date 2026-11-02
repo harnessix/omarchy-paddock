@@ -1384,7 +1384,8 @@ mod tests {
                 .and_then(|m| m.src.clone())
         };
         let shared = npm(pkg.join("bin/agent.js")).expect("an npm harness gets .npm");
-        assert_eq!(shared, env.paddock_cache().join("shared/npm"));
+        assert!(shared.ends_with("npm/upper"), "{}", shared.display());
+        assert!(shared.starts_with(crate::storage::layers::projects_root(&env)));
         assert_eq!(npm(PathBuf::from("/usr/bin/true")), None);
     }
 

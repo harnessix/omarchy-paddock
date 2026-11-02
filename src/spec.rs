@@ -19,6 +19,16 @@ pub enum MountKind {
     MaskFile,
     /// Hide a directory: an empty read-only tmpfs over it.
     MaskDir,
+    /// An overlay: reads from [`Mount::layers`] `lower`, writes to `src` (the
+    /// upper folder). A backend without overlays binds `src` read-write.
+    Overlay,
+}
+
+/// The read-only lower folder and the work folder of an overlay mount.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Layers {
+    pub lower: PathBuf,
+    pub work: PathBuf,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -28,6 +38,9 @@ pub struct Mount {
     pub kind: MountKind,
     /// Who asked for this mount, for `paddock explain` and policy errors.
     pub origin: String,
+    /// The lower and work folders of an [`MountKind::Overlay`] mount.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub layers: Option<Layers>,
 }
 
 impl Mount {
@@ -37,6 +50,7 @@ impl Mount {
             dst: dst.into(),
             kind: if rw { MountKind::Rw } else { MountKind::Ro },
             origin: origin.to_string(),
+            layers: None,
         }
     }
     pub fn same(path: impl Into<PathBuf>, rw: bool, origin: &str) -> Self {
@@ -49,6 +63,7 @@ impl Mount {
             dst: dst.into(),
             kind: MountKind::Tmpfs,
             origin: origin.to_string(),
+            layers: None,
         }
     }
     pub fn mask(dst: impl Into<PathBuf>, is_dir: bool, origin: &str) -> Self {
@@ -61,6 +76,26 @@ impl Mount {
                 MountKind::MaskFile
             },
             origin: origin.to_string(),
+            layers: None,
+        }
+    }
+    /// An overlay at `dst`: `lower` read-only, writes go to `upper`.
+    pub fn overlay(
+        lower: impl Into<PathBuf>,
+        upper: impl Into<PathBuf>,
+        work: impl Into<PathBuf>,
+        dst: impl Into<PathBuf>,
+        origin: &str,
+    ) -> Self {
+        Self {
+            src: Some(upper.into()),
+            dst: dst.into(),
+            kind: MountKind::Overlay,
+            origin: origin.to_string(),
+            layers: Some(Layers {
+                lower: lower.into(),
+                work: work.into(),
+            }),
         }
     }
     pub fn is_bind(&self) -> bool {
