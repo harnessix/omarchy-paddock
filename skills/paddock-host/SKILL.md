@@ -47,7 +47,7 @@ Plain `git push` exits with 1 when the host refuses. `paddock-host --help` lists
 Host variables that look like secrets (tokens, passwords, API keys) stay on the host. Your harness gets only its own login variables. If a task needs another token, do not search for it. Tell the user which variable it needs.
 
 - A token whose value contains `PADDOCK` is a stand-in. It works only through the base URL that paddock set (`http://127.0.0.1:3130/s/NAME`), for the hosts and paths that the user bound it to. Do not send it anywhere else.
-- A credential that the user gave as a file is in `/dev/paddock/secret/NAME`. Read it in one command only, for example `GH_TOKEN=$(cat /dev/paddock/secret/GH_TOKEN) gh pr list`. Never copy it into files or logs. EACCES means that the user revoked it.
+- A credential that the user gave as a file is in `/dev/paddock/secret/NAME`. Read it in one command only, for example `GH_TOKEN=$(cat /dev/paddock/secret/GH_TOKEN) gh pr list`. Never copy it into files or logs. If the file is gone or a read fails with EACCES, the user revoked it.
 
 ## Waiting
 
