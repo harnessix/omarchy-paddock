@@ -292,19 +292,19 @@ pub fn command_in(
                 format!("WorkingDirectory={}", s(cwd)),
             ];
             for d in &cfg.hide {
-                p.push(format!("TemporaryFileSystem={}", s(d)));
+                p.push(format!("TemporaryFileSystem={}", unit_path(d)));
             }
             match cfg.home {
                 Home::Hidden => p.push("ProtectHome=tmpfs".into()),
                 Home::ReadOnly => p.push("ProtectHome=read-only".into()),
-                Home::Full => p.push(format!("ReadWritePaths={}", s(home))),
+                Home::Full => p.push(format!("ReadWritePaths={}", unit_path(home))),
             }
-            p.push(format!("BindPaths={}", s(project)));
+            p.push(format!("BindPaths={}", unit_path(project)));
             for d in &cfg.paths {
-                p.push(format!("BindPaths={}", s(d)));
+                p.push(format!("BindPaths={}", unit_path(d)));
             }
             for d in &cfg.ro_paths {
-                p.push(format!("BindReadOnlyPaths={}", s(d)));
+                p.push(format!("BindReadOnlyPaths={}", unit_path(d)));
             }
             if cfg.network {
                 p.push("RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK".into());
@@ -378,6 +378,20 @@ pub fn command_in(
             c
         }
     }
+}
+
+/// A path in a list property of a unit (`BindPaths=`, `ReadWritePaths=`):
+/// systemd splits these at white space and `:`, and takes a character after
+/// `\` as it is.
+fn unit_path(p: &Path) -> String {
+    let mut out = String::new();
+    for ch in p.display().to_string().chars() {
+        if ch.is_whitespace() || matches!(ch, ':' | '\\' | '"' | '\'') {
+            out.push('\\');
+        }
+        out.push(ch);
+    }
+    out
 }
 
 /// systemd's own exit codes when a unit cannot start (for example 218 for
@@ -532,6 +546,33 @@ mod tests {
         assert!(c
             .get_envs()
             .any(|(k, v)| k == "GH_TOKEN" && v == Some("ghp_secret".as_ref())));
+    }
+
+    #[test]
+    fn a_path_with_a_space_stays_one_path_for_systemd() {
+        let cfg = ExecCfg {
+            home: Home::Full,
+            paths: vec![PathBuf::from("/srv/a:b")],
+            ..ExecCfg::default()
+        };
+        let a = args_of(&command(
+            Isolation::Systemd,
+            &cfg,
+            Path::new("/home/my user"),
+            Path::new("/home/my user/My Project"),
+            &["make".into()],
+            &BTreeMap::new(),
+            60,
+            "paddock-exec-x",
+        ));
+        for want in [
+            r"BindPaths=/home/my\ user/My\ Project",
+            r"ReadWritePaths=/home/my\ user",
+            r"BindPaths=/srv/a\:b",
+            "WorkingDirectory=/home/my user/My Project",
+        ] {
+            assert!(a.iter().any(|a| a == want), "{want} missing: {a:?}");
+        }
     }
 
     #[test]
