@@ -230,7 +230,12 @@ fn links_stay_inside_their_root_or_are_skipped() {
         Path::new("/home/demo/.fake/x"),
         root
     ));
-    assert!(!link_stays_inside(h, rel, Path::new("/home/demo/.ssh"), root));
+    assert!(!link_stays_inside(
+        h,
+        rel,
+        Path::new("/home/demo/.ssh"),
+        root
+    ));
     assert!(!link_stays_inside(h, rel, Path::new("/etc/passwd"), root));
 }
 
