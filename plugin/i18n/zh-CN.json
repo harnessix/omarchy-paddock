@@ -30,7 +30,7 @@
   "action.copy": "复制项目路径",
   "action.display": "显示沙箱的显示窗口",
   "action.stop": "停止这个沙箱",
-  "action.takeOver": "接管实时视图（可以使用按键）",
+  "action.takeOver": "打开可用按键滚动的实时视图（按键不会传给 agent）",
   "action.confirmStop": "再按一次以停止",
   "msg.noTerminal": "没有找到这个沙箱的窗口。",
   "msg.noView": "无法打开这个沙箱的实时视图。在终端中运行 paddock view 和它的 id 查看原因。",

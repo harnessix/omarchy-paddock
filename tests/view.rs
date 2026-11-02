@@ -135,8 +135,16 @@ fn the_caller_sees_the_same_output_and_exit_code_with_and_without_tmux() {
     assert_eq!(harness_lines(&b.stderr), harness_lines(&a.stderr));
     assert!(harness_lines(&a.stderr).contains("err one\nerr two"));
     // The session stays after the end (remain-on-exit).
-    let ls = on.tmux(&["list-sessions", "-F", "#{session_name} #{pane_dead}"]);
-    let text = String::from_utf8_lossy(&ls.stdout);
+    // `tail --pid` notices the end of paddock within about a second.
+    let mut text = String::new();
+    for _ in 0..50 {
+        let ls = on.tmux(&["list-sessions", "-F", "#{session_name} #{pane_dead}"]);
+        text = String::from_utf8_lossy(&ls.stdout).into_owned();
+        if text.trim_end().ends_with(" 1") {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
     assert!(text.trim_end().ends_with(" 1"), "{text}");
 }
 
