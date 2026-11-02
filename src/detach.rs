@@ -30,6 +30,12 @@ pub const MAX_TEXT: usize = 4096;
 pub const MAX_PROMPT: u64 = 1 << 20;
 /// `paddock gc` is not needed: launch removes run records older than this.
 const RECORD_AGE: u64 = 30 * 24 * 3600;
+/// `paddock ps --json` lists runs that ended within this many seconds.
+pub const ENDED_WINDOW: u64 = 10 * 60;
+/// The ended list keeps at most this many runs.
+pub const ENDED_KEEP: usize = 8;
+/// The done text in that list keeps at most this many characters.
+pub const ENDED_TEXT: usize = 200;
 /// A run whose pane never started its paddock counts as ended after this.
 const START_GRACE: u64 = 20;
 /// The exit code of `paddock wait` when the time ran out.
@@ -100,6 +106,9 @@ pub struct Record {
     pub exit_code: Option<i32>,
     #[serde(default)]
     pub done: Option<Done>,
+    /// `paddock stop` ended this run.
+    #[serde(default)]
+    pub stopped: bool,
 }
 
 static RECORD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -132,6 +141,105 @@ impl Record {
 /// A sandbox is a detached run.
 pub fn is_detached(env: &HostEnv, id: &str) -> bool {
     crate::view::valid_id(id) && record_file(env, id).is_file()
+}
+
+fn stop_file(env: &HostEnv, id: &str) -> PathBuf {
+    records_dir(env).join(format!("{id}.stop"))
+}
+
+/// `paddock stop` asked this run to end. The marker is a separate file so a
+/// later write of the run record cannot drop it.
+pub fn mark_stopped(env: &HostEnv, id: &str) -> Result<()> {
+    if !crate::view::valid_id(id) {
+        bail!("{id} is not a sandbox id");
+    }
+    crate::privfs::dir(&records_dir(env))?;
+    crate::privfs::write(&stop_file(env, id), b"stopped\n")?;
+    if Record::load(env, id).is_some() {
+        let _ = Record::update(env, id, |r| r.stopped = true);
+    }
+    Ok(())
+}
+
+/// The end of a run that had a view log and was not detached. A detached
+/// run already has a record. `detach-run` writes its end.
+pub fn record_view_end(env: &HostEnv, id: &str, harness: &str, project: &Path) {
+    if !crate::view::valid_id(id) || is_detached(env, id) {
+        return;
+    }
+    let stopped = stop_file(env, id).is_file();
+    let rec = Record {
+        id: id.to_string(),
+        harness: harness.to_string(),
+        project: project.to_path_buf(),
+        ended: Some(crate::state::now()),
+        stopped,
+        ..Default::default()
+    };
+    if rec.save(env).is_ok() && stopped {
+        let _ = std::fs::remove_file(stop_file(env, id));
+    }
+}
+
+/// Runs that ended in the last 10 minutes, newest first, at most 8.
+/// `text` is the `done` text with control characters removed.
+pub fn recent_ended(env: &HostEnv, now: u64) -> Vec<serde_json::Value> {
+    let Ok(rd) = std::fs::read_dir(records_dir(env)) else {
+        return Vec::new();
+    };
+    let mut rows = Vec::new();
+    for e in rd.flatten() {
+        let Some(name) = e.file_name().to_str().map(str::to_string) else {
+            continue;
+        };
+        let Some(id) = name.strip_suffix(".json") else {
+            continue;
+        };
+        let Some(rec) = Record::load(env, id) else {
+            continue;
+        };
+        let Some(ended) = rec.ended else {
+            continue;
+        };
+        if now.saturating_sub(ended) > ENDED_WINDOW {
+            continue;
+        }
+        let stopped = rec.stopped || stop_file(env, id).is_file();
+        let status = if stopped {
+            "stopped"
+        } else {
+            match rec.done.as_ref().map(|d| d.status) {
+                Some(Status::Ok) => "ok",
+                Some(Status::Failed) => "failed",
+                None => "unknown",
+            }
+        };
+        let text = rec
+            .done
+            .as_ref()
+            .map(|d| crate::view::plain_limit(&d.text, ENDED_TEXT))
+            .unwrap_or_default();
+        rows.push(serde_json::json!({
+            "id": rec.id,
+            "harness": rec.harness,
+            "project": rec.project,
+            "ended": ended,
+            "status": status,
+            "text": text,
+        }));
+    }
+    rows.sort_by(|a, b| {
+        let ae = a["ended"].as_u64().unwrap_or(0);
+        let be = b["ended"].as_u64().unwrap_or(0);
+        be.cmp(&ae).then_with(|| {
+            b["id"]
+                .as_str()
+                .unwrap_or("")
+                .cmp(a["id"].as_str().unwrap_or(""))
+        })
+    });
+    rows.truncate(ENDED_KEEP);
+    rows
 }
 
 /// Keep `text` printable and at most `MAX_TEXT` bytes: no terminal control
