@@ -316,7 +316,7 @@ fn chunked_and_sized_responses_decode() {
     assert!(complete(b"HTTP/1.1 200 OK\r\nContent-Length: 9\r\n\r\n", true, false).is_some());
     assert!(matches!(
         complete(b"SSH-2.0-x\r\n\r\n", false, false),
-        Some(Err(Upstream::Unreachable(_)))
+        Some(Err(Upstream::NoAnswer(_)))
     ));
     assert!(matches!(dechunk(b"zz\r\n"), Some(Err(()))));
 }
@@ -658,4 +658,47 @@ fn a_paid_device_without_a_budget_asks_for_one_and_a_child_spends_the_root() {
     assert_eq!(l.budget("box1", "search").unwrap(), Some(ledger::UNIT));
     assert_eq!(l.budget("kid", "search").unwrap(), None);
     assert_eq!(l.spent("box1", "search").unwrap(), 4_000);
+}
+
+#[test]
+fn review_b_a_paid_request_that_times_out_still_costs() {
+    use std::io::Read as _;
+    let dir = tempfile::tempdir().unwrap();
+    let l = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = l.local_addr().unwrap();
+    let hits = Arc::new(AtomicUsize::new(0));
+    let h2 = hits.clone();
+    std::thread::spawn(move || {
+        for s in l.incoming() {
+            let mut s = s.unwrap();
+            let h3 = h2.clone();
+            std::thread::spawn(move || {
+                let mut b = [0u8; 1024];
+                let _ = s.read(&mut b);
+                h3.fetch_add(1, Ordering::SeqCst);
+                std::thread::sleep(Duration::from_secs(5)); // longer than the timeout
+            });
+        }
+    });
+    let (ctx, _) = ctx(dir.path(), Answer::Session);
+    let env = ctx.env.clone();
+    let text = format!(
+        "[devices.search]\nkind = \"http\"\nenabled = true\ntarget = \"{addr}\"\nmethods = [\"GET\"]\npaths = [\"/\"]\ntimeout = 1\ncost = 0.002\nbudget = 0.004\n"
+    );
+    let dev = Http::new(DevicesCfg::parse(&text).unwrap().user.remove(0), ctx);
+    for _ in 0..5 {
+        let _ = dev.call(
+            &Call::for_test("box1", Duration::from_secs(10)),
+            b"GET /q\n\n",
+        );
+    }
+    let spent = Ledger::open(&ledger::path(&env))
+        .unwrap()
+        .spent("box1", "search")
+        .unwrap();
+    assert!(
+        hits.load(Ordering::SeqCst) <= 2,
+        "{} requests reached the service, ledger spent {spent}",
+        hits.load(Ordering::SeqCst)
+    );
 }

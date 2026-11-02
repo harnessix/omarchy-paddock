@@ -925,7 +925,7 @@ impl Http {
                 return Err(Upstream::Cancelled);
             }
             if Instant::now() >= end {
-                return Err(Upstream::Unreachable(format!(
+                return Err(Upstream::NoAnswer(format!(
                     "{target} did not answer in {} seconds",
                     self.def.timeout
                 )));
@@ -933,7 +933,7 @@ impl Http {
             match s.read(&mut chunk) {
                 Ok(0) => {
                     return complete(&buf, req.method == "HEAD", true).unwrap_or_else(|| {
-                        Err(Upstream::Unreachable(format!(
+                        Err(Upstream::NoAnswer(format!(
                             "{target} closed the connection before a full response"
                         )))
                     })
@@ -952,7 +952,7 @@ impl Http {
                             | std::io::ErrorKind::Interrupted
                     ) => {}
                 Err(e) => {
-                    return Err(Upstream::Unreachable(format!(
+                    return Err(Upstream::NoAnswer(format!(
                         "cannot read from {target}: {e}"
                     )))
                 }
@@ -964,7 +964,11 @@ impl Http {
 /// Why a request to the service failed.
 #[derive(Debug)]
 pub enum Upstream {
+    /// The request never reached the service: it costs nothing.
     Unreachable(String),
+    /// The service got the request but gave no usable answer (a timeout,
+    /// a closed connection, a broken response): it costs the declared cost.
+    NoAnswer(String),
     TooLarge,
     Cancelled,
 }
@@ -972,7 +976,7 @@ pub enum Upstream {
 /// The response for the agent when `buf` holds a whole HTTP response, or
 /// None when more bytes must come. `eof`: the server closed the connection.
 fn complete(buf: &[u8], head_only: bool, eof: bool) -> Option<Result<Vec<u8>, Upstream>> {
-    let bad = |m: &str| Some(Err(Upstream::Unreachable(m.to_string())));
+    let bad = |m: &str| Some(Err(Upstream::NoAnswer(m.to_string())));
     let mut start = 0;
     loop {
         let rest = &buf[start..];
@@ -1166,6 +1170,11 @@ impl Device for Http {
                 self.gate.settle(charge, None, false, "unreachable");
                 self.gate.audit(&detail, decision, "unreachable", start);
                 Ok(paddock_answer(502, "Bad Gateway", "unreachable", &why))
+            }
+            Err(Upstream::NoAnswer(why)) => {
+                self.gate.settle(charge, None, true, "no answer");
+                self.gate.audit(&detail, decision, "no answer", start);
+                Ok(paddock_answer(502, "Bad Gateway", "no answer", &why))
             }
             Err(Upstream::TooLarge) => {
                 self.gate.settle(charge, None, true, "too large");
