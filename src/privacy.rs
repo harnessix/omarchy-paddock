@@ -217,6 +217,46 @@ pub fn training_notes(env: &HostEnv) -> Result<Vec<TrainingNote>> {
         .collect())
 }
 
+/// For `paddock doctor`: one line for each installed harness whose own
+/// onboarding comes in the next sandbox with the host login, because a
+/// `[state] done_flags` file in the host home is missing or not done.
+pub fn onboarding_lines(env: &HostEnv) -> Result<Vec<String>> {
+    let f = HarnessFactory::new(env)?;
+    Ok(f.names()
+        .iter()
+        .filter(|n| f.create(n).is_ok())
+        .filter_map(|n| f.profile(n))
+        .filter_map(|p| onboarding_line(&env.home, p))
+        .collect())
+}
+
+fn onboarding_line(home: &Path, p: &Profile) -> Option<String> {
+    let open = p.state.done_flags.iter().find(|(rel, keys)| {
+        let v: Option<serde_json::Value> = std::fs::read(home.join(rel))
+            .ok()
+            .filter(|b| b.len() <= 64 * 1024)
+            .and_then(|b| serde_json::from_slice(&b).ok());
+        !v.is_some_and(|v| {
+            keys.iter()
+                .all(|k| v.get(k) == Some(&serde_json::Value::Bool(true)))
+        })
+    })?;
+    let mut line = format!(
+        "{} shows its onboarding in a new sandbox: ~/{} is missing or not done.",
+        p.name, open.0
+    );
+    if let Some(o) = p
+        .privacy
+        .training
+        .as_ref()
+        .and_then(|t| t.onboarding.as_ref())
+    {
+        line.push(' ');
+        line.push_str(o);
+    }
+    Some(line)
+}
+
 /// One line about the telemetry mode, for `paddock doctor`.
 pub fn telemetry_line(mode: Telemetry) -> &'static str {
     match mode {
@@ -237,6 +277,26 @@ mod tests {
             value,
             origin: "test".into(),
         }
+    }
+
+    #[test]
+    fn the_onboarding_line_shows_until_every_done_flag_is_true() {
+        let t = tempfile::tempdir().unwrap();
+        let p: Profile = toml::from_str(
+            "name = \"t\"\n[state]\ndone_flags = { \".t/o.json\" = [\"a\", \"b\"] }\n\
+             [privacy.training]\nsetting = \"s\"\nurl = \"u\"\nonboarding = \"Box checked.\"\n",
+        )
+        .unwrap();
+        let line = onboarding_line(t.path(), &p).unwrap();
+        assert!(line.starts_with("t shows its onboarding"), "{line}");
+        assert!(line.ends_with("Box checked."), "{line}");
+        std::fs::create_dir_all(t.path().join(".t")).unwrap();
+        std::fs::write(t.path().join(".t/o.json"), r#"{"a": true, "b": false}"#).unwrap();
+        assert!(onboarding_line(t.path(), &p).is_some());
+        std::fs::write(t.path().join(".t/o.json"), r#"{"a": true, "b": true}"#).unwrap();
+        assert!(onboarding_line(t.path(), &p).is_none());
+        let none: Profile = toml::from_str("name = \"n\"\n").unwrap();
+        assert!(onboarding_line(t.path(), &none).is_none());
     }
 
     #[test]
