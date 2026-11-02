@@ -231,6 +231,32 @@ fn a_return_writes_the_changes_back_with_the_safety_rules() {
 }
 
 #[test]
+fn a_return_never_writes_through_a_folder_swapped_for_a_symlink() {
+    // Review C-H3: the swap comes after the last check of the original.
+    let t = tempfile::tempdir().unwrap();
+    let e = env(t.path());
+    let o = original(t.path());
+    let (name, copy) = borrowed(&e, &o);
+    std::fs::write(copy.join("src/a.rs"), "planted").unwrap();
+    std::fs::write(copy.join("src/new.rs"), "planted").unwrap();
+    std::fs::remove_file(copy.join("src/gone.rs")).unwrap();
+    let plan = plan_return(&e, "s-1", &name, DEFAULT_MAX).unwrap();
+    let home = t.path().join("victim");
+    std::fs::create_dir(&home).unwrap();
+    std::fs::write(home.join("a.rs"), "mine").unwrap();
+    std::fs::write(home.join("gone.rs"), "mine").unwrap();
+    std::fs::rename(o.join("src"), t.path().join("moved")).unwrap();
+    symlink(&home, o.join("src")).unwrap();
+    assert!(plan.write_back().is_err());
+    assert_eq!(std::fs::read_to_string(home.join("a.rs")).unwrap(), "mine");
+    assert_eq!(
+        std::fs::read_to_string(home.join("gone.rs")).unwrap(),
+        "mine"
+    );
+    assert!(!home.join("new.rs").exists());
+}
+
+#[test]
 fn a_return_refuses_when_the_original_changed_after_the_borrow() {
     let t = tempfile::tempdir().unwrap();
     let e = env(t.path());

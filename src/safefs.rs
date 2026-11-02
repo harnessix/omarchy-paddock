@@ -757,17 +757,43 @@ impl Dir {
     /// Write a new file next to `name`, then rename it over `name`. renameat
     /// replaces a symlink at `name` itself and never writes through it.
     pub fn write(&self, name: &OsStr, bytes: &[u8], mode: u32) -> Result<()> {
+        self.write_with(name, &mut &*bytes, mode, false).map(|_| ())
+    }
+
+    /// `write` from a reader, and the file gets exactly `mode`, without the
+    /// umask. Returns the bytes written.
+    pub fn write_from(&self, name: &OsStr, from: &mut impl Read, mode: u32) -> Result<u64> {
+        self.write_with(name, from, mode, true)
+    }
+
+    fn write_with(
+        &self,
+        name: &OsStr,
+        from: &mut impl Read,
+        mode: u32,
+        exact: bool,
+    ) -> Result<u64> {
         let mut tmp = name.to_os_string();
         tmp.push(format!(".paddock-tmp-{}", std::process::id()));
         let _ = self.remove(&tmp);
-        let mut f = self.create_new(&tmp, mode)?;
-        let written = f.write_all(bytes).and_then(|_| f.sync_all());
+        let mut f = self.create_new(&tmp, if exact { 0o600 } else { mode })?;
+        let written = std::io::copy(from, &mut f).and_then(|n| {
+            f.sync_all()?;
+            if exact {
+                use std::os::unix::fs::PermissionsExt;
+                f.set_permissions(std::fs::Permissions::from_mode(mode))?;
+            }
+            Ok(n)
+        });
         drop(f);
         let (t, n) = (cstr(&tmp)?, cstr(name)?);
-        if let Err(e) = written {
-            let _ = self.remove(&tmp);
-            return Err(e.into());
-        }
+        let written = match written {
+            Ok(w) => w,
+            Err(e) => {
+                let _ = self.remove(&tmp);
+                return Err(e.into());
+            }
+        };
         // SAFETY: renameat between names in the same open directory.
         if unsafe {
             libc::renameat(
@@ -782,6 +808,45 @@ impl Dir {
             let _ = self.remove(&tmp);
             return Err(anyhow::Error::from(e)
                 .context(format!("cannot write {}", self.path.join(name).display())));
+        }
+        Ok(written)
+    }
+
+    /// Remove the empty folder `name`. Missing is fine.
+    pub fn remove_dir(&self, name: &OsStr) -> std::io::Result<()> {
+        let n = CString::new(name.as_bytes()).map_err(std::io::Error::other)?;
+        // SAFETY: unlinkat with AT_REMOVEDIR removes only an empty folder.
+        if unsafe { libc::unlinkat(self.fd.as_raw_fd(), n.as_ptr(), libc::AT_REMOVEDIR) } != 0 {
+            let e = last_err();
+            if e.raw_os_error() != Some(libc::ENOENT) {
+                return Err(e);
+            }
+        }
+        Ok(())
+    }
+
+    /// Make the folder `name` with `mode` (less the umask). A folder that is
+    /// there already is fine; anything else there is an error.
+    pub fn make_dir(&self, name: &OsStr, mode: u32) -> Result<()> {
+        let n = cstr(name)?;
+        // SAFETY: mkdirat with a NUL-terminated name.
+        if unsafe { libc::mkdirat(self.fd.as_raw_fd(), n.as_ptr(), mode as libc::mode_t) } != 0 {
+            let e = last_err();
+            if e.raw_os_error() != Some(libc::EEXIST) || self.kind(name)? != Some(Kind::Dir) {
+                return Err(anyhow::Error::from(e)
+                    .context(format!("cannot create {}", self.path.join(name).display())));
+            }
+        }
+        Ok(())
+    }
+
+    /// Make the symlink `name` that points to `target`.
+    pub fn symlink(&self, target: &Path, name: &OsStr) -> Result<()> {
+        let (t, n) = (cstr(target.as_os_str())?, cstr(name)?);
+        // SAFETY: symlinkat with NUL-terminated strings.
+        if unsafe { libc::symlinkat(t.as_ptr(), self.fd.as_raw_fd(), n.as_ptr()) } != 0 {
+            return Err(anyhow::Error::from(last_err())
+                .context(format!("cannot create {}", self.path.join(name).display())));
         }
         Ok(())
     }
