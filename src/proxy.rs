@@ -859,8 +859,9 @@ fn handle(cfg: &HostProxy, mut client: UnixStream) -> Result<()> {
 }
 
 /// Network mode `api`: read the TLS ClientHello that follows the CONNECT
-/// and check its server name against `host`. Nothing goes upstream before
-/// this check. Returns the bytes to forward: the early bytes and the hello.
+/// and check its server name against `host`. The tunnel opens first, but
+/// no client bytes go upstream before this check. Returns the bytes to
+/// forward: the early bytes and the hello.
 fn checked_hello(
     client: &mut UnixStream,
     early: Vec<u8>,
