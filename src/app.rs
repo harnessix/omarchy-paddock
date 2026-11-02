@@ -330,16 +330,10 @@ pub fn run(env: &HostEnv, o: &AppOptions) -> Result<i32> {
             .and_then(|a| a.worktree)
             .unwrap_or(false);
     if let Some(id) = profile.app.as_ref().and_then(|a| a.flatpak.clone()) {
-        if worktree {
-            bail!(
-                "{} is a flatpak app: worktrees work only for apps that paddock sandboxes itself",
-                o.name
-            );
-        }
         if o.backend.as_deref().is_some_and(|b| b != "bwrap") {
             bail!("{} is a flatpak app: flatpak runs its own bubblewrap sandbox, so it needs the bwrap backend", o.name);
         }
-        return run_flatpak(env, &profile, &id, &roots, gpu, o);
+        return run_flatpak(env, &profile, &id, &roots, gpu, worktree, o);
     }
     let opts = Options {
         harness: o.name.clone(),
@@ -651,12 +645,27 @@ fn approved_manifest(env: &HostEnv, root: &std::path::Path) -> Result<Manifest> 
     Ok(loaded.merged)
 }
 
+/// A worktree of the first workspace folder for a flatpak app, and the
+/// workspace folders with the worktree in place of that folder.
+pub fn flatpak_worktree(
+    env: &HostEnv,
+    name: &str,
+    roots: &[PathBuf],
+) -> Result<(build::Worktree, Vec<PathBuf>)> {
+    let w = build::create_worktree(env, &roots[0], Some(name))?;
+    let mut out = roots.to_vec();
+    out[0] = w.path.clone();
+    Ok((w, out))
+}
+
+#[allow(clippy::too_many_arguments)]
 fn run_flatpak(
     env: &HostEnv,
     profile: &Profile,
     id: &str,
     roots: &[PathBuf],
     gpu: bool,
+    worktree: bool,
     o: &AppOptions,
 ) -> Result<i32> {
     let flatpak = env.which("flatpak").context("this app needs flatpak")?;
@@ -664,6 +673,29 @@ fn run_flatpak(
     if !matches!(net, Network::Egress | Network::None) {
         bail!("flatpak apps support network modes egress and none, not {net:?}");
     }
+    // The settings belong to the repository, as for other apps.
+    let m = approved_manifest(env, &roots[0])?;
+    if !worktree {
+        return start_flatpak(env, profile, id, roots, &m, flatpak, net, gpu, o);
+    }
+    let (w, roots) = flatpak_worktree(env, &o.name, roots)?;
+    let r = start_flatpak(env, profile, id, &roots, &m, flatpak, net, gpu, o);
+    report_worktree(env, &o.name, &w);
+    r
+}
+
+#[allow(clippy::too_many_arguments)]
+fn start_flatpak(
+    env: &HostEnv,
+    profile: &Profile,
+    id: &str,
+    roots: &[PathBuf],
+    m: &Manifest,
+    flatpak: PathBuf,
+    net: Network,
+    gpu: bool,
+    o: &AppOptions,
+) -> Result<i32> {
     let mut spec = SandboxSpec::new(
         crate::state::new_id(&profile.name, &roots[0]),
         &profile.name,
@@ -674,8 +706,7 @@ fn run_flatpak(
         env.gid,
         &env.user,
     );
-    let m = approved_manifest(env, &roots[0])?;
-    let ws = flatpak_workspace(env, &mut spec, &m, roots)?;
+    let ws = flatpak_workspace(env, &mut spec, m, roots)?;
     let warning = check_exposed(
         &profile.name,
         &ws.exposed,
@@ -708,7 +739,7 @@ fn run_flatpak(
     let mut child = Command::new(&program)
         .args(&args)
         .env_clear()
-        .envs(flatpak_env(env, &m, profile, inherit))
+        .envs(flatpak_env(env, m, profile, inherit))
         .spawn()
         .with_context(|| format!("cannot start {}", program.display()))?;
     // Listed with the other sandboxes, so the panel shows it and its warning.
@@ -1433,6 +1464,67 @@ mod tests {
         assert!(ws.args.contains(&want), "{:?}", ws.args);
         let want = format!("--filesystem={}:ro", main.join(".git/config").display());
         assert!(ws.args.contains(&want), "{:?}", ws.args);
+    }
+
+    #[test]
+    fn a_flatpak_worktree_can_commit_and_keeps_git_files_read_only() {
+        let t = tempfile::tempdir().unwrap();
+        let env = test_env(t.path());
+        std::fs::create_dir_all(&env.home).unwrap();
+        let main = t.path().join("main");
+        repo(&main);
+        let other = t.path().join("other");
+        std::fs::create_dir_all(&other).unwrap();
+        let (w, roots) = flatpak_worktree(&env, "f", &[main.clone(), other.clone()]).unwrap();
+        assert_eq!(roots, [w.path.clone(), other]);
+        assert!(w.branch.starts_with("paddock/f-"), "{}", w.branch);
+        let ws = workspace(&env, &Manifest::default(), &roots).unwrap();
+        let has = |p: PathBuf, mode: &str| {
+            let want = format!("--filesystem={}:{mode}", p.display());
+            assert!(ws.args.contains(&want), "{want} in {:?}", ws.args);
+        };
+        let common = main.join(".git");
+        let meta = std::fs::read_dir(common.join("worktrees"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        // The worktree, the object store and the worktree metadata are
+        // writable: the common dir holds both.
+        has(w.path.clone(), "rw");
+        has(common.clone(), "rw");
+        assert!(meta.starts_with(&common) && common.join("objects").is_dir());
+        has(w.path.join(".git"), "ro");
+        for dir in [&common, &meta] {
+            has(dir.join("hooks"), "ro");
+            for f in ["config", "config.worktree", "commondir"] {
+                has(dir.join(f), "ro");
+            }
+        }
+        has(meta.join("gitdir"), "ro");
+        // Nothing hides or writes over the object store or the metadata.
+        for p in [common.join("objects"), meta.clone()] {
+            let p = p.display();
+            for bad in [
+                format!("--filesystem={p}:ro"),
+                format!("--nofilesystem={p}"),
+            ] {
+                assert!(!ws.args.contains(&bad), "{bad} in {:?}", ws.args);
+            }
+        }
+    }
+
+    #[test]
+    fn a_flatpak_worktree_needs_a_git_repository() {
+        let t = tempfile::tempdir().unwrap();
+        let env = test_env(t.path());
+        let plain = t.path().join("plain");
+        std::fs::create_dir_all(&plain).unwrap();
+        let e = flatpak_worktree(&env, "f", std::slice::from_ref(&plain))
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("--worktree needs a git repository"), "{e}");
     }
 
     #[test]
