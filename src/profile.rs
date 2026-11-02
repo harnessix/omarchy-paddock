@@ -177,6 +177,13 @@ pub struct State {
     /// neither side counts as newer.
     #[serde(default)]
     pub auth_expiry: std::collections::BTreeMap<String, String>,
+    /// JSON files, relative to HOME, with boolean keys that only go from
+    /// false to true, such as a finished onboarding. A listed key that is
+    /// true on one side (the login store or the sandbox) becomes true on the
+    /// other. paddock never writes false over true, and never sets a key
+    /// that is true on neither side.
+    #[serde(default)]
+    pub done_flags: BTreeMap<String, Vec<String>>,
     /// Host files and directories, relative to HOME, mounted read-only.
     #[serde(default)]
     pub import_ro: Vec<String>,
@@ -354,6 +361,10 @@ pub struct Training {
     pub setting: String,
     /// The official page with the setting, or the documentation about it.
     pub url: String,
+    /// What the harness's own onboarding asks about data use. `paddock
+    /// doctor` shows it while a `[state] done_flags` file on the host is
+    /// missing or not done, so the onboarding comes in the next sandbox.
+    pub onboarding: Option<String>,
 }
 
 pub(crate) const BUILTIN: &[(&str, &str)] = &[

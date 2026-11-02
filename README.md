@@ -1627,6 +1627,8 @@ wrap_on_host = "it keeps its own sandbox, which cannot start inside paddock"
 [state]
 # An entry that ends with / is a folder: paddock copies every file in it.
 auth = [".myagent/credentials/"]
+# JSON keys that only go from false to true, such as a finished onboarding. paddock carries a true value between the login store and the sandbox, in both directions, and never writes false over true.
+done_flags = { ".myagent/onboarding.json" = ["onboardingComplete"] }
 
 # The folder that an account variable replaces, for paddock wrap.
 [state.account]

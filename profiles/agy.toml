@@ -20,6 +20,8 @@ yolo_args = ["--dangerously-skip-permissions"]
 auth = [".gemini/antigravity-cli/antigravity-oauth-token", ".gemini/antigravity-cli/mcp_oauth_tokens.json"]
 import_ro = [".gemini/settings.json", ".gemini/GEMINI.md", ".agents/skills"]
 seed = [".gemini/antigravity-cli/settings.json", ".gemini/antigravity-cli/mcp"]
+# Antigravity's finished onboarding. Only true values are carried, in both directions.
+done_flags = { ".gemini/antigravity-cli/cache/onboarding.json" = ["onboardingComplete", "consumerOnboardingComplete"] }
 env_pass = ["GEMINI_API_KEY", "GOOGLE_API_KEY", "GOOGLE_CLOUD_PROJECT"]
 
 [network]
@@ -28,9 +30,13 @@ endpoints = ["generativelanguage.googleapis.com", "oauth2.googleapis.com", "clou
 # "Enable Telemetry" is saved with the account, not in settings.json, so no
 # file or variable can turn it off. It also covers the use of interactions
 # to improve Antigravity and models. https://antigravity.google/docs/settings
+# The onboarding screen has the data-use opt-in checked by default. paddock
+# carries the finished onboarding (state.done_flags), so the screen does not
+# come back in each new project.
 [privacy.training]
 setting = "type /settings in agy and turn off Enable Telemetry"
 url = "https://antigravity.google/docs/settings"
+onboarding = "Its data-use box there is checked by default."
 
 # One task without a terminal, for `paddock-host spawn`. `agy --help`:
 # --print runs one prompt and prints the response; the prompt is the value

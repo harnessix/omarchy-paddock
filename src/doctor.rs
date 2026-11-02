@@ -252,6 +252,9 @@ pub fn report(env: &HostEnv) -> Result<bool> {
     for n in &notes {
         println!("  {:<16} {}: {}", n.harness, n.setting, n.url);
     }
+    for l in crate::privacy::onboarding_lines(env)? {
+        println!("  note     {l}");
+    }
 
     println!("\nShell commands:");
     if crate::shims::installed(env) {

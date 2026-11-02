@@ -341,6 +341,8 @@ pub struct AuthSync {
     /// sandbox home, and its store on the host. A login that the sandbox
     /// adds there is copied out too.
     folders: Vec<(PathBuf, PathBuf)>,
+    /// Files with flags that only go from false to true (`done_flags`).
+    flags: Vec<FlagItem>,
 }
 
 /// The names of the regular files in a host folder. Symlinks are left out.
@@ -512,12 +514,25 @@ impl AuthSync {
                 kept,
             });
         }
+        let mut flags = Vec::new();
+        for (rel, keys) in &profile.state.done_flags {
+            let stored = auth_file(env, profile, mode, rel);
+            let it = FlagItem {
+                store: Store::for_file(mode, &stored),
+                stored,
+                rel: PathBuf::from(rel),
+                keys: keys.clone(),
+            };
+            it.to_sandbox(&home);
+            flags.push(it);
+        }
         Ok(Self {
             mode: mode.clone(),
             home: home_src.to_path_buf(),
             locks: env.paddock_state().join("locks"),
             items,
             folders,
+            flags,
         })
     }
 
@@ -624,6 +639,9 @@ impl AuthSync {
                 Err(e) => log::warn!("login sync: {}: {e:#}", it.rel.display()),
             }
         }
+        for f in &self.flags {
+            f.to_store(&home, &self.locks);
+        }
         steps
     }
 
@@ -690,7 +708,150 @@ impl AuthSync {
             it.store.write(&it.stored, &bytes)?;
             r.saved.push(it.stored.clone());
         }
+        for f in &self.flags {
+            f.to_store(&home, &self.locks);
+        }
         Ok(r)
+    }
+}
+
+/// The largest `done_flags` file that paddock reads.
+const FLAGS_MAX: u64 = 64 * 1024;
+
+/// A `done_flags` file: its store (the host home, an account folder or the
+/// isolated store, as for `auth`) and the keys that only go to true.
+struct FlagItem {
+    store: Store,
+    stored: PathBuf,
+    rel: PathBuf,
+    keys: Vec<String>,
+}
+
+type JsonMap = serde_json::Map<String, serde_json::Value>;
+
+/// A `done_flags` file as a JSON object. Ok(None): missing. Err: larger
+/// than `FLAGS_MAX`, not JSON, not an object, or not readable.
+fn read_flags(bytes: Result<Option<Vec<u8>>>) -> Result<Option<(Vec<u8>, JsonMap)>> {
+    let Some(b) = bytes? else {
+        return Ok(None);
+    };
+    if b.len() as u64 > FLAGS_MAX {
+        anyhow::bail!("larger than {FLAGS_MAX} bytes");
+    }
+    match serde_json::from_slice::<serde_json::Value>(&b)? {
+        serde_json::Value::Object(m) => Ok(Some((b, m))),
+        _ => anyhow::bail!("not a JSON object"),
+    }
+}
+
+/// The listed keys that are `true` in `from` and not `true` in `to`.
+fn missing_true<'a>(keys: &'a [String], from: &JsonMap, to: Option<&JsonMap>) -> Vec<&'a str> {
+    let on = |m: &JsonMap, k: &str| m.get(k) == Some(&serde_json::Value::Bool(true));
+    keys.iter()
+        .filter(|k| on(from, k) && !to.is_some_and(|t| on(t, k)))
+        .map(String::as_str)
+        .collect()
+}
+
+/// `to` with the keys set to true, or a copy of `from` when `to` is missing.
+fn with_true(to: Option<JsonMap>, from: &JsonMap, keys: &[&str]) -> Result<Vec<u8>> {
+    let mut m = to.unwrap_or_else(|| from.clone());
+    for k in keys {
+        m.insert((*k).to_string(), serde_json::Value::Bool(true));
+    }
+    Ok(serde_json::to_vec_pretty(&serde_json::Value::Object(m))?)
+}
+
+impl FlagItem {
+    fn read_store(&self) -> Result<Option<Vec<u8>>> {
+        self.store.read(&self.stored)
+    }
+
+    fn skip(&self, side: &str, e: anyhow::Error) {
+        log::debug!(
+            "done flags: skipping {} in {side}: {e:#}",
+            self.rel.display()
+        );
+    }
+
+    /// At start: the keys that are true in the store become true in the
+    /// sandbox copy. A missing copy starts as the store's file.
+    fn to_sandbox(&self, home: &crate::safefs::Root) {
+        let src = match read_flags(self.read_store()) {
+            Ok(Some((_, m))) => m,
+            Ok(None) => return,
+            Err(e) => return self.skip("the store", e),
+        };
+        let (before, inside) = match read_flags(home.read(&self.rel, FLAGS_MAX)) {
+            Ok(Some((b, m))) => (Some(b), Some(m)),
+            Ok(None) => (None, None),
+            Err(e) => return self.skip("the sandbox", e),
+        };
+        let keys = missing_true(&self.keys, &src, inside.as_ref());
+        if keys.is_empty() {
+            return;
+        }
+        let bytes = match with_true(inside, &src, &keys) {
+            Ok(b) => b,
+            Err(e) => return self.skip("the sandbox", e),
+        };
+        // Read the target again right before the write.
+        if home.read(&self.rel, FLAGS_MAX).ok().flatten() != before {
+            return;
+        }
+        if let Err(e) = home.write(&self.rel, &bytes, 0o600) {
+            log::warn!("done flags: {}: {e:#}", self.rel.display());
+        }
+    }
+
+    /// The keys that are true in the sandbox become true in the store. A
+    /// missing store file starts as the sandbox copy. True when it wrote.
+    fn to_store(&self, home: &crate::safefs::Root, locks: &Path) -> bool {
+        let inside = match read_flags(home.read(&self.rel, FLAGS_MAX)) {
+            Ok(Some((_, m))) => m,
+            Ok(None) => return false,
+            Err(e) => {
+                self.skip("the sandbox", e);
+                return false;
+            }
+        };
+        if missing_true(&self.keys, &inside, None).is_empty() {
+            return false;
+        }
+        let _lock = StoreLock::take(locks, &self.stored);
+        let (before, stored) = match read_flags(self.read_store()) {
+            Ok(Some((b, m))) => (Some(b), Some(m)),
+            Ok(None) => (None, None),
+            Err(e) => {
+                self.skip("the store", e);
+                return false;
+            }
+        };
+        let keys = missing_true(&self.keys, &inside, stored.as_ref());
+        if keys.is_empty() {
+            return false;
+        }
+        let bytes = match with_true(stored, &inside, &keys) {
+            Ok(b) => b,
+            Err(e) => {
+                self.skip("the store", e);
+                return false;
+            }
+        };
+        // Read the target again right before the write.
+        if self.read_store().ok().flatten() != before {
+            return false;
+        }
+        match self.store.write(&self.stored, &bytes) {
+            Ok(()) => {
+                log::info!("saved the done flags {keys:?} to {}", self.stored.display());
+                true
+            }
+            Err(e) => {
+                log::warn!("done flags: {}: {e:#}", self.stored.display());
+                false
+            }
+        }
     }
 }
 
@@ -1245,6 +1406,182 @@ mod auth_sync_tests {
         )
         .unwrap();
         (t, env, p, host_home, sandbox_home)
+    }
+
+    const FLAGS: &str = ".tool/cache/onboarding.json";
+
+    fn flags_profile() -> Profile {
+        toml::from_str(&format!(
+            "name = \"t\"\n[state]\nauth = [\".tool/token\"]\n\
+             done_flags = {{ \"{FLAGS}\" = [\"done\", \"consumerDone\"] }}\n"
+        ))
+        .unwrap()
+    }
+
+    fn put(path: &Path, v: serde_json::Value) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, serde_json::to_vec(&v).unwrap()).unwrap();
+    }
+
+    fn get(path: &Path) -> serde_json::Value {
+        serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn done_flags_go_into_a_missing_sandbox_file() {
+        let (_t, env, _, host, sb) = setup();
+        let p = flags_profile();
+        put(
+            &host.join(FLAGS),
+            serde_json::json!({"done": true, "consumerDone": true, "other": false}),
+        );
+        AuthSync::copy_in(&env, &p, &AuthMode::Shared, &sb).unwrap();
+        assert_eq!(
+            get(&sb.join(FLAGS)),
+            serde_json::json!({"done": true, "consumerDone": true, "other": false})
+        );
+    }
+
+    #[test]
+    fn done_flags_turn_true_in_the_sandbox_and_keep_other_keys() {
+        let (_t, env, _, host, sb) = setup();
+        let p = flags_profile();
+        put(
+            &host.join(FLAGS),
+            serde_json::json!({"done": true, "consumerDone": true, "other": true}),
+        );
+        put(
+            &sb.join(FLAGS),
+            serde_json::json!({"done": false, "consumerDone": false, "other": false, "x": 1}),
+        );
+        let a = AuthSync::copy_in(&env, &p, &AuthMode::Shared, &sb).unwrap();
+        assert_eq!(
+            get(&sb.join(FLAGS)),
+            serde_json::json!({"done": true, "consumerDone": true, "other": false, "x": 1})
+        );
+        // The sandbox writes false again: the source stays true.
+        put(
+            &sb.join(FLAGS),
+            serde_json::json!({"done": false, "consumerDone": false}),
+        );
+        a.copy_out().unwrap();
+        assert_eq!(
+            get(&host.join(FLAGS)),
+            serde_json::json!({"done": true, "consumerDone": true, "other": true})
+        );
+    }
+
+    #[test]
+    fn a_done_flag_set_in_the_sandbox_reaches_the_source() {
+        let (_t, env, _, host, sb) = setup();
+        let p = flags_profile();
+        // Source missing.
+        let mut a = AuthSync::copy_in(&env, &p, &AuthMode::Shared, &sb).unwrap();
+        assert!(!sb.join(FLAGS).exists());
+        put(
+            &sb.join(FLAGS),
+            serde_json::json!({"done": true, "consumerDone": false}),
+        );
+        // The live sync carries it.
+        a.sync_now();
+        assert_eq!(
+            get(&host.join(FLAGS)),
+            serde_json::json!({"done": true, "consumerDone": false})
+        );
+        // Source false, with another key: only the listed true key moves.
+        put(
+            &host.join(FLAGS),
+            serde_json::json!({"done": false, "consumerDone": false, "enterprise": false}),
+        );
+        put(
+            &sb.join(FLAGS),
+            serde_json::json!({"done": true, "consumerDone": true, "enterprise": true}),
+        );
+        a.copy_out().unwrap();
+        assert_eq!(
+            get(&host.join(FLAGS)),
+            serde_json::json!({"done": true, "consumerDone": true, "enterprise": false})
+        );
+    }
+
+    #[test]
+    fn done_flags_that_are_true_nowhere_write_nothing() {
+        let (_t, env, _, host, sb) = setup();
+        let p = flags_profile();
+        let a = AuthSync::copy_in(&env, &p, &AuthMode::Shared, &sb).unwrap();
+        assert!(!sb.join(FLAGS).exists());
+        put(
+            &sb.join(FLAGS),
+            serde_json::json!({"done": false, "consumerDone": false, "other": true}),
+        );
+        a.copy_out().unwrap();
+        assert!(!host.join(FLAGS).exists());
+        assert!(!host.join(".tool/cache").exists());
+        // Source false too: nothing changes on either side.
+        put(&host.join(FLAGS), serde_json::json!({"done": false}));
+        let before = std::fs::read(sb.join(FLAGS)).unwrap();
+        let a = AuthSync::copy_in(&env, &p, &AuthMode::Shared, &sb).unwrap();
+        a.copy_out().unwrap();
+        assert_eq!(std::fs::read(sb.join(FLAGS)).unwrap(), before);
+        assert_eq!(get(&host.join(FLAGS)), serde_json::json!({"done": false}));
+    }
+
+    #[test]
+    fn invalid_or_large_done_flag_files_are_skipped() {
+        let (_t, env, _, host, sb) = setup();
+        let p = flags_profile();
+        std::fs::create_dir_all(host.join(".tool/cache")).unwrap();
+        std::fs::write(host.join(FLAGS), "{not json").unwrap();
+        put(&sb.join(FLAGS), serde_json::json!({"done": true}));
+        let a = AuthSync::copy_in(&env, &p, &AuthMode::Shared, &sb).unwrap();
+        a.copy_out().unwrap();
+        assert_eq!(std::fs::read(host.join(FLAGS)).unwrap(), b"{not json");
+        // A sandbox file over 64 KiB is not read.
+        let big = format!("{{\"done\": true, \"pad\": \"{}\"}}", "x".repeat(70 * 1024));
+        std::fs::write(sb.join(FLAGS), &big).unwrap();
+        std::fs::write(host.join(FLAGS), "{\"done\": false}").unwrap();
+        a.copy_out().unwrap();
+        assert_eq!(get(&host.join(FLAGS)), serde_json::json!({"done": false}));
+        // A large source is not read either.
+        std::fs::write(host.join(FLAGS), &big).unwrap();
+        put(&sb.join(FLAGS), serde_json::json!({"done": false}));
+        AuthSync::copy_in(&env, &p, &AuthMode::Shared, &sb).unwrap();
+        assert_eq!(get(&sb.join(FLAGS)), serde_json::json!({"done": false}));
+        // Not an object.
+        std::fs::write(host.join(FLAGS), "[true]").unwrap();
+        AuthSync::copy_in(&env, &p, &AuthMode::Shared, &sb).unwrap();
+        assert_eq!(get(&sb.join(FLAGS)), serde_json::json!({"done": false}));
+    }
+
+    #[test]
+    fn isolated_auth_keeps_done_flags_in_the_isolated_store() {
+        let (_t, env, _, host, sb) = setup();
+        let p = flags_profile();
+        let mode = AuthMode::Isolated("work".into());
+        let store = auth_root(&env, "t", &mode).join(FLAGS);
+        // The host home is not the source.
+        put(&host.join(FLAGS), serde_json::json!({"done": true}));
+        AuthSync::copy_in(&env, &p, &mode, &sb).unwrap();
+        assert!(!sb.join(FLAGS).exists());
+        put(
+            &store,
+            serde_json::json!({"done": true, "consumerDone": false}),
+        );
+        let a2 = AuthSync::copy_in(&env, &p, &mode, &sb).unwrap();
+        assert_eq!(
+            get(&sb.join(FLAGS)),
+            serde_json::json!({"done": true, "consumerDone": false})
+        );
+        put(
+            &sb.join(FLAGS),
+            serde_json::json!({"done": true, "consumerDone": true}),
+        );
+        a2.copy_out().unwrap();
+        assert_eq!(
+            get(&store),
+            serde_json::json!({"done": true, "consumerDone": true})
+        );
+        assert_eq!(get(&host.join(FLAGS)), serde_json::json!({"done": true}));
     }
 
     #[test]
