@@ -74,6 +74,11 @@ pub struct Tool {
     pub only_known: bool,
     /// Flags without a value, for `only_known`.
     pub bool_flags: &'static [&'static str],
+    /// The flag that takes a jq expression: (long, short). gh's jq reads
+    /// the host environment (`$ENV`, `env`), where a token can be.
+    pub jq_flags: (&'static str, &'static str),
+    /// The token and login variables of the host that the tool reads.
+    pub env: &'static [&'static str],
 }
 
 use Access::{Read, Write};
@@ -149,13 +154,27 @@ pub const GH: Tool = Tool {
     ],
     branch_flags: &[(("pr", "create"), "--head", "-H")],
     repo_positional: &[("repo", "view")],
-    body_flags: &[(("*", "*"), "--body", "-b")],
+    // Only these commands have a body: `-b` is `--branch` of `run list`.
+    body_flags: &[
+        (("pr", "create"), "--body", "-b"),
+        (("pr", "comment"), "--body", "-b"),
+        (("issue", "comment"), "--body", "-b"),
+    ],
     body_args: &[],
     body_stdin: &["--body-file", "-"],
     needs_body: &[],
     flags_first: false,
     only_known: false,
     bool_flags: &[],
+    jq_flags: ("--jq", "-q"),
+    env: &[
+        "GH_TOKEN",
+        "GITHUB_TOKEN",
+        "GH_HOST",
+        "GH_ENTERPRISE_TOKEN",
+        "GITHUB_ENTERPRISE_TOKEN",
+        "GH_CONFIG_DIR",
+    ],
 };
 
 /// tea, the Gitea and Forgejo command line.
@@ -229,6 +248,9 @@ pub const TEA: Tool = Tool {
     flags_first: true,
     only_known: true,
     bool_flags: &["--allow-maintainer-edits", "--comments"],
+    jq_flags: ("", ""),
+    // tea keeps its logins in its own config.yml.
+    env: &[],
 };
 
 /// glab, the GitLab command line.
@@ -322,6 +344,8 @@ pub const GLAB: Tool = Tool {
         "--yes",
         "-y",
     ],
+    jq_flags: ("", ""),
+    env: &["GITLAB_TOKEN", "GITLAB_ACCESS_TOKEN", "GLAB_CONFIG_DIR"],
 };
 
 pub const TOOLS: &[&Tool] = &[&GH, &TEA, &GLAB];
@@ -510,18 +534,10 @@ pub struct ForgeExec {
 /// The tools that the executor runs for `forge`.
 pub const EXEC_TOOLS: &[&str] = &["gh", "tea", "glab"];
 
-/// Variables that the tool gets besides the base ones: its own login and
-/// host settings, the session bus for a keyring, and proxies.
+/// Variables that every tool gets besides the base ones and its own login
+/// variables (`Tool::env`): the config folder, the session bus for a
+/// keyring, and proxies. A tool never gets the token of another forge.
 pub const FORGE_ENV: &[&str] = &[
-    "GH_TOKEN",
-    "GITHUB_TOKEN",
-    "GH_HOST",
-    "GH_ENTERPRISE_TOKEN",
-    "GITHUB_ENTERPRISE_TOKEN",
-    "GH_CONFIG_DIR",
-    "GITLAB_TOKEN",
-    "GITLAB_ACCESS_TOKEN",
-    "GLAB_CONFIG_DIR",
     "XDG_CONFIG_HOME",
     "DBUS_SESSION_BUS_ADDRESS",
     "XDG_RUNTIME_DIR",
@@ -534,6 +550,22 @@ pub const FORGE_ENV: &[&str] = &[
     "all_proxy",
     "no_proxy",
 ];
+
+/// The host variables that the executor passes to a tool.
+pub fn forge_env(name: &str) -> Vec<String> {
+    let own = tool(name).map_or(&[][..], |t| t.env);
+    own.iter().chain(FORGE_ENV).map(|s| s.to_string()).collect()
+}
+
+/// A jq expression that reads the environment: `$ENV` or `env`.
+fn reads_env(expr: &str) -> bool {
+    let word = |c: char| c.is_ascii_alphanumeric() || c == '_';
+    let lower = expr.to_ascii_lowercase();
+    lower.match_indices("env").any(|(i, _)| {
+        !lower[..i].chars().next_back().is_some_and(word)
+            && !lower[i + 3..].chars().next().is_some_and(word)
+    })
+}
 
 /// The settings that make the tool quiet and non-interactive.
 pub fn forge_vars() -> std::collections::BTreeMap<String, String> {
@@ -663,7 +695,10 @@ pub fn split_body(t: &Tool, argv: &[String]) -> (Vec<String>, Option<String>) {
                 i += 1;
                 continue;
             }
-            if let Some(v) = a.strip_prefix(&format!("{long}=")) {
+            if let Some(v) = a.strip_prefix(&format!("{long}=")).or_else(|| {
+                a.strip_prefix(&format!("{short}="))
+                    .filter(|_| !short.is_empty())
+            }) {
                 body = Some(v.to_string());
                 continue;
             }
@@ -809,6 +844,26 @@ pub fn check_with(
                 t.name
             );
         }
+        let (jq_long, jq_short) = t.jq_flags;
+        if !jq_long.is_empty() {
+            // --jq X, --jq=X, -q X, -qX, and -q inside a group like -cq X.
+            let attached = if flag == jq_long {
+                Some(a.split_once('=').map_or("", |(_, v)| v))
+            } else if a.starts_with('-') && !a.starts_with("--") {
+                a[1..].split_once(&jq_short[1..]).map(|(_, v)| v)
+            } else {
+                None
+            };
+            let expr: Vec<&str> = attached
+                .into_iter()
+                .chain(attached.and(rest.get(i).map(String::as_str)))
+                .collect();
+            if expr.iter().any(|e| reads_env(e)) {
+                bail!(
+                    "a jq expression cannot read the environment ($ENV, env) through paddock-host: the host environment can hold a token"
+                );
+            }
+        }
         if t.denied_flags.contains(&flag) {
             bail!(
                 "{flag} is not allowed through paddock-host: it would read a host file, open a program on the host, or pick another host or login. Pass the text as an argument instead"
@@ -894,6 +949,11 @@ pub fn check_with(
         argv_final.push(repo.form(t.repo_form));
     } else {
         let branch = branch.filter(|b| !b.is_empty() && !b.starts_with('-'));
+        // The sandbox names the branch: as an argument, a pull request URL
+        // or OWNER/REPO#N would pick another repository over --repo.
+        if let Some(b) = branch {
+            check_positional(b, &known, &pick)?;
+        }
         if positional == 0 && t.branch_default.contains(&cmd) {
             let b = branch.context("name the pull request: no current branch")?;
             out.insert(0, b.to_string());
@@ -1074,6 +1134,10 @@ mod tests {
         ]
     }
 
+    fn w(args: &[&str]) -> Vec<String> {
+        args.iter().map(|s| s.to_string()).collect()
+    }
+
     fn run(args: &[&str]) -> Result<Call> {
         let a: Vec<String> = args.iter().map(|s| s.to_string()).collect();
         check(&GH, &a, Some("fix-login"), &remotes())
@@ -1133,11 +1197,89 @@ mod tests {
     }
 
     #[test]
+    fn b_is_the_branch_of_run_list_not_a_body() {
+        let (rest, body) = split_body(&GH, &w(&["run", "list", "-b", "main"]));
+        assert_eq!(body, None);
+        assert_eq!(rest, w(&["run", "list", "-b", "main"]));
+        let c = run(&["run", "list", "-b", "main"]).unwrap();
+        assert_eq!(c.stdin, None);
+        assert!(!c.argv.contains(&"--body-file".to_string()), "{:?}", c.argv);
+        // A comment still takes -b as its body.
+        let c = run(&["pr", "comment", "3", "-b", "hi"]).unwrap();
+        assert_eq!(c.stdin.as_deref(), Some("hi"));
+    }
+
+    #[test]
+    fn tea_short_body_with_equals_is_the_body() {
+        for form in [
+            &["-d=secret text"][..],
+            &["-d", "secret text"],
+            &["--description=secret text"],
+        ] {
+            let mut a = w(&["pulls", "create", "--title", "x"]);
+            a.extend(w(form));
+            let (rest, body) = split_body(&TEA, &a);
+            assert_eq!(body.as_deref(), Some("secret text"), "{form:?}");
+            assert!(!rest.iter().any(|x| x.contains("secret")), "{rest:?}");
+        }
+    }
+
+    #[test]
+    fn jq_cannot_read_the_host_environment() {
+        for bad in [
+            &["repo", "view", "--json", "name", "--jq", "$ENV.GH_TOKEN"][..],
+            &["repo", "view", "--json", "name", "--jq=env.GH_TOKEN"],
+            &["pr", "list", "--json", "title", "-q", "env | .GH_TOKEN"],
+            &["pr", "list", "--json", "title", "-qenv.GH_TOKEN"],
+            &["pr", "list", "--json", "title", "-q=$ENV"],
+            &[
+                "pr",
+                "view",
+                "1",
+                "--json",
+                "title",
+                "-cq",
+                "$ENV.GITHUB_TOKEN",
+            ],
+        ] {
+            assert!(run(bad).is_err(), "{bad:?}");
+        }
+        for ok in [
+            &["pr", "list", "--json", "title", "--jq", ".[].title"][..],
+            &["repo", "view", "--json", "name", "-q", ".environment"],
+            &["pr", "create", "--title", "fix env"],
+        ] {
+            assert!(run(ok).is_ok(), "{ok:?}");
+        }
+    }
+
+    #[test]
+    fn a_tool_gets_only_its_own_token_variables() {
+        let gh = forge_env("gh");
+        assert!(gh.contains(&"GH_TOKEN".to_string()));
+        assert!(!gh.iter().any(|v| v.starts_with("GITLAB")));
+        let glab = forge_env("glab");
+        assert!(glab.contains(&"GITLAB_TOKEN".to_string()));
+        assert!(!glab
+            .iter()
+            .any(|v| v.contains("GH_") || v.starts_with("GITHUB")));
+        assert!(!forge_env("tea").iter().any(|v| v.contains("TOKEN")));
+    }
+
+    #[test]
     fn the_repository_must_be_a_project_remote() {
         assert!(run(&["pr", "list", "-R", "other/app"]).is_err());
         assert!(run(&["pr", "list", "--repo=other/app"]).is_err());
         assert!(run(&["pr", "list", "-Rother/app"]).is_err());
         assert!(run(&["pr", "view", "https://github.com/other/app/pull/1"]).is_err());
+        // The sandbox's branch goes into the arguments too.
+        for b in ["https://github.com/other/app/pull/1", "other/app#1"] {
+            assert!(
+                check(&GH, &w(&["pr", "view"]), Some(b), &remotes()).is_err(),
+                "{b}"
+            );
+        }
+        assert!(check(&GH, &w(&["pr", "view"]), Some("fix-login"), &remotes()).is_ok());
         assert!(run(&["issue", "view", "other/app#4"]).is_err());
         assert!(run(&["repo", "view", "other/app"]).is_err());
         let c = run(&["pr", "list", "-R", "demo/app"]).unwrap();

@@ -165,6 +165,9 @@ fn run(
                     .map(|s| s.to_string())
                     .collect(),
                 remember_allowed: false,
+                // Credential helpers and gh reach the keyring over the
+                // session bus.
+                hide: Vec::new(),
             };
             let unit = format!(
                 "paddock-push-{}",
@@ -211,11 +214,11 @@ fn run(
                 network: true,
                 paths: Vec::new(),
                 ro_paths: Vec::new(),
-                env: crate::broker::forge::FORGE_ENV
-                    .iter()
-                    .map(|s| s.to_string())
-                    .collect(),
+                env: crate::broker::forge::forge_env(name),
                 remember_allowed: false,
+                // Credential helpers and gh reach the keyring over the
+                // session bus.
+                hide: Vec::new(),
             };
             let mut vars = cfg.pass_env(&job.env);
             vars.extend(crate::broker::forge::forge_vars());
@@ -304,6 +307,8 @@ fn desktop_cfg(job: &Job, workdir: &Path) -> crate::execbox::ExecCfg {
         ro_paths: ro.into_iter().filter(|p| p.exists()).collect(),
         env: DESKTOP_ENV.iter().map(|s| s.to_string()).collect(),
         remember_allowed: false,
+        // Only the Wayland and compositor sockets, bound above.
+        hide: crate::execbox::session_dirs(),
     }
 }
 
@@ -439,9 +444,12 @@ fn copy(
                 .arg("-p")
                 .arg(format!("StandardInputData={}", base64(text.as_bytes())))
                 .args(&args[i..]);
-            // The variables go in --setenv; systemd-run itself needs only the
-            // way to the user manager.
-            c.env_clear();
+            // --setenv names the variables; systemd-run takes the values
+            // from its own environment.
+            c.env_clear().envs(
+                cmd.get_envs()
+                    .filter_map(|(k, v)| v.map(|v| (k.to_os_string(), v.to_os_string()))),
+            );
             for k in ["XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS"] {
                 if let Ok(v) = std::env::var(k) {
                     c.env(k, v);
@@ -660,7 +668,7 @@ pub fn main(env: &HostEnv, idle: Duration) -> Result<i32> {
                 });
             }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                let quiet = start.elapsed().as_secs() - last.load(Ordering::SeqCst);
+                let quiet = quiet(start.elapsed().as_secs(), last.load(Ordering::SeqCst));
                 if running.load(Ordering::SeqCst) == 0 && quiet >= idle.as_secs() {
                     return Ok(0);
                 }
@@ -669,6 +677,13 @@ pub fn main(env: &HostEnv, idle: Duration) -> Result<i32> {
             Err(e) => return Err(e.into()),
         }
     }
+}
+
+/// Seconds without a request. A request can end between reading the clock
+/// and reading `last`, so `last` can be ahead of `now`: that is no quiet
+/// time, not an underflow.
+fn quiet(now: u64, last: u64) -> u64 {
+    now.saturating_sub(last)
 }
 
 /// Where the broker sends signed jobs.
@@ -918,6 +933,13 @@ pub fn status_line(env: &HostEnv) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_request_that_ends_while_the_clock_is_read_is_no_quiet_time() {
+        // The clock said 5, then a request ended at 6.
+        assert_eq!(quiet(5, 6), 0);
+        assert_eq!(quiet(130, 10), 120);
+    }
     use super::*;
 
     #[test]

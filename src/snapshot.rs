@@ -151,6 +151,12 @@ impl Skip {
             || (self.names && is_dir && NON_GIT_SKIP.contains(&name))
     }
 
+    /// `rel` or a folder above it is left out.
+    pub fn covers(&self, rel: &str) -> bool {
+        let parts: Vec<&str> = rel.split('/').collect();
+        (0..parts.len()).any(|i| self.skips(&parts[..=i].join("/"), parts[i], i + 1 < parts.len()))
+    }
+
     pub fn union(&self, other: &Skip) -> Skip {
         Skip {
             names: self.names || other.names,
@@ -346,6 +352,36 @@ fn open_regular(p: &Path) -> std::io::Result<File> {
     Ok(f)
 }
 
+/// Opens the files of a project that a sandbox can write. It walks from
+/// the project down and never follows a symlink, also not in the middle of
+/// a path: another sandbox of the project can swap a folder for one.
+struct Reader {
+    root: crate::safefs::Root,
+    /// The folder of the last file: the walk is sorted, so neighbours share it.
+    last: Option<(String, crate::safefs::Dir)>,
+}
+
+impl Reader {
+    fn new(project: &Path) -> Result<Self> {
+        Ok(Reader {
+            root: crate::safefs::Root::open(project)?,
+            last: None,
+        })
+    }
+
+    fn open(&mut self, rel: &str) -> Result<File> {
+        let (parent, name) = rel.rsplit_once('/').unwrap_or(("", rel));
+        if self.last.as_ref().is_none_or(|(p, _)| p != parent) {
+            self.last = None;
+            let d = self.root.dir(Path::new(parent), false)?;
+            self.last = Some((parent.to_string(), d));
+        }
+        let d = &self.last.as_ref().expect("set above").1;
+        d.open_read(std::ffi::OsStr::new(name))?
+            .with_context(|| format!("{rel} is gone"))
+    }
+}
+
 /// Copy one file: shared data when `reflink` and the file system allow it,
 /// else a full copy when it fits in `budget`. `Ok(None)`: it does not fit,
 /// and `dst` is gone again. `Ok(Some(true))`: shared data.
@@ -433,6 +469,7 @@ pub fn take(
         let mut reflink = opts.reflink;
         let mut unreadable = Vec::new();
         let mut made: BTreeSet<PathBuf> = BTreeSet::new();
+        let mut reader = Reader::new(project)?;
         for (rel, fp) in files.iter_mut() {
             if Instant::now() > deadline {
                 return Ok(Copied::Slow);
@@ -447,7 +484,7 @@ pub fn take(
                 std::os::unix::fs::symlink(t, &dst)?;
                 continue;
             }
-            let Ok(src) = open_regular(&project.join(rel)) else {
+            let Ok(src) = reader.open(rel) else {
                 unreadable.push(rel.clone());
                 continue;
             };
@@ -586,10 +623,12 @@ pub fn plan(meta: &Meta, current: &BTreeMap<String, Fp>) -> Plan {
             (Some(a), Some(b)) if a != b => Change::Changed,
             _ => continue,
         };
+        // Without an end record (the end walk ran out of time, or paddock
+        // was stopped), any change can be a later edit.
         let after_end = meta
             .end
             .as_ref()
-            .is_some_and(|end| end.get(p) != current.get(p));
+            .is_none_or(|end| end.get(p) != current.get(p));
         entries.push(Entry {
             path: p.clone(),
             change,
@@ -597,6 +636,17 @@ pub fn plan(meta: &Meta, current: &BTreeMap<String, Fp>) -> Plan {
         });
     }
     Plan { entries }
+}
+
+/// What `paddock undo` would change in `project` now. Paths that the
+/// snapshot or today's rules leave out stay as they are, also when the
+/// snapshot has them: a folder can become ignored during the session.
+pub fn undo_plan(meta: &Meta, project: &Path) -> Result<Plan> {
+    let skip = meta.skip.union(&skip_rules(project, TIME_LIMIT));
+    let current = walk(project, &skip, None)?;
+    let mut meta = meta.clone();
+    meta.files.retain(|p, _| !skip.covers(p));
+    Ok(plan(&meta, &current))
 }
 
 /// What `restore` did.
@@ -756,7 +806,13 @@ pub fn render_plan(meta: &Meta, plan: &Plan) -> String {
         }
     }
     let late: Vec<&Entry> = plan.entries.iter().filter(|e| e.after_end).collect();
-    if !late.is_empty() {
+    if !late.is_empty() && meta.end.is_none() {
+        t.push_str(&format!(
+            "  warning: paddock did not record the end of the session, so it cannot tell the changes of the session from later edits. {} file(s) differ (skipped without --force): {}\n",
+            late.len(),
+            names(&late, 10)
+        ));
+    } else if !late.is_empty() {
         t.push_str(&format!(
             "  warning: {} changed after the session ended (skipped without --force): {}\n",
             late.len(),
@@ -866,9 +922,7 @@ pub fn undo_cmd(
     {
         bail!("a sandbox of this project runs; stop it first (`paddock ps`)");
     }
-    let skip = meta.skip.union(&skip_rules(&project, TIME_LIMIT));
-    let current = walk(&project, &skip, None)?;
-    let p = plan(meta, &current);
+    let p = undo_plan(meta, &project)?;
     if p.entries.is_empty() {
         println!("The project is the same as the snapshot of {}.", meta.id);
         return Ok(0);

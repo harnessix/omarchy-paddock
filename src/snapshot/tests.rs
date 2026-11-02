@@ -98,6 +98,37 @@ fn git_skip_rules_take_ignored_folders_only() {
     assert!(s.skips("x/.git", ".git", false));
     assert!(!s.skips("a.log", "a.log", false));
     assert!(!s.skips("target", "target", true));
+    assert!(s.covers("out/x/y") && s.covers("web/node_modules/a") && s.covers("d/.git/x"));
+    assert!(!s.covers("outx/y") && !s.covers("a.log") && !s.covers("web/a"));
+}
+
+#[test]
+fn undo_leaves_a_folder_alone_that_became_ignored() {
+    // Review C-M4.
+    if !has_git() {
+        println!("skipped: no git");
+        return;
+    }
+    let t = tempfile::tempdir().unwrap();
+    let (p, root) = (t.path().join("p"), t.path().join("snaps"));
+    fs::create_dir_all(&p).unwrap();
+    git(&p, &["init", "-q"]);
+    write(&p, "notes/todo.md", "old");
+    write(&p, "a", "1");
+    let Taken::Done { dir, .. } = take(&root, &p, "s1", "fake", 1, &opts(1 << 20, false)).unwrap()
+    else {
+        panic!()
+    };
+    // The session ignores notes/, and the user edits the file later.
+    write(&p, ".gitignore", "notes/\n");
+    write(&p, "a", "agent");
+    finish(&root, &p, "s1", 2).unwrap();
+    write(&p, "notes/todo.md", "user edit");
+    let m = Meta::load(&dir).unwrap();
+    assert!(m.files.contains_key("notes/todo.md"));
+    let pl = undo_plan(&m, &p).unwrap();
+    let paths: Vec<&str> = pl.entries.iter().map(|e| e.path.as_str()).collect();
+    assert_eq!(paths, vec![".gitignore", "a"]);
 }
 
 #[test]
@@ -209,11 +240,11 @@ fn the_plan_names_added_changed_deleted_and_late_changes() {
             ("new", Change::Added, false),
         ]
     );
-    // Without an end record nothing counts as late.
+    // Without an end record every change can be a later edit (review C-H4).
     let m = meta(&[("late", fp(1, 1))], None);
-    assert!(!plan(&m, &current).entries[0].after_end);
+    assert!(plan(&m, &current).entries.iter().all(|e| e.after_end));
     let text = render_plan(&m, &plan(&m, &current));
-    assert!(text.contains("added"), "{text}");
+    assert!(text.contains("did not record the end"), "{text}");
 }
 
 #[test]
@@ -347,6 +378,47 @@ fn undo_skips_files_changed_after_the_end_unless_forced() {
 }
 
 #[test]
+fn undo_keeps_later_edits_when_the_end_was_not_recorded() {
+    // Review C-H4: no finish(), as when the end walk runs out of time.
+    let t = tempfile::tempdir().unwrap();
+    let (p, root, trash) = (
+        t.path().join("p"),
+        t.path().join("snaps"),
+        t.path().join("trash"),
+    );
+    write(&p, "a", "1");
+    let Taken::Done { dir, .. } = take(&root, &p, "s1", "fake", 1, &opts(1 << 20, false)).unwrap()
+    else {
+        panic!()
+    };
+    write(&p, "a", "user edit");
+    let m = Meta::load(&dir).unwrap();
+    let pl = plan(&m, &walk(&p, &m.skip, None).unwrap());
+    assert!(pl.entries.iter().all(|e| e.after_end));
+    restore(&dir, &m, &p, &pl, false, &trash, "t1").unwrap();
+    assert_eq!(fs::read_to_string(p.join("a")).unwrap(), "user edit");
+}
+
+#[test]
+fn the_snapshot_copy_never_follows_a_folder_swapped_for_a_link() {
+    // Review C-M5: another sandbox swaps `d/` between the walk and the copy.
+    let t = tempfile::tempdir().unwrap();
+    let (p, secret) = (t.path().join("p"), t.path().join("secret"));
+    write(&p, "d/key", "project");
+    write(&p, "e/x", "x");
+    write(&secret, "key", "host key");
+    let mut r = Reader::new(&p).unwrap();
+    assert!(r.open("e/x").is_ok());
+    fs::rename(p.join("d"), t.path().join("moved")).unwrap();
+    std::os::unix::fs::symlink(&secret, p.join("d")).unwrap();
+    assert!(r.open("d/key").is_err());
+    assert!(
+        open_regular(&p.join("d/key")).is_ok(),
+        "the old way followed it"
+    );
+}
+
+#[test]
 fn undo_does_not_write_through_a_planted_link() {
     let t = tempfile::tempdir().unwrap();
     let (p, root, trash, outside) = (
@@ -363,6 +435,7 @@ fn undo_does_not_write_through_a_planted_link() {
     };
     fs::remove_dir_all(p.join("src")).unwrap();
     std::os::unix::fs::symlink(&outside, p.join("src")).unwrap();
+    finish(&root, &p, "s1", 2).unwrap();
     let m = Meta::load(&dir).unwrap();
     let pl = plan(&m, &walk(&p, &m.skip, None).unwrap());
     restore(&dir, &m, &p, &pl, false, &trash, "t1").unwrap();

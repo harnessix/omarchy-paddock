@@ -415,7 +415,17 @@ impl Proxy {
                 Ok(identities_answer(&shown))
             }
             Request::Sign { blob, data, flags } => {
-                let Some(key) = self.keys.iter().find(|k| k.blob == blob) else {
+                // Every credential that names this key; the strictest one
+                // that is not revoked decides.
+                let named: Vec<&Key> = self.keys.iter().filter(|k| k.blob == blob).collect();
+                let live = || {
+                    named
+                        .iter()
+                        .copied()
+                        .filter(|k| !self.is_revoked(&k.name))
+                        .max_by_key(|k| k.confirm == Confirm::Each)
+                };
+                let Some(&first) = named.first() else {
                     let unknown = Key {
                         name: String::new(),
                         fingerprint: fingerprint(&blob),
@@ -426,13 +436,20 @@ impl Proxy {
                     (self.report)(&unknown, "denied: not a configured key");
                     return Ok(vec![FAILURE]);
                 };
-                if self.is_revoked(&key.name) {
-                    (self.report)(key, "denied: revoked");
+                let Some(key) = live() else {
+                    (self.report)(first, "denied: revoked");
                     return Ok(vec![FAILURE]);
-                }
-                if key.confirm == Confirm::Each && !(self.ask)(key) {
-                    (self.report)(key, "denied by the user");
-                    return Ok(vec![FAILURE]);
+                };
+                if key.confirm == Confirm::Each {
+                    if !(self.ask)(key) {
+                        (self.report)(key, "denied by the user");
+                        return Ok(vec![FAILURE]);
+                    }
+                    // A revoke while the card was open wins over Allow.
+                    if live().is_none() {
+                        (self.report)(key, "denied: revoked");
+                        return Ok(vec![FAILURE]);
+                    }
                 }
                 let resp = self.ask_host(upstream, &sign_request(&key.blob, &data, flags))?;
                 if valid_sign_response(&resp) {

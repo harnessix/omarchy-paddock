@@ -64,12 +64,14 @@ fn git_files_that_paddock_binds_read_only_are_protected() {
 
 #[test]
 fn symlinks_that_leave_the_folder_are_found() {
-    assert!(escapes("a", Path::new("/etc/passwd")));
-    assert!(escapes("a", Path::new("../x")));
-    assert!(escapes("d/a", Path::new("../../x")));
-    assert!(escapes("d/a", Path::new("x/../../../y")));
-    assert!(!escapes("d/a", Path::new("../x")));
-    assert!(!escapes("a", Path::new("d/./x")));
+    let none = BTreeMap::new();
+    let escapes = |r: &str, t: &str| leaves(&none, r, Path::new(t));
+    assert!(escapes("a", "/etc/passwd"));
+    assert!(escapes("a", "../x"));
+    assert!(escapes("d/a", "../../x"));
+    assert!(escapes("d/a", "x/../../../y"));
+    assert!(!escapes("d/a", "../x"));
+    assert!(!escapes("a", "d/./x"));
 }
 
 #[test]
@@ -145,13 +147,31 @@ fn without_reflinks_the_size_limit_holds() {
     std::fs::write(o.join("big"), vec![7u8; 4096]).unwrap();
     let p = plan_borrow(&e, &o, no_check).unwrap();
     // A file system with reflinks copies it anyway; others refuse.
-    let src = p.src.proc_path();
     let stage = t.path().join("stage");
     std::fs::create_dir(&stage).unwrap();
-    let entries = scan(&src).unwrap();
-    if let Err(err) = copy_tree(&src, &stage, &entries, 100) {
+    let entries = scan(&p.src.proc_path()).unwrap();
+    if let Err(err) = copy_tree(&p.src.root().unwrap(), &stage, &entries, 100) {
         assert!(format!("{err:#}").contains("[borrow] max"), "{err:#}");
     }
+}
+
+#[test]
+fn a_borrow_never_copies_through_a_folder_swapped_for_a_symlink() {
+    // Review C-H2: the sandbox swaps a folder for a link after the scan.
+    let t = tempfile::tempdir().unwrap();
+    let e = env(t.path());
+    let o = original(t.path());
+    let p = plan_borrow(&e, &o, no_check).unwrap();
+    let entries = scan(&p.src.proc_path()).unwrap();
+    let secret = t.path().join("secret");
+    std::fs::create_dir(&secret).unwrap();
+    std::fs::write(secret.join("a.rs"), "key").unwrap();
+    std::fs::rename(o.join("src"), t.path().join("moved")).unwrap();
+    symlink(&secret, o.join("src")).unwrap();
+    let stage = t.path().join("stage");
+    std::fs::create_dir(&stage).unwrap();
+    assert!(copy_tree(&p.src.root().unwrap(), &stage, &entries, DEFAULT_MAX).is_err());
+    assert!(std::fs::read_to_string(stage.join("src/a.rs")).map_or(true, |s| s != "key"));
 }
 
 #[test]
@@ -213,6 +233,55 @@ fn a_return_writes_the_changes_back_with_the_safety_rules() {
 }
 
 #[test]
+fn a_return_never_writes_through_a_folder_swapped_for_a_symlink() {
+    // Review C-H3: the swap comes after the last check of the original.
+    let t = tempfile::tempdir().unwrap();
+    let e = env(t.path());
+    let o = original(t.path());
+    let (name, copy) = borrowed(&e, &o);
+    std::fs::write(copy.join("src/a.rs"), "planted").unwrap();
+    std::fs::write(copy.join("src/new.rs"), "planted").unwrap();
+    std::fs::remove_file(copy.join("src/gone.rs")).unwrap();
+    let plan = plan_return(&e, "s-1", &name, DEFAULT_MAX).unwrap();
+    let home = t.path().join("victim");
+    std::fs::create_dir(&home).unwrap();
+    std::fs::write(home.join("a.rs"), "mine").unwrap();
+    std::fs::write(home.join("gone.rs"), "mine").unwrap();
+    std::fs::rename(o.join("src"), t.path().join("moved")).unwrap();
+    symlink(&home, o.join("src")).unwrap();
+    assert!(plan.write_back().is_err());
+    assert_eq!(std::fs::read_to_string(home.join("a.rs")).unwrap(), "mine");
+    assert_eq!(
+        std::fs::read_to_string(home.join("gone.rs")).unwrap(),
+        "mine"
+    );
+    assert!(!home.join("new.rs").exists());
+}
+
+#[test]
+fn a_folder_with_git_files_that_became_a_file_stops_the_return_before_it_writes() {
+    // Review C-L10: the write failed halfway and left the original changed.
+    let t = tempfile::tempdir().unwrap();
+    let e = env(t.path());
+    let o = original(t.path());
+    std::fs::create_dir_all(o.join("sub/.git")).unwrap();
+    std::fs::write(o.join("sub/.git/config"), "[core]\n").unwrap();
+    std::fs::write(o.join("sub/f"), "f").unwrap();
+    let (name, copy) = borrowed(&e, &o);
+    std::fs::write(copy.join("README"), "new readme\n").unwrap();
+    std::fs::remove_dir_all(copy.join("sub")).unwrap();
+    std::fs::write(copy.join("sub"), "now a file").unwrap();
+    if let Ok(plan) = plan_return(&e, "s-1", &name, DEFAULT_MAX) {
+        let _ = plan.apply(&e, "s-1");
+    }
+    assert_eq!(
+        std::fs::read_to_string(o.join("README")).unwrap(),
+        "old readme\n"
+    );
+    assert!(o.join("sub/f").exists());
+}
+
+#[test]
 fn a_return_refuses_when_the_original_changed_after_the_borrow() {
     let t = tempfile::tempdir().unwrap();
     let e = env(t.path());
@@ -253,6 +322,43 @@ fn a_return_refuses_symlinks_that_point_outside() {
     let err = plan_return(&e, "s-1", &name, DEFAULT_MAX).err().unwrap();
     assert!(format!("{err:#}").contains("outside the folder"), "{err:#}");
     assert!(!o.join("pw").exists());
+}
+
+#[test]
+fn chained_symlinks_that_leave_the_folder_stop_the_return() {
+    // Review A-M6.
+    let t = tempfile::tempdir().unwrap();
+    let e = env(t.path());
+    let o = original(t.path());
+    let (name, copy) = borrowed(&e, &o);
+    std::fs::create_dir(t.path().join("secret")).unwrap();
+    std::fs::write(t.path().join("secret/key"), "k").unwrap();
+    symlink(".", copy.join("s")).unwrap();
+    symlink("s/..", copy.join("x")).unwrap();
+    let err = plan_return(&e, "s-1", &name, DEFAULT_MAX).err().unwrap();
+    assert!(format!("{err:#}").contains("outside the folder"), "{err:#}");
+    assert!(!o.join("x").exists());
+}
+
+#[test]
+fn symlinks_are_followed_in_the_tree_to_find_where_they_lead() {
+    let l = |t: &str| Entry::symlink(PathBuf::from(t));
+    let tree: BTreeMap<String, Entry> = [
+        ("s".to_string(), l(".")),
+        ("d".to_string(), Entry::dir()),
+        ("d/up".to_string(), l("..")),
+        ("lib.so".to_string(), l("lib.so.1")),
+        ("lib.so.1".to_string(), l("d/lib.so.1.2")),
+        ("loop".to_string(), l("loop")),
+    ]
+    .into_iter()
+    .collect();
+    assert!(leaves(&tree, "x", Path::new("s/..")));
+    assert!(leaves(&tree, "x", Path::new("d/up/..")));
+    assert!(leaves(&tree, "x", Path::new("loop")));
+    assert!(!leaves(&tree, "x", Path::new("lib.so")));
+    assert!(!leaves(&tree, "d/x", Path::new("up/d")));
+    assert!(!leaves(&tree, "d/x", Path::new("../s/d")));
 }
 
 #[test]

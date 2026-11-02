@@ -19,7 +19,7 @@ use crate::env::HostEnv;
 use anyhow::{bail, Context as _, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::io::{Read, Write};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
@@ -358,23 +358,50 @@ pub fn git_protected(rel: &str, kind: Kind) -> bool {
     false
 }
 
-/// A symlink whose target leaves the borrowed folder.
-pub fn escapes(rel: &str, target: &Path) -> bool {
-    if target.is_absolute() {
+/// A symlink of `tree` that leads outside the borrowed folder, also through
+/// other symlinks of `tree` on the way: `x -> s/..` with `s -> .` leaves it.
+pub fn leaves(tree: &BTreeMap<String, Entry>, rel: &str, target: &Path) -> bool {
+    let mut at: Vec<String> = rel.split('/').map(str::to_string).collect();
+    at.pop();
+    // The parts still to walk, the next one last.
+    let mut todo: Vec<String> = Vec::new();
+    let push = |todo: &mut Vec<String>, t: &Path| -> bool {
+        if t.is_absolute() {
+            return false;
+        }
+        for c in t.components().rev() {
+            match c {
+                Component::Normal(n) => todo.push(n.to_string_lossy().into_owned()),
+                Component::ParentDir => todo.push("..".into()),
+                Component::CurDir => {}
+                _ => return false,
+            }
+        }
+        true
+    };
+    if !push(&mut todo, target) {
         return true;
     }
-    let mut depth = rel.split('/').count() as i64 - 1;
-    for c in target.components() {
-        match c {
-            Component::Normal(_) => depth += 1,
-            Component::CurDir => {}
-            Component::ParentDir => {
-                depth -= 1;
-                if depth < 0 {
-                    return true;
-                }
+    let mut hops = 0;
+    while let Some(c) = todo.pop() {
+        if c == ".." {
+            if at.pop().is_none() {
+                return true;
             }
-            _ => return true,
+            continue;
+        }
+        at.push(c);
+        let Some(e) = tree.get(&at.join("/")).filter(|e| e.kind == Kind::Symlink) else {
+            continue;
+        };
+        hops += 1;
+        // The kernel gives up after 40 links; so does this walk.
+        if hops > 40 {
+            return true;
+        }
+        at.pop();
+        if !push(&mut todo, e.target.as_deref().unwrap_or(Path::new("/"))) {
+            return true;
         }
     }
     false
@@ -481,11 +508,19 @@ fn set_mtime(f: &std::fs::File, mtime: i64) -> Result<()> {
 }
 
 /// Copy the scanned entries of `src` into `dst`. Bytes that cannot be
-/// reflinked count against `max`.
-fn copy_tree(src: &Path, dst: &Path, entries: &BTreeMap<String, Entry>, max: u64) -> Result<u64> {
+/// reflinked count against `max`. The source can be sandbox-writable, so
+/// it is walked through `safefs`: a symlink on the way is an error.
+fn copy_tree(
+    src: &crate::safefs::Root,
+    dst: &Path,
+    entries: &BTreeMap<String, Entry>,
+    max: u64,
+) -> Result<u64> {
     let mut plain = 0u64;
+    // The folder of the last file: entries come sorted, so neighbours share it.
+    let mut last: Option<(String, crate::safefs::Dir)> = None;
     for (r, e) in entries {
-        let (from, to) = (src.join(r), dst.join(r));
+        let to = dst.join(r);
         match e.kind {
             Kind::Dir => {
                 std::fs::create_dir(&to)?;
@@ -495,8 +530,14 @@ fn copy_tree(src: &Path, dst: &Path, entries: &BTreeMap<String, Entry>, max: u64
                 std::os::unix::fs::symlink(e.target.as_deref().unwrap_or(Path::new("")), &to)?
             }
             Kind::File => {
-                let f = std::fs::File::open(&from)
-                    .with_context(|| format!("cannot read {}", from.display()))?;
+                let (parent, name) = r.rsplit_once('/').unwrap_or(("", r));
+                if last.as_ref().is_none_or(|(p, _)| p != parent) {
+                    last = Some((parent.to_string(), src.dir(Path::new(parent), false)?));
+                }
+                let d = &last.as_ref().expect("set above").1;
+                let f = d
+                    .open_read(OsStr::new(name))?
+                    .with_context(|| format!("{r} is gone from the original"))?;
                 let t = std::fs::OpenOptions::new()
                     .write(true)
                     .create_new(true)
@@ -531,7 +572,11 @@ pub fn borrow(env: &HostEnv, id: &str, p: &BorrowPlan, max: u64) -> Result<serde
     crate::privfs::dir(&m)?;
     let stage = m.join(format!("stage-{}", nonce()));
     std::fs::create_dir(&stage)?;
-    let plain = match copy_tree(&src, &stage, &entries, max) {
+    let plain = match p
+        .src
+        .root()
+        .and_then(|r| copy_tree(&r, &stage, &entries, max))
+    {
         Ok(n) => n,
         Err(e) => {
             let _ = std::fs::remove_dir_all(&stage);
@@ -827,15 +872,23 @@ pub fn plan_return(env: &HostEnv, id: &str, name: &str, max: u64) -> Result<Retu
             }
         }
     }
-    let out: Vec<String> = ch
-        .added
+    // Every symlink counts: a new one can also turn an old one around, as
+    // `s -> .` does to `x -> s/..`. An old link that already led outside in
+    // the original stays as it was.
+    let new: BTreeSet<&String> = ch.added.iter().chain(&ch.changed).collect();
+    let out: Vec<String> = copy
         .iter()
-        .chain(&ch.changed)
-        .filter(|r| {
-            let e = &copy[*r];
-            e.kind == Kind::Symlink && escapes(r, e.target.as_deref().unwrap_or(Path::new("/")))
+        .filter(|(r, e)| {
+            let t = |e: &Entry| e.target.clone().unwrap_or_else(|| PathBuf::from("/"));
+            e.kind == Kind::Symlink
+                && leaves(&copy, r, &t(e))
+                && (new.contains(r)
+                    || !manifest
+                        .entries
+                        .get(*r)
+                        .is_some_and(|o| leaves(&manifest.entries, r, &t(o))))
         })
-        .cloned()
+        .map(|(r, _)| r.clone())
         .collect();
     let plan = ReturnPlan {
         name: name.to_string(),
@@ -850,6 +903,26 @@ pub fn plan_return(env: &HostEnv, id: &str, name: &str, max: u64) -> Result<Retu
         bail!(
             "these symlinks of the copy point outside the folder, so paddock does not return it: {}",
             shown(&out)
+        );
+    }
+    // A folder that keeps a git file cannot become a file: the write would
+    // fail halfway, after the other changes.
+    let stuck: Vec<String> = plan
+        .changes
+        .changed
+        .iter()
+        .filter(|r| {
+            let below = format!("{r}/");
+            plan.manifest.entries[*r].kind == Kind::Dir
+                && plan.copy[*r].kind != Kind::Dir
+                && plan.changes.kept.iter().any(|k| k.starts_with(&below))
+        })
+        .cloned()
+        .collect();
+    if !stuck.is_empty() {
+        bail!(
+            "these folders are no folders in the copy, but they hold git files that a return never removes, so paddock does not return it: {}. Make them folders again in the copy",
+            shown(&stuck)
         );
     }
     Ok(plan)
@@ -898,21 +971,35 @@ impl ReturnPlan {
     pub fn apply(&self, env: &HostEnv, id: &str) -> Result<serde_json::Value> {
         // Check again: the original can change while the user decides.
         check_original(&self.manifest)?;
-        let orig = &self.manifest.original;
         let c = &self.changes;
-        // A path in the original, with no symlink on the way.
-        let place = |r: &str| -> Result<PathBuf> {
-            let mut p = orig.clone();
-            let parts: Vec<&str> = r.split('/').collect();
-            for (i, part) in parts.iter().enumerate() {
-                p.push(part);
-                if i + 1 < parts.len()
-                    && std::fs::symlink_metadata(&p).is_ok_and(|m| !m.file_type().is_dir())
-                {
-                    bail!("{} is not a folder in the original", p.display());
-                }
-            }
-            Ok(p)
+        let bytes = self.write_back()?;
+        // The borrow is over: the copy and its manifest go.
+        if let Ok(r) = crate::safefs::Root::open(&dir(env, id)) {
+            let _ = r.remove_tree(Path::new(&self.name));
+        }
+        let _ = std::fs::remove_file(meta(env, id).join(format!("{}.json", self.name)));
+        Ok(serde_json::json!({
+            "name": self.name,
+            "original": self.manifest.original,
+            "added": c.added.len(),
+            "changed": c.changed.len(),
+            "deleted": c.deleted.len(),
+            "kept": c.kept,
+            "skipped": c.skipped,
+            "bytes": bytes,
+        }))
+    }
+    /// Write the changes into the original. Every step acts through a
+    /// folder opened from the original down, never through a path: the
+    /// sandbox may swap a folder for a symlink at any time.
+    fn write_back(&self) -> Result<u64> {
+        use crate::safefs::Kind as K;
+        let root = crate::safefs::Root::open(&self.manifest.original)?;
+        let c = &self.changes;
+        // The folder of `r` in the original, and its name there.
+        let at = |r: &str| -> Result<(crate::safefs::Dir, OsString)> {
+            let (parent, name) = r.rsplit_once('/').unwrap_or(("", r));
+            Ok((root.dir(Path::new(parent), false)?, OsString::from(name)))
         };
         // Remove first, children before their folders: deletions and the
         // old entry of a changed kind.
@@ -929,18 +1016,21 @@ impl ReturnPlan {
         gone.sort();
         gone.dedup();
         for r in gone.into_iter().rev() {
-            let p = place(r)?;
-            match std::fs::symlink_metadata(&p) {
-                Ok(m) if m.file_type().is_dir() => {
+            let (d, n) = at(r)?;
+            match d.kind(&n)? {
+                Some(K::Dir) => {
                     // A folder that keeps a git file stays.
-                    if let Err(e) = std::fs::remove_dir(&p) {
+                    if let Err(e) = d.remove_dir(&n) {
                         if e.raw_os_error() != Some(libc::ENOTEMPTY) {
-                            return Err(e.into());
+                            return Err(anyhow::Error::from(e).context(format!(
+                                "cannot remove {}",
+                                d.path().join(&n).display()
+                            )));
                         }
                     }
                 }
-                Ok(_) => std::fs::remove_file(&p)?,
-                Err(_) => {}
+                Some(_) => d.remove(&n)?,
+                None => {}
             }
         }
         let mut put: Vec<&String> = c.added.iter().chain(&c.changed).collect();
@@ -948,59 +1038,22 @@ impl ReturnPlan {
         let mut bytes = 0u64;
         for r in put {
             let e = &self.copy[r];
-            let p = place(r)?;
+            let (d, n) = at(r)?;
             match e.kind {
-                Kind::Dir => match std::fs::create_dir(&p) {
-                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && p.is_dir() => {}
-                    r => r?,
-                },
-                Kind::Symlink => {
-                    std::os::unix::fs::symlink(e.target.as_deref().unwrap_or(Path::new("")), &p)?
-                }
+                Kind::Dir => d.make_dir(&n, 0o777)?,
+                Kind::Symlink => d.symlink(e.target.as_deref().unwrap_or(Path::new("")), &n)?,
                 Kind::File => {
                     let mode = match self.manifest.entries.get(r) {
                         Some(o) if o.kind == Kind::File => o.mode & 0o7777,
                         // New files: no execute bit, no special bits.
                         _ => e.mode & 0o666,
                     };
-                    let tmp = p.with_file_name(format!(
-                        ".{}.paddock-return-{}",
-                        p.file_name().unwrap_or_default().to_string_lossy(),
-                        std::process::id()
-                    ));
-                    let _ = std::fs::remove_file(&tmp);
                     let mut from = std::fs::File::open(self.snap.join(r))?;
-                    let mut to = std::fs::OpenOptions::new()
-                        .write(true)
-                        .create_new(true)
-                        .mode(0o600)
-                        .open(&tmp)?;
-                    bytes += std::io::copy(&mut from, &mut to)?;
-                    to.sync_all()?;
-                    drop(to);
-                    std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(mode))?;
-                    if let Err(err) = std::fs::rename(&tmp, &p) {
-                        let _ = std::fs::remove_file(&tmp);
-                        return Err(err.into());
-                    }
+                    bytes += d.write_from(&n, &mut from, mode)?;
                 }
             }
         }
-        // The borrow is over: the copy and its manifest go.
-        if let Ok(r) = crate::safefs::Root::open(&dir(env, id)) {
-            let _ = r.remove_tree(Path::new(&self.name));
-        }
-        let _ = std::fs::remove_file(meta(env, id).join(format!("{}.json", self.name)));
-        Ok(serde_json::json!({
-            "name": self.name,
-            "original": self.manifest.original,
-            "added": c.added.len(),
-            "changed": c.changed.len(),
-            "deleted": c.deleted.len(),
-            "kept": c.kept,
-            "skipped": c.skipped,
-            "bytes": bytes,
-        }))
+        Ok(bytes)
     }
 }
 

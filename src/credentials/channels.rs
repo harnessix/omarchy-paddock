@@ -21,7 +21,7 @@ use super::{secret::Secret, Credential, Kind};
 use crate::broker::Status;
 use crate::env::HostEnv;
 use anyhow::{bail, Context as _, Result};
-use std::collections::BTreeSet;
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -184,7 +184,7 @@ pub fn docker_login(env: &HostEnv, server: &str, host: &str) -> Result<Login> {
 /// Run a host tool with `stdin`, for at most TOOL_TIMEOUT. Its output is a
 /// secret. stderr goes nowhere: it can hold a value too.
 fn run_tool(exe: &Path, args: &[&str], stdin: &[u8], envs: &[(&str, &str)]) -> Result<Secret> {
-    use std::io::{Read as _, Write as _};
+    use std::io::Write as _;
     use std::process::{Command, Stdio};
     let name = exe
         .file_name()
@@ -203,12 +203,7 @@ fn run_tool(exe: &Path, args: &[&str], stdin: &[u8], envs: &[(&str, &str)]) -> R
     std::thread::spawn(move || {
         let _ = input.write_all(&data);
     });
-    let mut out = child.stdout.take().expect("piped");
-    let reader = std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        let _ = (&mut out).take(MAX_OUTPUT as u64 + 1).read_to_end(&mut buf);
-        buf
-    });
+    let reader = crate::broker::Pipe::read(child.stdout.take().expect("piped"), MAX_OUTPUT + 1);
     let start = std::time::Instant::now();
     let status = loop {
         if let Some(s) = child.try_wait()? {
@@ -224,7 +219,15 @@ fn run_tool(exe: &Path, args: &[&str], stdin: &[u8], envs: &[(&str, &str)]) -> R
         }
         std::thread::sleep(Duration::from_millis(20));
     };
-    let buf = Secret::new(reader.join().unwrap_or_default());
+    // A process left behind can keep stdout open: the output is not
+    // whole then.
+    let deadline =
+        (start + TOOL_TIMEOUT).min(std::time::Instant::now() + crate::broker::PIPE_GRACE);
+    let (out, ended) = reader.finish(deadline);
+    let buf = Secret::new(out);
+    if !ended {
+        bail!("{} left its output open after it ended", name);
+    }
     if !status.success() {
         bail!("{name} failed ({status})");
     }
@@ -236,7 +239,7 @@ fn run_tool(exe: &Path, args: &[&str], stdin: &[u8], envs: &[(&str, &str)]) -> R
 
 /// Asks the user at the first use: the summary and the detail of the card.
 /// True: allowed for the rest of the run.
-pub type Ask = Arc<dyn Fn(&str, &str) -> bool + Send + Sync>;
+pub type Ask = Arc<dyn Fn(&str, &str) -> Option<bool> + Send + Sync>;
 
 /// The docker and aws credentials of one run, served for the broker.
 pub struct Channels {
@@ -246,8 +249,9 @@ pub struct Channels {
     /// The revoke file of the run (`credentials-revoked`).
     pub revoked: PathBuf,
     pub ask: Ask,
-    /// The uses that the user allowed in this run.
-    allowed: Mutex<BTreeSet<String>>,
+    /// The uses that the user answered in this run: true allowed, false
+    /// denied. A card without an answer is not remembered.
+    answered: Mutex<BTreeMap<String, bool>>,
     /// One card at a time, so that two first uses ask once.
     asking: Mutex<()>,
 }
@@ -266,7 +270,7 @@ impl Channels {
             creds,
             revoked,
             ask,
-            allowed: Mutex::new(BTreeSet::new()),
+            answered: Mutex::new(BTreeMap::new()),
             asking: Mutex::new(()),
         }
     }
@@ -278,19 +282,23 @@ impl Channels {
     }
 
     /// Whether the user allows `key` in this run: asked at the first use.
+    /// Yes and No both hold for the rest of the run, so a sandbox cannot
+    /// raise the card again and again until it gets a Yes.
     fn permit(&self, key: &str, summary: &str, detail: &str) -> bool {
-        if self.allowed.lock().unwrap().contains(key) {
-            return true;
+        if let Some(&a) = self.answered.lock().unwrap().get(key) {
+            return a;
         }
         let _one = self.asking.lock().unwrap();
-        if self.allowed.lock().unwrap().contains(key) {
-            return true;
+        if let Some(&a) = self.answered.lock().unwrap().get(key) {
+            return a;
         }
-        if !(self.ask)(summary, detail) {
-            return false;
+        match (self.ask)(summary, detail) {
+            Some(a) => {
+                self.answered.lock().unwrap().insert(key.to_string(), a);
+                a
+            }
+            None => false,
         }
-        self.allowed.lock().unwrap().insert(key.to_string());
-        true
     }
 
     fn audit(&self, name: &str, what: &str, decision: &str) {
@@ -386,8 +394,8 @@ impl Channels {
             &format!("aws\0{name}"),
             &format!("AWS credentials of the profile {profile} ({name})"),
             &format!(
-                "The sandbox asks for AWS credentials of your profile {profile}.\nCredential: {name}\nYes gives it credentials that end after {} seconds, now and at each later request in this run, without a new question. The long-lived keys stay on the host. paddock credentials revoke ends it.",
-                c.aws_duration()
+                "The sandbox asks for AWS credentials of your profile {profile}.\nCredential: {name}\nYes gives it {}, now and at each later request in this run, without a new question. The long-lived keys stay on the host. paddock credentials revoke ends it.",
+                aws_lifetime(c.aws_duration())
             ),
         ) {
             self.audit(name, &what, "denied by the user");
@@ -404,6 +412,15 @@ impl Channels {
             }
         }
     }
+}
+
+/// How long an AWS set lasts, for a card: `duration` applies to a session
+/// that paddock makes from long-lived keys, not to temporary credentials
+/// that the profile gives already.
+pub fn aws_lifetime(duration: u64) -> String {
+    format!(
+        "short-lived credentials ({duration} seconds from long-lived keys; a single sign-on or assumed-role profile gives its own set as it is)"
+    )
 }
 
 /// The `credential_process` output for temporary credentials. None: a
@@ -568,10 +585,7 @@ pub fn approver_ask(
             started_by: Vec::new(),
             choices: Vec::new(),
         };
-        matches!(
-            approver.ask(&env, &p, wait),
-            Some(crate::broker::Answer::Once | crate::broker::Answer::Session)
-        )
+        approver.ask(&env, &p, wait).map(|a| !a.denies())
     })
 }
 

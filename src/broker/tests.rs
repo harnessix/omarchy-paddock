@@ -527,6 +527,60 @@ fn answers_go_through_the_approvals_directory() {
 }
 
 #[test]
+fn a_process_left_behind_does_not_hang_a_capture() {
+    let start = Instant::now();
+    let mut c = Command::new("sh");
+    c.args(["-c", "echo out; echo err >&2; sleep 30 &"]);
+    let (code, out, err) = run_capture(&mut c, Duration::from_secs(30)).unwrap();
+    assert_eq!((code, out.as_str(), err.as_str()), (0, "out\n", "err\n"));
+    assert!(
+        start.elapsed() < Duration::from_secs(10),
+        "{:?}",
+        start.elapsed()
+    );
+}
+
+#[test]
+fn the_first_answer_wins_and_is_written_whole() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut vars = BTreeMap::new();
+    vars.insert(
+        "XDG_RUNTIME_DIR".into(),
+        tmp.path().join("rt").display().to_string(),
+    );
+    let env = HostEnv::from_parts(tmp.path().join("home"), "t".into(), 1, 1, vars);
+    let p = Pending {
+        id: "r-2-abc".into(),
+        sandbox: "s".into(),
+        harness: "claude".into(),
+        project: tmp.path().into(),
+        capability: "exec".into(),
+        summary: "run".into(),
+        detail: "run".into(),
+        reason: String::new(),
+        created: 1,
+        expires: 11,
+        session_allowed: true,
+        choices: Vec::new(),
+        started_by: vec![],
+    };
+    write_pending(&env, &p).unwrap();
+    answer(&env, "r-2-abc", Answer::Deny).unwrap();
+    let e = answer(&env, "r-2-abc", Answer::Once).unwrap_err();
+    assert!(format!("{e:#}").contains("already answered"), "{e:#}");
+    let dir = approvals_dir(&env);
+    let t = std::fs::read_to_string(dir.join("r-2-abc.answer")).unwrap();
+    assert_eq!(AnswerFile::parse(&t).map(|(a, _)| a), Some(Answer::Deny));
+    // No temporary file stays behind.
+    let left: Vec<_> = std::fs::read_dir(&dir)
+        .unwrap()
+        .flatten()
+        .filter(|e| e.file_name().to_string_lossy().contains("paddock-tmp"))
+        .collect();
+    assert!(left.is_empty(), "{left:?}");
+}
+
+#[test]
 fn the_client_talks_to_the_broker_over_the_socket() {
     let (t, b, _) = setup(Some(Answer::Once), HostPolicy::default());
     let sock = t.path().join("host.sock");
@@ -1382,4 +1436,15 @@ fn glab_runs_exactly_the_checked_arguments_on_a_self_hosted_gitlab() {
         assert_eq!(r.status, Status::Invalid, "{argv:?}: {}", r.message);
     }
     assert_eq!(fixed.asked.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn a_push_url_with_credentials_stays_out_of_the_audit_line() {
+    let r = req(
+        "git-push",
+        serde_json::json!({ "remote": "https://u:ghp_secret@example.com/a.git" }),
+    );
+    let d = audit_detail(&r, Path::new("/srv/app"), None);
+    assert!(!d.contains("ghp_secret"), "{d}");
+    assert!(d.contains("example.com"), "{d}");
 }

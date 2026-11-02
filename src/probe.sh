@@ -285,9 +285,13 @@ if [ -n "$PADDOCK_PROBE_PUSH" ]; then
   if g push -q origin HEAD:refs/heads/paddock-probe >/dev/null 2>&1; then ok git-push-session-grant; else fail git-push-session-grant "the second push failed"; fi
   (cd "$P" && paddock-host git push -q --force origin HEAD~1:refs/heads/paddock-probe >/dev/null 2>&1)
   (cd "$P" && paddock-host git push -q --force origin HEAD~2:refs/heads/paddock-probe >/dev/null 2>&1)
-  # .git/config is read-only here, so name the new remote another way.
+  # .git/config is read-only here, so name the new remotes another way.
+  # A new remote on this machine is refused before any card.
   url=$(g remote get-url origin)
-  (cd "$P" && GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=remote.sneaky.url GIT_CONFIG_VALUE_0="$url" paddock-host git push -q sneaky HEAD:refs/heads/sneaky >/dev/null 2>&1); rc=$?
+  (cd "$P" && GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=remote.local.url GIT_CONFIG_VALUE_0="$url" paddock-host git push -q local HEAD:refs/heads/local >/dev/null 2>&1); rc=$?
+  if [ "$rc" != 0 ] && [ "$rc" != 3 ]; then ok git-push-local-remote-refused; else fail git-push-local-remote-refused "exit code $rc, expected a refusal before the card"; fi
+  # A new network remote gets a card, which doctor declines: nothing is sent.
+  (cd "$P" && GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=remote.sneaky.url GIT_CONFIG_VALUE_0="https://example.invalid/sneaky.git" paddock-host git push -q sneaky HEAD:refs/heads/sneaky >/dev/null 2>&1); rc=$?
   if [ "$rc" = 3 ]; then ok git-push-denied-exit-code; else fail git-push-denied-exit-code "exit code $rc, expected 3"; fi
   (cd "$P" && gh auth token >/dev/null 2>&1); rc=$?
   if [ "$rc" = 8 ]; then ok forge-refuses-auth; else fail forge-refuses-auth "exit code $rc, expected 8"; fi

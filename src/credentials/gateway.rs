@@ -167,7 +167,16 @@ impl Route {
 /// for text inside one segment (`/*/*/info/refs`).
 pub fn path_matches(bound: &str, path: &str) -> bool {
     if !bound.contains('*') {
-        return path.starts_with(bound);
+        // A prefix ends at a segment boundary (`/v1` is not `/v10`), and
+        // what follows it has no escaped dot, slash or backslash and no
+        // empty segment, which a server can resolve to another path.
+        let Some(rest) = path.strip_prefix(bound) else {
+            return false;
+        };
+        let lower = rest.to_ascii_lowercase();
+        return (bound.ends_with('/') || rest.is_empty() || rest.starts_with('/'))
+            && !path.contains("//")
+            && !["%2e", "%2f", "%5c"].iter().any(|bad| lower.contains(bad));
     }
     // No escaped slashes or dots behind a wildcard, and no `.` or `..`
     // segment, which a server can resolve to another path.
@@ -338,7 +347,10 @@ impl Gateway {
         };
         if self.is_revoked(name) {
             self.routes.lock().unwrap().remove(name);
-            return self.refuse(&mut conn, 403, "revoked", name, &method, &upath);
+            // The user's own doing, not the sandbox's: a harness that keeps
+            // trying does not freeze it.
+            (self.report)(name, &method, "", &upath, "refused: revoked");
+            return reply(&mut conn, 403, "revoked");
         }
         let Some(route) = self.routes.lock().unwrap().get(name).cloned() else {
             return self.refuse(&mut conn, 404, "no such credential", name, &method, &upath);
@@ -846,6 +858,17 @@ mod tests {
     }
 
     #[test]
+    fn refusals_after_a_revoke_do_not_freeze() {
+        let w = world(&[], None);
+        std::fs::write(w.revoked.path(), "GH\n").unwrap();
+        for _ in 0..MAX_REFUSED + 5 {
+            let r = send(&w, "GET /s/GH/user HTTP/1.1\r\n\r\n");
+            assert!(r.starts_with("HTTP/1.1 403"), "{r}");
+        }
+        assert_eq!(w.abuse.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
     fn events_stream_through_as_they_come() {
         let w = world(&[], None);
         let (mut a, b) = UnixStream::pair().unwrap();
@@ -932,6 +955,28 @@ mod tests {
         assert!(!path_matches("/*/*.git/x", "/o/r/x"));
         assert!(!path_matches("/*/*/info/refs", "/../x/info/refs"));
         assert!(!path_matches("/*/*/info/refs", "/o/./info/refs"));
+    }
+
+    #[test]
+    fn a_prefix_takes_no_escaped_traversal_or_partial_segment() {
+        assert!(path_matches("/repos/my-org/", "/repos/my-org/r/issues"));
+        assert!(path_matches("/v1", "/v1"));
+        assert!(path_matches("/v1", "/v1/models"));
+        assert!(path_matches(
+            "/api/v4/projects/g%2Fp",
+            "/api/v4/projects/g%2Fp/mrs"
+        ));
+        for bad in [
+            "/repos/my-org/%2e%2e/x/y",
+            "/repos/my-org/%2E%2E/x/y",
+            "/repos/my-org/..%2Fother/y",
+            "/repos/my-org/a%5c..%5cb",
+            "/repos/my-org//x",
+        ] {
+            assert!(!path_matches("/repos/my-org/", bad), "{bad}");
+        }
+        assert!(!path_matches("/v1", "/v10/models"));
+        assert!(!path_matches("/v1", "/v1%2F..%2Fadmin"));
     }
 
     #[test]

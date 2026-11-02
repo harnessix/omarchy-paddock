@@ -50,6 +50,9 @@ pub struct Repo {
     /// `objects/info/alternates` at start. A change means the sandbox points
     /// the object store at other host repositories.
     pub alternates: Option<String>,
+    /// The top of the work tree: git reads a relative remote path from
+    /// there.
+    pub work_tree: PathBuf,
 }
 
 /// Read the remotes of a repository. The call names the git directory and
@@ -118,11 +121,25 @@ impl Repo {
             common_dir,
             remotes,
             alternates,
+            work_tree: layout.work_tree,
         })
     }
 
     pub fn find(&self, name: &str) -> Option<&Remote> {
         self.remotes.iter().find(|r| r.name == name)
+    }
+
+    /// A remote URL as the host pushes to it: a relative path (`../up.git`)
+    /// from the top of the work tree, as git in the project reads it, not
+    /// from the scratch repository.
+    pub fn absolute(&self, url: &str) -> String {
+        let scp = url
+            .split_once(':')
+            .is_some_and(|(host, _)| !host.is_empty() && !host.contains('/'));
+        if url.contains("://") || scp || Path::new(url).is_absolute() {
+            return url.to_string();
+        }
+        self.work_tree.join(url).display().to_string()
     }
 }
 
@@ -300,7 +317,8 @@ impl PushPlan {
         }
         t.push_str(&format!(
             "Push with your credentials to:\n  {} ({})\n",
-            self.url, self.remote
+            redact(&self.url),
+            self.remote
         ));
         for n in &self.notes {
             t.push_str(&format!("Note: {n}\n"));
@@ -355,6 +373,28 @@ fn short_ref(r: &str) -> &str {
         .unwrap_or(r)
 }
 
+/// A URL without its credentials, for the card and the logs:
+/// `https://user:TOKEN@host` becomes `https://***@host`. An SSH user name
+/// stays, a password goes.
+pub fn redact(u: &str) -> String {
+    let Some((scheme, rest)) = u.split_once("://") else {
+        return u.to_string();
+    };
+    let authority = rest.split('/').next().unwrap_or(rest);
+    let Some((user, host)) = authority.rsplit_once('@') else {
+        return u.to_string();
+    };
+    let user = if scheme.to_ascii_lowercase().starts_with("http") {
+        "***".to_string()
+    } else {
+        match user.split_once(':') {
+            Some((name, _)) => format!("{name}:***"),
+            None => user.to_string(),
+        }
+    };
+    format!("{scheme}://{user}@{host}{}", &rest[authority.len()..])
+}
+
 /// Remove control characters: commit subjects come from the sandbox.
 fn clean(s: &str) -> String {
     s.chars().filter(|c| !c.is_control()).take(200).collect()
@@ -386,15 +426,29 @@ pub fn valid_ref(r: &str) -> bool {
         && !r.chars().any(|c| c.is_control() || " ~^:?*[\\".contains(c))
 }
 
-/// Check a URL for a remote that the host does not know.
+/// Check a URL for a remote that the host does not know. Only network
+/// remotes: a path or `file://` URL on this machine can name a repository
+/// that the sandbox wrote, and git runs that repository's hooks
+/// (`pre-receive`) on the host when it pushes there.
 fn valid_new_url(u: &str) -> Result<()> {
-    if u.is_empty()
+    let network = match u.split_once("://") {
+        Some((scheme, _)) => ["https", "http", "ssh", "git", "git+ssh", "ssh+git"]
+            .contains(&scheme.to_ascii_lowercase().as_str()),
+        // git reads `host:path` as SSH when no `/` comes before the colon.
+        None => u
+            .split_once(':')
+            .is_some_and(|(host, _)| !host.is_empty() && !host.contains('/')),
+    };
+    if !network
         || u.starts_with('-')
         || u.contains("::")
         || u.starts_with("ext:")
         || u.chars().any(|c| c.is_control())
     {
-        bail!("{u:?} is not a URL that paddock pushes to");
+        bail!(
+            "{:?} is not a URL that paddock pushes to (a new remote must be a network URL)",
+            redact(u)
+        );
     }
     Ok(())
 }
@@ -477,14 +531,14 @@ pub fn plan(
     let mut notes = Vec::new();
     let (url, known) = match repo.find(name) {
         Some(r) => {
-            let target = r.push_target().to_string();
-            if sandbox_url != r.url && sandbox_url != target && sandbox_url != name {
+            let raw = r.push_target();
+            if sandbox_url != r.url && sandbox_url != raw && sandbox_url != name {
                 notes.push(format!(
                     "the sandbox changed this remote's URL to {}; paddock pushes to the original URL",
-                    clean(sandbox_url)
+                    clean(&redact(sandbox_url))
                 ));
             }
-            (target, true)
+            (repo.absolute(raw), true)
         }
         None => {
             valid_new_url(sandbox_url)?;
@@ -590,7 +644,7 @@ pub fn plan(
         });
     }
     Ok(PushPlan {
-        remote: clean(name),
+        remote: clean(&redact(name)),
         url,
         known,
         notes,
@@ -912,7 +966,11 @@ mod tests {
         let p = plan(
             Some(&repo),
             &run,
-            &args("sneaky", url, one("refs/heads/x", false)),
+            &args(
+                "sneaky",
+                "https://example.com/other.git",
+                one("refs/heads/x", false),
+            ),
         )
         .unwrap();
         assert!(!p.known && !p.session_allowed());
@@ -936,5 +994,114 @@ mod tests {
             &args("x", "ext::sh -c evil", one("refs/heads/x", false))
         )
         .is_err());
+    }
+
+    #[test]
+    fn push_urls_lose_their_credentials_on_the_card_and_in_the_logs() {
+        assert_eq!(
+            redact("https://user:ghp_secret@github.com/a/b.git"),
+            "https://***@github.com/a/b.git"
+        );
+        assert_eq!(
+            redact("https://ghp_secret@github.com/a/b.git"),
+            "https://***@github.com/a/b.git"
+        );
+        assert_eq!(
+            redact("ssh://git:pw@host/a/b.git"),
+            "ssh://git:***@host/a/b.git"
+        );
+        assert_eq!(redact("ssh://git@host/a.git"), "ssh://git@host/a.git");
+        assert_eq!(redact("git@host:a/b.git"), "git@host:a/b.git");
+        let tmp = tempfile::tempdir().unwrap();
+        let (work, remote) = project(tmp.path());
+        let repo = Repo::snapshot(&work).unwrap();
+        let sha = sh(&work, &["rev-parse", "HEAD"]);
+        let run = tmp.path().join("run");
+        let one = serde_json::json!([{ "sha": sha, "dst": "refs/heads/x" }]);
+        let url = "https://user:ghp_secret@example.com/a/b.git";
+        // The URL as the remote name, as `git push URL` sends it.
+        let p = plan(Some(&repo), &run, &args(url, url, one.clone())).unwrap();
+        assert_eq!(p.url, url, "the push itself keeps the credentials");
+        for text in [p.summary(), p.detail()] {
+            assert!(!text.contains("ghp_secret"), "{text}");
+        }
+        // A changed URL of a known remote, in the note.
+        let p = plan(Some(&repo), &run, &args("origin", url, one.clone())).unwrap();
+        assert_eq!(p.url, remote.to_str().unwrap());
+        assert!(!p.detail().contains("ghp_secret"), "{}", p.detail());
+        let e = plan(
+            Some(&repo),
+            &run,
+            &args("x", "ext::https://u:ghp_secret@x/", one),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(!e.contains("ghp_secret"), "{e}");
+    }
+
+    #[test]
+    fn a_relative_remote_path_is_read_from_the_work_tree() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (work, remote) = project(tmp.path());
+        sh(&work, &["remote", "set-url", "origin", "../remote.git"]);
+        let repo = Repo::snapshot(&work).unwrap();
+        let sha = sh(&work, &["rev-parse", "HEAD"]);
+        let a = args(
+            "origin",
+            "../remote.git",
+            serde_json::json!([{ "sha": sha, "dst": "refs/heads/rel" }]),
+        );
+        let p = plan(Some(&repo), &tmp.path().join("run"), &a).unwrap();
+        assert!(p.notes.is_empty(), "{:?}", p.notes);
+        let r = push(&p).unwrap();
+        assert_eq!(r["refs"][0]["ok"], true, "{r}");
+        assert_eq!(sh(&remote, &["rev-parse", "refs/heads/rel"]), sha);
+    }
+
+    #[test]
+    fn a_new_remote_on_this_machine_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (work, _) = project(tmp.path());
+        let repo = Repo::snapshot(&work).unwrap();
+        let sha = sh(&work, &["rev-parse", "HEAD"]);
+        let run = tmp.path().join("run");
+        // The sandbox can write the project: a bare repository there with a
+        // hook would run that hook on the host when the host pushes to it.
+        let evil = work.join("evil.git");
+        sh(
+            tmp.path(),
+            &["init", "-q", "--bare", evil.to_str().unwrap()],
+        );
+        let hook = evil.join("hooks/pre-receive");
+        std::fs::write(&hook, "#!/bin/sh\ntouch ../RAN\n").unwrap();
+        std::fs::set_permissions(&hook, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
+        let one = serde_json::json!([{ "sha": sha, "dst": "refs/heads/x" }]);
+        let path = evil.to_str().unwrap().to_string();
+        for url in [
+            path.clone(),
+            format!("file://{path}"),
+            "evil.git".to_string(),
+            "../evil.git".to_string(),
+            "./evil.git".to_string(),
+            "~/evil.git".to_string(),
+            "file:///srv/x.git".to_string(),
+        ] {
+            assert!(
+                plan(Some(&repo), &run, &args("evil", &url, one.clone())).is_err(),
+                "{url}"
+            );
+        }
+        assert!(!work.join("RAN").exists());
+        for url in [
+            "https://example.com/a/b.git",
+            "ssh://git@example.com/a/b.git",
+            "git@example.com:a/b.git",
+        ] {
+            assert!(
+                plan(Some(&repo), &run, &args("ok", url, one.clone())).is_ok(),
+                "{url}"
+            );
+        }
     }
 }

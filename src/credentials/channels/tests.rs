@@ -53,7 +53,7 @@ fn channels(env: &HostEnv, yes: bool) -> (Channels, Arc<AtomicUsize>) {
         crate::credentials::revoked_file(env, "sb-1"),
         Arc::new(move |_: &str, _: &str| {
             a.fetch_add(1, Ordering::SeqCst);
-            yes
+            Some(yes)
         }),
     );
     (ch, asked)
@@ -208,8 +208,32 @@ fn a_denied_card_and_a_missing_login_give_nothing() {
         .handle(&args(&[("kind", "docker"), ("server", "ghcr.io")]))
         .unwrap_err();
     assert_eq!(s, Status::Denied);
-    // A denial is not remembered: the next use asks again.
-    let _ = ch.handle(&args(&[("kind", "docker"), ("server", "ghcr.io")]));
+    // A denial holds for the run: no new card until a Yes.
+    let (s, _) = ch
+        .handle(&args(&[("kind", "docker"), ("server", "ghcr.io")]))
+        .unwrap_err();
+    assert_eq!(s, Status::Denied);
+    assert_eq!(asked.load(Ordering::SeqCst), 1);
+    // A card without an answer is not remembered: the next use asks again.
+    let asked = Arc::new(AtomicUsize::new(0));
+    let a = asked.clone();
+    let creds: Vec<(String, Credential)> = crate::credentials::load(&env)
+        .unwrap()
+        .into_iter()
+        .collect();
+    let ch = Channels::new(
+        env.clone(),
+        spec(&env),
+        creds,
+        crate::credentials::revoked_file(&env, "sb-1"),
+        Arc::new(move |_: &str, _: &str| {
+            a.fetch_add(1, Ordering::SeqCst);
+            None
+        }),
+    );
+    for _ in 0..2 {
+        let _ = ch.handle(&args(&[("kind", "docker"), ("server", "ghcr.io")]));
+    }
     assert_eq!(asked.load(Ordering::SeqCst), 2);
     // The store has no login: a failure, with no value.
     std::fs::write(
@@ -420,4 +444,29 @@ fn the_sandbox_gets_an_aws_configuration_without_keys() {
     // The plan names them on the start card; aws is not on this PATH.
     let p = crate::credentials::plan(&env, "claude", false).unwrap();
     assert!(p.deliver.is_empty() || env.which("aws").is_some());
+}
+
+#[test]
+fn a_process_left_behind_does_not_hang_a_tool() {
+    let t = tempfile::tempdir().unwrap();
+    let exe = t.path().join("tool");
+    std::fs::write(&exe, "#!/bin/sh\necho out\nsleep 30 &\n").unwrap();
+    std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let start = std::time::Instant::now();
+    let e = run_tool(&exe, &["get"], b"", &[]).unwrap_err();
+    assert!(format!("{e:#}").contains("left its output open"), "{e:#}");
+    assert!(start.elapsed() < Duration::from_secs(10));
+}
+
+#[test]
+fn the_aws_cards_do_not_promise_the_duration_for_sso() {
+    let all = parse(AWS).unwrap();
+    let (name, c) = all.iter().next().unwrap();
+    let text = format!(
+        "{} {}",
+        crate::credentials::describe(name, c),
+        aws_lifetime(c.aws_duration())
+    );
+    assert!(!text.contains("end after"), "{text}");
+    assert!(text.contains("single sign-on"), "{text}");
 }
