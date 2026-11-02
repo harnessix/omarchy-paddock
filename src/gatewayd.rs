@@ -165,6 +165,9 @@ fn run(
                     .map(|s| s.to_string())
                     .collect(),
                 remember_allowed: false,
+                // Credential helpers and gh reach the keyring over the
+                // session bus.
+                hide: Vec::new(),
             };
             let unit = format!(
                 "paddock-push-{}",
@@ -213,6 +216,9 @@ fn run(
                 ro_paths: Vec::new(),
                 env: crate::broker::forge::forge_env(name),
                 remember_allowed: false,
+                // Credential helpers and gh reach the keyring over the
+                // session bus.
+                hide: Vec::new(),
             };
             let mut vars = cfg.pass_env(&job.env);
             vars.extend(crate::broker::forge::forge_vars());
@@ -301,6 +307,8 @@ fn desktop_cfg(job: &Job, workdir: &Path) -> crate::execbox::ExecCfg {
         ro_paths: ro.into_iter().filter(|p| p.exists()).collect(),
         env: DESKTOP_ENV.iter().map(|s| s.to_string()).collect(),
         remember_allowed: false,
+        // Only the Wayland and compositor sockets, bound above.
+        hide: crate::execbox::session_dirs(),
     }
 }
 

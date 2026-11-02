@@ -3,7 +3,8 @@
 //! The executor (`paddock gatewayd`) never runs a command with the whole
 //! host. By default the command sees the system read-only, the project
 //! read-write, an empty home and its own `/tmp`. It can use the network,
-//! but it cannot gain privileges or create namespaces. Only a few host
+//! but it cannot gain privileges, create namespaces or reach the user's
+//! systemd manager and session bus. Only a few host
 //! variables pass. `[exec]` in the user configuration widens this:
 //!
 //! ```toml
@@ -58,6 +59,24 @@ pub struct ExecCfg {
     /// log, for `paddock tools suggest`. Off by default: arguments can hold
     /// private text that no filter finds.
     pub remember_allowed: bool,
+    /// Folders the command cannot see: by default the user's runtime
+    /// folders, with the user manager, the session bus and agent sockets,
+    /// where `systemd-run --user` would start a command outside every
+    /// limit. Not part of `[exec]`.
+    pub hide: Vec<PathBuf>,
+}
+
+/// The user's runtime folders on this host: `/run/user` and
+/// `$XDG_RUNTIME_DIR` where it is elsewhere.
+pub fn session_dirs() -> Vec<PathBuf> {
+    let mut v = vec![PathBuf::from("/run/user")];
+    if let Some(rt) = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from) {
+        if rt.is_absolute() && !rt.starts_with("/run/user") {
+            v.push(rt);
+        }
+    }
+    v.retain(|p| p.is_dir());
+    v
 }
 
 impl Default for ExecCfg {
@@ -69,6 +88,7 @@ impl Default for ExecCfg {
             ro_paths: Vec::new(),
             env: Vec::new(),
             remember_allowed: false,
+            hide: session_dirs(),
         }
     }
 }
@@ -204,7 +224,14 @@ fn bwrap_starts(bwrap: &Path) -> bool {
     let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
     *seen.entry(bwrap.to_path_buf()).or_insert_with(|| {
         Command::new(bwrap)
-            .args(["--unshare-user", "--ro-bind", "/", "/", "true"])
+            .args([
+                "--unshare-user",
+                "--disable-userns",
+                "--ro-bind",
+                "/",
+                "/",
+                "true",
+            ])
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
@@ -264,6 +291,9 @@ pub fn command_in(
                 format!("RuntimeMaxSec={}", timeout + 5),
                 format!("WorkingDirectory={}", s(cwd)),
             ];
+            for d in &cfg.hide {
+                p.push(format!("TemporaryFileSystem={}", s(d)));
+            }
             match cfg.home {
                 Home::Hidden => p.push("ProtectHome=tmpfs".into()),
                 Home::ReadOnly => p.push("ProtectHome=read-only".into()),
@@ -305,6 +335,8 @@ pub fn command_in(
                 "--new-session",
                 "--unshare-pid",
                 "--unshare-ipc",
+                "--unshare-user",
+                "--disable-userns",
             ]);
             c.args([
                 "--ro-bind",
@@ -317,6 +349,9 @@ pub fn command_in(
                 "--tmpfs",
                 "/tmp",
             ]);
+            for d in &cfg.hide {
+                c.args(["--tmpfs", &s(d)]);
+            }
             match cfg.home {
                 Home::Hidden => {
                     c.args(["--tmpfs", &s(home)]);
@@ -467,6 +502,51 @@ mod tests {
             assert!(args.iter().any(|a| a == want), "{want} missing: {args:?}");
         }
         assert_eq!(&args[args.len() - 3..], ["--", "make", "test"]);
+    }
+
+    fn args_of(c: &Command) -> Vec<String> {
+        c.get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    #[test]
+    fn the_user_session_is_out_of_reach() {
+        let cfg = ExecCfg {
+            hide: vec![PathBuf::from("/run/user")],
+            ..ExecCfg::default()
+        };
+        let run = |how| {
+            args_of(&command(
+                how,
+                &cfg,
+                Path::new("/home/demo"),
+                Path::new("/run/user/1000/paddock/proj"),
+                &["make".into()],
+                &BTreeMap::new(),
+                60,
+                "paddock-exec-x",
+            ))
+        };
+        let a = run(Isolation::Systemd);
+        assert!(
+            a.iter().any(|a| a == "TemporaryFileSystem=/run/user"),
+            "{a:?}"
+        );
+        let a = run(Isolation::Bwrap);
+        assert!(a.iter().any(|a| a == "--disable-userns"), "{a:?}");
+        let tmpfs = a.windows(2).position(|w| w == ["--tmpfs", "/run/user"]);
+        let bind = a.iter().position(|a| a == "/run/user/1000/paddock/proj");
+        assert!(
+            tmpfs.is_some() && tmpfs < bind,
+            "the project must be bound over the hidden folder: {a:?}"
+        );
+        // A user whose runtime folder exists hides it by default.
+        if Path::new("/run/user").is_dir() {
+            assert!(ExecCfg::default()
+                .hide
+                .contains(&PathBuf::from("/run/user")));
+        }
     }
 
     /// The real systemd unit, where this host has a systemd user instance:
