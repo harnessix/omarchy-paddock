@@ -6,7 +6,7 @@ use crate::env::HostEnv;
 use crate::gui::{self, WindowCompositor};
 use crate::manifest::hex;
 use crate::spec::{GuiMode, SandboxSpec};
-use crate::state::{self, AuthSync, Running};
+use crate::state::{self, AuthSync, Running, SyncStep};
 use anyhow::{bail, Context, Result};
 use sha2::{Digest, Sha256};
 use std::io::{IsTerminal, Read};
@@ -997,6 +997,7 @@ pub fn run(
         });
 
     let live = HistorySync::start(history, HISTORY_EVERY);
+    let login_sync = LoginSync::start(auth, quiet);
 
     // The child owns the terminal. Ctrl-C reaches it directly; paddock waits.
     let old_int = unsafe { libc::signal(libc::SIGINT, libc::SIG_IGN) };
@@ -1030,6 +1031,7 @@ pub fn run(
         );
     }
     let (history, copied) = live.finish();
+    let auth = login_sync.finish();
     let synced = auth.copy_out()?;
     match history.as_ref().map(|h| h.copy_out()).unwrap_or(Ok(vec![])) {
         Ok(files) if copied + files.len() > 0 => log::info!(
@@ -1323,6 +1325,60 @@ fn provision(
         .status()
         .with_context(|| format!("cannot start {}", l.program.display()))?;
     Ok(status.success())
+}
+
+/// How often a running sandbox and the host bring its login files in line.
+const LOGIN_EVERY: Duration = Duration::from_secs(2);
+
+/// Keeps the login files of a running sandbox and the host in line, both
+/// ways (`AuthSync::sync_now`), so a refreshed token reaches the host and
+/// every other sandbox on the same login within seconds, not at the end.
+struct LoginSync {
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    thread: Option<std::thread::JoinHandle<AuthSync>>,
+}
+
+impl LoginSync {
+    fn start(mut auth: AuthSync, quiet: bool) -> Self {
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let s = stop.clone();
+        let thread = std::thread::spawn(move || {
+            while !s.load(std::sync::atomic::Ordering::SeqCst) {
+                for step in auth.sync_now() {
+                    match step {
+                        SyncStep::ToStore(f) if !quiet => {
+                            log::info!("saved a refreshed login to {}", f.display())
+                        }
+                        SyncStep::ToSandbox(f) if !quiet => {
+                            log::info!("the sandbox got the newer login of {}", f.display())
+                        }
+                        _ => {}
+                    }
+                }
+                let start = std::time::Instant::now();
+                while start.elapsed() < LOGIN_EVERY && !s.load(std::sync::atomic::Ordering::SeqCst)
+                {
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+            }
+            // One last look before the copy back at the end.
+            auth.sync_now();
+            auth
+        });
+        Self {
+            stop,
+            thread: Some(thread),
+        }
+    }
+
+    fn finish(mut self) -> AuthSync {
+        self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        self.thread
+            .take()
+            .expect("started")
+            .join()
+            .expect("login sync thread")
+    }
 }
 
 /// History copied to the host while the sandbox runs, so the Omarchy agents

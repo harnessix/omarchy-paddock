@@ -309,6 +309,8 @@ struct AuthItem {
     stored: PathBuf,
     /// Relative to the sandbox home, which the sandbox can write.
     rel: PathBuf,
+    /// The hashes of the sandbox copy and of the store at the last sync
+    /// (at the start, then after each `sync_now`).
     inside_at_start: Option<String>,
     stored_at_start: Option<String>,
     /// A login that a keeper keeps (keeper.rs): the sandbox got it without
@@ -318,6 +320,12 @@ struct AuthItem {
 
 /// Credentials are copied, not bind-mounted: harnesses replace token files
 /// with a rename, which a single-file bind mount does not survive.
+///
+/// While the sandbox runs, `sync_now` keeps the copy and the store the same
+/// in both directions. Many OAuth logins rotate their refresh token: the
+/// old one stops working at the first refresh. A copy that went back only
+/// at the end left the store, and every sandbox that started meanwhile,
+/// with a dead token.
 ///
 /// The sandbox home is sandbox-controlled: every access to it goes through
 /// `safefs`, so a symlink planted there is never followed by the host.
@@ -372,8 +380,58 @@ fn inside_hash(root: &crate::safefs::Root, rel: &Path) -> Result<Option<String>>
 
 pub struct SyncResult {
     pub saved: Vec<PathBuf>,
-    /// Files that changed in the store while the sandbox ran. The store wins.
+    /// Files that changed in the store while the sandbox ran, where the
+    /// sandbox copy is not newer. The store wins.
     pub conflicts: Vec<PathBuf>,
+}
+
+/// One step of `sync_now`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SyncStep {
+    /// The sandbox copy went to the store.
+    ToStore(PathBuf),
+    /// The store went into the sandbox.
+    ToSandbox(PathBuf),
+}
+
+/// When a login expires, from the file itself: the latest number or
+/// RFC 3339 time under a key such as `expiresAt`, `expires_at`, `expiry`
+/// or `exp`, anywhere in a JSON file. Seconds; milliseconds are converted.
+/// None when the file says nothing, or is not JSON.
+pub fn login_expiry(bytes: &[u8]) -> Option<u64> {
+    fn walk(v: &serde_json::Value, key: Option<&str>, best: &mut Option<u64>) {
+        match v {
+            serde_json::Value::Object(m) => {
+                for (k, v) in m {
+                    walk(v, Some(k), best);
+                }
+            }
+            serde_json::Value::Array(a) => a.iter().for_each(|v| walk(v, key, best)),
+            _ => {
+                let Some(k) = key.map(|k| k.to_ascii_lowercase().replace(['_', '-'], "")) else {
+                    return;
+                };
+                if !(k.starts_with("expire") || k == "exp" || k == "expiry") {
+                    return;
+                }
+                let t = match v {
+                    serde_json::Value::Number(n) => n.as_u64(),
+                    serde_json::Value::String(s) => {
+                        crate::forage::parse_time(s).or_else(|| s.parse::<u64>().ok())
+                    }
+                    _ => None,
+                };
+                // Milliseconds since 1970 are above 1e12.
+                if let Some(t) = t.map(|t| if t > 1_000_000_000_000 { t / 1000 } else { t }) {
+                    *best = Some(best.map_or(t, |b| b.max(t)));
+                }
+            }
+        }
+    }
+    let v: serde_json::Value = serde_json::from_slice(bytes).ok()?;
+    let mut best = None;
+    walk(&v, None, &mut best);
+    best
 }
 
 impl AuthSync {
@@ -471,6 +529,68 @@ impl AuthSync {
             .collect()
     }
 
+    /// Bring the sandbox copies and the store into line, while the sandbox
+    /// runs. A side that changed since the last sync goes to the other one.
+    /// When both changed, the one that expires later wins; when neither file
+    /// says when it expires, nothing moves and the end of the run decides.
+    /// A file that a side removed is never removed on the other side. Logins
+    /// that a keeper keeps are left to the keeper.
+    pub fn sync_now(&mut self) -> Vec<SyncStep> {
+        let mut steps = Vec::new();
+        let Ok(home) = crate::safefs::Root::open(&self.home) else {
+            return steps;
+        };
+        for it in self.items.iter_mut().filter(|i| !i.kept) {
+            let inside = match home.read(&it.rel, crate::safefs::MAX_READ) {
+                Ok(b) => b,
+                Err(e) => {
+                    log::debug!("login sync: {}: {e:#}", it.rel.display());
+                    continue;
+                }
+            };
+            let stored = it.store.read(&it.stored).ok().flatten();
+            let (Some(inside), Some(stored)) = (inside, stored) else {
+                continue;
+            };
+            let (hi, hs) = (
+                Some(hex(&Sha256::digest(&inside))),
+                Some(hex(&Sha256::digest(&stored))),
+            );
+            if hi == hs {
+                (it.inside_at_start, it.stored_at_start) = (hi, hs);
+                continue;
+            }
+            let inside_changed = hi != it.inside_at_start;
+            let store_changed = hs != it.stored_at_start;
+            let inside_wins = match (inside_changed, store_changed) {
+                (true, false) => true,
+                (false, true) => false,
+                (false, false) => continue,
+                (true, true) => match (login_expiry(&inside), login_expiry(&stored)) {
+                    (Some(a), Some(b)) if a != b => a > b,
+                    _ => continue,
+                },
+            };
+            let done = if inside_wins {
+                it.store
+                    .write(&it.stored, &inside)
+                    .map(|_| SyncStep::ToStore(it.stored.clone()))
+            } else {
+                home.write(&it.rel, &stored, 0o600)
+                    .map(|_| SyncStep::ToSandbox(it.stored.clone()))
+            };
+            match done {
+                Ok(step) => {
+                    let h = if inside_wins { hi } else { hs };
+                    (it.inside_at_start, it.stored_at_start) = (h.clone(), h);
+                    steps.push(step);
+                }
+                Err(e) => log::warn!("login sync: {}: {e:#}", it.rel.display()),
+            }
+        }
+        steps
+    }
+
     /// Copy back every credential that changed inside the sandbox, for example
     /// after a login or a token refresh. If the store changed too (the harness
     /// also runs on the host), the store keeps its version.
@@ -521,8 +641,16 @@ impl AuthSync {
                 continue;
             }
             if it.store.hash(&it.stored) != it.stored_at_start {
-                r.conflicts.push(it.stored.clone());
-                continue;
+                // Both changed: the copy wins only when it expires later.
+                let stored = it.store.read(&it.stored).ok().flatten().unwrap_or_default();
+                let newer = matches!(
+                    (login_expiry(&bytes), login_expiry(&stored)),
+                    (Some(a), Some(b)) if a > b
+                );
+                if !newer {
+                    r.conflicts.push(it.stored.clone());
+                    continue;
+                }
             }
             it.store.write(&it.stored, &bytes)?;
             r.saved.push(it.stored.clone());
@@ -1169,6 +1297,159 @@ mod auth_sync_tests {
         assert_eq!(std::fs::read_to_string(creds.join("a.json")).unwrap(), "a2");
         assert_eq!(std::fs::read_to_string(creds.join("b.json")).unwrap(), "b1");
         assert_eq!(std::fs::read_to_string(&secret).unwrap(), "PRIVATE KEY");
+    }
+
+    /// A login file as an OAuth harness writes it: a refresh token and when
+    /// the access token expires (milliseconds, like Claude Code).
+    fn login(rt: u32, expires_ms: u64) -> String {
+        serde_json::json!({"claudeAiOauth": {"refreshToken": format!("rt{rt}"), "expiresAt": expires_ms}})
+            .to_string()
+    }
+
+    fn rt_of(path: &Path) -> String {
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        v["claudeAiOauth"]["refreshToken"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    }
+
+    #[test]
+    fn login_expiry_reads_the_usual_fields() {
+        assert_eq!(
+            login_expiry(login(1, 1_800_000_000_000).as_bytes()),
+            Some(1_800_000_000)
+        );
+        assert_eq!(
+            login_expiry(br#"{"tokens":{"expires_at":1800000000}}"#),
+            Some(1_800_000_000)
+        );
+        assert_eq!(
+            login_expiry(br#"{"expiry":"2027-01-15T00:00:00Z"}"#),
+            crate::forage::parse_time("2027-01-15T00:00:00Z")
+        );
+        assert_eq!(login_expiry(br#"{"token":"x"}"#), None);
+        assert_eq!(login_expiry(b"not json"), None);
+    }
+
+    #[test]
+    fn a_running_sandbox_and_the_host_stay_in_line() {
+        let (_t, env, p, host_home, sb) = setup();
+        let host = host_home.join(".tool/token");
+        std::fs::write(&host, login(1, 1_000)).unwrap();
+        let mut a = AuthSync::copy_in(&env, &p, &AuthMode::Shared, &sb).unwrap();
+        // Nothing changed: nothing moves.
+        assert!(a.sync_now().is_empty());
+        // The harness refreshes inside: the host gets it at once.
+        std::fs::write(sb.join(".tool/token"), login(2, 2_000)).unwrap();
+        assert_eq!(a.sync_now(), vec![SyncStep::ToStore(host.clone())]);
+        assert_eq!(rt_of(&host), "rt2");
+        // Someone else (the host, another sandbox) refreshes: the sandbox gets it.
+        std::fs::write(&host, login(3, 3_000)).unwrap();
+        assert_eq!(a.sync_now(), vec![SyncStep::ToSandbox(host.clone())]);
+        assert_eq!(rt_of(&sb.join(".tool/token")), "rt3");
+        // Both changed: the one that expires later wins, either way.
+        std::fs::write(sb.join(".tool/token"), login(5, 5_000)).unwrap();
+        std::fs::write(&host, login(4, 4_000)).unwrap();
+        a.sync_now();
+        assert_eq!(
+            (rt_of(&host), rt_of(&sb.join(".tool/token"))),
+            ("rt5".into(), "rt5".into())
+        );
+        std::fs::write(sb.join(".tool/token"), login(6, 6_000)).unwrap();
+        std::fs::write(&host, login(7, 7_000)).unwrap();
+        a.sync_now();
+        assert_eq!(
+            (rt_of(&host), rt_of(&sb.join(".tool/token"))),
+            ("rt7".into(), "rt7".into())
+        );
+        // Both changed and neither says when it expires: nothing moves.
+        std::fs::write(sb.join(".tool/token"), "inside").unwrap();
+        std::fs::write(&host, "host").unwrap();
+        assert!(a.sync_now().is_empty());
+        // A side that is gone is never removed on the other side.
+        std::fs::remove_file(&host).unwrap();
+        assert!(a.sync_now().is_empty());
+        assert!(sb.join(".tool/token").exists());
+    }
+
+    /// The failure that this sync fixes: an OAuth server whose refresh
+    /// tokens work once, three sandboxes on one login that each refresh
+    /// once, and a fourth that starts later. Each harness refreshes with the
+    /// token in its file, as Claude Code does after it reads the file again.
+    #[test]
+    fn refresh_tokens_that_work_once_survive_several_sandboxes() {
+        let (t, env, p, host_home, _) = setup();
+        let host = host_home.join(".tool/token");
+        std::fs::write(&host, login(1, 1_000)).unwrap();
+        let mut valid = 1u32; // the one refresh token that the server accepts
+        let refresh = |file: &Path, valid: &mut u32| -> bool {
+            let rt: u32 = rt_of(file)[2..].parse().unwrap();
+            if rt != *valid {
+                return false; // the server refuses a used token: "log in again"
+            }
+            *valid += 1;
+            std::fs::write(file, login(*valid, 1_000 * u64::from(*valid))).unwrap();
+            true
+        };
+        let mut boxes: Vec<(PathBuf, AuthSync)> = Vec::new();
+        for i in 0..3 {
+            let sb = t.path().join(format!("sb{i}"));
+            std::fs::create_dir_all(&sb).unwrap();
+            let a = AuthSync::copy_in(&env, &p, &AuthMode::Shared, &sb).unwrap();
+            boxes.push((sb, a));
+        }
+        for i in 0..3 {
+            // Each sandbox refreshes in turn; the sync runs between them.
+            for (_, a) in boxes.iter_mut() {
+                a.sync_now();
+            }
+            for (_, a) in boxes.iter_mut() {
+                a.sync_now();
+            }
+            let file = boxes[i].0.join(".tool/token");
+            assert!(refresh(&file, &mut valid), "sandbox {i} got a used token");
+        }
+        for (_, a) in boxes.iter_mut() {
+            a.sync_now();
+        }
+        // A sandbox that starts now copies a token that still works.
+        let late = t.path().join("late");
+        std::fs::create_dir_all(&late).unwrap();
+        let mut l = AuthSync::copy_in(&env, &p, &AuthMode::Shared, &late).unwrap();
+        assert!(
+            refresh(&late.join(".tool/token"), &mut valid),
+            "the late sandbox got a used token"
+        );
+        l.sync_now();
+        // At the end nobody reports a conflict or overwrites the newest login.
+        for (_, a) in boxes.into_iter() {
+            let r = a.copy_out().unwrap();
+            assert!(r.conflicts.is_empty(), "{:?}", r.conflicts);
+        }
+        // The host holds the one token that the server accepts now.
+        assert_eq!(rt_of(&host), format!("rt{valid}"));
+    }
+
+    #[test]
+    fn copy_out_lets_a_newer_copy_win() {
+        let (_t, env, p, host_home, sb) = setup();
+        let host = host_home.join(".tool/token");
+        std::fs::write(&host, login(1, 1_000)).unwrap();
+        let a = AuthSync::copy_in(&env, &p, &AuthMode::Shared, &sb).unwrap();
+        std::fs::write(&host, login(2, 2_000)).unwrap();
+        std::fs::write(sb.join(".tool/token"), login(3, 3_000)).unwrap();
+        let r = a.copy_out().unwrap();
+        assert_eq!(r.saved, vec![host.clone()]);
+        assert_eq!(rt_of(&host), "rt3");
+        // An older copy still loses.
+        let b = AuthSync::copy_in(&env, &p, &AuthMode::Shared, &sb).unwrap();
+        std::fs::write(&host, login(5, 5_000)).unwrap();
+        std::fs::write(sb.join(".tool/token"), login(4, 4_000)).unwrap();
+        let r = b.copy_out().unwrap();
+        assert_eq!(r.conflicts, vec![host.clone()]);
+        assert_eq!(rt_of(&host), "rt5");
     }
 
     #[test]
