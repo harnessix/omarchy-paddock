@@ -941,6 +941,11 @@ pub fn check_with(
         argv_final.push(repo.form(t.repo_form));
     } else {
         let branch = branch.filter(|b| !b.is_empty() && !b.starts_with('-'));
+        // The sandbox names the branch: as an argument, a pull request URL
+        // or OWNER/REPO#N would pick another repository over --repo.
+        if let Some(b) = branch {
+            check_positional(b, &known, &pick)?;
+        }
         if positional == 0 && t.branch_default.contains(&cmd) {
             let b = branch.context("name the pull request: no current branch")?;
             out.insert(0, b.to_string());
@@ -1121,6 +1126,10 @@ mod tests {
         ]
     }
 
+    fn w(args: &[&str]) -> Vec<String> {
+        args.iter().map(|s| s.to_string()).collect()
+    }
+
     fn run(args: &[&str]) -> Result<Call> {
         let a: Vec<String> = args.iter().map(|s| s.to_string()).collect();
         check(&GH, &a, Some("fix-login"), &remotes())
@@ -1227,6 +1236,14 @@ mod tests {
         assert!(run(&["pr", "list", "--repo=other/app"]).is_err());
         assert!(run(&["pr", "list", "-Rother/app"]).is_err());
         assert!(run(&["pr", "view", "https://github.com/other/app/pull/1"]).is_err());
+        // The sandbox's branch goes into the arguments too.
+        for b in ["https://github.com/other/app/pull/1", "other/app#1"] {
+            assert!(
+                check(&GH, &w(&["pr", "view"]), Some(b), &remotes()).is_err(),
+                "{b}"
+            );
+        }
+        assert!(check(&GH, &w(&["pr", "view"]), Some("fix-login"), &remotes()).is_ok());
         assert!(run(&["issue", "view", "other/app#4"]).is_err());
         assert!(run(&["repo", "view", "other/app"]).is_err());
         let c = run(&["pr", "list", "-R", "demo/app"]).unwrap();
