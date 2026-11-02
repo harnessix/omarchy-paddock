@@ -422,6 +422,18 @@ enum Cmd {
     /// with the other homes, within a time limit. paddock starts this.
     #[command(hide = true)]
     DedupeHome { home: PathBuf },
+    /// After a bwrap sandbox ends: copy the verified new packages of the
+    /// project's cache layers into the shared layers. paddock starts this.
+    #[command(hide = true)]
+    PromoteCaches {
+        project: PathBuf,
+        /// The crates.io sparse index. Tests only: a local server.
+        #[arg(long)]
+        crates_index: Option<String>,
+        /// The Go checksum database. Tests only: a local server.
+        #[arg(long)]
+        sumdb: Option<String>,
+    },
     /// Update the launcher entries, the Omarchy menu and the shell shims to
     /// the harnesses installed now. Only the parts that are turned on.
     Refresh {
@@ -2360,6 +2372,19 @@ fn real_main() -> Result<i32> {
             let r =
                 paddock::storage::dedupe::home(&env, &home, paddock::storage::dedupe::AFTER_RUN)?;
             log::info!("dedupe after the run: {r:?}");
+            Ok(0)
+        }
+        Cmd::PromoteCaches {
+            project,
+            crates_index,
+            sumdb,
+        } => {
+            paddock::storage::dedupe::be_idle();
+            let r =
+                paddock::storage::layers::promote::command(&env, &project, crates_index, sumdb)?;
+            for o in &r {
+                println!("{} {} {} {}", o.cache, o.package, o.version, o.result);
+            }
             Ok(0)
         }
         Cmd::Recover {

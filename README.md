@@ -1640,7 +1640,13 @@ pasta hides the host addresses that exist when the sandbox starts. If the host g
 
 Shared package caches connect the sandboxes of different projects. The shared mise installs are read-only in every project sandbox, and no project file runs while paddock writes them (see mise toolchains). The package caches (cargo, npm, pnpm, bun, yarn, uv, pip, go) are in layers. On the bwrap backend each cache is an overlay. The lower layer under `$XDG_CACHE_HOME/paddock/layers` is shared by all projects, is read-only in every sandbox, and only paddock writes it on the host. The upper layer under `$XDG_CACHE_HOME/paddock/projects` belongs to one project and takes all writes. A file that one project changes in its cache never reaches another project.
 
-The shared layer starts empty. Unpacked sources and build caches always stay in each project.
+After a bwrap sandbox ends, paddock checks the new downloads in the project's upper layer in the background, for at most two minutes. It copies a package into the shared layer only when its content matches a source that no project can change:
+
+- cargo: a `.crate` file from crates.io, against the `cksum` in the crates.io sparse index, fetched on the host.
+- npm: a file of `_cacache/content-v2`, against the sha512 or sha256 hash in its own path.
+- go: a module zip and its `go.mod`, against the `h1:` hashes of the checksum database `sum.golang.org`, fetched on the host.
+
+A file that fails the check, or that paddock cannot check (no network, another registry), stays in the project. paddock never replaces a file that is already in the shared layer. The audit log records each result with the cache, the package and the version, never the content. A small record in the paddock state keeps each checked package version, so paddock asks the index only once for it. pip, uv, pnpm, bun and yarn have no shared layer: their packages stay in each project. Unpacked sources and build caches always stay in each project.
 
 The docker, podman and srt backends have no overlay. They bind the project's own folder, read-write, so each project downloads its packages again. `[storage] layered_caches = false` does the same on the bwrap backend. No setting goes back to one writable cache for all projects.
 
