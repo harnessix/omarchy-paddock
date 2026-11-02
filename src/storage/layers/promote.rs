@@ -149,8 +149,10 @@ struct Candidate {
 }
 
 enum Check {
-    /// Crate from the crates.io index.
-    Crate,
+    /// Crate from the crates.io index, with every published split for this file.
+    Crate {
+        splits: Vec<(String, String)>,
+    },
     /// npm content: the algorithm and the hex digest from the path.
     Content(String, String),
     GoZip {
@@ -164,7 +166,7 @@ enum Check {
 impl Check {
     fn kind(&self) -> &'static str {
         match self {
-            Check::Crate => "crate",
+            Check::Crate { .. } => "crate",
             Check::Content(..) => "content",
             Check::GoZip { .. } => "zip",
             Check::GoMod { .. } => "mod",
@@ -312,6 +314,31 @@ fn promote_one(
     Ok(Some("promoted".into()))
 }
 
+fn crate_cksum(
+    package: &str,
+    version: &str,
+    sources: &Sources,
+    fetch: &dyn Fetch,
+    index_cache: &mut BTreeMap<String, Option<String>>,
+) -> Result<Option<String>> {
+    let url = format!(
+        "{}/{}",
+        sources.crates_index.trim_end_matches('/'),
+        index_path(package).context("not a crate name")?
+    );
+    let entry = match index_cache.get(&url) {
+        Some(e) => e.clone(),
+        None => {
+            let e = fetch
+                .get(&url)?
+                .map(|b| String::from_utf8_lossy(&b).into_owned());
+            index_cache.insert(url, e.clone());
+            e
+        }
+    };
+    Ok(entry.and_then(|e| index_cksum(&e, version)))
+}
+
 /// "ok", or why the content does not match. Network errors are errors, so
 /// they are not recorded and the next run tries again.
 fn verify(
@@ -323,27 +350,25 @@ fn verify(
     index_cache: &mut BTreeMap<String, Option<String>>,
 ) -> Result<String> {
     Ok(match &c.check {
-        Check::Crate => {
-            let url = format!(
-                "{}/{}",
-                sources.crates_index.trim_end_matches('/'),
-                index_path(&c.package).context("not a crate name")?
-            );
-            let entry = match index_cache.get(&url) {
-                Some(e) => e.clone(),
-                None => {
-                    let e = fetch
-                        .get(&url)?
-                        .map(|b| String::from_utf8_lossy(&b).into_owned());
-                    index_cache.insert(url, e.clone());
-                    e
-                }
+        Check::Crate { splits } => {
+            let this_ck = crate_cksum(&c.package, &c.version, sources, fetch, index_cache)?;
+            let Some(ck) = this_ck else {
+                return Ok("the crates.io index has no such version".into());
             };
-            match entry.and_then(|e| index_cksum(&e, &c.version)) {
-                Some(ck) if ck.eq_ignore_ascii_case(sha) => "ok".into(),
-                Some(_) => "the cksum of the crates.io index differs".into(),
-                None => "the crates.io index has no such version".into(),
+            if !ck.eq_ignore_ascii_case(sha) {
+                return Ok("the cksum of the crates.io index differs".into());
             }
+            for (pkg, ver) in splits {
+                if pkg == &c.package && ver == &c.version {
+                    continue;
+                }
+                if let Some(other_ck) = crate_cksum(pkg, ver, sources, fetch, index_cache)? {
+                    if !other_ck.eq_ignore_ascii_case(sha) {
+                        return Ok("another published split has a different cksum".into());
+                    }
+                }
+            }
+            "ok".into()
         }
         Check::Content(algo, hex) => {
             let got = match algo.as_str() {
@@ -429,13 +454,16 @@ fn candidates(cache: &'static str, root: &Root) -> Vec<Candidate> {
                     let Some(stem) = f.strip_suffix(".crate") else {
                         continue;
                     };
-                    for (package, version) in crate_splits(stem) {
+                    let splits = crate_splits(stem);
+                    for (package, version) in &splits {
                         out.push(Candidate {
                             cache,
                             rel: d.join(&f),
-                            package,
-                            version,
-                            check: Check::Crate,
+                            package: package.clone(),
+                            version: version.clone(),
+                            check: Check::Crate {
+                                splits: splits.clone(),
+                            },
                         });
                     }
                 }
@@ -1255,6 +1283,24 @@ mod tests {
         let r = run(&env, &proj, &src, &http(), later());
         let zip = lower(&env, "go-mod").join(v).join("v1.0.0.zip");
         assert!(!zip.exists(), "promoted a zip a strict reader rejects on CRC: {r:?}");
+    }
+
+    #[test]
+    fn an_ambiguous_crate_name_is_not_promoted_on_one_cksum() {
+        let t = tempfile::tempdir().unwrap();
+        let (env, proj) = project(t.path(), "cargo-registry");
+        let up = upper(&env, &proj, "cargo-registry");
+        let dir = "cache/index.crates.io-1949cf8c6b5b557f";
+        let body = b"one file, two names";
+        put(&up, &format!("{dir}/a-1-2.0.0.crate"), body);
+        let srv = serve(HashMap::from([
+            ("/1/a".to_string(), format!("{{\"name\":\"a\",\"vers\":\"1-2.0.0\",\"cksum\":\"{}\"}}\n", sha(body))),
+            ("/3/a/a-1".to_string(), format!("{{\"name\":\"a-1\",\"vers\":\"2.0.0\",\"cksum\":\"{}\"}}\n", sha(b"the other crate"))),
+        ]));
+        let src = Sources { crates_index: srv.base.clone(), sumdb: String::new() };
+        let r = run(&env, &proj, &src, &http(), later());
+        let placed = lower(&env, "cargo-registry").join(dir).join("a-1-2.0.0.crate");
+        assert!(!placed.exists(), "promoted a file whose other identity has a different cksum: {r:?}");
     }
 
     #[test]
