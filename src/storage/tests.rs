@@ -174,6 +174,7 @@ fn inventory(homes: Vec<Home>) -> Inventory {
         snapshots: vec![],
         tmpfs_caches: true,
         classes: vec![],
+        layers: vec![],
     }
 }
 
@@ -737,16 +738,44 @@ fn worktrees_with_commits_need_force_and_keep_their_branch() {
 }
 
 #[test]
+fn the_old_shared_package_caches_go_and_so_do_layers_of_gone_projects() {
+    let (t, env) = setup();
+    let shared = env.paddock_cache().join("shared");
+    std::fs::create_dir_all(shared.join("cargo-registry/registry")).unwrap();
+    std::fs::create_dir_all(shared.join("npm")).unwrap();
+    std::fs::create_dir_all(shared.join("mise-tools")).unwrap();
+    assert!(check_removable(&env, &shared.join("npm")).is_ok());
+    assert!(check_removable(&env, &shared.join("mise-tools")).is_err());
+    let gone = t.path().join("gone");
+    std::fs::create_dir_all(&gone).unwrap();
+    layers::mount_with(&env, &gone, "npm", "/h/.npm".into(), "t", true).unwrap();
+    std::fs::remove_dir(&gone).unwrap();
+
+    let c = FakeContainers::default();
+    let h = host(&c, &[]);
+    let inv = scan(&env, &h, false);
+    assert_eq!(inv.old_caches.len(), 2);
+    let items = plan(&inv, &opts(), state::now());
+    let l = find(&items, "cache layers").expect("the layers of a gone project go");
+    assert_eq!(l.tier, Tier::Auto);
+    let r = render_du(&env, &inv, state::now());
+    assert!(r.contains("Shared cache layer:"), "{r}");
+    assert!(r.contains("Project cache layers:"), "{r}");
+    apply(&env, &c, &items);
+    assert!(!shared.join("npm").exists());
+    assert!(!layers::project_dir(&env, &gone).exists());
+    assert!(layers::lower(&env, "npm").is_dir());
+}
+
+#[test]
 fn the_old_mise_cache_goes_unless_a_sandbox_runs() {
     let (_t, env) = setup();
     let shared = env.paddock_cache().join("shared");
     let old = shared.join("mise-installs");
     std::fs::create_dir_all(old.join("jq/1.7.1")).unwrap();
-    std::fs::create_dir_all(shared.join("cargo-registry")).unwrap();
     std::fs::create_dir_all(shared.join("mise-tools")).unwrap();
     // Only the exact old folder: never another shared cache.
     assert!(check_removable(&env, &old).is_ok());
-    assert!(check_removable(&env, &shared.join("cargo-registry")).is_err());
     assert!(check_removable(&env, &shared.join("mise-tools")).is_err());
     assert!(check_removable(&env, &old.join("jq")).is_err());
 
@@ -761,7 +790,7 @@ fn the_old_mise_cache_goes_unless_a_sandbox_runs() {
     assert!(find(&items, "old cache").unwrap().selected());
     apply(&env, &c, &items);
     assert!(!old.exists());
-    assert!(shared.join("cargo-registry").exists());
+    assert!(shared.join("mise-tools").exists());
     assert!(shared.join("mise-tools").exists());
 }
 

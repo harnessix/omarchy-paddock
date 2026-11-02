@@ -23,6 +23,7 @@ use std::process::{Command, Stdio};
 
 pub mod caches;
 pub mod dedupe;
+pub mod layers;
 
 pub const ORIGIN_FILE: &str = ".paddock-origin";
 const ORIGIN_VERSION: u32 = 1;
@@ -34,7 +35,21 @@ pub const SESSION_DAYS: u64 = 30;
 pub const DEFAULT_OLDER_THAN: u64 = 90;
 /// Folders under `$XDG_CACHE_HOME/paddock/shared` that paddock no longer
 /// mounts, with the folder that replaced each.
-const OLD_CACHES: &[(&str, &str)] = &[("mise-installs", "mise-tools")];
+/// The package caches here were writable by every sandbox, so their content
+/// is not trusted: the layers start empty.
+const OLD_CACHES: &[(&str, &str)] = &[
+    ("mise-installs", "mise-tools"),
+    ("cargo-registry", "layers/cargo-registry"),
+    ("cargo-git", "layers/cargo-git"),
+    ("npm", "layers/npm"),
+    ("pnpm-store", "layers/pnpm-store"),
+    ("bun", "layers/bun"),
+    ("yarn", "layers/yarn"),
+    ("uv", "layers/uv"),
+    ("pip", "layers/pip"),
+    ("go-mod", "layers/go-mod"),
+    ("go-build", "layers/go-build"),
+];
 
 /// Where a home came from, written by paddock at each start. The sandbox can
 /// rewrite it, so it is a hint only.
@@ -267,6 +282,8 @@ pub struct Inventory {
     pub tmpfs_caches: bool,
     /// The bytes of each cache class, when measured.
     pub classes: Vec<ClassUse>,
+    /// The shared cache layers and the layers of each project.
+    pub layers: Vec<layers::Layer>,
 }
 
 /// A project snapshot, or a folder of the undo trash (`trash`).
@@ -645,6 +662,7 @@ pub fn removable_roots(env: &HostEnv) -> Vec<PathBuf> {
         crate::borrow::meta_root(env),
         crate::snapshot::root(env),
         crate::snapshot::trash_root(env),
+        layers::projects_root(env),
     ]
 }
 
@@ -1293,6 +1311,7 @@ pub fn scan(env: &HostEnv, host: &Host, with_sizes: bool) -> Inventory {
         snapshots: scan_snapshots(env),
         tmpfs_caches: caches::enabled(env),
         classes: vec![],
+        layers: layers::scan(env),
     };
     if with_sizes {
         measure(&mut inv, |_| true);
@@ -1318,7 +1337,7 @@ fn class_use(env: &HostEnv, homes: &[Home]) -> Vec<ClassUse> {
             ".cache/uv" => "uv",
             _ => continue,
         };
-        let p = shared_cache(env).join(name);
+        let p = layers::lower(env, name);
         if std::fs::symlink_metadata(&p).is_ok_and(|m| m.is_dir()) {
             paths.push((*c, p));
         }
@@ -1356,6 +1375,7 @@ fn measure(inv: &mut Inventory, want: impl Fn(&Path) -> bool) {
         .map(|h| &h.path)
         .chain(inv.worktrees.iter().map(|w| &w.path))
         .chain(inv.old_caches.iter().map(|c| &c.path))
+        .chain(inv.layers.iter().map(|c| &c.path))
         .chain(inv.scratch.iter().map(|c| &c.path))
         .filter(|p| want(p))
         .cloned()
@@ -1379,6 +1399,11 @@ fn measure(inv: &mut Inventory, want: impl Fn(&Path) -> bool) {
         }
     }
     for c in &mut inv.old_caches {
+        if let Some(b) = by.get(&c.path) {
+            c.bytes = *b;
+        }
+    }
+    for c in &mut inv.layers {
         if let Some(b) = by.get(&c.path) {
             c.bytes = *b;
         }
@@ -1481,6 +1506,24 @@ fn home_label(h: &Home) -> String {
 /// Decide what gc removes. Pure: everything comes from the inventory.
 pub fn plan(inv: &Inventory, o: &GcOptions, now: u64) -> Vec<Item> {
     let mut items = Vec::new();
+    for l in inv.layers.iter().filter(|l| l.orphan) {
+        let project = l
+            .project
+            .as_ref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "unknown".into());
+        items.push(Item {
+            what: format!("cache layers {}", l.path.display()),
+            tier: Tier::Auto,
+            bytes: l.bytes,
+            reason: format!("its project {project} no longer exists"),
+            warning: None,
+            needs: vec![],
+            action: Action::Path {
+                path: l.path.clone(),
+            },
+        });
+    }
     for c in &inv.old_caches {
         if inv.any_running {
             continue;
@@ -1807,6 +1850,7 @@ pub fn measure_plan(inv: &mut Inventory, items: &mut [Item]) {
         .iter()
         .map(|w| &w.path)
         .chain(inv.old_caches.iter().map(|c| &c.path))
+        .chain(inv.layers.iter().map(|c| &c.path))
         .chain(inv.scratch.iter().map(|c| &c.path))
         .collect();
     let want: BTreeSet<PathBuf> = listed
@@ -1839,6 +1883,7 @@ pub fn measure_plan(inv: &mut Inventory, items: &mut [Item]) {
         .map(|h| (&h.path, h.bytes))
         .chain(inv.worktrees.iter().map(|w| (&w.path, w.bytes)))
         .chain(inv.old_caches.iter().map(|c| (&c.path, c.bytes)))
+        .chain(inv.layers.iter().map(|c| (&c.path, c.bytes)))
         .chain(inv.scratch.iter().map(|c| (&c.path, c.bytes)))
         .collect();
     for i in items.iter_mut() {
@@ -2320,6 +2365,22 @@ pub fn render_du(env: &HostEnv, inv: &Inventory, now: u64) -> String {
         human(sb),
         inv.sessions.len()
     ));
+    for l in &inv.layers {
+        match &l.project {
+            None => t.push_str(&format!(
+                "Shared cache layer: {} in {}\n",
+                human(l.bytes),
+                tilde(&l.path)
+            )),
+            Some(p) => t.push_str(&format!(
+                "Project cache layers: {} in {} ({}{})\n",
+                human(l.bytes),
+                tilde(&l.path),
+                tilde(p),
+                if l.orphan { ", gone" } else { "" }
+            )),
+        }
+    }
     for c in &inv.old_caches {
         t.push_str(&format!(
             "Old cache: {} in {} (paddock uses {} now)\n",

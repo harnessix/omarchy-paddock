@@ -6,7 +6,7 @@
 use super::{base_env, identity_files, needs_pasta, Backend, Launch};
 use crate::env::HostEnv;
 use crate::spec::{
-    sandbox_runtime_dir, MountKind, Network, SandboxSpec, SANDBOX_WAYLAND, TOOL_DIR,
+    sandbox_runtime_dir, Mount, MountKind, Network, SandboxSpec, SANDBOX_WAYLAND, TOOL_DIR,
 };
 use anyhow::{bail, Context, Result};
 use std::path::{Path, PathBuf};
@@ -22,6 +22,23 @@ pub(crate) const ROOT_LINKS: &[&str] = &["/bin", "/sbin", "/lib", "/lib64", "/li
 
 fn arg(v: &mut Vec<String>, items: &[&str]) {
     v.extend(items.iter().map(|s| s.to_string()));
+}
+
+/// The bwrap arguments of an overlay mount: the lower folder read-only,
+/// writes into the upper folder. Without layers it is a read-write bind.
+pub fn overlay_args(m: &Mount) -> Vec<String> {
+    let upper = m.src.as_deref().unwrap_or(&m.dst);
+    match &m.layers {
+        Some(l) => vec![
+            "--overlay-src".into(),
+            p(&l.lower),
+            "--overlay".into(),
+            p(upper),
+            p(&l.work),
+            p(&m.dst),
+        ],
+        None => vec!["--bind".into(), p(upper), p(&m.dst)],
+    }
 }
 
 fn p(path: &Path) -> String {
@@ -171,6 +188,7 @@ impl Backend for Bwrap {
                 }
                 MountKind::Rw => a.extend(["--bind".into(), p(m.src.as_ref().unwrap()), p(&m.dst)]),
                 MountKind::Tmpfs => a.extend(["--tmpfs".into(), p(&m.dst)]),
+                MountKind::Overlay => a.extend(overlay_args(m)),
                 MountKind::MaskFile => a.extend(["--ro-bind".into(), p(&empty_f), p(&m.dst)]),
                 MountKind::MaskDir => {
                     a.extend([

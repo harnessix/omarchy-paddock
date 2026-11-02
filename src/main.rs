@@ -1304,6 +1304,7 @@ fn explain(env: &HostEnv, a: &RunArgs, json: bool) -> Result<()> {
         let kind = match m.kind {
             MountKind::Ro => "ro    ",
             MountKind::Rw => "rw    ",
+            MountKind::Overlay => "layers",
             MountKind::Tmpfs => "tmpfs ",
             MountKind::MaskFile | MountKind::MaskDir => "hidden",
         };

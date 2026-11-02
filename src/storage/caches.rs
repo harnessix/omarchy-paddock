@@ -5,8 +5,9 @@
 //!   the start are an empty tmpfs in the sandbox: they vanish at exit. Paths
 //!   with a `*` are only known after the app ran: `paddock gc` clears them in
 //!   its automatic tier.
-//! - Shared: package caches that check each entry themselves (npm, pip, uv).
-//!   The detectors mount one shared copy for every project (detect.rs).
+//! - Shared: package caches (npm, pip, uv). The detectors mount them in
+//!   layers: a shared read-only layer of verified packages under a layer of
+//!   the project (layers.rs).
 //! - Runtime: runtimes that a harness downloads into its home. They stay,
 //!   and `paddock gc --dedupe` shares their data between homes.
 //!
@@ -30,7 +31,7 @@ impl Class {
     pub fn label(self) -> &'static str {
         match self {
             Class::Scratch => "pure caches (tmpfs, or cleared by gc)",
-            Class::Shared => "package caches (one shared copy for all projects)",
+            Class::Shared => "package caches (in layers: shared, verified, and per project)",
             Class::Runtime => "runtimes (kept, gc --dedupe shares them)",
         }
     }
