@@ -171,3 +171,30 @@ fn the_view_commands_of_the_panel_parse() {
         assert!(err.contains("has no run log"), "{err}");
     }
 }
+
+/// A QML object with two functions of one name does not load: Qt reports
+/// "Duplicate method name" and the whole panel stays away. Checks the
+/// functions of each file's root object (two-space indent).
+#[test]
+fn no_qml_root_object_has_two_functions_of_one_name() {
+    for file in [
+        "plugin/Panel.qml",
+        "plugin/Service.qml",
+        "plugin/BarWidget.qml",
+    ] {
+        let mut seen = BTreeSet::new();
+        for line in read(file).lines() {
+            let Some(rest) = line.strip_prefix("  function ") else {
+                continue;
+            };
+            let name: String = rest
+                .chars()
+                .take_while(|c| c.is_alphanumeric() || *c == '_')
+                .collect();
+            assert!(
+                seen.insert(name.clone()),
+                "{file}: two functions named {name}"
+            );
+        }
+    }
+}
