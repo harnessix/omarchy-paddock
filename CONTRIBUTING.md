@@ -32,7 +32,7 @@ paddock is a security tool. Some changes let a sandbox reach more of the host: a
 
 ## Continuous integration
 
-GitHub Actions runs checks on every pull request and on each push to `main`. It runs `cargo fmt`, `cargo clippy` and the tests. It runs the escape probe on the bwrap backend without a display. It checks the plugin manifest. A leak guard fails the build if a file contains private notes, internal names, or home paths other than `/home/demo`, or if a commit email is not a noreply address. The scripts are in `.github/scripts/`. Every check must pass before review.
+GitHub Actions runs checks on every pull request and on each push to `main`. It runs `cargo fmt`, `cargo clippy` and the tests. It runs the escape probe on the bwrap backend without a display. It checks the plugin manifest. A changelog check requires a file in `changes/` when a pull request changes `src/`, `plugin/`, `profiles/` or `skills/`. The label `no-changelog` skips that requirement. The check rejects an edit of the `Unreleased` section unless the head branch starts with `release/` or the pull request has the label `release`. A leak guard fails the build if a file contains private notes, internal names, or home paths other than `/home/demo`, or if a commit email is not a noreply address. The scripts are in `.github/scripts/`. Every check must pass before review.
 
 ## The pull request
 
@@ -53,6 +53,14 @@ To report a bug, use the issue form. It asks for the output of `paddock doctor -
 
 A test that runs the paddock binary must give it temporary folders: `XDG_DATA_HOME` and `XDG_STATE_HOME` (and the other XDG folders), or a cleared environment with a temporary `HOME`. `tests/no_real_folders.rs` checks this. A build that runs with your own folders can write its own path into your launchers and shell commands. paddock refuses that when the home folder is your real one, but the test must not rely on it.
 
+## Changelog
+
+A pull request with a user-visible change adds one file `changes/SLUG.md`. SLUG is a short name in lower case with dashes. The branch name works. Each line starts with `- ` and one of `New:`, `Changed:`, `Fix:`, `Removed:` or `Security:`. A small note omits the prefix. The file `changes/README.md` gives the same rules in short.
+
+CI requires a new or changed file in `changes/` when the pull request changes `src/`, `plugin/`, `profiles/` or `skills/`. The label `no-changelog` skips that requirement. Do not edit the `## Unreleased` section of `CHANGELOG.md` in a feature pull request. A release pull request is one whose head branch starts with `release/`, or one with the label `release`. Only a release pull request edits that section.
+
+A release pull request runs `.github/scripts/changelog-assemble.sh` from the repository root. The script places the fragments at the top of `## Unreleased`, in prefix order, and deletes the fragment files. It does not create a tag or a GitHub release. Then rename the section `Unreleased` to the version.
+
 ## Releases
 
-A release PR changes the version in every place that names it: `Cargo.toml`, `Cargo.lock`, `manifest.json`, `pkgbuild/PKGBUILD`, `.github/ISSUE_TEMPLATE/bug_report.yml`, and the install commands in `README.md` and `skills/paddock/SKILL.md`. It also renames the CHANGELOG section "Unreleased" to the version. `tests/release_version.rs` fails when one place is left behind. After the merge, a maintainer pushes the tag `vX.Y.Z` on the merge commit, and `release.yml` builds the binary for it.
+A release PR changes the version in every place that names it: `Cargo.toml`, `Cargo.lock`, `manifest.json`, `pkgbuild/PKGBUILD`, `.github/ISSUE_TEMPLATE/bug_report.yml`, and the install commands in `README.md` and `skills/paddock/SKILL.md`. It follows the changelog steps above: assemble the fragments, then rename the CHANGELOG section "Unreleased" to the version. `tests/release_version.rs` fails when one place is left behind. After the merge, a maintainer pushes the tag `vX.Y.Z` on the merge commit, and `release.yml` builds the binary for it.

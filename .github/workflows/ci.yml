@@ -83,3 +83,19 @@ jobs:
           else
             .github/scripts/leak-guard.sh
           fi
+
+  changelog:
+    name: changelog fragments
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Check fragments
+        env:
+          CHANGELOG_LABELS: ${{ join(github.event.pull_request.labels.*.name, ',') }}
+          CHANGELOG_HEAD_REF: ${{ github.head_ref }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: .github/scripts/changelog-fragment.sh "$BASE_SHA" "$HEAD_SHA"
