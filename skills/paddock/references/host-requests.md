@@ -36,3 +36,5 @@ Before you add a harness there, ask the user and explain: the child uses the use
 | `[spawn] max_mem`, `max_cpus` | no limit; they need `systemd-run --user` |
 
 `paddock ps` shows children under their parent, and `paddock stop PARENT` stops them too.
+
+`paddock view ID` opens a terminal with a read-only live view of a sandbox without a terminal, such as a spawned child (`--write` lets you scroll and close it with keys, the agent never gets them). It needs tmux for a live session and shows the run log without it.

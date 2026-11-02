@@ -113,6 +113,14 @@ enum Cmd {
     },
     /// Stop a running sandbox.
     Stop { id: String },
+    /// Open a live view of a sandbox that runs without a terminal, in a new
+    /// terminal window. Read-only unless --write.
+    View {
+        id: String,
+        /// Attach with the keyboard: scroll the view, or close it.
+        #[arg(long)]
+        write: bool,
+    },
     /// Freeze a running sandbox: it uses no CPU and keeps its memory until
     /// you thaw it.
     Freeze {
@@ -2107,6 +2115,9 @@ fn real_main() -> Result<i32> {
             // Children follow their parent.
             let list = state::tree_order(Running::list(&env));
             if json {
+                let sessions = paddock::view::Tmux::find(&env)
+                    .map(|t| t.sessions())
+                    .unwrap_or_default();
                 let rows: Vec<serde_json::Value> = list
                     .iter()
                     .map(|r| {
@@ -2123,6 +2134,11 @@ fn real_main() -> Result<i32> {
                                 "timers".into(),
                                 serde_json::to_value(timers).unwrap_or_default(),
                             );
+                        }
+                        if let Some(o) = v.as_object_mut() {
+                            let (view, tmux) = paddock::view::available(&env, &sessions, &r.id);
+                            o.insert("view".into(), view.into());
+                            o.insert("view_tmux".into(), tmux.into());
                         }
                         if let Some(o) = v.as_object_mut() {
                             o.insert(
@@ -2577,6 +2593,10 @@ fn real_main() -> Result<i32> {
             let all = Running::list(&env);
             stop_one(&env, &all, &id)
         }
+        Cmd::View { id, write } => {
+            paddock::view::open(&env, &id, write)?;
+            Ok(0)
+        }
         Cmd::Doctor {
             escape,
             backend,
@@ -2970,6 +2990,7 @@ fn gc_cmd(env: &HostEnv, o: &paddock::storage::GcOptions, json: bool) -> Result<
     let mut items = storage::plan(&inv, o, state::now());
     storage::measure_plan(&mut inv, &mut items);
     items.extend(paddock::borrow::gc_items(env));
+    items.extend(paddock::view::gc_items(env, state::now()));
     match paddock::kv::gc_items(env, state::now()) {
         Ok(kv) => items.extend(kv),
         Err(e) => inv
@@ -3056,6 +3077,10 @@ fn stop_one(env: &HostEnv, all: &[Running], id: &str) -> Result<i32> {
     }
     unsafe { libc::kill(r.pid as i32, libc::SIGTERM) };
     println!("Sent SIGTERM to {id}.");
+    // The live views end with them.
+    for v in children.iter().map(|c| c.id.as_str()).chain([id]) {
+        paddock::view::end_session(env, v);
+    }
     if !children.is_empty() {
         println!(
             "Sent SIGTERM to the sandboxes it started: {}.",

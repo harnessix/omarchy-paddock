@@ -32,6 +32,7 @@ pub const USER_ONLY: &[&str] = &[
     "monitor",
     "storage",
     "snapshot",
+    "view",
 ];
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
