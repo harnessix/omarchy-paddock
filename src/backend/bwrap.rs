@@ -73,6 +73,13 @@ impl Backend for Bwrap {
                 ver.1
             );
         }
+        if spec.shadow.is_some() && ver < (0, 10) {
+            bail!(
+                "bubblewrap {}.{} is too old for --profile default: 0.10 or newer is needed for --overlay",
+                ver.0,
+                ver.1
+            );
+        }
         if needs_pasta(spec) && env.which("pasta").is_none() {
             bail!("network mode 'egress' needs pasta (package passt). Install it, or use --network none or --network host");
         }
@@ -180,7 +187,14 @@ impl Backend for Bwrap {
         }
 
         // The sandbox home, then everything else in parent-before-child order.
-        a.extend(["--bind".into(), p(&spec.home_src), p(&spec.home)]);
+        // In shadow mode the home is the overlay among the mounts.
+        if !spec
+            .mounts
+            .iter()
+            .any(|m| m.dst == spec.home && m.kind == MountKind::Overlay)
+        {
+            a.extend(["--bind".into(), p(&spec.home_src), p(&spec.home)]);
+        }
         for m in spec.ordered_mounts() {
             match m.kind {
                 MountKind::Ro => {

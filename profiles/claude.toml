@@ -13,6 +13,8 @@ yolo_args = ["--dangerously-skip-permissions"]
 env = { DISABLE_AUTOUPDATER = "1" }
 
 [state]
+# The host data that `--profile default` copies into a private snapshot.
+data = [".claude", ".claude.json"]
 # Holds the account token and the MCP OAuth tokens (mcpOAuth).
 auth = [".claude/.credentials.json"]
 auth_expiry = { ".claude/.credentials.json" = "claudeAiOauth.expiresAt" }

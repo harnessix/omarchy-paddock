@@ -331,6 +331,10 @@ pub struct SandboxSpec {
     pub generated: Vec<(PathBuf, PathBuf)>,
     /// Values written into settings files in the sandbox home before the start.
     pub home_settings: Vec<HomeSetting>,
+    /// `--profile default`: the home is an overlay on a private snapshot of
+    /// the harness's host data (shadow.rs). Only bwrap runs it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub shadow: Option<crate::shadow::Plan>,
 }
 
 impl SandboxSpec {
@@ -392,6 +396,7 @@ impl SandboxSpec {
             inherit_path: Vec::new(),
             generated: Vec::new(),
             home_settings: Vec::new(),
+            shadow: None,
         }
     }
 

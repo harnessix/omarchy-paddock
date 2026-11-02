@@ -241,6 +241,11 @@ pub struct State {
     /// without `*` is a tmpfs in the sandbox, and `paddock gc` clears them.
     #[serde(default)]
     pub scratch: Vec<String>,
+    /// The data roots of the harness, relative to HOME: the files and
+    /// folders that `--profile default` copies into a private snapshot
+    /// (shadow.rs). The `auth` files inside them stay out of the snapshot.
+    #[serde(default)]
+    pub data: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]

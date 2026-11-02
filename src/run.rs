@@ -633,6 +633,23 @@ pub fn run(
         harness: built.spec.harness.clone(),
         view: false,
     };
+    // `--profile default`: the private snapshot of the data roots, before
+    // anything else starts. The run folder goes when `run` returns.
+    let shadow = built.spec.shadow.clone().map(ShadowRun);
+    if let Some(ShadowRun(p)) = &shadow {
+        let copied = p.fill(&env.home, crate::shadow::copy_limit(env), None)?;
+        if !quiet {
+            eprintln!("paddock: {}", copied.line());
+            let host = crate::shadow::host_copies(&built.profile, &built.harness_exe);
+            if !host.is_empty() {
+                eprintln!(
+                    "paddock: {} runs on the host too (pid {}). The snapshot is private: nothing of this run goes back, and nothing of that one comes in",
+                    built.spec.harness,
+                    host.iter().map(u32::to_string).collect::<Vec<_>>().join(", ")
+                );
+            }
+        }
+    }
     // App mode: a restricted Wayland socket and a portal-only session bus,
     // both alive until the sandbox exits.
     let _app = if built.spec.gui.mode == GuiMode::App {
@@ -785,17 +802,44 @@ pub fn run(
     write_files(&launch)?;
 
     let spec = &built.spec;
-    state::seed(env, &built.profile, &built.auth, &spec.home_src)?;
-    state::toml_set(&built.profile, &spec.home_src, &spec.project)?;
-    state::json_import(
-        env,
-        &built.profile,
-        &built.auth,
-        &spec.home_src,
-        &spec.project,
-    )?;
-    for w in crate::privacy::write_settings(&spec.home_src, &spec.home_settings)? {
-        log::warn!("{w}");
+    if let Some(p) = &spec.shadow {
+        // The snapshot has the host data: no seed copies and no
+        // json_import. The files that paddock writes below start as the
+        // snapshot's copy.
+        let mut up: Vec<PathBuf> = built
+            .profile
+            .state
+            .toml_set
+            .iter()
+            .map(|t| PathBuf::from(&t.file))
+            .collect();
+        up.extend(spec.home_settings.iter().map(|h| h.file.clone()));
+        up.extend(built.profile.state.done_flags.keys().map(PathBuf::from));
+        for rel in up {
+            p.copy_up(&rel)
+                .with_context(|| format!("cannot prepare ~/{}", rel.display()))?;
+        }
+        // A large settings file of the snapshot does not stop the run.
+        if let Err(e) = state::toml_set(&built.profile, &spec.home_src, &spec.project) {
+            log::warn!("{e:#}");
+        }
+        match crate::privacy::write_settings(&spec.home_src, &spec.home_settings) {
+            Ok(w) => w.iter().for_each(|w| log::warn!("{w}")),
+            Err(e) => log::warn!("{e:#}"),
+        }
+    } else {
+        state::seed(env, &built.profile, &built.auth, &spec.home_src)?;
+        state::toml_set(&built.profile, &spec.home_src, &spec.project)?;
+        state::json_import(
+            env,
+            &built.profile,
+            &built.auth,
+            &spec.home_src,
+            &spec.project,
+        )?;
+        for w in crate::privacy::write_settings(&spec.home_src, &spec.home_settings)? {
+            log::warn!("{w}");
+        }
     }
     let auth = AuthSync::copy_in(env, &built.profile, &built.auth, &spec.home_src)?;
     // The keeper refreshes the logins that the sandbox got without their
@@ -866,6 +910,8 @@ pub fn run(
         }
     }
 
+    // What paddock itself put into the upper folder is not news at the end.
+    let shadow_base = spec.shadow.as_ref().map(|p| p.baseline());
     let mut cmd = Command::new(&launch.program);
     cmd.args(&launch.args).env_clear().envs(&launch.env);
     if capture {
@@ -1071,9 +1117,18 @@ pub fn run(
         }
     }
     // Kept after exit, so `paddock files` can list what the sandbox left.
-    if let Err(e) =
-        crate::recover::Session::begin(env, &spec.id, &spec.harness, &spec.project, &spec.home_src)
-    {
+    // A shadow run leaves nothing.
+    let session = match spec.shadow {
+        Some(_) => Ok(()),
+        None => crate::recover::Session::begin(
+            env,
+            &spec.id,
+            &spec.harness,
+            &spec.project,
+            &spec.home_src,
+        ),
+    };
+    if let Err(e) = session {
         if !quiet {
             log::warn!("cannot record the session for `paddock files`: {e:#}");
         }
@@ -1189,16 +1244,43 @@ pub fn run(
             }
         }
     }
-    // Share identical file data of this home with the other homes, in the
-    // background: the exit does not wait for it.
-    crate::storage::dedupe::spawn_after_run(env, &spec.home_src);
     // Copy the verified new packages of this project's cache layers into
-    // the shared layers, in the background too.
+    // the shared layers, in the background.
     crate::storage::layers::promote::spawn_after_run(env, spec, backend.name());
+    if let (Some(p), Some(base)) = (&spec.shadow, &shadow_base) {
+        if !quiet {
+            let skip: Vec<PathBuf> = spec
+                .mounts
+                .iter()
+                .filter_map(|m| m.dst.strip_prefix(&spec.home).ok())
+                .map(Path::to_path_buf)
+                .collect();
+            for l in p.summary(base, &skip).lines() {
+                eprintln!("paddock: {l}");
+            }
+        }
+        drop(shadow);
+        return Ok(Outcome { code, stdout: out });
+    }
+    // Share identical file data of this home with the other homes, in the
+    // background too: the exit does not wait for it.
+    crate::storage::dedupe::spawn_after_run(env, &spec.home_src);
     if !quiet {
         recovery_notice(env, &spec.id, &spec.home_src, running.started);
     }
     Ok(Outcome { code, stdout: out })
+}
+
+/// The run folder of a shadow run: removed when the run ends, also on an
+/// error.
+struct ShadowRun(crate::shadow::Plan);
+
+impl Drop for ShadowRun {
+    fn drop(&mut self) {
+        if let Err(e) = self.0.remove() {
+            log::warn!("{e:#}");
+        }
+    }
 }
 
 /// Quick Recovery at exit: name the files that the sandbox left in its

@@ -253,6 +253,9 @@ impl Backend for Docker {
     }
 
     fn check(&self, env: &HostEnv, _spec: &SandboxSpec) -> Result<()> {
+        if _spec.shadow.is_some() {
+            bail!("--profile default runs only on the bwrap backend: it needs an overlay at the sandbox home");
+        }
         if _spec.network == Network::Allowlist {
             bail!("network mode 'allowlist' needs the srt backend");
         }
