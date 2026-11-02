@@ -48,24 +48,45 @@ fn local_port(raw: &str) -> Option<u16> {
 }
 
 /// The callback ports named by a URL that the sandbox asked to open: in its
-/// callback parameters, or the URL itself when it points at localhost.
+/// callback parameters, or the URL itself when it points at localhost. Some
+/// apps open their own site first and pass the login page on in a parameter
+/// (`next=https://auth.../authorize?redirect_uri=...`), so links in parameter
+/// values and in the fragment are searched too, a few levels deep.
 pub fn callback_ports(raw: &str) -> Vec<u16> {
     let mut out = Vec::new();
-    if let Some(p) = local_port(raw) {
-        out.push(p);
-    }
-    if let Ok(u) = url::Url::parse(raw) {
-        for (k, v) in u.query_pairs() {
-            if CALLBACK_KEYS.contains(&k.as_ref()) {
-                if let Some(p) = local_port(&v) {
-                    out.push(p);
-                }
-            }
-        }
-    }
+    search(raw, None, 3, &mut out);
     out.sort();
     out.dedup();
     out
+}
+
+fn search(raw: &str, base: Option<&url::Url>, depth: u8, out: &mut Vec<u16>) {
+    if let Some(p) = local_port(raw) {
+        out.push(p);
+    }
+    let parsed = match base {
+        // A path on the same site, such as `next=/auth/login?redirect_uri=...`.
+        Some(b) if raw.starts_with('/') && !raw.starts_with("//") => b.join(raw),
+        _ => url::Url::parse(raw),
+    };
+    let Ok(u) = parsed else {
+        return;
+    };
+    let mut pairs: Vec<(String, String)> = u.query_pairs().into_owned().collect();
+    if let Some(f) = u.fragment() {
+        pairs.extend(url::form_urlencoded::parse(f.as_bytes()).into_owned());
+    }
+    for (k, v) in pairs {
+        if CALLBACK_KEYS.contains(&k.as_str()) {
+            if let Some(p) = local_port(&v) {
+                out.push(p);
+            }
+        }
+        let nested = v.starts_with("http://") || v.starts_with("https://") || v.starts_with('/');
+        if depth > 0 && nested {
+            search(&v, Some(&u), depth - 1, out);
+        }
+    }
 }
 
 /// Called by the host passthrough channel after it opened a URL.
@@ -158,6 +179,31 @@ mod tests {
             "https://a.example/?redirect_uri=https%3A%2F%2Fevil.example%3A9%2F"
         )
         .is_empty());
+    }
+
+    #[test]
+    fn finds_a_callback_port_in_a_nested_login_link() {
+        // The app opens its own site, which passes the login page on.
+        let login = "https://auth.example.com/oauth/authorize?client_id=x&redirect_uri=http%3A%2F%2F127.0.0.1%3A1455%2Fauth%2Fcallback";
+        let enc = |s: &str| url::form_urlencoded::byte_serialize(s.as_bytes()).collect::<String>();
+        let once = format!("https://app.example.com/auth/login?next={}", enc(login));
+        assert_eq!(callback_ports(&once), vec![1455]);
+        let twice = format!("https://app.example.com/start?continue={}", enc(&once));
+        assert_eq!(callback_ports(&twice), vec![1455]);
+        // A path on the same site, and a fragment.
+        let path = format!(
+            "https://app.example.com/l?next={}",
+            enc("/authorize?redirect_uri=http://localhost:1456/cb")
+        );
+        assert_eq!(callback_ports(&path), vec![1456]);
+        let frag = format!("https://app.example.com/#next={}", enc(login));
+        assert_eq!(callback_ports(&frag), vec![1455]);
+        // A nested callback to another host stays out.
+        let far = format!(
+            "https://app.example.com/?next={}",
+            enc("https://a.example/?redirect_uri=https://evil.example:9/")
+        );
+        assert!(callback_ports(&far).is_empty());
     }
 
     #[test]
