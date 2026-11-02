@@ -46,8 +46,14 @@ pub(crate) enum LaunchersCmd {
 pub(crate) fn run(env: &HostEnv, cmd: ShimsCmd) -> Result<i32> {
     match cmd {
         ShimsCmd::Exec { program, args } => {
+            if program == paddock::omarchy::USAGE {
+                return paddock::omarchy_usage::update(env, &args);
+            }
             if program != paddock::omarchy::SCOPE {
-                bail!("paddock shims exec only runs omarchy-agent");
+                bail!(
+                    "paddock shims exec only runs omarchy-agent and {}",
+                    paddock::omarchy::USAGE
+                );
             }
             paddock::omarchy::exec_agent(env, &args)
         }
@@ -60,6 +66,10 @@ pub(crate) fn run(env: &HostEnv, cmd: ShimsCmd) -> Result<i32> {
                 r.config.display()
             );
             println!("Wrote the shim folder {}.", r.shims.display());
+            println!(
+                "The same block wraps {}: the agents panel's usage scripts run in a box that sees the harness folders of the host and of the sandbox homes, read-only, and nothing else of the home.",
+                omarchy::USAGE
+            );
             match paddock::omarchy_usage::install(env) {
                 Ok(_) => println!(
                     "Added one marked block to {}: the agents panel checks the limits of a login that a sandbox holds from paddock's side. It takes effect at your next login.",
@@ -92,13 +102,19 @@ pub(crate) fn run(env: &HostEnv, cmd: ShimsCmd) -> Result<i32> {
                         if s.on() {
                             "on, agents that omarchy-agent starts run in a sandbox"
                         } else if s.user_wrapper {
-                            "off, your mise config has its own [wrappers.omarchy-agent]"
+                            "off, your mise config has its own wrapper for omarchy-agent or omarchy-agent-usage-update"
                         } else if s.block || s.shims {
                             "incomplete, run paddock shims install --scope omarchy-agent again"
                         } else {
                             "off"
                         }
                     );
+                    if s.on() {
+                        println!(
+                            "  {}: wrapped, the agents panel's usage scripts run in the usage box",
+                            paddock::omarchy::USAGE
+                        );
+                    }
                     println!("scope shell:");
                     let on = shims::installed(env);
                     let active = shims::active(env);

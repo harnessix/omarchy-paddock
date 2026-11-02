@@ -9,12 +9,18 @@
 //!   It puts a folder first on the PATH of everything that Hyprland starts,
 //!   ahead of `$OMARCHY_PATH/bin`, the same way as Omarchy's `envs.lua`. The
 //!   folder holds one command, `omarchy-agent-usage-update`, which runs
-//!   `paddock omarchy-usage-update`.
-//! - Without a held login, that runs Omarchy's command unchanged.
+//!   `paddock shims exec omarchy-agent-usage-update`. Hyprland puts
+//!   Omarchy's bin folder ahead of mise's wrappers, and the panel runs the
+//!   command without a shell, so the mise wrapper of omarchy.rs alone never
+//!   sees the panel's runs.
+//! - Omarchy's command runs, unchanged, in the usage box (usage_box.rs): the
+//!   harness folders of the host and of every sandbox home as one read-only
+//!   tree, and nothing else of the home. When the box cannot start, the
+//!   command does not run at all.
 //! - For an agent whose login a sandbox holds, it adds `--except AGENT`, so
-//!   the host does not check that login. For Claude Code and Grok Build,
+//!   the box does not check that login. For Claude Code and Grok Build,
 //!   paddock then runs Omarchy's own collector in a sandbox of its own, with
-//!   network mode egress, which sees the host home read-only and the
+//!   network mode egress, which sees the view of the usage box and the
 //!   sandbox's copy of the login in place of the host file. Its record goes
 //!   where Omarchy's would. Those collectors only read a login, they never
 //!   refresh it.
@@ -33,7 +39,6 @@ use crate::state::{HeldLogin, Running};
 use anyhow::{bail, Context, Result};
 use std::collections::BTreeMap;
 use std::io::Read;
-use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -184,7 +189,7 @@ pub fn hook_script(paddock: &Path) -> String {
         "#!/bin/sh\n\
          {MARK}\n\
          p={}\n\
-         if [ -x \"$p\" ]; then exec \"$p\" omarchy-usage-update -- \"$@\"; fi\n\
+         if [ -x \"$p\" ]; then exec \"$p\" shims exec {COMMAND} \"$@\"; fi\n\
          exec \"${{OMARCHY_PATH:-/usr/share/omarchy}}/bin/{COMMAND}\" \"$@\"\n",
         sh_quote(&paddock.display().to_string())
     )
@@ -391,20 +396,19 @@ pub fn update(env: &HostEnv, raw: &[String]) -> Result<i32> {
         .into_iter()
         .filter(|(agent, _)| args.wanted(agent))
         .collect();
-    let mut cmd = Command::new(&real);
-    cmd.args(raw).env("PATH", path_without_hook(env));
-    if held.is_empty() {
-        let e = cmd.exec();
-        bail!("cannot run {}: {e}", real.display());
-    }
+    let mut box_args = raw.to_vec();
     for agent in held.keys() {
-        cmd.args(["--except", agent]);
+        box_args.extend(["--except".to_string(), agent.to_string()]);
     }
-    let mut status = cmd
-        .status()
-        .with_context(|| format!("cannot run {}", real.display()))?
-        .code()
-        .unwrap_or(1);
+    // Omarchy's command runs in the usage box (usage_box.rs), never on the
+    // host. When the box cannot start, the held logins are not checked
+    // either: the panel keeps its last records.
+    let Some(mut status) = crate::usage_box::run(env, &real, &box_args)? else {
+        return Ok(1);
+    };
+    if held.is_empty() {
+        return Ok(status);
+    }
     for (agent, logins) in &held {
         let read_only = AGENTS.iter().any(|a| &a.id == agent && a.read_only);
         let done = if read_only {
@@ -561,8 +565,8 @@ pub fn login_copies(run: &Path, logins: &[HeldLogin]) -> Result<Vec<(PathBuf, Pa
     Ok(out)
 }
 
-/// The sandbox for a collector: the system and the host home read-only, the
-/// login copies over the host files, Omarchy's cache folder writable, and
+/// The sandbox for a collector: the system read-only, the home of the usage
+/// box (harness folders only, read-only), the login copies over the host files, Omarchy's cache folder writable, and
 /// with `network`, network mode egress (LAN blocked).
 pub fn collector_command(
     env: &HostEnv,
@@ -616,10 +620,15 @@ pub fn collector_command(
         std::fs::set_permissions(&resolv, std::os::unix::fs::PermissionsExt::from_mode(0o644))?;
         a.extend(["--ro-bind".into(), s(&resolv), s(&resolv_target())]);
     }
-    a.extend(["--ro-bind".into(), s(&env.home), s(&env.home)]);
-    let cache = env.cache_dir.join("omarchy").join("agent-usage");
+    // The view of the usage box (usage_box.rs), without the record folder:
+    // paddock writes the record from the collector's output.
+    let cache = crate::usage_box::cache_dir(env);
     std::fs::create_dir_all(&cache)?;
-    a.extend(["--bind".into(), s(&cache), s(&cache)]);
+    let mut view = crate::usage_box::view(env);
+    let records = crate::usage_box::state_dir(env);
+    view.mounts
+        .retain(|m| *m != crate::usage_box::Mount::Rw(records.clone()));
+    a.extend(crate::usage_box::home_args(env, &view));
     for (copy, store) in binds {
         a.extend(["--ro-bind".into(), s(copy), s(store)]);
     }

@@ -44,13 +44,21 @@ fn write_exec(p: &Path, text: &str) {
     std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o755)).unwrap();
 }
 
-/// Records its arguments.
-const FAKE_UPDATE: &str = "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$HOME/real.log\"\n";
+/// Records its arguments in the panel's state folder, the one place of the
+/// home that the usage box can write.
+const FAKE_UPDATE: &str =
+    "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$HOME/.local/state/omarchy/agents/real.log\"\n";
+
+/// The usage box can start here (bwrap with a user namespace and overlays).
+fn box_works(w: &World) -> bool {
+    let _g = EXEC.lock().unwrap_or_else(|e| e.into_inner());
+    paddock::usage_box::probe(&w.env()).is_ok()
+}
 
 /// Prints a record with the login that it sees, its arguments, and whether
 /// it can write the home.
 const FAKE_CLAUDE: &str = r#"#!/bin/sh
-if touch "$HOME/written" 2>/dev/null; then home=rw; else home=ro; fi
+if touch "$HOME/.claude/written" 2>/dev/null; then home=rw; else home=ro; fi
 printf '{"id":"claude","login":%s,"args":"%s","home":"%s"}\n' "$(cat "$HOME/.claude/.credentials.json")" "$*" "$home"
 "#;
 
@@ -107,7 +115,8 @@ impl World {
     }
 
     fn real_log(&self) -> String {
-        std::fs::read_to_string(self.home.join("real.log")).unwrap_or_default()
+        std::fs::read_to_string(self.home.join(".local/state/omarchy/agents/real.log"))
+            .unwrap_or_default()
     }
 
     fn record(&self, agent: &str) -> serde_json::Value {
@@ -160,6 +169,10 @@ impl World {
 #[test]
 fn without_a_held_login_omarchy_s_command_runs_as_asked() {
     let w = world();
+    if !box_works(&w) {
+        eprintln!("skipped: the usage box cannot start here");
+        return;
+    }
     let out = w.update(&["--limits-only", "--except", "kimi"]);
     assert!(out.status.success(), "{out:?}");
     assert_eq!(w.real_log(), "--limits-only --except kimi\n");
@@ -167,11 +180,11 @@ fn without_a_held_login_omarchy_s_command_runs_as_asked() {
 
 #[test]
 fn a_held_claude_login_is_checked_only_from_paddock_s_side() {
-    if !tools_work() {
-        eprintln!("skipped: bwrap or pasta does not work here");
+    let w = world();
+    if !tools_work() || !box_works(&w) {
+        eprintln!("skipped: bwrap, pasta or the usage box does not work here");
         return;
     }
-    let w = world();
     let sb = w.home.join(".local/share/paddock/homes/claude/shared/p");
     std::fs::create_dir_all(sb.join(".claude")).unwrap();
     std::fs::write(sb.join(".claude/.credentials.json"), r#"{"t":"sandbox"}"#).unwrap();
@@ -195,10 +208,10 @@ fn a_held_claude_login_is_checked_only_from_paddock_s_side() {
         std::fs::read_to_string(&host_login).unwrap(),
         r#"{"t":"host"}"#
     );
-    assert!(!w.home.join("written").exists());
+    assert!(!w.home.join(".claude/written").exists());
 
     // An agent that the panel did not ask for is left alone.
-    std::fs::remove_file(w.home.join("real.log")).unwrap();
+    std::fs::remove_file(w.home.join(".local/state/omarchy/agents/real.log")).unwrap();
     let out = w.update(&["grok"]);
     assert!(out.status.success(), "{out:?}");
     assert_eq!(w.real_log(), "grok\n");
@@ -207,6 +220,10 @@ fn a_held_claude_login_is_checked_only_from_paddock_s_side() {
 #[test]
 fn a_held_codex_login_is_not_checked_at_all() {
     let w = world();
+    if !box_works(&w) {
+        eprintln!("skipped: the usage box cannot start here");
+        return;
+    }
     let sb = w.home.join(".local/share/paddock/homes/codex/shared/p");
     std::fs::create_dir_all(sb.join(".codex")).unwrap();
     std::fs::write(sb.join(".codex/auth.json"), "{}").unwrap();
@@ -355,6 +372,10 @@ fn a_kept_codex_login_is_checked_in_the_keeper_sandbox() {
         return;
     }
     let mut w = world();
+    if !box_works(&w) {
+        eprintln!("skipped: the usage box cannot start here");
+        return;
+    }
     // A fake codex first on PATH, and a profile without the mise lookup,
     // so that the real codex is never found.
     let bin = w.home.parent().unwrap().join("tools/bin");
@@ -426,12 +447,17 @@ fn a_kept_codex_login_is_checked_in_the_keeper_sandbox() {
 #[test]
 fn forage_refreshes_at_most_once_in_five_minutes_and_keeps_a_ledger() {
     let w = world();
+    if !box_works(&w) {
+        eprintln!("skipped: the usage box cannot start here");
+        return;
+    }
     // Omarchy's update writes a fresh record each time it runs.
     write_exec(
         &w.home.join("omarchy/bin/omarchy-agent-usage-update"),
         r#"#!/bin/sh
-printf '%s\n' "$*" >> "$HOME/real.log"
-n=$(wc -l < "$HOME/real.log")
+mkdir -p "$HOME/.local/state/omarchy/agents"
+printf '%s\n' "$*" >> "$HOME/.local/state/omarchy/agents/real.log"
+n=$(wc -l < "$HOME/.local/state/omarchy/agents/real.log")
 mkdir -p "$HOME/.local/state/omarchy/agents/usage"
 printf '{"id":"grok","limitsFetchedAt":%s000,"limitsStale":false,"limits":[{"label":"Weekly","percent":0.%s,"resetsAt":"2099-01-01T00:00:00+00:00"}]}\n' "$(date +%s)" "$n" > "$HOME/.local/state/omarchy/agents/usage/grok.json"
 "#,
@@ -459,4 +485,163 @@ printf '{"id":"grok","limitsFetchedAt":%s000,"limitsStale":false,"limits":[{"lab
         std::fs::read_to_string(w.home.join(".local/state/paddock/forage/grok.jsonl")).unwrap();
     assert_eq!(ledger.lines().count(), 1, "{ledger}");
     assert!(ledger.contains("\"used\":0.1"));
+}
+
+/// The fake Omarchy command for the usage box: it lists what it sees,
+/// tries to write an inherited folder twice, writes a record, and ends with
+/// its own output and exit code.
+const FAKE_BOX_UPDATE: &str = r#"#!/bin/sh
+s="$HOME/.local/state/omarchy/agents"
+mkdir -p "$s/usage"
+{
+  ls -A "$HOME/.codex/sessions"
+  [ -e "$HOME/.ssh" ] && echo ssh-visible
+  [ -e "$HOME/notes.txt" ] && echo notes-visible
+  [ -e "$HOME/.claude.json" ] && echo claude-json
+  env | cut -d= -f1 | sort | tr '\n' ' '
+  echo
+} > "$s/seen.txt"
+touch "$HOME/.codex/written" || true
+touch "$HOME/.codex/sessions/written" || true
+printf '{"id":"fake"}\n' > "$s/usage/fake.json"
+echo "out $*"
+echo "err line" >&2
+exit 3
+"#;
+
+fn box_world() -> World {
+    let w = world();
+    write_exec(
+        &w.home.join("omarchy/bin/omarchy-agent-usage-update"),
+        FAKE_BOX_UPDATE,
+    );
+    std::fs::create_dir_all(w.home.join(".codex/sessions")).unwrap();
+    std::fs::write(w.home.join(".codex/sessions/host-1.jsonl"), "{}\n").unwrap();
+    let sb = w
+        .home
+        .join(".local/share/paddock/homes/codex/shared/proj/.codex/sessions");
+    std::fs::create_dir_all(&sb).unwrap();
+    std::fs::write(sb.join("sandbox-1.jsonl"), "{}\n").unwrap();
+    std::fs::create_dir_all(w.home.join(".ssh")).unwrap();
+    std::fs::write(w.home.join(".ssh/id_ed25519"), "key").unwrap();
+    std::fs::write(w.home.join("notes.txt"), "private").unwrap();
+    std::fs::write(w.home.join(".claude.json"), "{}").unwrap();
+    w
+}
+
+fn shims_exec(w: &World, path: Option<&str>, args: &[&str]) -> std::process::Output {
+    let mut vars = w.vars.clone();
+    if let Some(p) = path {
+        vars.insert("PATH".into(), p.into());
+    }
+    let child = {
+        let _g = EXEC.lock().unwrap_or_else(|e| e.into_inner());
+        Command::new(env!("CARGO_BIN_EXE_paddock"))
+            .args(["shims", "exec", "omarchy-agent-usage-update"])
+            .args(args)
+            .env_clear()
+            .envs(&vars)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap()
+    };
+    child.wait_with_output().unwrap()
+}
+
+#[test]
+fn without_bwrap_the_wrapper_fails_closed() {
+    let w = box_world();
+    let marker = w.home.join(".local/state/omarchy/agents/seen.txt");
+    // No bwrap on PATH; paddock itself needs nothing from PATH here.
+    let out = shims_exec(&w, Some("/nonexistent"), &["--force"]);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_ne!(out.status.code(), Some(0), "{out:?}");
+    assert!(out.stdout.is_empty(), "{out:?}");
+    assert_eq!(err.trim().lines().count(), 1, "{err}");
+    assert!(err.contains("bwrap is not on PATH"), "{err}");
+    assert!(err.contains("paddock shims remove"), "{err}");
+    assert!(!marker.exists(), "Omarchy's command ran on the host");
+    // A bwrap that cannot start a box: the same.
+    let bin = w.home.parent().unwrap().join("broken-bin");
+    write_exec(&bin.join("bwrap"), "#!/bin/sh\nexit 1\n");
+    let out = shims_exec(&w, Some(&bin.display().to_string()), &[]);
+    assert_ne!(out.status.code(), Some(0));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("cannot start a sandbox"));
+    assert!(!marker.exists());
+}
+
+#[test]
+fn the_usage_box_merges_sessions_and_hides_the_rest_of_the_home() {
+    let w = box_world();
+    if !box_works(&w) {
+        eprintln!("skipped: the usage box cannot start here (bwrap, user namespaces, overlayfs)");
+        return;
+    }
+    let out = shims_exec(&w, None, &["--force", "codex"]);
+    let err = String::from_utf8_lossy(&out.stderr);
+    // Output and exit code pass through unchanged.
+    assert_eq!(out.status.code(), Some(3), "{err}");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "out --force codex\n");
+    assert!(err.contains("err line\n"), "{err}");
+    assert_eq!(
+        err.matches(paddock::usage_box::READ_ONLY_NOTE).count(),
+        1,
+        "{err}"
+    );
+    let state = w.home.join(".local/state/omarchy/agents");
+    let seen = std::fs::read_to_string(state.join("seen.txt")).unwrap();
+    let mut lines = seen.lines();
+    assert_eq!(lines.next(), Some("host-1.jsonl"), "{seen}");
+    assert_eq!(lines.next(), Some("sandbox-1.jsonl"), "{seen}");
+    assert_eq!(lines.next(), Some("claude-json"), "{seen}");
+    assert!(!seen.contains("ssh-visible") && !seen.contains("notes-visible"));
+    let vars: Vec<&str> = lines.next().unwrap().split_whitespace().collect();
+    for v in &vars {
+        assert!(
+            [
+                "HOME",
+                "PATH",
+                "OMARCHY_PATH",
+                "LANG",
+                "XDG_STATE_HOME",
+                "XDG_CACHE_HOME",
+                "PWD",
+                "SHLVL",
+                "_",
+                "OLDPWD"
+            ]
+            .contains(v),
+            "{v} reached the box: {vars:?}"
+        );
+    }
+    // The record landed, and nothing was written into the inherited folders.
+    assert!(state.join("usage/fake.json").is_file());
+    assert!(!w.home.join(".codex/written").exists());
+    assert!(!w.home.join(".codex/sessions/written").exists());
+    assert!(!w
+        .home
+        .join(".local/share/paddock/homes/codex/shared/proj/.codex/sessions/written")
+        .exists());
+}
+
+#[test]
+fn codex_and_grok_copy_no_sessions_back() {
+    let w = world();
+    let env = w.env();
+    let f = paddock::profile::HarnessFactory::new(&env).unwrap();
+    for name in ["codex", "grok"] {
+        let p = f.profile(name).unwrap();
+        let copy_back = p
+            .state
+            .history
+            .as_ref()
+            .map(|h| h.copy_back.clone())
+            .unwrap_or_default();
+        assert!(copy_back.is_empty(), "{name}: {copy_back:?}");
+    }
+    // The usage box still shows their folders.
+    let folders = paddock::usage_box::folders(&env);
+    assert!(folders[".codex"].contains("codex"));
+    assert!(folders[".grok"].contains("grok"));
 }

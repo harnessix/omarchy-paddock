@@ -300,6 +300,50 @@ fn omarchy_agent_starts_run_in_a_sandbox_and_typed_commands_do_not() {
 }
 
 #[test]
+fn the_block_wraps_the_usage_command_and_removal_keeps_the_rest() {
+    let w = world();
+    let config = w.root.join("cfg/mise/config.toml");
+    let out = ok(&w.paddock(&["shims", "install", "--scope", "omarchy-agent"]));
+    assert!(out.contains("omarchy-agent-usage-update"), "{out}");
+    let text = std::fs::read_to_string(&config).unwrap();
+    assert!(text.starts_with(USER_CONFIG), "{text}");
+    let doc: toml::Value = toml::from_str(&text).unwrap();
+    let args = doc["wrappers"]["omarchy-agent-usage-update"]["args"]
+        .as_array()
+        .unwrap();
+    let script = args[1].as_str().unwrap();
+    assert!(
+        script.contains("shims exec omarchy-agent-usage-update \"$@\""),
+        "{script}"
+    );
+    assert!(doc["wrappers"].get("omarchy-agent").is_some());
+    assert_eq!(doc["tools"]["node"].as_str(), Some("24"));
+    let list = ok(&w.paddock(&["shims", "list"]));
+    assert!(
+        list.contains("omarchy-agent-usage-update: wrapped"),
+        "{list}"
+    );
+    ok(&w.paddock(&["shims", "remove"]));
+    assert_eq!(std::fs::read_to_string(&config).unwrap(), USER_CONFIG);
+    let list = ok(&w.paddock(&["shims", "list"]));
+    assert!(!list.contains("usage-update: wrapped"), "{list}");
+}
+
+#[test]
+fn a_user_usage_wrapper_is_never_replaced() {
+    let w = world();
+    let config = w.root.join("cfg/mise/config.toml");
+    let own = "[wrappers.omarchy-agent-usage-update]\ncommand = \"mine\"\n";
+    std::fs::write(&config, own).unwrap();
+    let out = w.paddock(&["shims", "install", "--scope", "omarchy-agent"]);
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("own [wrappers.omarchy-agent-usage-update]")
+    );
+    assert_eq!(std::fs::read_to_string(&config).unwrap(), own);
+}
+
+#[test]
 fn a_user_wrapper_is_never_replaced() {
     let w = world();
     let config = w.root.join("cfg/mise/config.toml");
@@ -466,7 +510,8 @@ fn history_reaches_the_host_and_other_projects_stay_hidden() {
         "{\"t\":1}\n"
     );
 
-    // Codex: a session by date is copied back at exit.
+    // Codex: a session stays in the sandbox home. The usage box shows it
+    // to the agents panel; nothing is copied back to the host.
     write_exec(
         &w.tools.join("codex"),
         "#!/bin/sh\nmkdir -p \"$HOME/.codex/sessions/2026/10/30\"\nprintf '{\"r\":1}\\n' > \"$HOME/.codex/sessions/2026/10/30/rollout-1.jsonl\"\nls -A \"$HOME/.codex/sessions\" > \"$PWD/codex-seen.txt\"\n",
@@ -478,25 +523,26 @@ fn history_reaches_the_host_and_other_projects_stay_hidden() {
     )
     .unwrap();
     ok(&w.paddock(&["wrap", "--", "codex", "--approve-for-me"]));
-    assert_eq!(
-        std::fs::read_to_string(w.home.join(".codex/sessions/2026/10/30/rollout-1.jsonl")).unwrap(),
-        "{\"r\":1}\n"
-    );
+    assert!(!w.home.join(".codex/sessions/2026/10/30").exists());
     // The host's own sessions are not in the sandbox.
     let seen = std::fs::read_to_string(w.proj.join("codex-seen.txt")).unwrap();
     assert_eq!(seen.trim(), "2026");
-    assert!(!w
-        .root
-        .join("data/paddock/homes/codex")
-        .read_dir()
-        .unwrap()
-        .flatten()
-        .any(|l| l
-            .path()
+    let in_homes = |rel: &str| {
+        w.root
+            .join("data/paddock/homes/codex")
             .read_dir()
             .unwrap()
             .flatten()
-            .any(|h| h.path().join(".codex/sessions/2026/10/29").exists())));
+            .any(|l| {
+                l.path()
+                    .read_dir()
+                    .unwrap()
+                    .flatten()
+                    .any(|h| h.path().join(rel).exists())
+            })
+    };
+    assert!(in_homes(".codex/sessions/2026/10/30/rollout-1.jsonl"));
+    assert!(!in_homes(".codex/sessions/2026/10/29"));
 }
 
 #[test]
