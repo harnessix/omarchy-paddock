@@ -430,16 +430,17 @@ impl Tee {
     }
 
     /// Wait for the copies after the harness ended. A capture is read to
-    /// its end, as without the view. The other streams get `grace`: a
-    /// process that the harness left behind can hold them open.
+    /// its end, as without the view. Each other stream gets `grace` of its
+    /// own. A process that the harness left behind can hold one stream open,
+    /// and that wait must not eat the time of the other stream.
     pub fn finish(self, grace: Duration) -> Option<Vec<u8>> {
         let mut out = None;
-        let deadline = Instant::now() + grace;
         for (capture, h) in self.threads {
             if capture {
                 out = h.join().ok().flatten();
                 continue;
             }
+            let deadline = Instant::now() + grace;
             while !h.is_finished() && Instant::now() < deadline {
                 std::thread::sleep(Duration::from_millis(10));
             }

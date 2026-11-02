@@ -1,5 +1,6 @@
 use super::*;
 use std::collections::BTreeMap;
+use std::io::Read;
 use std::os::fd::{FromRawFd, OwnedFd};
 
 fn env_in(t: &Path, extra: &[(&str, &str)]) -> HostEnv {
@@ -380,5 +381,61 @@ fn review_e_spawn_capture_tees_stderr_even_when_stderr_is_terminal() {
     assert!(
         tee_err,
         "spawned child stderr must be teed into view, not inherited"
+    );
+}
+
+/// A reader that waits, then returns `data` once.
+struct Delayed {
+    wait: Duration,
+    data: Vec<u8>,
+    done: bool,
+}
+
+impl Read for Delayed {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.done {
+            return Ok(0);
+        }
+        std::thread::sleep(self.wait);
+        self.done = true;
+        let n = self.data.len().min(buf.len());
+        buf[..n].copy_from_slice(&self.data[..n]);
+        Ok(n)
+    }
+}
+
+#[test]
+fn review_e_l1_stderr_keeps_a_grace_period_after_stdout_holds_the_stream() {
+    let t = tempfile::tempdir().unwrap();
+    let path = t.path().join("run.log");
+    let mut tee = Tee::create(&path).unwrap();
+    let grace = Duration::from_millis(400);
+    let (out_r, out_w) = pipe();
+    let (err_r, err_w) = pipe();
+    // stdout stays open past the first grace. stderr becomes ready only
+    // after that first grace has passed. Pipes stand in for the two streams
+    // so the bytes do not land on this test's terminal.
+    tee.copy(
+        Delayed {
+            wait: grace + Duration::from_millis(50),
+            data: b"OUT\n".to_vec(),
+            done: false,
+        },
+        Sink::Fd(std::os::fd::AsRawFd::as_raw_fd(&out_w)),
+    );
+    tee.copy(
+        Delayed {
+            wait: grace + grace / 2,
+            data: b"ERR\n".to_vec(),
+            done: false,
+        },
+        Sink::Fd(std::os::fd::AsRawFd::as_raw_fd(&err_w)),
+    );
+    tee.finish(grace);
+    drop((out_r, out_w, err_r, err_w));
+    let log = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        log.contains("ERR"),
+        "stderr was dropped before it flushed: {log:?}"
     );
 }
