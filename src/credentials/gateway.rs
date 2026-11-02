@@ -347,7 +347,10 @@ impl Gateway {
         };
         if self.is_revoked(name) {
             self.routes.lock().unwrap().remove(name);
-            return self.refuse(&mut conn, 403, "revoked", name, &method, &upath);
+            // The user's own doing, not the sandbox's: a harness that keeps
+            // trying does not freeze it.
+            (self.report)(name, &method, "", &upath, "refused: revoked");
+            return reply(&mut conn, 403, "revoked");
         }
         let Some(route) = self.routes.lock().unwrap().get(name).cloned() else {
             return self.refuse(&mut conn, 404, "no such credential", name, &method, &upath);
@@ -852,6 +855,17 @@ mod tests {
             send(&w, "GET /s/GH/user HTTP/1.1\r\n\r\n");
         }
         assert_eq!(w.abuse.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn refusals_after_a_revoke_do_not_freeze() {
+        let w = world(&[], None);
+        std::fs::write(w.revoked.path(), "GH\n").unwrap();
+        for _ in 0..MAX_REFUSED + 5 {
+            let r = send(&w, "GET /s/GH/user HTTP/1.1\r\n\r\n");
+            assert!(r.starts_with("HTTP/1.1 403"), "{r}");
+        }
+        assert_eq!(w.abuse.load(Ordering::SeqCst), 0);
     }
 
     #[test]
