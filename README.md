@@ -245,7 +245,7 @@ paddock undo --list           # the snapshots: time, harness, size
 paddock undo claude-app-1a2b3c --yes
 ```
 
-`paddock undo` lists the files that the run added, changed and deleted, and asks before it restores. Changed and deleted files come back from the snapshot. Added files go to `~/.local/share/paddock/undo-trash/TIME/`, so you can undo an undo by hand. The command refuses while a sandbox of the project runs. A file that changed after the session ended (you or another agent edited it) gets a warning and stays as it is. `--force` restores it too. At exit, paddock names `paddock undo` when the run changed files.
+`paddock undo` lists the files that the run added, changed and deleted, and asks before it restores. Changed and deleted files come back from the snapshot. Added files go to `~/.local/share/paddock/undo-trash/TIME/`, so you can undo an undo by hand. The command refuses while a sandbox of the project runs. A file that changed after the session ended (you or another agent edited it) gets a warning and stays as it is. When paddock did not record the end of the session (it was stopped, or the end walk took longer than 20 s), every changed file counts as such. `--force` restores it too. At exit, paddock names `paddock undo` when the run changed files.
 
 The snapshot:
 

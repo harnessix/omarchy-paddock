@@ -209,11 +209,11 @@ fn the_plan_names_added_changed_deleted_and_late_changes() {
             ("new", Change::Added, false),
         ]
     );
-    // Without an end record nothing counts as late.
+    // Without an end record every change can be a later edit (review C-H4).
     let m = meta(&[("late", fp(1, 1))], None);
-    assert!(!plan(&m, &current).entries[0].after_end);
+    assert!(plan(&m, &current).entries.iter().all(|e| e.after_end));
     let text = render_plan(&m, &plan(&m, &current));
-    assert!(text.contains("added"), "{text}");
+    assert!(text.contains("did not record the end"), "{text}");
 }
 
 #[test]
@@ -347,6 +347,28 @@ fn undo_skips_files_changed_after_the_end_unless_forced() {
 }
 
 #[test]
+fn undo_keeps_later_edits_when_the_end_was_not_recorded() {
+    // Review C-H4: no finish(), as when the end walk runs out of time.
+    let t = tempfile::tempdir().unwrap();
+    let (p, root, trash) = (
+        t.path().join("p"),
+        t.path().join("snaps"),
+        t.path().join("trash"),
+    );
+    write(&p, "a", "1");
+    let Taken::Done { dir, .. } = take(&root, &p, "s1", "fake", 1, &opts(1 << 20, false)).unwrap()
+    else {
+        panic!()
+    };
+    write(&p, "a", "user edit");
+    let m = Meta::load(&dir).unwrap();
+    let pl = plan(&m, &walk(&p, &m.skip, None).unwrap());
+    assert!(pl.entries.iter().all(|e| e.after_end));
+    restore(&dir, &m, &p, &pl, false, &trash, "t1").unwrap();
+    assert_eq!(fs::read_to_string(p.join("a")).unwrap(), "user edit");
+}
+
+#[test]
 fn undo_does_not_write_through_a_planted_link() {
     let t = tempfile::tempdir().unwrap();
     let (p, root, trash, outside) = (
@@ -363,6 +385,7 @@ fn undo_does_not_write_through_a_planted_link() {
     };
     fs::remove_dir_all(p.join("src")).unwrap();
     std::os::unix::fs::symlink(&outside, p.join("src")).unwrap();
+    finish(&root, &p, "s1", 2).unwrap();
     let m = Meta::load(&dir).unwrap();
     let pl = plan(&m, &walk(&p, &m.skip, None).unwrap());
     restore(&dir, &m, &p, &pl, false, &trash, "t1").unwrap();

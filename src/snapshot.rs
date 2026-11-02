@@ -586,10 +586,12 @@ pub fn plan(meta: &Meta, current: &BTreeMap<String, Fp>) -> Plan {
             (Some(a), Some(b)) if a != b => Change::Changed,
             _ => continue,
         };
+        // Without an end record (the end walk ran out of time, or paddock
+        // was stopped), any change can be a later edit.
         let after_end = meta
             .end
             .as_ref()
-            .is_some_and(|end| end.get(p) != current.get(p));
+            .is_none_or(|end| end.get(p) != current.get(p));
         entries.push(Entry {
             path: p.clone(),
             change,
@@ -756,7 +758,13 @@ pub fn render_plan(meta: &Meta, plan: &Plan) -> String {
         }
     }
     let late: Vec<&Entry> = plan.entries.iter().filter(|e| e.after_end).collect();
-    if !late.is_empty() {
+    if !late.is_empty() && meta.end.is_none() {
+        t.push_str(&format!(
+            "  warning: paddock did not record the end of the session, so it cannot tell the changes of the session from later edits. {} file(s) differ (skipped without --force): {}\n",
+            late.len(),
+            names(&late, 10)
+        ));
+    } else if !late.is_empty() {
         t.push_str(&format!(
             "  warning: {} changed after the session ended (skipped without --force): {}\n",
             late.len(),
