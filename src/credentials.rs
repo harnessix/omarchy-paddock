@@ -731,7 +731,6 @@ pub fn read(env: &HostEnv, plan: &Plan) -> (Vec<Value>, Vec<String>) {
 }
 
 fn run_command(cmd: &[String]) -> Result<secret::Secret> {
-    use std::io::Read as _;
     use std::process::{Command, Stdio};
     let mut child = Command::new(&cmd[0])
         .args(&cmd[1..])
@@ -740,12 +739,7 @@ fn run_command(cmd: &[String]) -> Result<secret::Secret> {
         .stderr(Stdio::null())
         .spawn()
         .with_context(|| format!("cannot run {}", cmd[0]))?;
-    let mut out = child.stdout.take().expect("piped");
-    let reader = std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        let _ = (&mut out).take(MAX_VALUE as u64 + 1).read_to_end(&mut buf);
-        buf
-    });
+    let reader = crate::broker::Pipe::read(child.stdout.take().expect("piped"), MAX_VALUE + 1);
     let start = std::time::Instant::now();
     let status = loop {
         if let Some(s) = child.try_wait()? {
@@ -763,7 +757,15 @@ fn run_command(cmd: &[String]) -> Result<secret::Secret> {
         std::thread::sleep(std::time::Duration::from_millis(20));
     };
     // Locked and wiped from here on, whatever the outcome.
-    let buf = secret::Secret::new(reader.join().unwrap_or_default());
+    // A process left behind can keep stdout open: the value is not
+    // whole then.
+    let deadline =
+        (start + COMMAND_TIMEOUT).min(std::time::Instant::now() + crate::broker::PIPE_GRACE);
+    let (out, ended) = reader.finish(deadline);
+    let buf = secret::Secret::new(out);
+    if !ended {
+        bail!("{} left its output open after it ended", cmd[0]);
+    }
     if !status.success() {
         bail!("{} failed ({status})", cmd[0]);
     }
@@ -1012,6 +1014,15 @@ pub fn revoke(env: &HostEnv, sandbox: &str, name: Option<&str>) -> Result<Vec<St
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_process_left_behind_does_not_hang_a_value_command() {
+        let start = std::time::Instant::now();
+        let cmd = ["sh", "-c", "echo v; sleep 30 &"].map(String::from);
+        let e = run_command(&cmd).unwrap_err();
+        assert!(format!("{e:#}").contains("left its output open"), "{e:#}");
+        assert!(start.elapsed() < std::time::Duration::from_secs(10));
+    }
 
     #[test]
     fn parses_the_documented_forms() {

@@ -421,3 +421,15 @@ fn the_sandbox_gets_an_aws_configuration_without_keys() {
     let p = crate::credentials::plan(&env, "claude", false).unwrap();
     assert!(p.deliver.is_empty() || env.which("aws").is_some());
 }
+
+#[test]
+fn a_process_left_behind_does_not_hang_a_tool() {
+    let t = tempfile::tempdir().unwrap();
+    let exe = t.path().join("tool");
+    std::fs::write(&exe, "#!/bin/sh\necho out\nsleep 30 &\n").unwrap();
+    std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let start = std::time::Instant::now();
+    let e = run_tool(&exe, &["get"], b"", &[]).unwrap_err();
+    assert!(format!("{e:#}").contains("left its output open"), "{e:#}");
+    assert!(start.elapsed() < Duration::from_secs(10));
+}

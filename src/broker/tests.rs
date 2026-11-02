@@ -527,6 +527,20 @@ fn answers_go_through_the_approvals_directory() {
 }
 
 #[test]
+fn a_process_left_behind_does_not_hang_a_capture() {
+    let start = Instant::now();
+    let mut c = Command::new("sh");
+    c.args(["-c", "echo out; echo err >&2; sleep 30 &"]);
+    let (code, out, err) = run_capture(&mut c, Duration::from_secs(30)).unwrap();
+    assert_eq!((code, out.as_str(), err.as_str()), (0, "out\n", "err\n"));
+    assert!(
+        start.elapsed() < Duration::from_secs(10),
+        "{:?}",
+        start.elapsed()
+    );
+}
+
+#[test]
 fn the_first_answer_wins_and_is_written_whole() {
     let tmp = tempfile::tempdir().unwrap();
     let mut vars = BTreeMap::new();

@@ -184,7 +184,7 @@ pub fn docker_login(env: &HostEnv, server: &str, host: &str) -> Result<Login> {
 /// Run a host tool with `stdin`, for at most TOOL_TIMEOUT. Its output is a
 /// secret. stderr goes nowhere: it can hold a value too.
 fn run_tool(exe: &Path, args: &[&str], stdin: &[u8], envs: &[(&str, &str)]) -> Result<Secret> {
-    use std::io::{Read as _, Write as _};
+    use std::io::Write as _;
     use std::process::{Command, Stdio};
     let name = exe
         .file_name()
@@ -203,12 +203,7 @@ fn run_tool(exe: &Path, args: &[&str], stdin: &[u8], envs: &[(&str, &str)]) -> R
     std::thread::spawn(move || {
         let _ = input.write_all(&data);
     });
-    let mut out = child.stdout.take().expect("piped");
-    let reader = std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        let _ = (&mut out).take(MAX_OUTPUT as u64 + 1).read_to_end(&mut buf);
-        buf
-    });
+    let reader = crate::broker::Pipe::read(child.stdout.take().expect("piped"), MAX_OUTPUT + 1);
     let start = std::time::Instant::now();
     let status = loop {
         if let Some(s) = child.try_wait()? {
@@ -224,7 +219,15 @@ fn run_tool(exe: &Path, args: &[&str], stdin: &[u8], envs: &[(&str, &str)]) -> R
         }
         std::thread::sleep(Duration::from_millis(20));
     };
-    let buf = Secret::new(reader.join().unwrap_or_default());
+    // A process left behind can keep stdout open: the output is not
+    // whole then.
+    let deadline =
+        (start + TOOL_TIMEOUT).min(std::time::Instant::now() + crate::broker::PIPE_GRACE);
+    let (out, ended) = reader.finish(deadline);
+    let buf = Secret::new(out);
+    if !ended {
+        bail!("{} left its output open after it ended", name);
+    }
     if !status.success() {
         bail!("{name} failed ({status})");
     }

@@ -1276,6 +1276,50 @@ pub(crate) fn inbox(project: &Path) -> Result<crate::safefs::Dir> {
     dot.subdir(std::ffi::OsStr::new("inbox"), true)
 }
 
+/// The output of a command, read in a thread. A process that the command
+/// left behind can keep the pipe open after the command ended, so the end
+/// of the pipe is waited for only until a deadline.
+pub(crate) struct Pipe {
+    buf: Arc<Mutex<Vec<u8>>>,
+    done: std::sync::mpsc::Receiver<()>,
+}
+
+/// How long the output may stay open after the command ended: enough to
+/// read what it wrote.
+pub(crate) const PIPE_GRACE: Duration = Duration::from_secs(2);
+
+impl Pipe {
+    /// Read `r` to its end, at most `cap` bytes.
+    pub(crate) fn read(mut r: impl Read + Send + 'static, cap: usize) -> Self {
+        let buf = Arc::new(Mutex::new(Vec::new()));
+        let (tx, done) = std::sync::mpsc::channel();
+        let b = buf.clone();
+        std::thread::spawn(move || {
+            let mut chunk = [0u8; 8192];
+            loop {
+                let room = cap.saturating_sub(b.lock().unwrap().len()).min(chunk.len());
+                match r.read(&mut chunk[..room]) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => b.lock().unwrap().extend_from_slice(&chunk[..n]),
+                }
+            }
+            // It can hold a credential value.
+            chunk.iter_mut().for_each(|c| *c = 0);
+            let _ = tx.send(());
+        });
+        Self { buf, done }
+    }
+
+    /// What was read, once the pipe ended or `deadline` passed. False:
+    /// the pipe is still open, and the output can be cut short.
+    pub(crate) fn finish(self, deadline: Instant) -> (Vec<u8>, bool) {
+        let wait = deadline.saturating_duration_since(Instant::now());
+        let ended = self.done.recv_timeout(wait).is_ok();
+        let out = std::mem::take(&mut *self.buf.lock().unwrap());
+        (out, ended)
+    }
+}
+
 pub fn run_capture(cmd: &mut Command, timeout: Duration) -> Result<(i32, String, String)> {
     run_capture_input(cmd, timeout, None)
 }
@@ -1302,17 +1346,8 @@ pub fn run_capture_input(
             let _ = stdin.write_all(&data);
         });
     }
-    let (mut so, mut se) = (child.stdout.take().unwrap(), child.stderr.take().unwrap());
-    let t1 = std::thread::spawn(move || {
-        let mut b = Vec::new();
-        let _ = so.by_ref().take(MAX_OUTPUT as u64).read_to_end(&mut b);
-        b
-    });
-    let t2 = std::thread::spawn(move || {
-        let mut b = Vec::new();
-        let _ = se.by_ref().take(MAX_OUTPUT as u64).read_to_end(&mut b);
-        b
-    });
+    let so = Pipe::read(child.stdout.take().unwrap(), MAX_OUTPUT);
+    let se = Pipe::read(child.stderr.take().unwrap(), MAX_OUTPUT);
     let start = Instant::now();
     let code = loop {
         if let Some(s) = child.try_wait()? {
@@ -1328,8 +1363,11 @@ pub fn run_capture_input(
         }
         std::thread::sleep(Duration::from_millis(50));
     };
-    let out = String::from_utf8_lossy(&t1.join().unwrap_or_default()).into_owned();
-    let err = String::from_utf8_lossy(&t2.join().unwrap_or_default()).into_owned();
+    // A process left behind (an ssh ControlPersist master) can keep the
+    // output open: take what came, within the time limit.
+    let deadline = (start + timeout).min(Instant::now() + PIPE_GRACE);
+    let out = String::from_utf8_lossy(&so.finish(deadline).0).into_owned();
+    let err = String::from_utf8_lossy(&se.finish(deadline).0).into_owned();
     Ok((code, out, err))
 }
 
