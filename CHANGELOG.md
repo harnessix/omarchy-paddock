@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- New: `paddock view ID` opens a live view of a sandbox that runs without a terminal (a script or a spawned child). paddock shows its output in a session of its own tmux server, and the bar panel opens it with a click. `[view] tmux = false` turns it off.
 - Fix: `paddock worktree list`, `merge` and `remove` act on the branch that paddock made for the worktree. paddock records it on the host when it creates the worktree. Before, a `git switch feature-x` in the worktree made `remove` delete `feature-x` and keep the `paddock/` branch. A worktree without a record counts only a `paddock/` branch.
 - Fix: a quota budget counts only its share of the account's use. Each rise of the window is split among the quota timers on the same window that ran during it (frozen timers do not count, and a timer whose sandbox ended still counts for the steps it ran in), so four sandboxes with `--quota weekly=1%` no longer end at once after a few minutes. When the account reports whole percents, a budget is over only above it, not at it.
 - Fix: the paused leases of a frozen sandbox whose paddock process died (killed, crashed, a restart) count down again at the next claim. Before, they held for ever.

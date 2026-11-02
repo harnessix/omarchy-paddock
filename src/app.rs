@@ -351,6 +351,8 @@ pub fn run(env: &HostEnv, o: &AppOptions) -> Result<i32> {
         ..Default::default()
     };
     let mut built = build::build(env, &opts)?;
+    // An app has a window: nothing to show in a terminal view.
+    built.view = false;
     add_roots(env, &mut built.spec, &built.manifest, &roots[1..])?;
     crate::policy::enforce(env, &built.spec)?;
     let backend = crate::run::select_backend(env, &built)?;

@@ -59,6 +59,7 @@ pub mod storage;
 mod testutil;
 pub mod timer;
 pub mod update;
+pub mod view;
 pub mod waiting;
 pub mod wlsec;
 pub mod worktree;

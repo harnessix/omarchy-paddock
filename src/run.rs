@@ -901,6 +901,24 @@ pub fn run(
     if forwarding.stop_requested() {
         bail!("paddock was asked to stop before the sandbox started");
     }
+    // The live view of a run without a terminal (view.rs). paddock copies
+    // each stream that is not a terminal to the caller and to the run log.
+    // A terminal stays the harness's own.
+    let mut view = if built.view && !interactive {
+        let out_tty = !capture && std::io::stdout().is_terminal();
+        let err_tty = std::io::stderr().is_terminal();
+        crate::view::Live::start(env, &spec.id, &spec.harness, !out_tty, !err_tty, quiet)
+    } else {
+        None
+    };
+    if let Some(l) = &view {
+        if l.tee_out {
+            cmd.stdout(Stdio::piped());
+        }
+        if l.tee_err {
+            cmd.stderr(Stdio::piped());
+        }
+    }
     let mut child = cmd
         .spawn()
         .with_context(|| format!("cannot start {}", launch.program.display()))?;
@@ -922,6 +940,19 @@ pub fn run(
         None => inherited,
     };
     forwarding.set_child(child.id());
+    if let Some(l) = view.as_mut() {
+        if let Some(o) = child.stdout.take().filter(|_| l.tee_out) {
+            let sink = if capture {
+                crate::view::Sink::Capture
+            } else {
+                crate::view::Sink::Fd(1)
+            };
+            l.tee.copy(o, sink);
+        }
+        if let Some(e) = child.stderr.take().filter(|_| l.tee_err) {
+            l.tee.copy(e, crate::view::Sink::Fd(2));
+        }
+    }
     if let (Some(data), Some(mut w)) = (stdin, child.stdin.take()) {
         // A thread, so a harness that does not read cannot block paddock.
         std::thread::spawn(move || {
@@ -1015,13 +1046,23 @@ pub fn run(
     let old_int = unsafe { libc::signal(libc::SIGINT, libc::SIG_IGN) };
     let old_quit = unsafe { libc::signal(libc::SIGQUIT, libc::SIG_IGN) };
     let mut out = None;
-    if capture {
+    if capture && view.is_none() {
         out = Some(read_capped(child.stdout.take().unwrap()));
     }
     let status = child.wait()?;
     unsafe {
         libc::signal(libc::SIGINT, old_int);
         libc::signal(libc::SIGQUIT, old_quit);
+    }
+    use std::os::unix::process::ExitStatusExt;
+    let code = status
+        .code()
+        .unwrap_or_else(|| 128 + status.signal().unwrap_or(0));
+    if let Some(l) = view.take() {
+        let kept = l.finish(code);
+        if capture {
+            out = Some(String::from_utf8_lossy(&kept.unwrap_or_default()).into_owned());
+        }
     }
     if forwarding.hung_up() {
         // The terminal is gone: a write to it would fail and end the exit
@@ -1090,10 +1131,6 @@ pub fn run(
     if !quiet {
         recovery_notice(env, &spec.id, &spec.home_src, running.started);
     }
-    use std::os::unix::process::ExitStatusExt;
-    let code = status
-        .code()
-        .unwrap_or_else(|| 128 + status.signal().unwrap_or(0));
     Ok(Outcome { code, stdout: out })
 }
 

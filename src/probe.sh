@@ -115,6 +115,17 @@ elif [ "${n:-0}" -le 3 ]; then ok host-users-hidden; else fail host-users-hidden
 if [ -e "$PADDOCK_PROBE_HOSTTMP" ]; then fail host-tmp-hidden "a file in the host /tmp is visible"; else ok host-tmp-hidden; fi
 if [ -S "$PADDOCK_PROBE_HOSTSOCK" ]; then fail host-tmp-sockets-hidden "a socket in the host /tmp is visible"; else ok host-tmp-sockets-hidden; fi
 
+# The live views: paddock's tmux server on the host shows the output of
+# sandboxes and takes keys. Its socket, and any tmux socket of the host,
+# must not be reachable here. This sandbox is new, so it has none of its own.
+seen=""
+if [ -n "$PADDOCK_PROBE_VIEWSOCK" ] && [ -e "$PADDOCK_PROBE_VIEWSOCK" ]; then seen=" $PADDOCK_PROBE_VIEWSOCK"; fi
+for s in /tmp/tmux-*/* "${TMUX_TMPDIR:-/nonexistent}"/tmux-*/* /run/user/*/tmux-*/* /run/user/*/paddock/view.sock; do
+  [ -S "$s" ] && seen="$seen $s"
+done
+[ -n "$TMUX" ] && seen="$seen TMUX=$TMUX"
+if [ -z "$seen" ]; then ok view-socket-hidden; else fail view-socket-hidden "visible:$seen"; fi
+
 if has sudo; then
   if sudo -n true 2>/dev/null; then fail no-privilege-gain "sudo works"; else ok no-privilege-gain; fi
 else

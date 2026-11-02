@@ -48,6 +48,7 @@ fn bwrap_offline_escape_probe_passes() {
         "ok git-commondir-read-only",
         "ok git-planted-config-never-runs",
         "ok git-layout-still-trusted",
+        "ok view-socket-hidden",
     ] {
         assert!(text.contains(check), "missing {check}:\n{text}");
     }

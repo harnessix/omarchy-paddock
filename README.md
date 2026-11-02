@@ -968,6 +968,23 @@ These rules always hold:
 
 `paddock ps` and the bar panel show children under their parent, and the approval card names the sandbox that started a child. `paddock log` records the parent, the child, the harness, the role, the branch, the limits, the exit status, the reason for the end and the durations. It never records the task or the output. Gemini CLI has no one-shot entry yet, because paddock did not check its flags on a real install.
 
+### Watch a sandbox without a window
+
+A sandbox that starts without a terminal, such as `paddock run claude -- -p < ticket` in a script or a spawned child, has nothing on your screen. When `tmux` is on your PATH, paddock shows its output in a tmux session. Click the row in the bar panel, or run:
+
+```sh
+paddock view <id>           # a new terminal with a read-only live view
+paddock view <id> --write   # the same with keys: scroll with the tmux copy mode, or close the view
+```
+
+- paddock copies the output of the harness byte for byte to the caller and to a run log, and the session shows that log. The script that started the sandbox gets the same output, exit code and input as without tmux.
+- The session uses paddock's own tmux server on `$XDG_RUNTIME_DIR/paddock/view.sock`, never your tmux server or your tmux configuration. No sandbox sees the socket or the logs. `paddock doctor --escape` checks this (`view-socket-hidden`).
+- The keys of the view do not reach the harness. The harness reads its input from the caller.
+- The session stays after the sandbox ends, with the exit code on the last line. `paddock stop <id>` ends it. `paddock gc --yes` removes sessions and logs of sandboxes that ended more than a day ago.
+- Without tmux, `paddock view` opens `tail -f` of the run log. It uses `xdg-terminal-exec`, or `$TERMINAL -e` without it.
+- One-shot modes such as `claude -p` print nothing until the end, so the view shows little until then.
+- `[view] tmux = false` in `~/.config/paddock/config.toml` turns the tmux session off.
+
 You can let an agent on the host answer requests for you (`paddock approver`). paddock trusts that setting only from a root-owned file (`sudo paddock approver enable --system`) or from a file signed with a password that you type when a sandbox starts, so that a process on your computer cannot turn it on for itself. The agent approver can only answer the capabilities that you list, the rules above still hold, and if it does not answer clearly, the request comes to you.
 
 ## Shared state: paddock kv

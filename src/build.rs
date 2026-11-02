@@ -278,6 +278,9 @@ pub struct Built {
     /// Serve the built-in `echo` device whatever the user configuration says.
     /// `paddock doctor --escape` tests the device mount with it.
     pub test_devices: bool,
+    /// Show the run in a live view when it has no terminal (view.rs).
+    /// Off for the escape probe and app windows.
+    pub view: bool,
     pub worktree: Option<Worktree>,
     /// The pasture it joined; None: a pasture of its own.
     pub pasture: Option<String>,
@@ -954,6 +957,7 @@ pub fn build_with(env: &HostEnv, opts: &Options, harness: Harness) -> Result<Bui
         device_ceiling: None,
         test_devices: false,
         shared_history,
+        view: true,
         worktree: pending.keep(),
         pasture: opts.pasture.clone(),
         bridge,
