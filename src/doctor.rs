@@ -631,6 +631,7 @@ pub fn escape(env: &HostEnv, o: &EscapeOpts) -> Result<usize> {
         built.spec.set_env(k, v, "doctor");
     }
     built.test_devices = true;
+    built.view = false;
     let kv_sandbox = built.spec.id.clone();
     let kv_project = built.spec.project.clone();
     let env2 = HostEnv::detect()?;
@@ -646,6 +647,20 @@ pub fn escape(env: &HostEnv, o: &EscapeOpts) -> Result<usize> {
     built.spec.set_env(
         "PADDOCK_PROBE_HOSTSOCK",
         host_sock.display().to_string(),
+        "doctor",
+    );
+    // The socket of paddock's tmux server for the live views (view.rs).
+    // Without a server, a stand-in at its path.
+    let view_sock = crate::view::socket(&env2);
+    let mut view_standin = if view_sock.exists() {
+        None
+    } else {
+        view_sock.parent().map(crate::privfs::dir).transpose()?;
+        Some(std::os::unix::net::UnixListener::bind(&view_sock)?)
+    };
+    built.spec.set_env(
+        "PADDOCK_PROBE_VIEWSOCK",
+        view_sock.display().to_string(),
         "doctor",
     );
     built.spec.set_env(
@@ -712,6 +727,9 @@ pub fn escape(env: &HostEnv, o: &EscapeOpts) -> Result<usize> {
     let _ = crate::safefs::Root::open(&home_src).and_then(|r| r.remove_tree(Path::new(KEYRINGS)));
     let _ = std::fs::remove_file(&host_tmp);
     let _ = std::fs::remove_file(&host_sock);
+    if view_standin.take().is_some() {
+        let _ = std::fs::remove_file(&view_sock);
+    }
     if timed_out.load(std::sync::atomic::Ordering::SeqCst) {
         kv_probe.cleanup(&kv_sandbox, &kv_project);
         println!("  FAIL probe-finished: the sandbox did not finish in 300 seconds");

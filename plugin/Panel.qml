@@ -8,7 +8,8 @@ import qs.Commons as Commons
 import qs.Ui
 
 // The paddock panel. One keyboard and mouse cursor, as in Omarchy's own panels:
-//   list view     Up/Down pick a sandbox, Enter goes to its terminal,
+//   list view     Up/Down pick a sandbox, Enter goes to its terminal (or
+//                 opens the live view of a sandbox without a terminal),
 //                 Left/Right reach the row actions, Delete stops (press twice),
 //                 N starts a new sandbox.
 //   new sandbox   pick a recent project, then a harness; Enter opens a terminal
@@ -119,6 +120,7 @@ Panel {
     if (s && s.canFreeze) a.push("freeze")
     if (s && s.revocable) a.push("revoke")
     if (s && s.monitor !== "") a.push("ack")
+    if (s && s.viewTmux) a.push("takeover")
     a.push("stop")
     return a
   }
@@ -330,6 +332,18 @@ Panel {
       else root.say(strings.t("msg.noTerminal"))
     })
   }
+  // The live view of a sandbox without a terminal (paddock view): a new
+  // terminal window, read-only unless takeOver.
+  function openView(s, takeOver) {
+    runPaddock(takeOver ? ["view", s.id, "--write"] : ["view", s.id], function(code) {
+      if (code === 0) root.close()
+      else root.say(strings.t("msg.noView"))
+    })
+  }
+  function activate(s) {
+    if (s.view) openView(s, false)
+    else goToTerminal(s)
+  }
   function showDisplay(s) {
     runPaddock(["focus", s.id, "--display"], function(code) {
       if (code === 0) root.close()
@@ -411,6 +425,7 @@ Panel {
     else if (name === "display") showDisplay(s)
     else if (name === "revoke") revokeCredentials(s)
     else if (name === "ack") ackMonitor(s)
+    else if (name === "takeover") openView(s, true)
     else if (name === "stop") stop(s)
   }
 
@@ -739,7 +754,7 @@ Panel {
     }
     if (sandboxes.length === 0) { startNew(); return }
     var s = sandboxAt(selectedIndex)
-    if (actionIndex < 0) goToTerminal(s)
+    if (actionIndex < 0) activate(s)
     else runAction(s, actionsFor(s)[actionIndex])
   }
 
@@ -805,6 +820,9 @@ Panel {
             auth: root.plain(r.auth || "", 40),
             started: Number(r.started || 0),
             frozenSince: Number(r.frozen_since || 0),
+            // A live view (paddock view): a tmux session or a run log.
+            view: r.view === true,
+            viewTmux: r.view_tmux === true,
             // Its own scope (bwrap, srt), or a container that can pause.
             canFreeze: (typeof r.unit === "string" && r.unit !== "") || r.backend === "docker" || r.backend === "podman",
             windowPid: Number.isInteger(r.window_pid) && r.window_pid > 0 ? r.window_pid : 0,
@@ -1507,7 +1525,7 @@ Panel {
                   ? strings.tn("row.boundary", modelData.boundaryCount).arg(Commons.I18n.formatNumber(modelData.boundaryCount)).arg(modelData.id)
                   : "", modelData.spent].filter(function(t) { return t !== "" }).join(" · ")
                 showActions: true
-                onActivated: root.goToTerminal(modelData)
+                onActivated: root.activate(modelData)
 
                 ActionButton {
                   sandboxIndex: index + root.approvals.length; position: 0
@@ -1549,6 +1567,13 @@ Panel {
                 ActionButton {
                   sandboxIndex: index + root.approvals.length
                   position: (modelData.windowPid > 0 ? 3 : 2) + (modelData.canFreeze ? 1 : 0) + (modelData.revocable ? 1 : 0) + (modelData.monitor !== "" ? 1 : 0)
+                  visible: modelData.viewTmux
+                  iconText: "󰆍"; tooltipText: strings.t("action.takeOver")
+                  onClicked: root.openView(modelData, true)
+                }
+                ActionButton {
+                  sandboxIndex: index + root.approvals.length
+                  position: (modelData.windowPid > 0 ? 3 : 2) + (modelData.canFreeze ? 1 : 0) + (modelData.revocable ? 1 : 0) + (modelData.monitor !== "" ? 1 : 0) + (modelData.viewTmux ? 1 : 0)
                   iconText: root.confirmId === modelData.id ? "󰗖" : "󰓛"
                   tooltipText: root.confirmId === modelData.id ? strings.t("action.confirmStop") : strings.t("action.stop")
                   foreground: root.confirmId === modelData.id ? root.urgent : root.fg

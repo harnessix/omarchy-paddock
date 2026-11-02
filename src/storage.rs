@@ -1438,6 +1438,11 @@ pub enum Action {
     Kv {
         sandboxes: Vec<String>,
     },
+    /// The live view of an ended sandbox: its tmux session and run log
+    /// (view.rs).
+    View {
+        id: String,
+    },
     /// Pure cache folders in a home, relative to it (storage/caches.rs).
     Caches {
         home: PathBuf,
@@ -2017,6 +2022,7 @@ pub fn apply(env: &HostEnv, containers: &dyn Containers, items: &[Item]) -> Vec<
                 }
                 Ok(())
             })(),
+            Action::View { id } => crate::view::remove(env, id),
             Action::Kv { sandboxes } => {
                 crate::kv::gc_apply(env, sandboxes, state::now()).map(|_| ())
             }

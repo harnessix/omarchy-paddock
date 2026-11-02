@@ -1,0 +1,678 @@
+//! A live view of a sandbox that runs without a terminal (README "Watch a
+//! sandbox without a window").
+//!
+//! paddock runs the sandbox as before. It copies the harness's stdout and
+//! stderr byte for byte to its own stdout and stderr (or to the capture of a
+//! spawn), and to a run log in `<runtime>/paddock/view/ID.log`. A tmux pane
+//! on paddock's own server (`<runtime>/paddock/view.sock`, never the user's
+//! server or configuration) shows that log with `tail -f`. The caller sees
+//! the same bytes, the same exit code and the same stdin as without the view.
+//! The runtime folder is hidden in every sandbox, so no sandbox reaches the
+//! socket or the logs.
+
+use crate::env::HostEnv;
+use anyhow::{bail, Context, Result};
+use std::ffi::OsString;
+use std::io::{Read, Write};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+use std::os::unix::process::CommandExt;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+/// `paddock gc` removes the view of a sandbox that ended this long ago.
+pub const MAX_AGE: u64 = 24 * 3600;
+/// The scrollback of a view pane, in lines.
+pub const HISTORY_LIMIT: &str = "100000";
+/// The run log stops growing at this size.
+const LOG_CAP: u64 = 64 << 20;
+/// The capture of a spawn keeps the last 4 MiB, as without the view.
+const CAPTURE_KEEP: usize = 4 << 20;
+
+pub fn socket(env: &HostEnv) -> PathBuf {
+    env.paddock_run().join("view.sock")
+}
+pub fn dir(env: &HostEnv) -> PathBuf {
+    env.paddock_run().join("view")
+}
+pub fn log_file(env: &HostEnv, id: &str) -> PathBuf {
+    dir(env).join(format!("{id}.log"))
+}
+/// Written when the sandbox ends: the last line of the pane. Its time of
+/// change is the end time for `paddock gc`.
+pub fn end_file(env: &HostEnv, id: &str) -> PathBuf {
+    dir(env).join(format!("{id}.end"))
+}
+
+/// A sandbox id names files and tmux sessions: letters, digits, `-`, `_`.
+pub fn valid_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 128
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
+/// `[view]` of `~/.config/paddock/config.toml`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Config {
+    /// Show the run in a tmux pane when tmux is on PATH. Default true.
+    pub tmux: bool,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Config { tmux: true }
+    }
+}
+
+#[derive(Debug, Default, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawConfig {
+    tmux: Option<bool>,
+}
+
+impl Config {
+    pub fn load(env: &HostEnv) -> Result<Self> {
+        let file = env.paddock_config().join("config.toml");
+        let Ok(text) = std::fs::read_to_string(&file) else {
+            return Ok(Self::default());
+        };
+        Self::parse(&text).with_context(|| format!("[view] in {} is invalid", file.display()))
+    }
+
+    pub fn parse(text: &str) -> Result<Self> {
+        let v: toml::Value = toml::from_str(text)?;
+        let raw: RawConfig = match v.get("view") {
+            Some(t) => t
+                .clone()
+                .try_into()
+                .context("[view] has one key: tmux = true or false")?,
+            None => RawConfig::default(),
+        };
+        Ok(Config {
+            tmux: raw.tmux.unwrap_or(true),
+        })
+    }
+}
+
+/// paddock's own tmux server.
+#[derive(Debug, Clone)]
+pub struct Tmux {
+    pub exe: PathBuf,
+    pub sock: PathBuf,
+    /// PATH, HOME and the locale for the server, nothing else.
+    vars: Vec<(String, String)>,
+    /// `systemd-run` and the variables it needs: the server starts in a
+    /// scope of its own. Without it, the server is in the cgroup of the
+    /// paddock that starts it, for example the scope of a spawned child,
+    /// and ends when that scope stops.
+    scope: Option<(PathBuf, Vec<(String, String)>)>,
+}
+
+impl Tmux {
+    /// The server of this user, when tmux is on PATH.
+    pub fn find(env: &HostEnv) -> Option<Tmux> {
+        let exe = env.which("tmux")?;
+        let vars = ["PATH", "HOME", "LANG", "LC_ALL", "LC_CTYPE"]
+            .iter()
+            .filter_map(|k| env.var(k).map(|v| (k.to_string(), v.to_string())))
+            .collect();
+        let scope = env.which("systemd-run").and_then(|run| {
+            let vars: Vec<(String, String)> = ["XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS"]
+                .iter()
+                .filter_map(|k| env.var(k).map(|v| (k.to_string(), v.to_string())))
+                .collect();
+            (vars.len() == 2).then_some((run, vars))
+        });
+        Some(Tmux {
+            exe,
+            sock: socket(env),
+            vars,
+            scope,
+        })
+    }
+
+    fn cmd(&self) -> Command {
+        let mut c = Command::new(&self.exe);
+        c.arg("-S")
+            .arg(&self.sock)
+            .arg("-f")
+            .arg("/dev/null")
+            .env_clear()
+            .envs(self.vars.iter().map(|(k, v)| (k, v)))
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        c
+    }
+
+    fn run(&self, args: &[&str]) -> bool {
+        if !self.sock.exists() {
+            return false;
+        }
+        self.cmd().args(args).status().is_ok_and(|s| s.success())
+    }
+
+    pub fn has(&self, id: &str) -> bool {
+        valid_id(id) && self.run(&["has-session", "-t", &format!("={id}")])
+    }
+
+    /// The names of the sessions of the server. Empty when no server runs.
+    pub fn sessions(&self) -> Vec<String> {
+        if !self.sock.exists() {
+            return vec![];
+        }
+        let out = self
+            .cmd()
+            .args(["list-sessions", "-F", "#{session_name}"])
+            .stdout(Stdio::piped())
+            .output();
+        match out {
+            Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .map(str::to_string)
+                .collect(),
+            _ => vec![],
+        }
+    }
+
+    pub fn kill(&self, id: &str) -> bool {
+        valid_id(id) && self.run(&["kill-session", "-t", &format!("={id}")])
+    }
+
+    /// Start the session of a sandbox: a pane that prints `header` and then
+    /// follows `log` until the process `pid` (the paddock that runs the
+    /// sandbox) ends, then prints `end`. The pane stays after that.
+    pub fn start(&self, id: &str, header: &str, log: &Path, pid: u32, end: &Path) -> Result<()> {
+        if !valid_id(id) {
+            bail!("{id} is not a sandbox id");
+        }
+        if let Some(d) = self.sock.parent() {
+            crate::privfs::dir(d)?;
+        }
+        let script = "printf '%s\\n\\n' \"$1\"; tail -n +1 --pid=\"$3\" -f -- \"$2\"; \
+                      cat -- \"$4\" 2>/dev/null";
+        let pid = pid.to_string();
+        let mut args: Vec<OsString> = [
+            "start-server",
+            ";",
+            "set-option",
+            "-g",
+            "history-limit",
+            HISTORY_LIMIT,
+            ";",
+            "set-option",
+            "-g",
+            "remain-on-exit",
+            "on",
+            ";",
+            "new-session",
+            "-d",
+            "-s",
+            id,
+            "-x",
+            "160",
+            "-y",
+            "48",
+            "sh",
+            "-c",
+            script,
+            "paddock-view",
+            header,
+        ]
+        .iter()
+        .map(OsString::from)
+        .collect();
+        args.extend([log.into(), pid.into(), end.into()]);
+        // A new server goes into a scope of its own when it can.
+        let running = self.run(&["list-sessions"]);
+        if let (false, Some((run, vars))) = (running, &self.scope) {
+            let ok = Command::new(run)
+                .args(["--user", "--scope", "--quiet", "--collect", "--"])
+                .arg(&self.exe)
+                .arg("-S")
+                .arg(&self.sock)
+                .args(["-f", "/dev/null"])
+                .args(&args)
+                .env_clear()
+                .envs(self.vars.iter().map(|(k, v)| (k, v)))
+                .envs(vars.iter().map(|(k, v)| (k, v)))
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .is_ok_and(|s| s.success());
+            if ok {
+                return Ok(());
+            }
+        }
+        let status = self
+            .cmd()
+            .args(&args)
+            .status()
+            .context("cannot start tmux")?;
+        if !status.success() {
+            bail!("tmux new-session failed ({status})");
+        }
+        Ok(())
+    }
+}
+
+/// The local time as `YYYY-MM-DD HH:MM`.
+pub fn local_time(secs: u64) -> String {
+    // SAFETY: localtime_r writes only into `tm`.
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    let t = secs as libc::time_t;
+    if unsafe { libc::localtime_r(&t, &mut tm) }.is_null() {
+        return secs.to_string();
+    }
+    format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}",
+        tm.tm_year + 1900,
+        tm.tm_mon + 1,
+        tm.tm_mday,
+        tm.tm_hour,
+        tm.tm_min
+    )
+}
+
+pub fn header(id: &str, harness: &str, started: u64) -> String {
+    format!(
+        "paddock: sandbox {id}, harness {harness}, started {}. One-shot output appears at the end.",
+        local_time(started)
+    )
+}
+
+/// Where a copied stream goes besides the log.
+pub enum Sink {
+    /// A file descriptor of this process (1 or 2), looked up at each write,
+    /// so a later redirect of it (a closed terminal) applies.
+    Fd(i32),
+    /// Kept in memory: the capture of a spawn. The last 4 MiB.
+    Capture,
+}
+
+struct LogFile {
+    file: Option<std::fs::File>,
+    written: u64,
+}
+
+impl LogFile {
+    fn write(&mut self, data: &[u8]) {
+        let Some(f) = self.file.as_mut() else { return };
+        let room = LOG_CAP.saturating_sub(self.written) as usize;
+        let n = data.len().min(room);
+        if f.write_all(&data[..n]).is_err() {
+            self.file = None;
+            return;
+        }
+        self.written += n as u64;
+        if n < data.len() {
+            let _ = f.write_all(b"\n[paddock: the run log is full; the view shows no more]\n");
+            self.file = None;
+        }
+    }
+}
+
+/// The copies of one run: one thread per stream.
+pub struct Tee {
+    log: Arc<Mutex<LogFile>>,
+    threads: Vec<(bool, std::thread::JoinHandle<Option<Vec<u8>>>)>,
+}
+
+impl Tee {
+    /// A new run log at `path` (any old one goes).
+    pub fn create(path: &Path) -> Result<Tee> {
+        if let Some(d) = path.parent() {
+            crate::privfs::dir(d)?;
+        }
+        let _ = std::fs::remove_file(path);
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path)
+            .with_context(|| format!("cannot create {}", path.display()))?;
+        Ok(Tee {
+            log: Arc::new(Mutex::new(LogFile {
+                file: Some(file),
+                written: 0,
+            })),
+            threads: vec![],
+        })
+    }
+
+    /// Copy `src` to `sink` and to the log until its end. When the sink
+    /// fails (the caller closed its end), the copy stops and closes `src`,
+    /// so the harness gets the same EPIPE as without the view.
+    pub fn copy(&mut self, mut src: impl Read + Send + 'static, sink: Sink) {
+        let log = self.log.clone();
+        let capture = matches!(sink, Sink::Capture);
+        let h = std::thread::spawn(move || {
+            let mut kept = Vec::new();
+            let mut buf = vec![0u8; 64 * 1024];
+            loop {
+                let n = match src.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => n,
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(_) => break,
+                };
+                let data = &buf[..n];
+                match sink {
+                    Sink::Fd(fd) => {
+                        if write_fd(fd, data).is_err() {
+                            log.lock().unwrap().write(data);
+                            break;
+                        }
+                    }
+                    Sink::Capture => {
+                        kept.extend_from_slice(data);
+                        if kept.len() > 2 * CAPTURE_KEEP {
+                            kept.drain(..kept.len() - CAPTURE_KEEP);
+                        }
+                    }
+                }
+                log.lock().unwrap().write(data);
+            }
+            if kept.len() > CAPTURE_KEEP {
+                kept.drain(..kept.len() - CAPTURE_KEEP);
+            }
+            capture.then_some(kept)
+        });
+        self.threads.push((capture, h));
+    }
+
+    /// Wait for the copies after the harness ended. A capture is read to
+    /// its end, as without the view. The other streams get `grace`: a
+    /// process that the harness left behind can hold them open.
+    pub fn finish(self, grace: Duration) -> Option<Vec<u8>> {
+        let mut out = None;
+        let deadline = Instant::now() + grace;
+        for (capture, h) in self.threads {
+            if capture {
+                out = h.join().ok().flatten();
+                continue;
+            }
+            while !h.is_finished() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            if h.is_finished() {
+                let _ = h.join();
+            }
+        }
+        if let Ok(mut l) = self.log.lock() {
+            if let Some(f) = l.file.as_mut() {
+                let _ = f.flush();
+            }
+        }
+        out
+    }
+}
+
+fn write_fd(fd: i32, mut data: &[u8]) -> std::io::Result<()> {
+    while !data.is_empty() {
+        // SAFETY: a write from a valid buffer to a descriptor of this process.
+        let n = unsafe { libc::write(fd, data.as_ptr().cast(), data.len()) };
+        if n < 0 {
+            let e = std::io::Error::last_os_error();
+            if e.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(e);
+        }
+        data = &data[n as usize..];
+    }
+    Ok(())
+}
+
+/// The view of one run, from the start of the sandbox to its end.
+pub struct Live {
+    pub tee: Tee,
+    pub tee_out: bool,
+    pub tee_err: bool,
+    end: PathBuf,
+    pub session: bool,
+}
+
+impl Live {
+    /// Prepare the view of a run without a terminal. `tee_out` and
+    /// `tee_err` say which streams paddock copies: a stream that is a
+    /// terminal stays the harness's own. None when nothing is copied or the
+    /// log cannot be made.
+    pub fn start(
+        env: &HostEnv,
+        id: &str,
+        harness: &str,
+        tee_out: bool,
+        tee_err: bool,
+        quiet: bool,
+    ) -> Option<Live> {
+        if !(tee_out || tee_err) || !valid_id(id) {
+            return None;
+        }
+        let log = log_file(env, id);
+        let end = end_file(env, id);
+        let _ = std::fs::remove_file(&end);
+        let tee = match Tee::create(&log) {
+            Ok(t) => t,
+            Err(e) => {
+                log::debug!("no view for this run: {e:#}");
+                return None;
+            }
+        };
+        let cfg = Config::load(env).unwrap_or_else(|e| {
+            if !quiet {
+                log::warn!("{e:#}");
+            }
+            Config::default()
+        });
+        let session = match Tmux::find(env).filter(|_| cfg.tmux) {
+            Some(t) => {
+                let h = header(id, harness, crate::state::now());
+                match t.start(id, &h, &log, std::process::id(), &end) {
+                    Ok(()) => true,
+                    Err(e) => {
+                        if !quiet {
+                            log::warn!("no tmux view for this sandbox: {e:#}");
+                        }
+                        false
+                    }
+                }
+            }
+            None => false,
+        };
+        Some(Live {
+            tee,
+            tee_out,
+            tee_err,
+            end,
+            session,
+        })
+    }
+
+    /// After the sandbox ended: wait for the copies and write the last
+    /// line of the pane. Gives back the capture, if there is one.
+    pub fn finish(self, code: i32) -> Option<Vec<u8>> {
+        let out = self.tee.finish(Duration::from_secs(2));
+        let line = format!(
+            "\npaddock: the sandbox ended at {} with exit code {code}.\n",
+            local_time(crate::state::now())
+        );
+        let _ = crate::privfs::write(&self.end, line.as_bytes());
+        out
+    }
+}
+
+/// End the view of a sandbox: its tmux session. The log stays until `gc`.
+pub fn end_session(env: &HostEnv, id: &str) -> bool {
+    Tmux::find(env).is_some_and(|t| t.kill(id))
+}
+
+/// Remove the view of a sandbox: its session and its files.
+pub fn remove(env: &HostEnv, id: &str) -> Result<()> {
+    if !valid_id(id) {
+        bail!("{id} is not a sandbox id");
+    }
+    end_session(env, id);
+    for f in [log_file(env, id), end_file(env, id)] {
+        match std::fs::remove_file(&f) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e).with_context(|| format!("remove {}", f.display())),
+        }
+    }
+    Ok(())
+}
+
+/// The views whose sandbox ended more than `MAX_AGE` before `now`: the
+/// sessions and the logs. `running` are the ids of the running sandboxes.
+pub fn stale(env: &HostEnv, sessions: &[String], running: &[String], now: u64) -> Vec<String> {
+    let mut ids: std::collections::BTreeSet<String> =
+        sessions.iter().filter(|s| valid_id(s)).cloned().collect();
+    if let Ok(rd) = std::fs::read_dir(dir(env)) {
+        for e in rd.flatten() {
+            let name = e.file_name().to_string_lossy().into_owned();
+            if let Some(id) = name
+                .strip_suffix(".log")
+                .or_else(|| name.strip_suffix(".end"))
+            {
+                if valid_id(id) {
+                    ids.insert(id.to_string());
+                }
+            }
+        }
+    }
+    ids.into_iter()
+        .filter(|id| !running.contains(id))
+        .filter(|id| {
+            // The end of the sandbox; without the end line (paddock was
+            // killed), the last write of the log. A session without files
+            // has no time at all: it goes.
+            let ended = [end_file(env, id), log_file(env, id)]
+                .iter()
+                .find_map(|f| std::fs::metadata(f).ok())
+                .map(|m| m.mtime().max(0) as u64);
+            ended.is_none_or(|t| now.saturating_sub(t) > MAX_AGE)
+        })
+        .collect()
+}
+
+/// The `paddock gc` items: one per stale view.
+pub fn gc_items(env: &HostEnv, now: u64) -> Vec<crate::storage::Item> {
+    let sessions = Tmux::find(env).map(|t| t.sessions()).unwrap_or_default();
+    let running: Vec<String> = crate::state::Running::list(env)
+        .into_iter()
+        .map(|r| r.id)
+        .collect();
+    stale(env, &sessions, &running, now)
+        .into_iter()
+        .map(|id| {
+            let bytes = std::fs::metadata(log_file(env, &id))
+                .map(|m| m.len())
+                .unwrap_or(0);
+            crate::storage::Item {
+                what: format!("the view of {id} (tmux session and run log)"),
+                tier: crate::storage::Tier::Auto,
+                bytes,
+                reason: "the sandbox ended more than a day ago".into(),
+                warning: None,
+                needs: vec![],
+                action: crate::storage::Action::View { id },
+            }
+        })
+        .collect()
+}
+
+/// What a sandbox row can open: `(view, tmux)`. `view` is a session or a
+/// run log, `tmux` a session (`paddock view --write` takes it over).
+pub fn available(env: &HostEnv, sessions: &[String], id: &str) -> (bool, bool) {
+    let tmux = sessions.iter().any(|s| s == id);
+    (tmux || log_file(env, id).is_file(), tmux)
+}
+
+/// The inputs of `paddock view`, so a test can check the command.
+pub struct Opener {
+    pub xdg_terminal_exec: Option<PathBuf>,
+    pub terminal: Option<String>,
+    pub tmux: Option<Tmux>,
+    pub log: PathBuf,
+}
+
+impl Opener {
+    pub fn from_env(env: &HostEnv, id: &str) -> Opener {
+        Opener {
+            xdg_terminal_exec: env.which("xdg-terminal-exec"),
+            terminal: env
+                .var("TERMINAL")
+                .filter(|t| !t.trim().is_empty())
+                .map(str::to_string),
+            tmux: Tmux::find(env),
+            log: log_file(env, id),
+        }
+    }
+
+    /// The command that opens the view of `id` in a new terminal.
+    pub fn command(&self, id: &str, write: bool) -> Result<Vec<OsString>> {
+        if !valid_id(id) {
+            bail!("{id} is not a sandbox id");
+        }
+        let inner: Vec<OsString> = match &self.tmux {
+            Some(t) if t.has(id) => {
+                let mut v: Vec<OsString> = vec![
+                    t.exe.clone().into(),
+                    "-S".into(),
+                    t.sock.clone().into(),
+                    "attach".into(),
+                ];
+                if !write {
+                    v.push("-r".into());
+                }
+                v.extend(["-t".into(), id.into()]);
+                v
+            }
+            _ if self.log.is_file() => vec![
+                "tail".into(),
+                "-n".into(),
+                "+1".into(),
+                "-f".into(),
+                "--".into(),
+                self.log.clone().into(),
+            ],
+            Some(_) => bail!(
+                "sandbox {id} has no view: it has no tmux session and no run log. A sandbox started from a terminal has no view, it uses that terminal"
+            ),
+            None => bail!(
+                "sandbox {id} has no run log, and tmux is not installed. A sandbox started from a terminal has no view, it uses that terminal"
+            ),
+        };
+        let mut argv: Vec<OsString> = match (&self.xdg_terminal_exec, &self.terminal) {
+            (Some(x), _) => vec![x.clone().into()],
+            (None, Some(t)) => vec![t.into(), "-e".into()],
+            (None, None) => {
+                bail!("no terminal to open: install xdg-terminal-exec or set $TERMINAL")
+            }
+        };
+        argv.extend(inner);
+        Ok(argv)
+    }
+}
+
+/// `paddock view ID [--write]`: open the view in a new terminal window.
+pub fn open(env: &HostEnv, id: &str, write: bool) -> Result<()> {
+    let argv = Opener::from_env(env, id).command(id, write)?;
+    let mut c = Command::new(&argv[0]);
+    c.args(&argv[1..])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .process_group(0);
+    c.spawn()
+        .with_context(|| format!("cannot start {}", argv[0].to_string_lossy()))?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests;
