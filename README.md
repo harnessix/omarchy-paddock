@@ -892,7 +892,7 @@ The push itself runs in the gateway executor, from the plan that the card showed
 
 - Force pushes, branch deletions and pushes to the default branch ask every time. "Allow for this session" is not offered for them.
 - "Allow for this session" covers one remote and one branch.
-- paddock reads the remotes when the sandbox starts. Inside the sandbox, `.git/config` is read-only. If the agent names another remote, for example with `git -c`, the card marks it as new and asks every time. The host always pushes to the URL that a remote had at the start.
+- paddock reads the remotes when the sandbox starts. Inside the sandbox, `.git/config` is read-only. If the agent names another remote, for example with `git -c`, the card marks it as new and asks every time. A new remote must be a network URL (`https://`, `ssh://`, `git://` or `host:path`): paddock refuses a path or `file://` URL on this machine, because git runs the hooks of the receiving repository there. The host always pushes to the URL that a remote had at the start.
 - Hooks never run on the host, not even `pre-push`.
 - Right before the push, paddock checks the object store of the repository again: `objects/info/alternates` must be unchanged, and `objects`, `objects/info` and `objects/pack` must still be plain directories. The scratch repository reads objects through them, so a symlink or a new alternates line would push objects of another repository of yours.
 

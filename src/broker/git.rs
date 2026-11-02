@@ -386,15 +386,26 @@ pub fn valid_ref(r: &str) -> bool {
         && !r.chars().any(|c| c.is_control() || " ~^:?*[\\".contains(c))
 }
 
-/// Check a URL for a remote that the host does not know.
+/// Check a URL for a remote that the host does not know. Only network
+/// remotes: a path or `file://` URL on this machine can name a repository
+/// that the sandbox wrote, and git runs that repository's hooks
+/// (`pre-receive`) on the host when it pushes there.
 fn valid_new_url(u: &str) -> Result<()> {
-    if u.is_empty()
+    let network = match u.split_once("://") {
+        Some((scheme, _)) => ["https", "http", "ssh", "git", "git+ssh", "ssh+git"]
+            .contains(&scheme.to_ascii_lowercase().as_str()),
+        // git reads `host:path` as SSH when no `/` comes before the colon.
+        None => u
+            .split_once(':')
+            .is_some_and(|(host, _)| !host.is_empty() && !host.contains('/')),
+    };
+    if !network
         || u.starts_with('-')
         || u.contains("::")
         || u.starts_with("ext:")
         || u.chars().any(|c| c.is_control())
     {
-        bail!("{u:?} is not a URL that paddock pushes to");
+        bail!("{u:?} is not a URL that paddock pushes to (a new remote must be a network URL)");
     }
     Ok(())
 }
@@ -912,7 +923,11 @@ mod tests {
         let p = plan(
             Some(&repo),
             &run,
-            &args("sneaky", url, one("refs/heads/x", false)),
+            &args(
+                "sneaky",
+                "https://example.com/other.git",
+                one("refs/heads/x", false),
+            ),
         )
         .unwrap();
         assert!(!p.known && !p.session_allowed());
@@ -936,5 +951,52 @@ mod tests {
             &args("x", "ext::sh -c evil", one("refs/heads/x", false))
         )
         .is_err());
+    }
+
+    #[test]
+    fn a_new_remote_on_this_machine_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (work, _) = project(tmp.path());
+        let repo = Repo::snapshot(&work).unwrap();
+        let sha = sh(&work, &["rev-parse", "HEAD"]);
+        let run = tmp.path().join("run");
+        // The sandbox can write the project: a bare repository there with a
+        // hook would run that hook on the host when the host pushes to it.
+        let evil = work.join("evil.git");
+        sh(
+            tmp.path(),
+            &["init", "-q", "--bare", evil.to_str().unwrap()],
+        );
+        let hook = evil.join("hooks/pre-receive");
+        std::fs::write(&hook, "#!/bin/sh\ntouch ../RAN\n").unwrap();
+        std::fs::set_permissions(&hook, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
+        let one = serde_json::json!([{ "sha": sha, "dst": "refs/heads/x" }]);
+        let path = evil.to_str().unwrap().to_string();
+        for url in [
+            path.clone(),
+            format!("file://{path}"),
+            "evil.git".to_string(),
+            "../evil.git".to_string(),
+            "./evil.git".to_string(),
+            "~/evil.git".to_string(),
+            "file:///srv/x.git".to_string(),
+        ] {
+            assert!(
+                plan(Some(&repo), &run, &args("evil", &url, one.clone())).is_err(),
+                "{url}"
+            );
+        }
+        assert!(!work.join("RAN").exists());
+        for url in [
+            "https://example.com/a/b.git",
+            "ssh://git@example.com/a/b.git",
+            "git@example.com:a/b.git",
+        ] {
+            assert!(
+                plan(Some(&repo), &run, &args("ok", url, one.clone())).is_ok(),
+                "{url}"
+            );
+        }
     }
 }
