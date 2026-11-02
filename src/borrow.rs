@@ -358,23 +358,50 @@ pub fn git_protected(rel: &str, kind: Kind) -> bool {
     false
 }
 
-/// A symlink whose target leaves the borrowed folder.
-pub fn escapes(rel: &str, target: &Path) -> bool {
-    if target.is_absolute() {
+/// A symlink of `tree` that leads outside the borrowed folder, also through
+/// other symlinks of `tree` on the way: `x -> s/..` with `s -> .` leaves it.
+pub fn leaves(tree: &BTreeMap<String, Entry>, rel: &str, target: &Path) -> bool {
+    let mut at: Vec<String> = rel.split('/').map(str::to_string).collect();
+    at.pop();
+    // The parts still to walk, the next one last.
+    let mut todo: Vec<String> = Vec::new();
+    let push = |todo: &mut Vec<String>, t: &Path| -> bool {
+        if t.is_absolute() {
+            return false;
+        }
+        for c in t.components().rev() {
+            match c {
+                Component::Normal(n) => todo.push(n.to_string_lossy().into_owned()),
+                Component::ParentDir => todo.push("..".into()),
+                Component::CurDir => {}
+                _ => return false,
+            }
+        }
+        true
+    };
+    if !push(&mut todo, target) {
         return true;
     }
-    let mut depth = rel.split('/').count() as i64 - 1;
-    for c in target.components() {
-        match c {
-            Component::Normal(_) => depth += 1,
-            Component::CurDir => {}
-            Component::ParentDir => {
-                depth -= 1;
-                if depth < 0 {
-                    return true;
-                }
+    let mut hops = 0;
+    while let Some(c) = todo.pop() {
+        if c == ".." {
+            if at.pop().is_none() {
+                return true;
             }
-            _ => return true,
+            continue;
+        }
+        at.push(c);
+        let Some(e) = tree.get(&at.join("/")).filter(|e| e.kind == Kind::Symlink) else {
+            continue;
+        };
+        hops += 1;
+        // The kernel gives up after 40 links; so does this walk.
+        if hops > 40 {
+            return true;
+        }
+        at.pop();
+        if !push(&mut todo, e.target.as_deref().unwrap_or(Path::new("/"))) {
+            return true;
         }
     }
     false
@@ -845,15 +872,23 @@ pub fn plan_return(env: &HostEnv, id: &str, name: &str, max: u64) -> Result<Retu
             }
         }
     }
-    let out: Vec<String> = ch
-        .added
+    // Every symlink counts: a new one can also turn an old one around, as
+    // `s -> .` does to `x -> s/..`. An old link that already led outside in
+    // the original stays as it was.
+    let new: BTreeSet<&String> = ch.added.iter().chain(&ch.changed).collect();
+    let out: Vec<String> = copy
         .iter()
-        .chain(&ch.changed)
-        .filter(|r| {
-            let e = &copy[*r];
-            e.kind == Kind::Symlink && escapes(r, e.target.as_deref().unwrap_or(Path::new("/")))
+        .filter(|(r, e)| {
+            let t = |e: &Entry| e.target.clone().unwrap_or_else(|| PathBuf::from("/"));
+            e.kind == Kind::Symlink
+                && leaves(&copy, r, &t(e))
+                && (new.contains(r)
+                    || !manifest
+                        .entries
+                        .get(*r)
+                        .is_some_and(|o| leaves(&manifest.entries, r, &t(o))))
         })
-        .cloned()
+        .map(|(r, _)| r.clone())
         .collect();
     let plan = ReturnPlan {
         name: name.to_string(),

@@ -64,12 +64,14 @@ fn git_files_that_paddock_binds_read_only_are_protected() {
 
 #[test]
 fn symlinks_that_leave_the_folder_are_found() {
-    assert!(escapes("a", Path::new("/etc/passwd")));
-    assert!(escapes("a", Path::new("../x")));
-    assert!(escapes("d/a", Path::new("../../x")));
-    assert!(escapes("d/a", Path::new("x/../../../y")));
-    assert!(!escapes("d/a", Path::new("../x")));
-    assert!(!escapes("a", Path::new("d/./x")));
+    let none = BTreeMap::new();
+    let escapes = |r: &str, t: &str| leaves(&none, r, Path::new(t));
+    assert!(escapes("a", "/etc/passwd"));
+    assert!(escapes("a", "../x"));
+    assert!(escapes("d/a", "../../x"));
+    assert!(escapes("d/a", "x/../../../y"));
+    assert!(!escapes("d/a", "../x"));
+    assert!(!escapes("a", "d/./x"));
 }
 
 #[test]
@@ -297,6 +299,43 @@ fn a_return_refuses_symlinks_that_point_outside() {
     let err = plan_return(&e, "s-1", &name, DEFAULT_MAX).err().unwrap();
     assert!(format!("{err:#}").contains("outside the folder"), "{err:#}");
     assert!(!o.join("pw").exists());
+}
+
+#[test]
+fn chained_symlinks_that_leave_the_folder_stop_the_return() {
+    // Review A-M6.
+    let t = tempfile::tempdir().unwrap();
+    let e = env(t.path());
+    let o = original(t.path());
+    let (name, copy) = borrowed(&e, &o);
+    std::fs::create_dir(t.path().join("secret")).unwrap();
+    std::fs::write(t.path().join("secret/key"), "k").unwrap();
+    symlink(".", copy.join("s")).unwrap();
+    symlink("s/..", copy.join("x")).unwrap();
+    let err = plan_return(&e, "s-1", &name, DEFAULT_MAX).err().unwrap();
+    assert!(format!("{err:#}").contains("outside the folder"), "{err:#}");
+    assert!(!o.join("x").exists());
+}
+
+#[test]
+fn symlinks_are_followed_in_the_tree_to_find_where_they_lead() {
+    let l = |t: &str| Entry::symlink(PathBuf::from(t));
+    let tree: BTreeMap<String, Entry> = [
+        ("s".to_string(), l(".")),
+        ("d".to_string(), Entry::dir()),
+        ("d/up".to_string(), l("..")),
+        ("lib.so".to_string(), l("lib.so.1")),
+        ("lib.so.1".to_string(), l("d/lib.so.1.2")),
+        ("loop".to_string(), l("loop")),
+    ]
+    .into_iter()
+    .collect();
+    assert!(leaves(&tree, "x", Path::new("s/..")));
+    assert!(leaves(&tree, "x", Path::new("d/up/..")));
+    assert!(leaves(&tree, "x", Path::new("loop")));
+    assert!(!leaves(&tree, "x", Path::new("lib.so")));
+    assert!(!leaves(&tree, "d/x", Path::new("up/d")));
+    assert!(!leaves(&tree, "d/x", Path::new("../s/d")));
 }
 
 #[test]
