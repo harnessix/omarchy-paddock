@@ -457,3 +457,16 @@ fn a_process_left_behind_does_not_hang_a_tool() {
     assert!(format!("{e:#}").contains("left its output open"), "{e:#}");
     assert!(start.elapsed() < Duration::from_secs(10));
 }
+
+#[test]
+fn the_aws_cards_do_not_promise_the_duration_for_sso() {
+    let all = parse(AWS).unwrap();
+    let (name, c) = all.iter().next().unwrap();
+    let text = format!(
+        "{} {}",
+        crate::credentials::describe(name, c),
+        aws_lifetime(c.aws_duration())
+    );
+    assert!(!text.contains("end after"), "{text}");
+    assert!(text.contains("single sign-on"), "{text}");
+}

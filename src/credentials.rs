@@ -594,7 +594,7 @@ pub fn plan(env: &HostEnv, harness: &str, spawned: bool) -> Result<Plan> {
     Ok(p)
 }
 
-fn describe(name: &str, c: &Credential) -> String {
+pub(crate) fn describe(name: &str, c: &Credential) -> String {
     let from = match c.from {
         Source::Env => format!("from the host variable {}", c.host_var(name)),
         Source::Command => format!("from the command `{}`", c.command.join(" ")),
@@ -605,9 +605,9 @@ fn describe(name: &str, c: &Credential) -> String {
             c.registries.join(", ")
         ),
         Via::Agent if c.kind() == Kind::Aws => format!(
-            "{name}: AWS credentials of your profile {} that end after {} seconds. The long-lived keys stay on the host, and you allow the first use in this run. The sandbox gets a new short-lived set at each later use",
+            "{name}: AWS credentials of your profile {}: {}. The long-lived keys stay on the host, and you allow the first use in this run. The sandbox gets a new short-lived set at each later use",
             c.profile.as_deref().unwrap_or(""),
-            c.aws_duration()
+            channels::aws_lifetime(c.aws_duration())
         ),
         Via::Agent => format!(
             "{name}: the ssh keys {} in your ssh agent. The private keys stay on the host: the sandbox gets an agent socket that lists only these keys and signs only with them{}",

@@ -394,8 +394,8 @@ impl Channels {
             &format!("aws\0{name}"),
             &format!("AWS credentials of the profile {profile} ({name})"),
             &format!(
-                "The sandbox asks for AWS credentials of your profile {profile}.\nCredential: {name}\nYes gives it credentials that end after {} seconds, now and at each later request in this run, without a new question. The long-lived keys stay on the host. paddock credentials revoke ends it.",
-                c.aws_duration()
+                "The sandbox asks for AWS credentials of your profile {profile}.\nCredential: {name}\nYes gives it {}, now and at each later request in this run, without a new question. The long-lived keys stay on the host. paddock credentials revoke ends it.",
+                aws_lifetime(c.aws_duration())
             ),
         ) {
             self.audit(name, &what, "denied by the user");
@@ -412,6 +412,15 @@ impl Channels {
             }
         }
     }
+}
+
+/// How long an AWS set lasts, for a card: `duration` applies to a session
+/// that paddock makes from long-lived keys, not to temporary credentials
+/// that the profile gives already.
+pub fn aws_lifetime(duration: u64) -> String {
+    format!(
+        "short-lived credentials ({duration} seconds from long-lived keys; a single sign-on or assumed-role profile gives its own set as it is)"
+    )
 }
 
 /// The `credential_process` output for temporary credentials. None: a
