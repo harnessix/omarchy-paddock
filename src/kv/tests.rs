@@ -1761,6 +1761,10 @@ fn a_frozen_holder_keeps_its_lease_and_the_time_it_had_left() {
     assert_eq!(r.status, Status::Done, "{}", r.message);
     let expires = r.result["expires"].as_u64().unwrap();
     let frozen_at = expires - 50;
+    // The holder's paddock still runs.
+    let mut holder = frozen_holder("a");
+    holder.pid = std::process::id();
+    holder.register(&w.env).unwrap();
     // `[suspend] leases = "keep"` is the default.
     assert!(
         crate::freeze::leases_frozen(&w.env, &w.root, &frozen_holder("a"), frozen_at).is_empty()
@@ -1800,6 +1804,29 @@ fn a_frozen_holder_keeps_its_lease_and_the_time_it_had_left() {
     assert_eq!(e.expires, Some(late + 50));
     assert!(!st.is_paused(&key, "lease:job").unwrap());
     assert!(st.get(&key, "lease:job", late + 50).unwrap().is_none());
+}
+
+#[test]
+fn review_b_a_paused_lease_of_a_holder_whose_paddock_died_runs_again() {
+    let w = world();
+    let (a, _) = service(&w, "a", None, KvCfg::default(), None);
+    let (b, _) = service(&w, "b", None, KvCfg::default(), None);
+    let r = a.handle(&claim(Scope::Pasture, "job", 60), None);
+    assert_eq!(r.status, Status::Done, "{}", r.message);
+    let now = crate::state::now();
+    assert!(crate::freeze::leases_frozen(&w.env, &w.root, &frozen_holder("a"), now).is_empty());
+    // a's paddock is killed while frozen: no thaw, no `finish`, no run record.
+    drop(a);
+    assert!(crate::state::Running::list(&w.env).is_empty());
+    let r = b.handle(&claim(Scope::Pasture, "job", 60), None);
+    assert_eq!(r.status, Status::Conflict, "{}", r.message);
+    assert_eq!(r.result["owner_state"], "running", "{}", r.message);
+    let e = w
+        .open(&team())
+        .get(&team().key(), "lease:job", now)
+        .unwrap()
+        .unwrap();
+    assert!(e.expires.unwrap() <= now + 61, "{:?}", e.expires);
 }
 
 #[test]

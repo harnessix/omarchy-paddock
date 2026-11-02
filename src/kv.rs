@@ -1300,7 +1300,20 @@ impl Service {
         now: u64,
     ) -> Result<Response> {
         let key = format!("{LEASE_PREFIX}{name}");
-        let cur = st.get(ns, &key, now)?;
+        let mut cur = st.get(ns, &key, now)?;
+        // A frozen holder whose paddock died (killed, crashed, a reboot)
+        // never thaws: its paused leases run again with the time they had.
+        if let Some(e) = &cur {
+            if e.writer != self.id.sandbox
+                && st.is_paused(ns, &key)?
+                && !crate::state::Running::list(&self.env)
+                    .iter()
+                    .any(|r| r.id == e.writer)
+            {
+                resume_leases(&self.root, &e.writer, now)?;
+                cur = st.get(ns, &key, now)?;
+            }
+        }
         if let Some(e) = &cur {
             if e.writer != self.id.sandbox {
                 // A frozen holder keeps its lease (`[suspend] leases = "keep"`).
