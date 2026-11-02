@@ -1004,45 +1004,9 @@ pub fn run(
     // pasta hides the host addresses that exist at start. Watch for new ones
     // (a VPN that comes up later) and report them: they stay reachable until
     // the next start.
-    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let new_addrs = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
-    let monitor =
-        (backend.name() == "bwrap" && spec.network == crate::spec::Network::Egress).then(|| {
-            let start_addrs = crate::proxy::local_addrs();
-            let (stop, found, env2, mut info) = (
-                stop.clone(),
-                new_addrs.clone(),
-                env.clone(),
-                running.clone(),
-            );
-            std::thread::spawn(move || {
-                while !stop.load(std::sync::atomic::Ordering::SeqCst) {
-                    std::thread::sleep(std::time::Duration::from_secs(3));
-                    let mut f = found.lock().unwrap();
-                    let mut changed = false;
-                    for a in crate::proxy::local_addrs() {
-                        let s = a.to_string();
-                        if !a.is_loopback() && !start_addrs.contains(&a) && !f.contains(&s) {
-                            f.push(s);
-                            changed = true;
-                        }
-                    }
-                    if changed {
-                        // The new addresses go first: they are the bigger risk.
-                        info.warnings
-                            .retain(|w| !w.starts_with("new host addresses"));
-                        info.warnings.insert(
-                            0,
-                            format!(
-                                "new host addresses since start are reachable: {}",
-                                f.join(", ")
-                            ),
-                        );
-                        let _ = info.register(&env2);
-                    }
-                }
-            })
-        });
+    let monitor = (backend.name() == "bwrap" && spec.network == crate::spec::Network::Egress)
+        .then(|| EgressAddrMonitor::start(env.clone(), running.clone(), new_addrs.clone()));
 
     let live = HistorySync::start(history, HISTORY_EVERY);
     let login_sync = LoginSync::start(auth, quiet);
@@ -1069,8 +1033,9 @@ pub fn run(
     if let Some(s) = &spawner {
         s.stop_all(Duration::from_secs(30));
     }
-    stop.store(true, std::sync::atomic::Ordering::SeqCst);
-    drop(monitor);
+    if let Some(m) = monitor {
+        m.finish();
+    }
     let late = new_addrs.lock().unwrap().clone();
     if !late.is_empty() && !quiet {
         eprintln!(
@@ -1558,6 +1523,110 @@ fn quiet_stdio() {
             libc::dup2(fd, 2);
             libc::close(fd);
         }
+    }
+}
+
+/// Watches for new host network addresses that become reachable while a sandbox
+/// runs under bwrap with network mode egress. Joined before exit.
+struct EgressAddrMonitor {
+    stop_tx: std::sync::mpsc::Sender<()>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl EgressAddrMonitor {
+    fn start(
+        env: HostEnv,
+        running: crate::state::Running,
+        found: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    ) -> Self {
+        let (stop_tx, stop_rx) = std::sync::mpsc::channel();
+        let start_addrs = crate::proxy::local_addrs();
+        let thread = std::thread::spawn(move || {
+            let mut info = running;
+            let check = |info: &mut crate::state::Running| {
+                let mut f = found.lock().unwrap();
+                let mut changed = false;
+                for a in crate::proxy::local_addrs() {
+                    let s = a.to_string();
+                    if !a.is_loopback() && !start_addrs.contains(&a) && !f.contains(&s) {
+                        f.push(s);
+                        changed = true;
+                    }
+                }
+                if changed {
+                    info.warnings
+                        .retain(|w| !w.starts_with("new host addresses"));
+                    info.warnings.insert(
+                        0,
+                        format!(
+                            "new host addresses since start are reachable: {}",
+                            f.join(", ")
+                        ),
+                    );
+                    let _ = info.register(&env);
+                }
+            };
+            while stop_rx
+                .recv_timeout(std::time::Duration::from_secs(3))
+                .is_err()
+            {
+                check(&mut info);
+            }
+            check(&mut info);
+        });
+        Self {
+            stop_tx,
+            thread: Some(thread),
+        }
+    }
+
+    fn finish(mut self) {
+        let _ = self.stop_tx.send(());
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
+    }
+}
+
+impl Drop for EgressAddrMonitor {
+    fn drop(&mut self) {
+        let _ = self.stop_tx.send(());
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
+    }
+}
+
+#[cfg(test)]
+mod egress_addr_monitor_tests {
+    use super::*;
+
+    #[test]
+    fn egress_addr_monitor_joins_on_finish() {
+        let t = tempfile::tempdir().unwrap();
+        let env = HostEnv::from_parts(
+            t.path().join("host"),
+            "demo".into(),
+            1,
+            1,
+            Default::default(),
+        );
+        let info: crate::state::Running = serde_json::from_value(serde_json::json!({
+            "id": "s-test",
+            "harness": "h",
+            "project": t.path().join("proj"),
+            "backend": "bwrap",
+            "network": "egress",
+            "gui": "off",
+            "pid": 1,
+            "started": 100,
+        }))
+        .unwrap();
+        let found = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let monitor = EgressAddrMonitor::start(env, info, found.clone());
+        let start = std::time::Instant::now();
+        monitor.finish();
+        assert!(start.elapsed() < std::time::Duration::from_secs(1));
     }
 }
 
