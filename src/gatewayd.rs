@@ -444,9 +444,12 @@ fn copy(
                 .arg("-p")
                 .arg(format!("StandardInputData={}", base64(text.as_bytes())))
                 .args(&args[i..]);
-            // The variables go in --setenv; systemd-run itself needs only the
-            // way to the user manager.
-            c.env_clear();
+            // --setenv names the variables; systemd-run takes the values
+            // from its own environment.
+            c.env_clear().envs(
+                cmd.get_envs()
+                    .filter_map(|(k, v)| v.map(|v| (k.to_os_string(), v.to_os_string()))),
+            );
             for k in ["XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS"] {
                 if let Ok(v) = std::env::var(k) {
                     c.env(k, v);

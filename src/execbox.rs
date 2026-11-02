@@ -315,11 +315,13 @@ pub fn command_in(
             for prop in p {
                 c.arg("-p").arg(prop);
             }
-            for (k, v) in env {
-                c.arg(format!("--setenv={k}={v}"));
+            // Only the names: systemd-run takes the values from its own
+            // environment, so no token is on a host command line.
+            for k in env.keys() {
+                c.arg(format!("--setenv={k}"));
             }
             c.arg("--").args(argv);
-            c.env_clear();
+            c.env_clear().envs(env);
             // systemd-run talks to the user manager over the runtime folder.
             for k in ["XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS"] {
                 if let Ok(v) = std::env::var(k) {
@@ -508,6 +510,28 @@ mod tests {
         c.get_args()
             .map(|a| a.to_string_lossy().into_owned())
             .collect()
+    }
+
+    #[test]
+    fn a_token_stays_off_the_systemd_run_command_line() {
+        let env: BTreeMap<String, String> =
+            [("GH_TOKEN".to_string(), "ghp_secret".to_string())].into();
+        let c = command(
+            Isolation::Systemd,
+            &ExecCfg::default(),
+            Path::new("/home/demo"),
+            Path::new("/home/demo/proj"),
+            &["gh".into()],
+            &env,
+            60,
+            "paddock-exec-x",
+        );
+        let a = args_of(&c);
+        assert!(a.iter().all(|a| !a.contains("ghp_secret")), "{a:?}");
+        assert!(a.iter().any(|a| a == "--setenv=GH_TOKEN"), "{a:?}");
+        assert!(c
+            .get_envs()
+            .any(|(k, v)| k == "GH_TOKEN" && v == Some("ghp_secret".as_ref())));
     }
 
     #[test]
