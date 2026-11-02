@@ -260,8 +260,23 @@ pub fn looks_secret(name: &str) -> bool {
     .any(|w| n.contains(w))
 }
 
+/// The home as written in `$HOME`, and its resolved path when `$HOME` goes
+/// through a symlink. Mount sources are compared in both forms.
+pub fn homes(env: &HostEnv) -> Vec<PathBuf> {
+    let mut v = vec![env.home.clone()];
+    if let Ok(real) = std::fs::canonicalize(&env.home) {
+        if real != env.home {
+            v.push(real);
+        }
+    }
+    v
+}
+
 pub fn denied_paths(env: &HostEnv) -> Vec<PathBuf> {
-    let mut v: Vec<PathBuf> = DENIED_HOME.iter().map(|p| env.home.join(p)).collect();
+    let mut v: Vec<PathBuf> = homes(env)
+        .iter()
+        .flat_map(|h| DENIED_HOME.iter().map(move |p| h.join(p)))
+        .collect();
     v.extend(DENIED_ABS.iter().map(PathBuf::from));
     if let Some(rt) = &env.runtime_dir {
         // The whole runtime directory holds the session bus, keyrings and the
@@ -277,6 +292,7 @@ fn overlaps(a: &Path, b: &Path) -> bool {
 
 pub fn enforce(env: &HostEnv, spec: &SandboxSpec) -> Result<()> {
     let denied = denied_paths(env);
+    let homes = homes(env);
     // The display socket is not a mount entry: gui.rs sets it only for the
     // nested compositor (window mode) or the approved host mode.
 
@@ -287,7 +303,7 @@ pub fn enforce(env: &HostEnv, spec: &SandboxSpec) -> Result<()> {
             if cand == Path::new("/") {
                 bail!("policy: refusing to mount / (from {})", m.origin);
             }
-            if env.home.starts_with(cand) {
+            if homes.iter().any(|h| h.starts_with(cand)) {
                 bail!(
                     "policy: refusing to mount {}: it is the home directory or contains it (from {})",
                     cand.display(),
@@ -427,6 +443,22 @@ mod tests {
         let mut s = spec(&env, &project);
         s.add_mount(Mount::same(&project, true, "test"));
         assert!(enforce(&env, &s).is_ok());
+    }
+
+    #[test]
+    fn a_symlinked_home_still_protects_its_paths() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("real");
+        std::fs::create_dir_all(real.join("home/.ssh")).unwrap();
+        std::os::unix::fs::symlink(&real, tmp.path().join("link")).unwrap();
+        let env = fake_env(&tmp.path().join("link/home"));
+        let project = tmp.path().join("p");
+        std::fs::create_dir_all(&project).unwrap();
+        for src in [real.join("home"), real.join("home/.ssh")] {
+            let mut s = spec(&env, &project);
+            s.add_mount(Mount::same(&src, false, "test"));
+            assert!(enforce(&env, &s).is_err(), "{}", src.display());
+        }
     }
 
     #[test]

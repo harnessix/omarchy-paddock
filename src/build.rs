@@ -332,7 +332,12 @@ pub fn build(env: &HostEnv, opts: &Options) -> Result<Built> {
 
 pub fn build_with(env: &HostEnv, opts: &Options, harness: Harness) -> Result<Built> {
     let project = resolve_project(opts.project.as_deref())?;
-    if project == env.home || env.home.starts_with(&project) {
+    // The project path is resolved, so compare it with the resolved home
+    // too: `$HOME` may name a symlink.
+    if crate::policy::homes(env)
+        .iter()
+        .any(|h| project == *h || h.starts_with(&project))
+    {
         bail!(
             "refusing to use {} as the project: it is the home directory or contains it",
             project.display()
@@ -939,6 +944,31 @@ mod tests {
         h.path_dirs.clear();
         h.exe = PathBuf::from("/home/demo/proj/node_modules/.bin/tool");
         assert!(check_harness_install(&h, &writable).is_err());
+    }
+
+    #[test]
+    fn a_symlinked_home_is_refused_as_the_project() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("real");
+        std::fs::create_dir_all(real.join("home")).unwrap();
+        std::os::unix::fs::symlink(&real, tmp.path().join("link")).unwrap();
+        let home = tmp.path().join("link/home");
+        let env = HostEnv::from_parts(home.clone(), "t".into(), 1000, 1000, Default::default());
+        let h = Harness {
+            profile: crate::profile::builtin("codex").unwrap(),
+            exe: PathBuf::from("/usr/bin/true"),
+            install_mounts: vec![],
+            path_dirs: vec![],
+            source: "test".into(),
+        };
+        let opts = Options {
+            harness: "codex".into(),
+            project: Some(home),
+            assume_yes: true,
+            ..Default::default()
+        };
+        let err = build_with(&env, &opts, h).err().expect("refused");
+        assert!(err.to_string().contains("home directory"), "{err}");
     }
 
     /// Build a spec for a built-in profile with a stand-in executable, a
