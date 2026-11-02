@@ -352,6 +352,36 @@ fn open_regular(p: &Path) -> std::io::Result<File> {
     Ok(f)
 }
 
+/// Opens the files of a project that a sandbox can write. It walks from
+/// the project down and never follows a symlink, also not in the middle of
+/// a path: another sandbox of the project can swap a folder for one.
+struct Reader {
+    root: crate::safefs::Root,
+    /// The folder of the last file: the walk is sorted, so neighbours share it.
+    last: Option<(String, crate::safefs::Dir)>,
+}
+
+impl Reader {
+    fn new(project: &Path) -> Result<Self> {
+        Ok(Reader {
+            root: crate::safefs::Root::open(project)?,
+            last: None,
+        })
+    }
+
+    fn open(&mut self, rel: &str) -> Result<File> {
+        let (parent, name) = rel.rsplit_once('/').unwrap_or(("", rel));
+        if self.last.as_ref().is_none_or(|(p, _)| p != parent) {
+            self.last = None;
+            let d = self.root.dir(Path::new(parent), false)?;
+            self.last = Some((parent.to_string(), d));
+        }
+        let d = &self.last.as_ref().expect("set above").1;
+        d.open_read(std::ffi::OsStr::new(name))?
+            .with_context(|| format!("{rel} is gone"))
+    }
+}
+
 /// Copy one file: shared data when `reflink` and the file system allow it,
 /// else a full copy when it fits in `budget`. `Ok(None)`: it does not fit,
 /// and `dst` is gone again. `Ok(Some(true))`: shared data.
@@ -439,6 +469,7 @@ pub fn take(
         let mut reflink = opts.reflink;
         let mut unreadable = Vec::new();
         let mut made: BTreeSet<PathBuf> = BTreeSet::new();
+        let mut reader = Reader::new(project)?;
         for (rel, fp) in files.iter_mut() {
             if Instant::now() > deadline {
                 return Ok(Copied::Slow);
@@ -453,7 +484,7 @@ pub fn take(
                 std::os::unix::fs::symlink(t, &dst)?;
                 continue;
             }
-            let Ok(src) = open_regular(&project.join(rel)) else {
+            let Ok(src) = reader.open(rel) else {
                 unreadable.push(rel.clone());
                 continue;
             };

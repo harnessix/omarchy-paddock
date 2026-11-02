@@ -400,6 +400,25 @@ fn undo_keeps_later_edits_when_the_end_was_not_recorded() {
 }
 
 #[test]
+fn the_snapshot_copy_never_follows_a_folder_swapped_for_a_link() {
+    // Review C-M5: another sandbox swaps `d/` between the walk and the copy.
+    let t = tempfile::tempdir().unwrap();
+    let (p, secret) = (t.path().join("p"), t.path().join("secret"));
+    write(&p, "d/key", "project");
+    write(&p, "e/x", "x");
+    write(&secret, "key", "host key");
+    let mut r = Reader::new(&p).unwrap();
+    assert!(r.open("e/x").is_ok());
+    fs::rename(p.join("d"), t.path().join("moved")).unwrap();
+    std::os::unix::fs::symlink(&secret, p.join("d")).unwrap();
+    assert!(r.open("d/key").is_err());
+    assert!(
+        open_regular(&p.join("d/key")).is_ok(),
+        "the old way followed it"
+    );
+}
+
+#[test]
 fn undo_does_not_write_through_a_planted_link() {
     let t = tempfile::tempdir().unwrap();
     let (p, root, trash, outside) = (
