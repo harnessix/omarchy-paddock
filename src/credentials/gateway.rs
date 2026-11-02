@@ -167,7 +167,16 @@ impl Route {
 /// for text inside one segment (`/*/*/info/refs`).
 pub fn path_matches(bound: &str, path: &str) -> bool {
     if !bound.contains('*') {
-        return path.starts_with(bound);
+        // A prefix ends at a segment boundary (`/v1` is not `/v10`), and
+        // what follows it has no escaped dot, slash or backslash and no
+        // empty segment, which a server can resolve to another path.
+        let Some(rest) = path.strip_prefix(bound) else {
+            return false;
+        };
+        let lower = rest.to_ascii_lowercase();
+        return (bound.ends_with('/') || rest.is_empty() || rest.starts_with('/'))
+            && !path.contains("//")
+            && !["%2e", "%2f", "%5c"].iter().any(|bad| lower.contains(bad));
     }
     // No escaped slashes or dots behind a wildcard, and no `.` or `..`
     // segment, which a server can resolve to another path.
@@ -932,6 +941,28 @@ mod tests {
         assert!(!path_matches("/*/*.git/x", "/o/r/x"));
         assert!(!path_matches("/*/*/info/refs", "/../x/info/refs"));
         assert!(!path_matches("/*/*/info/refs", "/o/./info/refs"));
+    }
+
+    #[test]
+    fn a_prefix_takes_no_escaped_traversal_or_partial_segment() {
+        assert!(path_matches("/repos/my-org/", "/repos/my-org/r/issues"));
+        assert!(path_matches("/v1", "/v1"));
+        assert!(path_matches("/v1", "/v1/models"));
+        assert!(path_matches(
+            "/api/v4/projects/g%2Fp",
+            "/api/v4/projects/g%2Fp/mrs"
+        ));
+        for bad in [
+            "/repos/my-org/%2e%2e/x/y",
+            "/repos/my-org/%2E%2E/x/y",
+            "/repos/my-org/..%2Fother/y",
+            "/repos/my-org/a%5c..%5cb",
+            "/repos/my-org//x",
+        ] {
+            assert!(!path_matches("/repos/my-org/", bad), "{bad}");
+        }
+        assert!(!path_matches("/v1", "/v10/models"));
+        assert!(!path_matches("/v1", "/v1%2F..%2Fadmin"));
     }
 
     #[test]
