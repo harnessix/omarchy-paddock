@@ -905,6 +905,26 @@ pub fn plan_return(env: &HostEnv, id: &str, name: &str, max: u64) -> Result<Retu
             shown(&out)
         );
     }
+    // A folder that keeps a git file cannot become a file: the write would
+    // fail halfway, after the other changes.
+    let stuck: Vec<String> = plan
+        .changes
+        .changed
+        .iter()
+        .filter(|r| {
+            let below = format!("{r}/");
+            plan.manifest.entries[*r].kind == Kind::Dir
+                && plan.copy[*r].kind != Kind::Dir
+                && plan.changes.kept.iter().any(|k| k.starts_with(&below))
+        })
+        .cloned()
+        .collect();
+    if !stuck.is_empty() {
+        bail!(
+            "these folders are no folders in the copy, but they hold git files that a return never removes, so paddock does not return it: {}. Make them folders again in the copy",
+            shown(&stuck)
+        );
+    }
     Ok(plan)
 }
 

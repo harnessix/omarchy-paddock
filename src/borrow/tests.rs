@@ -259,6 +259,29 @@ fn a_return_never_writes_through_a_folder_swapped_for_a_symlink() {
 }
 
 #[test]
+fn a_folder_with_git_files_that_became_a_file_stops_the_return_before_it_writes() {
+    // Review C-L10: the write failed halfway and left the original changed.
+    let t = tempfile::tempdir().unwrap();
+    let e = env(t.path());
+    let o = original(t.path());
+    std::fs::create_dir_all(o.join("sub/.git")).unwrap();
+    std::fs::write(o.join("sub/.git/config"), "[core]\n").unwrap();
+    std::fs::write(o.join("sub/f"), "f").unwrap();
+    let (name, copy) = borrowed(&e, &o);
+    std::fs::write(copy.join("README"), "new readme\n").unwrap();
+    std::fs::remove_dir_all(copy.join("sub")).unwrap();
+    std::fs::write(copy.join("sub"), "now a file").unwrap();
+    if let Ok(plan) = plan_return(&e, "s-1", &name, DEFAULT_MAX) {
+        let _ = plan.apply(&e, "s-1");
+    }
+    assert_eq!(
+        std::fs::read_to_string(o.join("README")).unwrap(),
+        "old readme\n"
+    );
+    assert!(o.join("sub/f").exists());
+}
+
+#[test]
 fn a_return_refuses_when_the_original_changed_after_the_borrow() {
     let t = tempfile::tempdir().unwrap();
     let e = env(t.path());
