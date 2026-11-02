@@ -282,5 +282,35 @@
   "wt.removed": "Worktree removed.",
   "wt.removeFailed": "paddock could not remove it. paddock worktree remove %1 tells why.",
   "keys.wt": "↵ open folder · ←→ merge, remove · Del remove · Esc back",
-  "keys.wtRow": "↵ or W worktrees"
+  "keys.wtRow": "↵ or W worktrees",
+  "row.kindDetached": "in the background, take over from the view",
+  "row.kindView": "no terminal, open the live view",
+  "row.kindWindow": "in its own window",
+  "row.kindTerminal": "in a terminal",
+  "group.worktrees": {
+    "one": "%1 worktree",
+    "other": "%1 worktrees"
+  },
+  "group.unmerged": {
+    "one": "%1 unmerged commit",
+    "other": "%1 unmerged commits"
+  },
+  "ended.header": "Just ended",
+  "ended.ok": "done",
+  "ended.failed": "failed",
+  "ended.stopped": "stopped",
+  "ended.unknown": "ended",
+  "ended.row": "%1 · %2 · %3",
+  "panel.waiting": {
+    "one": "%1 waiting",
+    "other": "%1 waiting"
+  },
+  "panel.endedCount": {
+    "one": "%1 ended",
+    "other": "%1 ended"
+  },
+  "panel.sumRunning": {
+    "one": "%1 running",
+    "other": "%1 running"
+  }
 }

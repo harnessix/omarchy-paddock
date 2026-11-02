@@ -260,5 +260,30 @@
   "wt.removed": "工作树已删除。",
   "wt.removeFailed": "paddock 无法删除。paddock worktree remove %1 会说明原因。",
   "keys.wt": "↵ 打开文件夹 · ←→ 合并、删除 · Del 删除 · Esc 返回",
-  "keys.wtRow": "↵ 或 W 查看工作树"
+  "keys.wtRow": "↵ 或 W 查看工作树",
+  "row.kindDetached": "后台运行，可在实时画面里接管",
+  "row.kindView": "没有终端，点开看实时画面",
+  "row.kindWindow": "在自己的窗口里",
+  "row.kindTerminal": "在终端里",
+  "group.worktrees": {
+    "other": "%1 个 worktree"
+  },
+  "group.unmerged": {
+    "other": "%1 个未合并提交"
+  },
+  "ended.header": "刚结束",
+  "ended.ok": "完成",
+  "ended.failed": "失败",
+  "ended.stopped": "已停止",
+  "ended.unknown": "已结束",
+  "ended.row": "%1 · %2 · %3",
+  "panel.waiting": {
+    "other": "%1 个待处理"
+  },
+  "panel.endedCount": {
+    "other": "%1 个刚结束"
+  },
+  "panel.sumRunning": {
+    "other": "%1 个运行中"
+  }
 }

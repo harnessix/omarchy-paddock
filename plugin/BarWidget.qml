@@ -17,6 +17,7 @@ BarWidget {
   readonly property int runningCount: panelLoader.item ? panelLoader.item.runningCount : 0
   readonly property string pluginState: panelLoader.item ? panelLoader.item.pluginState : "ok"
   readonly property int pendingCount: panelLoader.item ? panelLoader.item.pendingCount : 0
+  readonly property var endedNotice: panelLoader.item ? panelLoader.item.endedNotice : null
   readonly property bool popoutSwitchClosing: panelLoader.item ? panelLoader.item.popoutSwitchClosing === true : false
 
   function open(payloadJson) { if (panelLoader.item) panelLoader.item.open(payloadJson) }
@@ -66,10 +67,17 @@ BarWidget {
     readonly property string alertGlyph: "󱟸"
     readonly property bool iconOnly: root.vertical
       || (root.runningCount === 0 && root.pendingCount === 0 && root.settings && root.settings.hideWhenIdle === "Icon only")
+    // Running sandboxes, then requests that wait for an answer, then for a
+    // short while the run that just ended.
     text: {
       if (root.pluginState === "missing") return glyph + " !"
-      if (root.pendingCount > 0) return alertGlyph + " " + Commons.I18n.formatNumber(root.pendingCount)
-      if (root.runningCount > 0) return glyph + " " + Commons.I18n.formatNumber(root.runningCount)
+      var parts = []
+      if (root.runningCount > 0) parts.push(glyph + " " + Commons.I18n.formatNumber(root.runningCount))
+      if (root.pendingCount > 0) parts.push(alertGlyph + " " + Commons.I18n.formatNumber(root.pendingCount))
+      if (root.endedNotice !== null && !root.iconOnly)
+        parts.push((root.endedNotice.status === "failed" ? "󰅙 " : "󰄬 ") + root.endedNotice.harness
+          + " " + strings.t("ended." + root.endedNotice.status))
+      if (parts.length) return parts.join("  ")
       return iconOnly ? glyph : glyph + " " + strings.t("bar.label")
     }
     labelVisible: !iconOnly
@@ -79,7 +87,7 @@ BarWidget {
       ? strings.tn("approve.header", root.pendingCount).arg(Commons.I18n.formatNumber(root.pendingCount))
       : strings.tn("bar.running", root.runningCount).arg(Commons.I18n.formatNumber(root.runningCount))
     // The urgent color is for requests that need an answer, not for running sandboxes.
-    active: root.pendingCount > 0
+    active: root.pendingCount > 0 || (root.endedNotice !== null && root.endedNotice.status === "failed")
     onPressed: function(b) { root.togglePanel() }
   }
 }
