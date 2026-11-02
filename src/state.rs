@@ -316,6 +316,8 @@ struct AuthItem {
     /// A login that a keeper keeps (keeper.rs): the sandbox got it without
     /// its refresh token, and it is never copied back.
     kept: bool,
+    /// The profile's expiry field for this file (`[state] auth_expiry`).
+    expiry: Option<String>,
 }
 
 /// Credentials are copied, not bind-mounted: harnesses replace token files
@@ -332,6 +334,8 @@ struct AuthItem {
 pub struct AuthSync {
     pub mode: AuthMode,
     home: PathBuf,
+    /// Where the locks between paddock processes on one login live.
+    locks: PathBuf,
     items: Vec<AuthItem>,
     /// Folder entries (`auth = ["dir/"]`): the folder relative to the
     /// sandbox home, and its store on the host. A login that the sandbox
@@ -394,44 +398,55 @@ pub enum SyncStep {
     ToSandbox(PathBuf),
 }
 
-/// When a login expires, from the file itself: the latest number or
-/// RFC 3339 time under a key such as `expiresAt`, `expires_at`, `expiry`
-/// or `exp`, anywhere in a JSON file. Seconds; milliseconds are converted.
-/// None when the file says nothing, or is not JSON.
-pub fn login_expiry(bytes: &[u8]) -> Option<u64> {
-    fn walk(v: &serde_json::Value, key: Option<&str>, best: &mut Option<u64>) {
-        match v {
-            serde_json::Value::Object(m) => {
-                for (k, v) in m {
-                    walk(v, Some(k), best);
-                }
-            }
-            serde_json::Value::Array(a) => a.iter().for_each(|v| walk(v, key, best)),
-            _ => {
-                let Some(k) = key.map(|k| k.to_ascii_lowercase().replace(['_', '-'], "")) else {
-                    return;
-                };
-                if !(k.starts_with("expire") || k == "exp" || k == "expiry") {
-                    return;
-                }
-                let t = match v {
-                    serde_json::Value::Number(n) => n.as_u64(),
-                    serde_json::Value::String(s) => {
-                        crate::forage::parse_time(s).or_else(|| s.parse::<u64>().ok())
-                    }
-                    _ => None,
-                };
-                // Milliseconds since 1970 are above 1e12.
-                if let Some(t) = t.map(|t| if t > 1_000_000_000_000 { t / 1000 } else { t }) {
-                    *best = Some(best.map_or(t, |b| b.max(t)));
-                }
-            }
-        }
-    }
+/// When a login expires: the field at the dotted `path` of a JSON file
+/// (`claudeAiOauth.expiresAt`), a number in seconds or milliseconds, or an
+/// RFC 3339 time. Seconds. None when the field is missing or the file is
+/// not JSON. Only the field that the profile names counts: a file can hold
+/// other logins (MCP servers) whose expiry says nothing about this one.
+pub fn login_expiry(bytes: &[u8], path: &str) -> Option<u64> {
     let v: serde_json::Value = serde_json::from_slice(bytes).ok()?;
-    let mut best = None;
-    walk(&v, None, &mut best);
-    best
+    let field = path.split('.').try_fold(&v, |cur, k| cur.get(k))?;
+    let t = match field {
+        serde_json::Value::Number(n) => n.as_u64(),
+        serde_json::Value::String(s) => {
+            crate::forage::parse_time(s).or_else(|| s.parse::<u64>().ok())
+        }
+        _ => None,
+    }?;
+    // Milliseconds since 1970 are above 1e12.
+    Some(if t > 1_000_000_000_000 { t / 1000 } else { t })
+}
+
+/// Which of two versions of a login file expires later, by the profile's
+/// field. None when that is not known.
+fn later(a: &[u8], b: &[u8], path: Option<&str>) -> Option<bool> {
+    let path = path?;
+    match (login_expiry(a, path), login_expiry(b, path)) {
+        (Some(x), Some(y)) if x != y => Some(x > y),
+        _ => None,
+    }
+}
+
+fn is_json(bytes: &[u8]) -> bool {
+    serde_json::from_slice::<serde::de::IgnoredAny>(bytes).is_ok()
+}
+
+/// A lock between the paddock processes that sync the same stored login:
+/// held while one of them reads, compares and writes it.
+struct StoreLock {
+    /// Held for its lock, which the kernel drops with the file.
+    _file: std::fs::File,
+}
+
+impl StoreLock {
+    fn take(dir: &Path, stored: &Path) -> Option<Self> {
+        let name = hex(&Sha256::digest(stored.as_os_str().as_encoded_bytes()));
+        crate::privfs::dir(dir).ok()?;
+        let f = crate::privfs::append(&dir.join(format!("{}.lock", &name[..16]))).ok()?;
+        // SAFETY: flock on an open file descriptor that this struct owns.
+        (unsafe { libc::flock(std::os::fd::AsRawFd::as_raw_fd(&f), libc::LOCK_EX) } == 0)
+            .then_some(Self { _file: f })
+    }
 }
 
 impl AuthSync {
@@ -486,6 +501,11 @@ impl AuthSync {
             items.push(AuthItem {
                 inside_at_start: inside_hash(&home, &rel)?,
                 stored_at_start: store.hash(&stored),
+                expiry: profile
+                    .state
+                    .auth_expiry
+                    .get(rel.to_string_lossy().as_ref())
+                    .cloned(),
                 store,
                 stored,
                 rel,
@@ -495,6 +515,7 @@ impl AuthSync {
         Ok(Self {
             mode: mode.clone(),
             home: home_src.to_path_buf(),
+            locks: env.paddock_state().join("locks"),
             items,
             folders,
         })
@@ -541,6 +562,8 @@ impl AuthSync {
             return steps;
         };
         for it in self.items.iter_mut().filter(|i| !i.kept) {
+            // One process at a time reads, compares and writes this login.
+            let _lock = StoreLock::take(&self.locks, &it.stored);
             let inside = match home.read(&it.rel, crate::safefs::MAX_READ) {
                 Ok(b) => b,
                 Err(e) => {
@@ -552,6 +575,11 @@ impl AuthSync {
             let (Some(inside), Some(stored)) = (inside, stored) else {
                 continue;
             };
+            // Only JSON logins move while the harness runs. A database file
+            // (SQLite) is open in the harness; it waits for the end.
+            if !is_json(&inside) || !is_json(&stored) {
+                continue;
+            }
             let (hi, hs) = (
                 Some(hex(&Sha256::digest(&inside))),
                 Some(hex(&Sha256::digest(&stored))),
@@ -566,16 +594,24 @@ impl AuthSync {
                 (true, false) => true,
                 (false, true) => false,
                 (false, false) => continue,
-                (true, true) => match (login_expiry(&inside), login_expiry(&stored)) {
-                    (Some(a), Some(b)) if a != b => a > b,
-                    _ => continue,
+                (true, true) => match later(&inside, &stored, it.expiry.as_deref()) {
+                    Some(w) => w,
+                    None => continue,
                 },
             };
+            // Read the target again right before the write: a refresh that
+            // landed since the first read must not be overwritten.
             let done = if inside_wins {
+                if it.store.hash(&it.stored) != hs {
+                    continue;
+                }
                 it.store
                     .write(&it.stored, &inside)
                     .map(|_| SyncStep::ToStore(it.stored.clone()))
             } else {
+                if inside_hash(&home, &it.rel).ok().flatten() != hi {
+                    continue;
+                }
                 home.write(&it.rel, &stored, 0o600)
                     .map(|_| SyncStep::ToSandbox(it.stored.clone()))
             };
@@ -617,6 +653,7 @@ impl AuthSync {
                     stored,
                     rel,
                     kept: false,
+                    expiry: None,
                 });
             }
         }
@@ -640,13 +677,11 @@ impl AuthSync {
             if now == it.inside_at_start {
                 continue;
             }
+            let _lock = StoreLock::take(&self.locks, &it.stored);
             if it.store.hash(&it.stored) != it.stored_at_start {
                 // Both changed: the copy wins only when it expires later.
                 let stored = it.store.read(&it.stored).ok().flatten().unwrap_or_default();
-                let newer = matches!(
-                    (login_expiry(&bytes), login_expiry(&stored)),
-                    (Some(a), Some(b)) if a > b
-                );
+                let newer = later(&bytes, &stored, it.expiry.as_deref()) == Some(true);
                 if !newer {
                     r.conflicts.push(it.stored.clone());
                     continue;
@@ -1204,8 +1239,11 @@ mod auth_sync_tests {
         std::fs::create_dir_all(host_home.join(".tool")).unwrap();
         std::fs::create_dir_all(&sandbox_home).unwrap();
         let env = HostEnv::from_parts(host_home.clone(), "demo".into(), 1, 1, BTreeMap::new());
-        let p: Profile =
-            toml::from_str("name = \"t\"\n[state]\nauth = [\".tool/token\"]\n").unwrap();
+        let p: Profile = toml::from_str(
+            "name = \"t\"\n[state]\nauth = [\".tool/token\"]\n\
+                 auth_expiry = { \".tool/token\" = \"claudeAiOauth.expiresAt\" }\n",
+        )
+        .unwrap();
         (t, env, p, host_home, sandbox_home)
     }
 
@@ -1316,21 +1354,56 @@ mod auth_sync_tests {
     }
 
     #[test]
-    fn login_expiry_reads_the_usual_fields() {
+    fn login_expiry_reads_only_the_named_field() {
+        let path = "claudeAiOauth.expiresAt";
         assert_eq!(
-            login_expiry(login(1, 1_800_000_000_000).as_bytes()),
+            login_expiry(login(1, 1_800_000_000_000).as_bytes(), path),
             Some(1_800_000_000)
         );
         assert_eq!(
-            login_expiry(br#"{"tokens":{"expires_at":1800000000}}"#),
+            login_expiry(br#"{"expiry_date":1800000000}"#, "expiry_date"),
             Some(1_800_000_000)
         );
         assert_eq!(
-            login_expiry(br#"{"expiry":"2027-01-15T00:00:00Z"}"#),
+            login_expiry(br#"{"expiry":"2027-01-15T00:00:00Z"}"#, "expiry"),
             crate::forage::parse_time("2027-01-15T00:00:00Z")
         );
-        assert_eq!(login_expiry(br#"{"token":"x"}"#), None);
-        assert_eq!(login_expiry(b"not json"), None);
+        assert_eq!(login_expiry(br#"{"token":"x"}"#, path), None);
+        assert_eq!(login_expiry(b"not json", path), None);
+    }
+
+    /// Another login in the same file (an MCP server) expires much later
+    /// than the account login: it must not decide which side is newer.
+    #[test]
+    fn only_the_account_login_decides_which_side_is_newer() {
+        let (_t, env, p, host_home, sb) = setup();
+        let host = host_home.join(".tool/token");
+        std::fs::write(&host, login(1, 1_000)).unwrap();
+        let mut a = AuthSync::copy_in(&env, &p, &AuthMode::Shared, &sb).unwrap();
+        let old_with_mcp = serde_json::json!({
+            "claudeAiOauth": {"refreshToken": "rt1", "expiresAt": 1_000},
+            "mcpOAuth": {"srv": {"expiresAt": 9_000_000_000_000u64}},
+        });
+        std::fs::write(sb.join(".tool/token"), old_with_mcp.to_string()).unwrap();
+        std::fs::write(&host, login(2, 5_000)).unwrap();
+        a.sync_now();
+        assert_eq!(rt_of(&host), "rt2");
+        assert_eq!(rt_of(&sb.join(".tool/token")), "rt2");
+    }
+
+    /// A database login (kiro-cli's SQLite file) is open in the harness: it
+    /// never moves while the sandbox runs.
+    #[test]
+    fn a_login_that_is_not_json_waits_for_the_end() {
+        let (_t, env, p, host_home, sb) = setup();
+        let host = host_home.join(".tool/token");
+        std::fs::write(&host, b"SQLite format 3\0one").unwrap();
+        let mut a = AuthSync::copy_in(&env, &p, &AuthMode::Shared, &sb).unwrap();
+        std::fs::write(sb.join(".tool/token"), b"SQLite format 3\0two").unwrap();
+        assert!(a.sync_now().is_empty());
+        assert_eq!(std::fs::read(&host).unwrap(), b"SQLite format 3\0one");
+        // The end of the run still copies it back.
+        assert_eq!(a.copy_out().unwrap().saved, vec![host.clone()]);
     }
 
     #[test]

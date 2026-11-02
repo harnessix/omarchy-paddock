@@ -170,6 +170,13 @@ pub struct State {
     /// Credential files, relative to HOME. Paddock copies them in and out.
     #[serde(default)]
     pub auth: Vec<String>,
+    /// For a JSON credential file: the dotted path of the field that says
+    /// when its login expires (`"claudeAiOauth.expiresAt"`), by the file's
+    /// entry in `auth`. When a running sandbox and the host both changed
+    /// the file, the login that expires later wins. Without an entry,
+    /// neither side counts as newer.
+    #[serde(default)]
+    pub auth_expiry: std::collections::BTreeMap<String, String>,
     /// Host files and directories, relative to HOME, mounted read-only.
     #[serde(default)]
     pub import_ro: Vec<String>,

@@ -15,6 +15,7 @@ env = { DISABLE_AUTOUPDATER = "1" }
 [state]
 # Holds the account token and the MCP OAuth tokens (mcpOAuth).
 auth = [".claude/.credentials.json"]
+auth_expiry = { ".claude/.credentials.json" = "claudeAiOauth.expiresAt" }
 import_ro = [
   ".claude/settings.json",
   ".claude/CLAUDE.md",
