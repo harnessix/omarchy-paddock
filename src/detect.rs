@@ -251,7 +251,8 @@ impl Detector for Mise {
     }
 }
 
-/// A language package cache: shared across projects, never the host cache.
+/// A language package cache in layers: see [`crate::storage::layers`].
+/// Never the host cache.
 pub struct Cache {
     name: &'static str,
     markers: &'static [&'static str],
@@ -307,19 +308,23 @@ impl Detector for Cache {
         }
         let origin = format!("detector {}: package cache", self.name);
         for (cache, rel) in self.caches {
-            spec.add_mount(cache_mount(cx.env, cache, spec.home.join(rel), &origin)?);
+            spec.add_mount(crate::storage::layers::mount(
+                cx.env,
+                cx.project,
+                cache,
+                spec.home.join(rel),
+                &origin,
+            )?);
         }
         Ok(())
     }
 }
 
-/// Share `.npm` for a harness that is an npm package (Claude Code, codex,
-/// gemini and copilot install through npm), also in a project without a
-/// `package.json`. Such a harness fills its home's npm cache through `npx`
-/// (MCP servers) and its update checks, the same downloads in every home.
-/// npm checks each entry of `_cacache` against its sha512 integrity hash,
-/// so one shared copy is as safe as a copy per project, the same reason
-/// [`Cache::node`] shares it. pnpm, bun and yarn stay for `package.json`.
+/// Mount the layered `.npm` for a harness that is an npm package (Claude
+/// Code, codex, gemini and copilot install through npm), also in a project
+/// without a `package.json`. Such a harness fills its home's npm cache
+/// through `npx` (MCP servers) and its update checks, the same downloads in
+/// every home. pnpm, bun and yarn stay for `package.json`.
 pub fn npm_harness(
     env: &HostEnv,
     harness: &crate::profile::Harness,
@@ -333,8 +338,10 @@ pub fn npm_harness(
     if spec.mounts.iter().any(|m| m.dst == dst) {
         return Ok(());
     }
-    spec.add_mount(cache_mount(
+    let project = spec.project.clone();
+    spec.add_mount(crate::storage::layers::mount(
         env,
+        &project,
         "npm",
         dst,
         "detector node: npm cache of an npm harness",

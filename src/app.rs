@@ -550,6 +550,9 @@ pub fn flatpak_workspace(
             MountKind::Ro => ws.args.push(format!("--filesystem={p}:ro")),
             MountKind::MaskDir => ws.args.push(format!("--nofilesystem={p}")),
             MountKind::MaskFile => ws.exposed.push(mnt.dst.clone()),
+            MountKind::Overlay => {
+                bail!("flatpak cannot mount layers at {} (from {})", p, mnt.origin)
+            }
             MountKind::Tmpfs => bail!(
                 "flatpak cannot put an empty folder at {} (from {})",
                 p,
