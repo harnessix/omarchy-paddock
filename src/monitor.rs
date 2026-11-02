@@ -182,19 +182,16 @@ fn tool(name: &str, args: &[String]) -> Option<Tunnel> {
     }
 }
 
-/// `ssh` with `-R`, `-L` or `-D`, alone or combined (`-NR`). The options
+/// `ssh` with `-R`, `-L`, `-D`, `-W` or `-w`, or `-o RemoteForward`,
+/// `LocalForward` or `DynamicForward`, alone or combined (`-NR`). The options
 /// that take an argument end a combined word; ssh reads options before and
 /// after the host, and the second plain word starts the remote command.
 fn ssh(args: &[String]) -> Option<Tunnel> {
     const WITH_ARG: &str = "BbcDEeFIiJLlmOoPpQRSWw";
     let mut found: Vec<String> = Vec::new();
     let mut plain = 0;
-    let mut skip = false;
-    for a in args {
-        if skip {
-            skip = false;
-            continue;
-        }
+    let mut iter = args.iter().peekable();
+    while let Some(a) = iter.next() {
         if a == "--" {
             break;
         }
@@ -206,14 +203,43 @@ fn ssh(args: &[String]) -> Option<Tunnel> {
             continue;
         };
         for (i, c) in opts.char_indices() {
-            if matches!(c, 'R' | 'L' | 'D') {
+            if matches!(c, 'R' | 'L' | 'D' | 'W' | 'w') {
                 let flag = format!("-{c}");
                 if !found.contains(&flag) {
                     found.push(flag);
                 }
             }
+            if matches!(c, 'o' | 'O') {
+                let opt_arg = if i + c.len_utf8() < opts.len() {
+                    opts[i + c.len_utf8()..].to_string()
+                } else {
+                    iter.next().cloned().unwrap_or_default()
+                };
+                let key = opt_arg
+                    .split(|ch: char| ch == '=' || ch.is_whitespace())
+                    .next()
+                    .unwrap_or("");
+                let flag = if key.eq_ignore_ascii_case("RemoteForward") {
+                    Some("-R")
+                } else if key.eq_ignore_ascii_case("LocalForward") {
+                    Some("-L")
+                } else if key.eq_ignore_ascii_case("DynamicForward") {
+                    Some("-D")
+                } else {
+                    None
+                };
+                if let Some(f) = flag {
+                    let f = f.to_string();
+                    if !found.contains(&f) {
+                        found.push(f);
+                    }
+                }
+                break;
+            }
             if WITH_ARG.contains(c) {
-                skip = i + c.len_utf8() == opts.len();
+                if i + c.len_utf8() == opts.len() {
+                    iter.next();
+                }
                 break;
             }
         }
@@ -1409,6 +1435,30 @@ mod tests {
         );
         // Options after the host count too.
         assert_eq!(tunnel_in(&argv("ssh host -R 1:a:2")).unwrap().flags, ["-R"]);
+        assert!(tunnel_in(&argv("ssh -oRemoteForward=1:a:2 host")).is_some());
+        assert_eq!(
+            tunnel_in(&argv("ssh -o RemoteForward=1:a:2 host"))
+                .unwrap()
+                .flags,
+            ["-R"]
+        );
+        assert_eq!(
+            tunnel_in(&argv("ssh -o LocalForward 1:a:2 host"))
+                .unwrap()
+                .flags,
+            ["-L"]
+        );
+        assert_eq!(
+            tunnel_in(&argv("ssh -o DynamicForward=1080 host"))
+                .unwrap()
+                .flags,
+            ["-D"]
+        );
+        assert_eq!(
+            tunnel_in(&argv("ssh -W host:443 jump")).unwrap().flags,
+            ["-W"]
+        );
+        assert_eq!(tunnel_in(&argv("ssh -w 0:0 host")).unwrap().flags, ["-w"]);
     }
 
     #[test]
