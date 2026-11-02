@@ -211,10 +211,7 @@ fn run(
                 network: true,
                 paths: Vec::new(),
                 ro_paths: Vec::new(),
-                env: crate::broker::forge::FORGE_ENV
-                    .iter()
-                    .map(|s| s.to_string())
-                    .collect(),
+                env: crate::broker::forge::forge_env(name),
                 remember_allowed: false,
             };
             let mut vars = cfg.pass_env(&job.env);
