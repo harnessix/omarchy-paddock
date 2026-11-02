@@ -19,6 +19,9 @@ use anyhow::Result;
 use serde::Serialize;
 use std::path::{Path, PathBuf};
 
+pub mod promote;
+mod zip;
+
 /// The caches that the detectors mount in layers.
 pub const CACHES: &[&str] = &[
     "cargo-registry",
