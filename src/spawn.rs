@@ -22,7 +22,7 @@
 //!   A child stops when its parent ends, when `paddock stop` stops the
 //!   parent, and after a wall-clock timeout.
 //! - The prompt never goes into the arguments of a process. It reaches the
-//!   harness on stdin or as a file in the child's sandbox home.
+//!   harness on stdin or as a file of that run in the child's sandbox home.
 
 use crate::broker::Mode;
 use crate::build::Built;
@@ -51,9 +51,34 @@ pub const MAX_OUTPUT: usize = 64 * 1024;
 const MAX_STAT: usize = 16 * 1024;
 /// How much of the prompt the approval card shows.
 pub const PROMPT_SHOWN: usize = 1000;
-/// The prompt file in the child's sandbox home, for profiles that read it
-/// from a file.
-pub const PROMPT_IN_HOME: &str = ".paddock-spawn/prompt.md";
+/// Folder of prompt files in the sandbox home. Runs of one harness in one
+/// project share that home, so each run gets its own file under this folder.
+pub const PROMPT_DIR: &str = ".paddock-spawn";
+
+/// The old shared prompt path. A run removes it at the start, so a stale
+/// prompt does not stay behind.
+pub const LEGACY_PROMPT: &str = ".paddock-spawn/prompt.md";
+
+/// Relative path of one run's prompt: `.paddock-spawn/<id>/prompt.md`.
+/// `id` is the sandbox id and one path component.
+pub fn prompt_rel(id: &str) -> PathBuf {
+    PathBuf::from(PROMPT_DIR).join(id).join("prompt.md")
+}
+
+/// Write one run's prompt through safefs. Removes the old shared file first.
+pub fn write_prompt(home: &Path, id: &str, bytes: &[u8], mode: u32) -> Result<()> {
+    let root = crate::safefs::Root::open(home)?;
+    root.remove(Path::new(LEGACY_PROMPT))?;
+    root.write(&prompt_rel(id), bytes, mode)
+}
+
+/// Remove one run's prompt file. A missing file is fine.
+pub fn remove_prompt(home: &Path, id: &str) {
+    if let Ok(root) = crate::safefs::Root::open(home) {
+        let _ = root.remove(&prompt_rel(id));
+    }
+}
+
 /// How long a stopped child gets to end before paddock kills it.
 pub(crate) const STOP_GRACE: Duration = Duration::from_secs(15);
 
@@ -1797,22 +1822,17 @@ fn run_child(env: &HostEnv, job: &Job, prompt: Vec<u8>, result: &mut ChildResult
         // the parent's paddock wrote in a folder that no sandbox sees.
         built.parent = Some(c.parent.clone());
         built.device_ceiling = Some(c.devices.clone());
+        let home = built.spec.home_src.clone();
+        let prompt_id = built.spec.id.clone();
         match oneshot.prompt {
             crate::profile::PromptVia::Stdin => built.stdin = Some(prompt.clone()),
             crate::profile::PromptVia::File => {
-                crate::safefs::Root::open(&built.spec.home_src)?.write(
-                    Path::new(PROMPT_IN_HOME),
-                    &prompt,
-                    0o600,
-                )?;
+                write_prompt(&home, &prompt_id, &prompt, 0o600)?;
             }
         }
-        let home = built.spec.home_src.clone();
         let out = crate::run::run(env, built, backend.as_ref(), true, true);
         if oneshot.prompt == crate::profile::PromptVia::File {
-            if let Ok(r) = crate::safefs::Root::open(&home) {
-                let _ = r.remove(Path::new(PROMPT_IN_HOME));
-            }
+            remove_prompt(&home, &prompt_id);
         }
         out
     })();

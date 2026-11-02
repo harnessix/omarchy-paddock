@@ -801,7 +801,7 @@ pub fn build_with(env: &HostEnv, opts: &Options, harness: Harness) -> Result<Bui
         // The privacy flags are global options: before a subcommand.
         c.extend(crate::privacy::args(&profile, privacy));
         c.extend(crate::hostcli::status::harness_args(env, &profile.name));
-        c.extend(o.render(&spec.home.join(crate::spawn::PROMPT_IN_HOME)));
+        c.extend(o.render(&spec.home.join(crate::spawn::prompt_rel(&spec.id))));
         c
     } else if let Some(t) = opts.transparent.as_ref().filter(|t| !t.shell.is_empty()) {
         // The shell form: the script starts its `$0`, which is the harness.
@@ -832,7 +832,7 @@ pub fn build_with(env: &HostEnv, opts: &Options, harness: Harness) -> Result<Bui
         }));
         // `--detach`: the first prompt names a read-only copy of the task.
         if let Some(d) = &detach {
-            c.extend(d.render(&spec.home.join(crate::spawn::PROMPT_IN_HOME)));
+            c.extend(d.render(&spec.home.join(crate::spawn::prompt_rel(&spec.id))));
         }
         c
     };

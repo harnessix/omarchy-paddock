@@ -1,0 +1,1 @@
+- Fix: each run writes its prompt to `.paddock-spawn/<sandbox id>/prompt.md`, so two runs that share a sandbox home no longer replace each other's prompt. A run removes the old shared file `.paddock-spawn/prompt.md` when it starts.
