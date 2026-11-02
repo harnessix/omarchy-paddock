@@ -50,6 +50,9 @@ pub struct Repo {
     /// `objects/info/alternates` at start. A change means the sandbox points
     /// the object store at other host repositories.
     pub alternates: Option<String>,
+    /// The top of the work tree: git reads a relative remote path from
+    /// there.
+    pub work_tree: PathBuf,
 }
 
 /// Read the remotes of a repository. The call names the git directory and
@@ -118,11 +121,25 @@ impl Repo {
             common_dir,
             remotes,
             alternates,
+            work_tree: layout.work_tree,
         })
     }
 
     pub fn find(&self, name: &str) -> Option<&Remote> {
         self.remotes.iter().find(|r| r.name == name)
+    }
+
+    /// A remote URL as the host pushes to it: a relative path (`../up.git`)
+    /// from the top of the work tree, as git in the project reads it, not
+    /// from the scratch repository.
+    pub fn absolute(&self, url: &str) -> String {
+        let scp = url
+            .split_once(':')
+            .is_some_and(|(host, _)| !host.is_empty() && !host.contains('/'));
+        if url.contains("://") || scp || Path::new(url).is_absolute() {
+            return url.to_string();
+        }
+        self.work_tree.join(url).display().to_string()
     }
 }
 
@@ -514,14 +531,14 @@ pub fn plan(
     let mut notes = Vec::new();
     let (url, known) = match repo.find(name) {
         Some(r) => {
-            let target = r.push_target().to_string();
-            if sandbox_url != r.url && sandbox_url != target && sandbox_url != name {
+            let raw = r.push_target();
+            if sandbox_url != r.url && sandbox_url != raw && sandbox_url != name {
                 notes.push(format!(
                     "the sandbox changed this remote's URL to {}; paddock pushes to the original URL",
                     clean(&redact(sandbox_url))
                 ));
             }
-            (target, true)
+            (repo.absolute(raw), true)
         }
         None => {
             valid_new_url(sandbox_url)?;
@@ -1020,6 +1037,25 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(!e.contains("ghp_secret"), "{e}");
+    }
+
+    #[test]
+    fn a_relative_remote_path_is_read_from_the_work_tree() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (work, remote) = project(tmp.path());
+        sh(&work, &["remote", "set-url", "origin", "../remote.git"]);
+        let repo = Repo::snapshot(&work).unwrap();
+        let sha = sh(&work, &["rev-parse", "HEAD"]);
+        let a = args(
+            "origin",
+            "../remote.git",
+            serde_json::json!([{ "sha": sha, "dst": "refs/heads/rel" }]),
+        );
+        let p = plan(Some(&repo), &tmp.path().join("run"), &a).unwrap();
+        assert!(p.notes.is_empty(), "{:?}", p.notes);
+        let r = push(&p).unwrap();
+        assert_eq!(r["refs"][0]["ok"], true, "{r}");
+        assert_eq!(sh(&remote, &["rev-parse", "refs/heads/rel"]), sha);
     }
 
     #[test]
