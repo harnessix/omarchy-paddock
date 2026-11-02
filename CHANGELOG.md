@@ -4,6 +4,7 @@
 
 - Fix: the live login sync of #118 is safer. Two paddock processes no longer write a login file through the same temporary name (a lock and a unique name with fsync), each write first checks that the target did not change since it was read, only the expiry field that the profile names (`[state] auth_expiry`) decides which side is newer (an MCP login in the same file no longer counts), and files that are not JSON, such as an open SQLite database, wait for the end of the run.
 - Changed: the `paddock` and `paddock-host` skills are shorter, and details moved into reference files next to `SKILL.md`. `paddock skill install` now copies the whole `paddock-host` folder, with its `references/` files.
+- Fix: `paddock tools suggest` prints only blocks that load. Before, it printed a block for a relative program like `./build.sh`, and the pasted block broke `[host.tools]`.
 - Fix: `tea pulls create -d=TEXT` keeps the body text out of the audit log, like the other body forms.
 - Fix: `gh run list -b BRANCH` through `paddock-host` filters by branch. Before, paddock read `-b` as body text, gh failed, and the audit log showed a body.
 - Fix: a remote with a relative path (`../upstream.git`) pushes to that path from the top of the work tree, as git in the project reads it. Before, the host read it from its scratch repository, so the push failed or went to another folder.

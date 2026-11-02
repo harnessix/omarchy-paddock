@@ -312,14 +312,23 @@ pub fn suggest(audit: &str, known: &BTreeMap<String, Tool>) -> String {
         .collect();
     ranked.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
     for (argv, n) in ranked {
-        let name = unique_name(&argv, &mut names);
         let cmd = argv
             .iter()
             .map(|a| toml::Value::String(a.clone()).to_string())
             .collect::<Vec<_>>()
             .join(", ");
+        let body = format!("command = [{cmd}]\ncwd = \"project\"\nmode = \"ask\"\n");
+        // Only blocks that load: `./build.sh` is not a tool command.
+        let loads = toml::from_str::<toml::Value>(&body)
+            .map_err(anyhow::Error::from)
+            .and_then(|v| parse_tool("t", &v))
+            .is_ok();
+        if !loads {
+            continue;
+        }
+        let name = unique_name(&argv, &mut names);
         out.push_str(&format!(
-            "# allowed {n} times through exec\n[host.tools.{name}]\ncommand = [{cmd}]\ncwd = \"project\"\nmode = \"ask\"\n\n"
+            "# allowed {n} times through exec\n[host.tools.{name}]\n{body}\n"
         ));
     }
     out
@@ -509,11 +518,16 @@ mod tests {
             serde_json::json!({"capability": "exec", "decision": "allowed once"}).to_string(),
         ];
         log.push(line(&["ls"], "allowed once"));
+        // A relative program path does not load as a tool command.
+        for _ in 0..3 {
+            log.push(line(&["./build.sh"], "allowed once"));
+        }
         let out = suggest(&log.join("\n"), &BTreeMap::new());
         assert!(out.contains("[host.tools.omarchy-restart-shell]\ncommand = [\"omarchy\", \"restart\", \"shell\"]"), "{out}");
         assert!(out.contains("[host.tools.ls]\ncommand = [\"ls\"]"), "{out}");
         assert!(!out.contains("rm"), "{out}");
         assert!(!out.contains("make"), "{out}");
+        assert!(!out.contains("build"), "{out}");
         // The blocks parse as tools.
         let doc: toml::Value = toml::from_str(&out).unwrap();
         let parsed = parse_host(doc["host"].as_table().unwrap()).unwrap();
