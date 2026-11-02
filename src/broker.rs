@@ -591,7 +591,10 @@ pub fn audit_detail(req: &Request, project: &Path, prepared: Option<&str>) -> St
         ),
         "borrow" => format!("borrow {}", arg_str(req, "path").unwrap_or("")),
         "return" => format!("return {}", arg_str(req, "name").unwrap_or("")),
-        "git-push" => format!("git push {}", arg_str(req, "remote").unwrap_or("")),
+        "git-push" => format!(
+            "git push {}",
+            git::redact(arg_str(req, "remote").unwrap_or(""))
+        ),
         "screenshot" | "clipboard-read" => describe(req, project).1,
         other => other.to_string(),
     }

@@ -1383,3 +1383,14 @@ fn glab_runs_exactly_the_checked_arguments_on_a_self_hosted_gitlab() {
     }
     assert_eq!(fixed.asked.load(Ordering::SeqCst), 1);
 }
+
+#[test]
+fn a_push_url_with_credentials_stays_out_of_the_audit_line() {
+    let r = req(
+        "git-push",
+        serde_json::json!({ "remote": "https://u:ghp_secret@example.com/a.git" }),
+    );
+    let d = audit_detail(&r, Path::new("/srv/app"), None);
+    assert!(!d.contains("ghp_secret"), "{d}");
+    assert!(d.contains("example.com"), "{d}");
+}

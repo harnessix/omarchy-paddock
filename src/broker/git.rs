@@ -300,7 +300,8 @@ impl PushPlan {
         }
         t.push_str(&format!(
             "Push with your credentials to:\n  {} ({})\n",
-            self.url, self.remote
+            redact(&self.url),
+            self.remote
         ));
         for n in &self.notes {
             t.push_str(&format!("Note: {n}\n"));
@@ -355,6 +356,28 @@ fn short_ref(r: &str) -> &str {
         .unwrap_or(r)
 }
 
+/// A URL without its credentials, for the card and the logs:
+/// `https://user:TOKEN@host` becomes `https://***@host`. An SSH user name
+/// stays, a password goes.
+pub fn redact(u: &str) -> String {
+    let Some((scheme, rest)) = u.split_once("://") else {
+        return u.to_string();
+    };
+    let authority = rest.split('/').next().unwrap_or(rest);
+    let Some((user, host)) = authority.rsplit_once('@') else {
+        return u.to_string();
+    };
+    let user = if scheme.to_ascii_lowercase().starts_with("http") {
+        "***".to_string()
+    } else {
+        match user.split_once(':') {
+            Some((name, _)) => format!("{name}:***"),
+            None => user.to_string(),
+        }
+    };
+    format!("{scheme}://{user}@{host}{}", &rest[authority.len()..])
+}
+
 /// Remove control characters: commit subjects come from the sandbox.
 fn clean(s: &str) -> String {
     s.chars().filter(|c| !c.is_control()).take(200).collect()
@@ -405,7 +428,10 @@ fn valid_new_url(u: &str) -> Result<()> {
         || u.starts_with("ext:")
         || u.chars().any(|c| c.is_control())
     {
-        bail!("{u:?} is not a URL that paddock pushes to (a new remote must be a network URL)");
+        bail!(
+            "{:?} is not a URL that paddock pushes to (a new remote must be a network URL)",
+            redact(u)
+        );
     }
     Ok(())
 }
@@ -492,7 +518,7 @@ pub fn plan(
             if sandbox_url != r.url && sandbox_url != target && sandbox_url != name {
                 notes.push(format!(
                     "the sandbox changed this remote's URL to {}; paddock pushes to the original URL",
-                    clean(sandbox_url)
+                    clean(&redact(sandbox_url))
                 ));
             }
             (target, true)
@@ -601,7 +627,7 @@ pub fn plan(
         });
     }
     Ok(PushPlan {
-        remote: clean(name),
+        remote: clean(&redact(name)),
         url,
         known,
         notes,
@@ -951,6 +977,49 @@ mod tests {
             &args("x", "ext::sh -c evil", one("refs/heads/x", false))
         )
         .is_err());
+    }
+
+    #[test]
+    fn push_urls_lose_their_credentials_on_the_card_and_in_the_logs() {
+        assert_eq!(
+            redact("https://user:ghp_secret@github.com/a/b.git"),
+            "https://***@github.com/a/b.git"
+        );
+        assert_eq!(
+            redact("https://ghp_secret@github.com/a/b.git"),
+            "https://***@github.com/a/b.git"
+        );
+        assert_eq!(
+            redact("ssh://git:pw@host/a/b.git"),
+            "ssh://git:***@host/a/b.git"
+        );
+        assert_eq!(redact("ssh://git@host/a.git"), "ssh://git@host/a.git");
+        assert_eq!(redact("git@host:a/b.git"), "git@host:a/b.git");
+        let tmp = tempfile::tempdir().unwrap();
+        let (work, remote) = project(tmp.path());
+        let repo = Repo::snapshot(&work).unwrap();
+        let sha = sh(&work, &["rev-parse", "HEAD"]);
+        let run = tmp.path().join("run");
+        let one = serde_json::json!([{ "sha": sha, "dst": "refs/heads/x" }]);
+        let url = "https://user:ghp_secret@example.com/a/b.git";
+        // The URL as the remote name, as `git push URL` sends it.
+        let p = plan(Some(&repo), &run, &args(url, url, one.clone())).unwrap();
+        assert_eq!(p.url, url, "the push itself keeps the credentials");
+        for text in [p.summary(), p.detail()] {
+            assert!(!text.contains("ghp_secret"), "{text}");
+        }
+        // A changed URL of a known remote, in the note.
+        let p = plan(Some(&repo), &run, &args("origin", url, one.clone())).unwrap();
+        assert_eq!(p.url, remote.to_str().unwrap());
+        assert!(!p.detail().contains("ghp_secret"), "{}", p.detail());
+        let e = plan(
+            Some(&repo),
+            &run,
+            &args("x", "ext::https://u:ghp_secret@x/", one),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(!e.contains("ghp_secret"), "{e}");
     }
 
     #[test]
