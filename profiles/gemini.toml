@@ -17,6 +17,7 @@ yolo_args = ["--yolo"]
 
 [state]
 auth = [".gemini/oauth_creds.json", ".gemini/google_accounts.json", ".gemini/mcp-oauth-tokens.json"]
+auth_expiry = { ".gemini/oauth_creds.json" = "expiry_date" }
 import_ro = [".gemini/GEMINI.md", ".agents/skills"]
 seed = [".gemini/settings.json"]
 env_pass = ["GEMINI_API_KEY", "GOOGLE_API_KEY", "GOOGLE_CLOUD_PROJECT", "GOOGLE_GENAI_USE_VERTEXAI"]

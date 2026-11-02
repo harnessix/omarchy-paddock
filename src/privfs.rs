@@ -85,13 +85,25 @@ pub fn write(path: &Path, bytes: impl AsRef<[u8]>) -> io::Result<()> {
 
 /// Write a file atomically: a private temporary file next to it, then a
 /// rename. Readers never see half a file.
+///
+/// The temporary name is unique to this process and moment, so two writers
+/// of the same file never remove or rename each other's half-written file.
 pub fn write_atomic(path: &Path, bytes: impl AsRef<[u8]>) -> io::Result<()> {
-    let tmp = path.with_extension("paddock-tmp");
-    let _ = std::fs::remove_file(&tmp);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(format!(".paddock-tmp-{}-{nanos}", std::process::id()));
+    let tmp = path.with_file_name(name);
     let mut f = open(&tmp, OpenOptions::new().write(true).create_new(true))?;
-    f.write_all(bytes.as_ref())?;
+    let written = f.write_all(bytes.as_ref()).and_then(|_| f.sync_all());
     drop(f);
-    std::fs::rename(&tmp, path)
+    if let Err(e) = written.and_then(|_| std::fs::rename(&tmp, path)) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    Ok(())
 }
 
 /// Open a log file for appending, with 0600 in a 0700 folder.
@@ -197,5 +209,36 @@ pub(crate) mod tests {
                 assert_eq!(mode(&r), 0o700, "{}", r.display());
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod atomic_tests {
+    /// Two writers of one file never leave half of the other's content.
+    #[test]
+    fn concurrent_atomic_writes_leave_one_whole_file() {
+        let t = tempfile::tempdir().unwrap();
+        let p = t.path().join("login.json");
+        let (a, b) = (vec![b'a'; 200_000], vec![b'b'; 300_000]);
+        let run = |bytes: Vec<u8>, p: std::path::PathBuf| {
+            std::thread::spawn(move || {
+                for _ in 0..200 {
+                    super::write_atomic(&p, &bytes).unwrap();
+                }
+            })
+        };
+        let (x, y) = (run(a.clone(), p.clone()), run(b.clone(), p.clone()));
+        for _ in 0..400 {
+            let now = std::fs::read(&p).unwrap_or_default();
+            assert!(
+                now.is_empty() || now == a || now == b,
+                "a mixed file of {} bytes",
+                now.len()
+            );
+        }
+        x.join().unwrap();
+        y.join().unwrap();
+        let left: Vec<_> = std::fs::read_dir(t.path()).unwrap().flatten().collect();
+        assert_eq!(left.len(), 1, "temporary files were left behind");
     }
 }
