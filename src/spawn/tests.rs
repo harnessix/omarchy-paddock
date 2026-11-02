@@ -1140,6 +1140,8 @@ struct FakeSeam {
     delay: Duration,
     /// When set, `thaw` writes this file. A frozen stand-in exits then.
     release: Mutex<Option<PathBuf>>,
+    /// Ids that `freeze` reports as newly frozen. None means this call froze `sandbox`.
+    fresh: Mutex<Option<Vec<String>>>,
 }
 
 impl FakeSeam {
@@ -1150,6 +1152,7 @@ impl FakeSeam {
             answer,
             delay,
             release: Mutex::new(None),
+            fresh: Mutex::new(None),
         })
     }
     fn calls(&self) -> Vec<String> {
@@ -1158,8 +1161,19 @@ impl FakeSeam {
 }
 
 impl TimeoutSeam for FakeSeam {
-    fn freeze(&self, sandbox: &str) -> Result<()> {
+    fn freeze(&self, sandbox: &str) -> Result<Vec<String>> {
         self.calls.lock().unwrap().push(format!("freeze {sandbox}"));
+        Ok(self
+            .fresh
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap_or_else(|| vec![sandbox.to_string()]))
+    }
+    fn thaw_ids(&self, ids: &[String]) -> Result<()> {
+        for id in ids {
+            self.thaw(id)?;
+        }
         Ok(())
     }
     fn thaw(&self, sandbox: &str) -> Result<()> {
@@ -1275,6 +1289,22 @@ fn ask_freezes_the_child_and_more_time_thaws_and_extends_it() {
     }
     assert!(!card.detail.contains("TASK-TEXT"));
     assert_eq!(audit_decisions(&s.env), ["more time: 30m"]);
+}
+
+/// The user froze the child before it reached the limit. More time moves
+/// the limit and leaves that freeze in place.
+#[test]
+fn more_time_keeps_a_sandbox_the_user_froze() {
+    let s = setup();
+    let seam = FakeSeam::new(Choice::More("30m".into()), Duration::from_secs(1));
+    *seam.fresh.lock().unwrap() = Some(vec![]);
+    let sp = limit_spawner(&s, OnTimeout::Ask, seam.clone(), child_that_runs("3"));
+    let done = run_with_limit(&sp, 1);
+    assert_eq!(done.state, State::Exited, "{done:?}");
+    assert_eq!(done.limits.timeout, 1 + 1800);
+    let sb = &done.sandbox;
+    assert_eq!(seam.calls(), [format!("freeze {sb}"), "ask".into()]);
+    assert_eq!(audit_decisions(&s.env), ["more time: 30m, stays frozen"]);
 }
 
 #[test]

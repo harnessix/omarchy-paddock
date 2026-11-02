@@ -742,8 +742,12 @@ pub enum Choice {
 /// Tests fake it, so they need no real freezer and no card.
 pub trait TimeoutSeam: Send + Sync {
     /// Freeze the child's sandbox and its own children.
-    fn freeze(&self, sandbox: &str) -> Result<()>;
+    /// The ids are the ones this call froze. An id that was already frozen is absent.
+    fn freeze(&self, sandbox: &str) -> Result<Vec<String>>;
+    /// Thaw the sandbox and the children this paddock froze, so a stop can land.
     fn thaw(&self, sandbox: &str) -> Result<()>;
+    /// Thaw only these sandboxes. Their children stay as they are.
+    fn thaw_ids(&self, ids: &[String]) -> Result<()>;
     /// Put the card up and wait for the answer, at most `wait`. Stop
     /// waiting when `cancelled` turns true.
     fn ask(
@@ -758,18 +762,24 @@ pub trait TimeoutSeam: Send + Sync {
 pub struct HostSeam(pub HostEnv);
 
 impl TimeoutSeam for HostSeam {
-    fn freeze(&self, sandbox: &str) -> Result<()> {
+    fn freeze(&self, sandbox: &str) -> Result<Vec<String>> {
         crate::freeze::freeze(
             &self.0,
             sandbox,
             true,
             "a spawned child reached its time limit",
         )
-        .map(|_| ())
     }
 
     fn thaw(&self, sandbox: &str) -> Result<()> {
         crate::freeze::thaw(&self.0, sandbox, true).map(|_| ())
+    }
+
+    fn thaw_ids(&self, ids: &[String]) -> Result<()> {
+        for id in ids {
+            crate::freeze::thaw(&self.0, id, false).map(|_| ())?;
+        }
+        Ok(())
     }
 
     fn ask(
@@ -1293,14 +1303,17 @@ impl Spawner {
             return none;
         };
         let since = Instant::now();
-        if let Err(e) = self.seam.freeze(&status.sandbox) {
-            log::warn!(
-                "spawn {id}: cannot freeze the child at its time limit, so paddock stops it: {e:#}"
-            );
-            self.stop_one(id, State::TimedOut);
-            self.audit_limit(&status, used, "stopped: cannot freeze", "paddock");
-            return none;
-        }
+        let freshly = match self.seam.freeze(&status.sandbox) {
+            Ok(v) => v,
+            Err(e) => {
+                log::warn!(
+                    "spawn {id}: cannot freeze the child at its time limit, so paddock stops it: {e:#}"
+                );
+                self.stop_one(id, State::TimedOut);
+                self.audit_limit(&status, used, "stopped: cannot freeze", "paddock");
+                return none;
+            }
+        };
         self.set_message(id, "frozen at its time limit: waits for the user");
         let card = self.limit_card(&status, used);
         let cancelled = || {
@@ -1324,14 +1337,32 @@ impl Spawner {
             // below lets it end and save its login, as at any other stop.
             self.stop_one(id, State::TimedOut);
         }
-        let thawed = match self.seam.thaw(&status.sandbox) {
-            Ok(()) => true,
-            Err(e) => {
-                log::warn!("spawn {id}: cannot thaw the child: {e:#}");
-                false
+        // More time thaws only what this limit froze. A sandbox the user
+        // froze stays frozen. A stop still thaws the tree so the child can
+        // end and save its login.
+        let thawed = if more.is_some() && freshly.is_empty() {
+            true
+        } else if more.is_some() {
+            match self.seam.thaw_ids(&freshly) {
+                Ok(()) => true,
+                Err(e) => {
+                    log::warn!("spawn {id}: cannot thaw the child: {e:#}");
+                    false
+                }
+            }
+        } else {
+            match self.seam.thaw(&status.sandbox) {
+                Ok(()) => true,
+                Err(e) => {
+                    log::warn!("spawn {id}: cannot thaw the child: {e:#}");
+                    false
+                }
             }
         };
         let (add, decision, by) = match (more, &choice) {
+            (Some(s), Choice::More(c)) if thawed && freshly.is_empty() => {
+                (s, format!("more time: {c}, stays frozen"), "user")
+            }
             (Some(s), Choice::More(c)) if thawed => (s, format!("more time: {c}"), "user"),
             (Some(_), _) => {
                 self.stop_one(id, State::TimedOut);
