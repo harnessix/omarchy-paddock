@@ -3,7 +3,7 @@ description = "xAI Grok Build"
 
 # Entries that come from documentation, not from a test. paddock doctor lists them.
 unverified = [
-  "a login and a full run inside paddock",
+  "a login inside paddock (full runs with a shared login work)",
   "state.auth .grok/mcp_credentials.json: the file store for MCP OAuth tokens",
   "privacy.env: the false values of the GROK_TELEMETRY_* variables",
   "network.endpoints: the hosts for the allowlist network mode",
