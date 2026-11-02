@@ -243,7 +243,7 @@ fn a_detached_build_gets_the_id_and_the_first_prompt_args() {
     assert!(b.detach);
     assert_eq!(b.spec.id, "fake-project-abc123");
     let last = b.spec.command.last().unwrap();
-    let file = b.spec.home.join(crate::spawn::PROMPT_IN_HOME);
+    let file = b.spec.home.join(crate::spawn::prompt_rel(&b.spec.id));
     assert_eq!(*last, format!("Read {} now.", file.display()));
     assert!(
         b.spec.command.iter().any(|a| a == "-i"),

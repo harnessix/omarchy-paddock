@@ -297,7 +297,12 @@ fn a_child_build_uses_the_snapshot_and_keeps_the_prompt_out_of_argv() {
         assert_eq!(w.branch, plan.branch);
         assert_eq!(b.home_key, repo);
         assert!(b.spec.command.iter().all(|a| !a.contains(SECRET_TASK)));
-        let named = b.spec.command.iter().any(|a| a.ends_with(PROMPT_IN_HOME));
+        let rel = prompt_rel(&b.spec.id);
+        let named = b
+            .spec
+            .command
+            .iter()
+            .any(|a| a.ends_with(rel.to_str().unwrap()));
         assert_eq!(named, file, "{:?}", b.spec.command);
         if file {
             assert!(b
@@ -307,6 +312,149 @@ fn a_child_build_uses_the_snapshot_and_keeps_the_prompt_out_of_argv() {
                 .any(|a| a.starts_with(&b.spec.home.display().to_string())));
         }
     }
+}
+
+#[test]
+fn two_runs_keep_separate_prompt_files() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = tempfile::tempdir().unwrap();
+    let env = env_in(tmp.path());
+    let repo = tmp.path().join("app");
+    std::fs::create_dir_all(&repo).unwrap();
+    git(&repo, &["init", "-q", "-b", "main"]);
+    git(&repo, &["commit", "-q", "--allow-empty", "-m", "one"]);
+    let repo = std::fs::canonicalize(&repo).unwrap();
+    let tables = "\
+[launch]
+args = [\"-i\"]
+[detach]
+args = [\"Read {prompt_file} now.\"]
+[oneshot]
+args = [\"-c\", \"cat \\\"$0\\\"\", \"{prompt_file}\"]
+prompt = \"file\"
+";
+    let harness = || fake_harness(tables);
+    let rendered = |b: &crate::build::Built| b.spec.home.join(prompt_rel(&b.spec.id));
+    let stored = |b: &crate::build::Built| b.spec.home_src.join(prompt_rel(&b.spec.id));
+
+    let detach = |id: &str| {
+        build_with(
+            &env,
+            &Options {
+                harness: "fake".into(),
+                project: Some(repo.clone()),
+                network: Some(Network::None),
+                inherit_env: Some(false),
+                assume_yes: true,
+                detach: Some(id.into()),
+                ..Default::default()
+            },
+            harness(),
+        )
+        .unwrap()
+    };
+    let first = detach("fake-app-aaaaaa");
+    let second = detach("fake-app-bbbbbb");
+    assert_eq!(first.spec.home_src, second.spec.home_src);
+    let first_path = rendered(&first);
+    let second_path = rendered(&second);
+    assert_ne!(first_path, second_path);
+    assert!(first
+        .spec
+        .command
+        .iter()
+        .any(|a| a.contains(first_path.to_str().unwrap())));
+    assert!(second
+        .spec
+        .command
+        .iter()
+        .any(|a| a.contains(second_path.to_str().unwrap())));
+    assert!(first.spec.command.iter().all(|a| !a.contains("bbbbbb")));
+    assert!(second.spec.command.iter().all(|a| !a.contains("aaaaaa")));
+
+    let child = |suffix: &str| {
+        let id = sandbox_id_for("fake", suffix);
+        let plan = ChildPlan {
+            id,
+            manifest: Manifest::default(),
+            branch: branch_for("fake", suffix),
+            base_from: repo.clone(),
+            base: None,
+            role: Role::Implementer,
+        };
+        build_with(
+            &env,
+            &Options {
+                harness: "fake".into(),
+                project: Some(repo.clone()),
+                network: Some(Network::None),
+                gui: Some(GuiMode::Off),
+                worktree: true,
+                child: Some(plan),
+                ..Default::default()
+            },
+            harness(),
+        )
+        .unwrap()
+    };
+    let one = child("0011aaaa");
+    let two = child("0011bbbb");
+    assert_eq!(one.spec.home_src, first.spec.home_src);
+    assert_eq!(two.spec.home_src, first.spec.home_src);
+    let one_path = rendered(&one);
+    let two_path = rendered(&two);
+    assert_ne!(one_path, two_path);
+    assert_ne!(one_path, first_path);
+    assert!(one
+        .spec
+        .command
+        .iter()
+        .any(|a| a.contains(one_path.to_str().unwrap())));
+    assert!(two
+        .spec
+        .command
+        .iter()
+        .any(|a| a.contains(two_path.to_str().unwrap())));
+
+    let home = &first.spec.home_src;
+    crate::safefs::Root::open(home)
+        .unwrap()
+        .write(Path::new(LEGACY_PROMPT), b"stale", 0o600)
+        .unwrap();
+    write_prompt(home, &first.spec.id, b"first", 0o400).unwrap();
+    assert!(crate::safefs::Root::open(home)
+        .unwrap()
+        .read(Path::new(LEGACY_PROMPT), 64)
+        .unwrap()
+        .is_none());
+    crate::safefs::Root::open(home)
+        .unwrap()
+        .write(Path::new(LEGACY_PROMPT), b"stale-again", 0o600)
+        .unwrap();
+    write_prompt(home, &second.spec.id, b"second", 0o400).unwrap();
+    write_prompt(home, &one.spec.id, b"child-one", 0o600).unwrap();
+    write_prompt(home, &two.spec.id, b"child-two", 0o600).unwrap();
+    assert_eq!(std::fs::read(stored(&first)).unwrap(), b"first");
+    assert_eq!(std::fs::read(stored(&second)).unwrap(), b"second");
+    assert_eq!(std::fs::read(stored(&one)).unwrap(), b"child-one");
+    assert_eq!(std::fs::read(stored(&two)).unwrap(), b"child-two");
+    assert!(crate::safefs::Root::open(home)
+        .unwrap()
+        .read(Path::new(LEGACY_PROMPT), 64)
+        .unwrap()
+        .is_none());
+    let mode = |b: &crate::build::Built| {
+        std::fs::metadata(stored(b)).unwrap().permissions().mode() & 0o777
+    };
+    assert_eq!(mode(&first), 0o400);
+    assert_eq!(mode(&one), 0o600);
+
+    remove_prompt(home, &second.spec.id);
+    remove_prompt(home, &two.spec.id);
+    assert!(!stored(&second).exists());
+    assert!(!stored(&two).exists());
+    assert_eq!(std::fs::read(stored(&first)).unwrap(), b"first");
+    assert_eq!(std::fs::read(stored(&one)).unwrap(), b"child-one");
 }
 
 /// Records every question; answers with a fixed answer.

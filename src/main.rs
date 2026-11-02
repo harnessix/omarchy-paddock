@@ -1366,19 +1366,15 @@ fn start_with(
     let prompt_home = match &detach {
         Some((_, prompt)) => {
             let home = built.spec.home_src.clone();
-            let root = paddock::safefs::Root::open(&home)?;
-            let rel = std::path::Path::new(paddock::spawn::PROMPT_IN_HOME);
-            root.remove(rel)?;
-            root.write(rel, prompt, 0o400)?;
-            Some(home)
+            let id = built.spec.id.clone();
+            paddock::spawn::write_prompt(&home, &id, prompt, 0o400)?;
+            Some((home, id))
         }
         None => None,
     };
     let code = start_built(env, &opts, built, shell);
-    if let Some(home) = prompt_home {
-        if let Ok(r) = paddock::safefs::Root::open(&home) {
-            let _ = r.remove(std::path::Path::new(paddock::spawn::PROMPT_IN_HOME));
-        }
+    if let Some((home, id)) = prompt_home {
+        paddock::spawn::remove_prompt(&home, &id);
     }
     code
 }
