@@ -1484,10 +1484,7 @@ mod auth_sync_tests {
         );
         // The live sync carries it.
         a.sync_now();
-        assert_eq!(
-            get(&host.join(FLAGS)),
-            serde_json::json!({"done": true})
-        );
+        assert_eq!(get(&host.join(FLAGS)), serde_json::json!({"done": true}));
         // Source false, with another key: only the listed true key moves.
         put(
             &host.join(FLAGS),
@@ -1520,8 +1517,14 @@ mod auth_sync_tests {
         );
         a.copy_out().unwrap();
         let got = get(&host.join(FLAGS));
-        assert!(got.get("token").is_none(), "unlisted key reached the host: {got}");
-        assert!(got.get("notAFlag").is_none(), "unlisted key reached the host: {got}");
+        assert!(
+            got.get("token").is_none(),
+            "unlisted key reached the host: {got}"
+        );
+        assert!(
+            got.get("notAFlag").is_none(),
+            "unlisted key reached the host: {got}"
+        );
         assert_eq!(got["done"], serde_json::json!(true));
     }
 
@@ -1589,10 +1592,7 @@ mod auth_sync_tests {
             serde_json::json!({"done": true, "consumerDone": false}),
         );
         let a2 = AuthSync::copy_in(&env, &p, &mode, &sb).unwrap();
-        assert_eq!(
-            get(&sb.join(FLAGS)),
-            serde_json::json!({"done": true})
-        );
+        assert_eq!(get(&sb.join(FLAGS)), serde_json::json!({"done": true}));
         put(
             &sb.join(FLAGS),
             serde_json::json!({"done": true, "consumerDone": true}),

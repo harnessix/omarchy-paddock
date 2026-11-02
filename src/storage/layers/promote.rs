@@ -298,7 +298,13 @@ fn promote_one(
         Err(_) => return Ok(Some("refused: the shared layer has no file there".into())),
     }
     let sha = crate::manifest::hex(&Sha256::digest(&data));
-    let key = format!("{}|{}|{}|{}|{sha}", c.cache, c.check.kind(), c.package, c.version);
+    let key = format!(
+        "{}|{}|{}|{}|{sha}",
+        c.cache,
+        c.check.kind(),
+        c.package,
+        c.version
+    );
     let verdict = match record.get(&key) {
         Some(v) => v.clone(),
         None => {
@@ -1246,9 +1252,14 @@ mod tests {
         put(&up, &format!("{v}/v1.0.0.zip"), GO_MOD);
         let srv = serve(HashMap::from([(
             "/lookup/example.com/m@v1.0.0".to_string(),
-            format!("1\nexample.com/m v1.0.0 {ZIP_H1}\nexample.com/m v1.0.0/go.mod {MOD_H1}\n\nsig\n"),
+            format!(
+                "1\nexample.com/m v1.0.0 {ZIP_H1}\nexample.com/m v1.0.0/go.mod {MOD_H1}\n\nsig\n"
+            ),
         )]));
-        let src = Sources { crates_index: String::new(), sumdb: srv.base.clone() };
+        let src = Sources {
+            crates_index: String::new(),
+            sumdb: srv.base.clone(),
+        };
         let r = run(&env, &proj, &src, &http(), later());
         let zip = lower(&env, "go-mod").join(v).join("v1.0.0.zip");
         assert!(
@@ -1277,12 +1288,20 @@ mod tests {
         put(&up, &format!("{v}/v1.0.0.zip"), &bad);
         let srv = serve(HashMap::from([(
             "/lookup/example.com/m@v1.0.0".to_string(),
-            format!("1\nexample.com/m v1.0.0 {ZIP_H1}\nexample.com/m v1.0.0/go.mod {MOD_H1}\n\nsig\n"),
+            format!(
+                "1\nexample.com/m v1.0.0 {ZIP_H1}\nexample.com/m v1.0.0/go.mod {MOD_H1}\n\nsig\n"
+            ),
         )]));
-        let src = Sources { crates_index: String::new(), sumdb: srv.base.clone() };
+        let src = Sources {
+            crates_index: String::new(),
+            sumdb: srv.base.clone(),
+        };
         let r = run(&env, &proj, &src, &http(), later());
         let zip = lower(&env, "go-mod").join(v).join("v1.0.0.zip");
-        assert!(!zip.exists(), "promoted a zip a strict reader rejects on CRC: {r:?}");
+        assert!(
+            !zip.exists(),
+            "promoted a zip a strict reader rejects on CRC: {r:?}"
+        );
     }
 
     #[test]
@@ -1294,13 +1313,33 @@ mod tests {
         let body = b"one file, two names";
         put(&up, &format!("{dir}/a-1-2.0.0.crate"), body);
         let srv = serve(HashMap::from([
-            ("/1/a".to_string(), format!("{{\"name\":\"a\",\"vers\":\"1-2.0.0\",\"cksum\":\"{}\"}}\n", sha(body))),
-            ("/3/a/a-1".to_string(), format!("{{\"name\":\"a-1\",\"vers\":\"2.0.0\",\"cksum\":\"{}\"}}\n", sha(b"the other crate"))),
+            (
+                "/1/a".to_string(),
+                format!(
+                    "{{\"name\":\"a\",\"vers\":\"1-2.0.0\",\"cksum\":\"{}\"}}\n",
+                    sha(body)
+                ),
+            ),
+            (
+                "/3/a/a-1".to_string(),
+                format!(
+                    "{{\"name\":\"a-1\",\"vers\":\"2.0.0\",\"cksum\":\"{}\"}}\n",
+                    sha(b"the other crate")
+                ),
+            ),
         ]));
-        let src = Sources { crates_index: srv.base.clone(), sumdb: String::new() };
+        let src = Sources {
+            crates_index: srv.base.clone(),
+            sumdb: String::new(),
+        };
         let r = run(&env, &proj, &src, &http(), later());
-        let placed = lower(&env, "cargo-registry").join(dir).join("a-1-2.0.0.crate");
-        assert!(!placed.exists(), "promoted a file whose other identity has a different cksum: {r:?}");
+        let placed = lower(&env, "cargo-registry")
+            .join(dir)
+            .join("a-1-2.0.0.crate");
+        assert!(
+            !placed.exists(),
+            "promoted a file whose other identity has a different cksum: {r:?}"
+        );
     }
 
     #[test]
