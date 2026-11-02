@@ -1644,6 +1644,55 @@ pub fn quota_peers(env: &HostEnv, agent: &str, window: &str, now: u64) -> Vec<cr
     out
 }
 
+/// Quota timers stored for `sandbox`. The 30-second tick records these
+/// while the sandbox runs. A sandbox that ends sooner still has them in
+/// its store. This does not call `Running::list`. That deletes the run
+/// folder of a process that has already ended.
+pub fn stored_quota_timers(env: &HostEnv, sandbox: &str, now: u64) -> Vec<crate::timer::Timer> {
+    let root = kv_root(env);
+    let mut spaces = vec![Ns::Own(sandbox.to_string())];
+    if let Some(r) = run_record(env, sandbox) {
+        let mut all = vec![r.clone()];
+        let mut up = r.parent.clone();
+        while let Some(p) = up {
+            if all.iter().any(|o| o.id == p) || all.len() > 16 {
+                break;
+            }
+            let Some(parent) = run_record(env, &p) else {
+                break;
+            };
+            up = parent.parent.clone();
+            all.push(parent);
+        }
+        for (ns, _) in timer_spaces(&identity_of(&r, &all)) {
+            if !spaces.contains(&ns) {
+                spaces.push(ns);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for ns in spaces {
+        let Ok(file) = ns.file(&root) else { continue };
+        if !file.is_file() {
+            continue;
+        }
+        let Ok(st) = Store::open(&file) else { continue };
+        for (t, _) in crate::timer::in_store(&st, &ns.key(), now).unwrap_or_default() {
+            if t.subject == sandbox && t.quota.is_some() && seen.insert((t.name.clone(), t.started))
+            {
+                out.push(t);
+            }
+        }
+    }
+    out
+}
+
+fn run_record(env: &HostEnv, id: &str) -> Option<crate::state::Running> {
+    let text = std::fs::read_to_string(crate::state::Running::file(env, id)).ok()?;
+    serde_json::from_str(&text).ok()
+}
+
 /// Write the timer summary of the running sandbox `sandbox`, if it runs.
 pub fn refresh_timer_summary(env: &HostEnv, root: &Path, sandbox: &str) -> Result<()> {
     let all = crate::state::Running::list(env);

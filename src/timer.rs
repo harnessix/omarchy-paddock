@@ -603,10 +603,29 @@ pub fn note_runs(env: &HostEnv, sandbox: &str, timers: &[Timer], now: u64) -> Re
     change_ended(env, |list| list.retain(|e| e.keep(&running, &live)))
 }
 
-/// The end of a sandbox: its quota timers ran until now.
+/// The end of a sandbox. Record its quota timers, including a run that
+/// ended before the 30-second tick, and mark the ones already recorded.
 pub fn end_runs(env: &HostEnv, sandbox: &str, now: u64) {
     let frozen = frozen_periods(env, sandbox, now);
+    let stored = crate::kv::stored_quota_timers(env, sandbox, now);
     let r = change_ended(env, |list| {
+        for t in &stored {
+            let Some(q) = &t.quota else { continue };
+            let e = Ended {
+                subject: t.subject.clone(),
+                name: t.name.clone(),
+                agent: q.agent.clone(),
+                window: q.window.clone(),
+                started: t.started,
+                stopped: t.stopped,
+                seen: now,
+                frozen: frozen.clone(),
+            };
+            match list.iter_mut().find(|x| x.is(t)) {
+                Some(x) => *x = e,
+                None => list.push(e),
+            }
+        }
         for e in list.iter_mut().filter(|e| e.subject == sandbox) {
             e.seen = now;
             e.frozen = frozen.clone();

@@ -2200,3 +2200,42 @@ fn review_e_a_stopped_timer_counts_the_sample_step_it_ran_in() {
     let s = t.status_in(&w.env, now);
     assert!((s.quota.unwrap().used - 0.02).abs() < 1e-9);
 }
+
+#[test]
+fn review_e_quota_timer_in_short_lived_sandbox_is_kept_in_ended() {
+    let w = world();
+    let now = crate::state::now();
+    let (file, ns) = crate::timer::self_file(&w.env, "b").unwrap();
+    let mut st = Store::open(&file).unwrap();
+    let t = crate::timer::Timer {
+        name: "task".into(),
+        owner: "user".into(),
+        subject: "b".into(),
+        started: now,
+        budget: 0,
+        hard: false,
+        quota: Some(crate::timer::Quota {
+            agent: "codex".into(),
+            window: "Weekly (7-day)".into(),
+            share: 0.10,
+            base: 0.40,
+            base_resets: 9000,
+            base_at: now,
+        }),
+        stopped: None,
+        announced: false,
+        enforced: false,
+        extensions: Vec::new(),
+    };
+    crate::timer::save(&mut st, &ns, &t, None, &HOST_W, Q, now).unwrap();
+    // b ends after 5 seconds, before any 30s timer_tick runs.
+    crate::timer::end_runs(&w.env, "b", now + 5);
+    let ended = crate::timer::read_ended(&w.env);
+    assert!(
+        !ended.is_empty(),
+        "quota timer of b was lost from ended runs"
+    );
+    assert_eq!(ended[0].subject, "b");
+    assert_eq!(ended[0].seen, now + 5);
+    assert!(ended[0].stopped.is_none());
+}
