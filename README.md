@@ -510,7 +510,7 @@ paddock-host boundary          # inside the sandbox: its own log, read-only
 
 ## Logins and MCP
 
-By default, a sandbox uses your existing login (auth mode `shared`). paddock copies the credential files of the harness from your home directory into the sandbox at start. If the harness refreshes a token in the sandbox, paddock writes it back when the sandbox exits. If the file also changed on the host in the meantime, the host version stays, and paddock tells you.
+By default, a sandbox uses your existing login (auth mode `shared`). paddock copies the credential files of the harness from your home directory into the sandbox at start. While the sandbox runs, paddock keeps its copy and your home in line every two seconds, both ways. When the harness refreshes a token in the sandbox, your home gets it at once, and every other sandbox on the same login gets it from there. When your home changes (a new login, or `claude` on the host), the sandbox gets it. This matters for OAuth logins whose refresh token works only once: with a copy that went back only at the end, a second sandbox started meanwhile got a token that no longer worked. When both sides changed, the login that expires later wins. When neither file says when it expires, the end of the run decides, and the host version stays.
 
 Some harnesses keep their login in the system keyring. Copilot CLI is one of them. Its sandbox gets a private keyring of its own (gnome-keyring, on a private session bus), encrypted with a password that paddock keeps on the host. The sandbox cannot reach your host keyring, and your host keyring does not see the sandbox's login. So you log in once inside the sandbox, and the login stays for later runs.
 
