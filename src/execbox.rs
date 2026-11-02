@@ -558,18 +558,18 @@ mod tests {
         let a = args_of(&command(
             Isolation::Systemd,
             &cfg,
-            Path::new("/home/my user"),
-            Path::new("/home/my user/My Project"),
+            Path::new("/home/demo/my home"),
+            Path::new("/home/demo/my home/My Project"),
             &["make".into()],
             &BTreeMap::new(),
             60,
             "paddock-exec-x",
         ));
         for want in [
-            r"BindPaths=/home/my\ user/My\ Project",
-            r"ReadWritePaths=/home/my\ user",
+            r"BindPaths=/home/demo/my\ home/My\ Project",
+            r"ReadWritePaths=/home/demo/my\ home",
             r"BindPaths=/srv/a\:b",
-            "WorkingDirectory=/home/my user/My Project",
+            "WorkingDirectory=/home/demo/my home/My Project",
         ] {
             assert!(a.iter().any(|a| a == want), "{want} missing: {a:?}");
         }
