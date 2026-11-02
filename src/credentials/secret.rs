@@ -280,20 +280,20 @@ pub(crate) mod tests {
 
     #[test]
     fn dropping_one_secret_keeps_its_page_neighbours_locked() {
-        let all: Vec<Secret> = (0..8).map(|i| Secret::from(format!("value-{i}"))).collect();
+        let mut all: Vec<Secret> = (0..64)
+            .map(|i| Secret::from(format!("value-{i}")))
+            .collect();
         if !all.iter().all(|s| s.locked) {
             eprintln!("skipped: mlock is not allowed here");
             return;
         }
         let page = |s: &Secret| pages(s.buf.as_ptr(), s.buf.capacity()).1;
-        let keep = &all[0];
-        assert!(
-            all[1..].iter().any(|s| page(s) == page(keep)),
-            "small secrets should share a page"
-        );
-        let mut all = all.into_iter();
-        let keep = all.next().unwrap();
-        drop(all.collect::<Vec<_>>());
+        // A secret that shares its page with another one.
+        let i = (0..all.len())
+            .find(|&i| (0..all.len()).any(|j| j != i && page(&all[j]) == page(&all[i])))
+            .expect("small secrets should share a page");
+        let keep = all.swap_remove(i);
+        drop(all);
         assert!(vm_lck() > 0, "the page of a live secret was unlocked");
         drop(keep);
     }
