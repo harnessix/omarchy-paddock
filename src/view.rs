@@ -382,6 +382,20 @@ impl LogFile {
     }
 }
 
+/// Writes harness output into a view log. The relay holds one.
+#[derive(Clone)]
+pub struct LogSink {
+    log: Arc<Mutex<LogFile>>,
+}
+
+impl LogSink {
+    pub fn append(&self, data: &[u8]) {
+        if let Ok(mut log) = self.log.lock() {
+            log.write(data);
+        }
+    }
+}
+
 /// The copies of one run: one thread per stream.
 pub struct Tee {
     log: Arc<Mutex<LogFile>>,
@@ -408,6 +422,13 @@ impl Tee {
             })),
             threads: vec![],
         })
+    }
+
+    /// A handle the relay uses to append harness output to this log.
+    pub fn sink(&self) -> LogSink {
+        LogSink {
+            log: self.log.clone(),
+        }
     }
 
     /// A tee with no log and no threads, for moving the real one out of `Live`.
@@ -543,7 +564,25 @@ impl Live {
         tee_err: bool,
         quiet: bool,
     ) -> Option<Live> {
-        if !(tee_out || tee_err) || !valid_id(id) {
+        Self::open(env, id, harness, tee_out, tee_err, quiet, false)
+    }
+
+    /// The run log and the tmux pane for a relayed terminal. The relay
+    /// writes the log. The harness keeps its pty.
+    pub fn start_relay(env: &HostEnv, id: &str, harness: &str, quiet: bool) -> Option<Live> {
+        Self::open(env, id, harness, false, false, quiet, true)
+    }
+
+    fn open(
+        env: &HostEnv,
+        id: &str,
+        harness: &str,
+        tee_out: bool,
+        tee_err: bool,
+        quiet: bool,
+        relay: bool,
+    ) -> Option<Live> {
+        if !valid_id(id) || !(relay || tee_out || tee_err) {
             return None;
         }
         let log = log_file(env, id);
@@ -918,6 +957,15 @@ impl Opener {
 
 /// `paddock view ID [--write]`: open the view in a new terminal window.
 pub fn open(env: &HostEnv, id: &str, write: bool) -> Result<()> {
+    if write
+        && crate::state::Running::list(env)
+            .iter()
+            .any(|r| r.id == id && r.relay)
+    {
+        bail!(
+            "paddock view --write is not offered for {id}. A background process started this run and owns the input"
+        );
+    }
     let argv = Opener::from_env(env, id).command(id, write)?;
     let mut c = Command::new(&argv[0]);
     c.args(&argv[1..])

@@ -2167,21 +2167,11 @@ fn real_main() -> Result<i32> {
             let Some(r) = Running::list(&env).into_iter().find(|r| r.id == id) else {
                 bail!("no running sandbox with id {id}")
             };
-            let out = std::process::Command::new("hyprctl")
-                .args(["clients", "-j"])
-                .output()
-                .map_err(|_| anyhow::anyhow!("focus needs Hyprland (hyprctl was not found)"))?;
-            let clients: Vec<serde_json::Value> =
-                serde_json::from_slice(&out.stdout).unwrap_or_default();
-            let windows: Vec<(u32, String)> = clients
-                .iter()
-                .filter_map(|c| {
-                    Some((
-                        c["pid"].as_u64()? as u32,
-                        c["address"].as_str()?.to_string(),
-                    ))
-                })
-                .collect();
+            let Some(found) = paddock::relay::hypr_clients() else {
+                bail!("focus needs Hyprland (hyprctl was not found)");
+            };
+            let windows: Vec<(u32, String)> =
+                found.into_iter().map(|c| (c.pid, c.address)).collect();
             let address_of = |pid: u32| {
                 windows
                     .iter()
@@ -4178,19 +4168,13 @@ fn app_windows(env: &HostEnv) -> Vec<(String, String, String)> {
     if apps.is_empty() {
         return vec![];
     }
-    let Ok(out) = std::process::Command::new("hyprctl")
-        .args(["clients", "-j"])
-        .output()
-    else {
+    let Some(clients) = paddock::relay::hypr_clients() else {
         return vec![];
     };
-    let clients: Vec<serde_json::Value> = serde_json::from_slice(&out.stdout).unwrap_or_default();
     let mut found = Vec::new();
     for c in &clients {
-        let (Some(pid), Some(address)) = (c["pid"].as_u64(), c["address"].as_str()) else {
-            continue;
-        };
-        let mut p = pid as u32;
+        let mut p = c.pid;
+        let address = c.address.as_str();
         'walk: for _ in 0..64 {
             for r in &apps {
                 let host = if r.host_pid > 0 { r.host_pid } else { r.pid };

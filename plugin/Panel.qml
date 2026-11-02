@@ -127,6 +127,7 @@ Panel {
     if (s && s.canFreeze) a.push("freeze")
     if (s && s.revocable) a.push("revoke")
     if (s && s.monitor !== "") a.push("ack")
+    if (s && s.relay) a.push("view")
     if (s && s.viewTmux && s.detached) a.push("takeover")
     a.push("stop")
     return a
@@ -413,6 +414,7 @@ Panel {
   }
   // What a row is when it has no activity line: where its output goes.
   function kindText(s) {
+    if (s.relay) return strings.t("row.kindRelay")
     if (s.detached) return strings.t("row.kindDetached")
     if (s.view) return strings.t("row.kindView")
     if (s.windowPid > 0 || s.gui === "app" || s.gui === "wayland") return strings.t("row.kindWindow")
@@ -517,6 +519,7 @@ Panel {
     else if (name === "display") showDisplay(s)
     else if (name === "revoke") revokeCredentials(s)
     else if (name === "ack") ackMonitor(s)
+    else if (name === "view") openView(s, false)
     else if (name === "takeover") openView(s, true)
     else if (name === "stop") stop(s)
   }
@@ -919,6 +922,8 @@ Panel {
             // A detached run (paddock run --detach): the view pane is the
             // terminal of the agent, so keys from the view reach it.
             detached: r.detached === true,
+            // A terminal that no window shows. The caller owns the input.
+            relay: r.relay === true,
             // Its own scope (bwrap, srt), or a container that can pause.
             canFreeze: (typeof r.unit === "string" && r.unit !== "") || r.backend === "docker" || r.backend === "podman",
             windowPid: Number.isInteger(r.window_pid) && r.window_pid > 0 ? r.window_pid : 0,
@@ -1719,13 +1724,20 @@ Panel {
                 ActionButton {
                   sandboxIndex: index + root.approvals.length
                   position: (modelData.windowPid > 0 ? 3 : 2) + (modelData.canFreeze ? 1 : 0) + (modelData.revocable ? 1 : 0) + (modelData.monitor !== "" ? 1 : 0)
+                  visible: modelData.relay
+                  iconText: "󰐊"; tooltipText: strings.t("action.view")
+                  onClicked: root.openView(modelData, false)
+                }
+                ActionButton {
+                  sandboxIndex: index + root.approvals.length
+                  position: (modelData.windowPid > 0 ? 3 : 2) + (modelData.canFreeze ? 1 : 0) + (modelData.revocable ? 1 : 0) + (modelData.monitor !== "" ? 1 : 0) + (modelData.relay ? 1 : 0)
                   visible: modelData.viewTmux && modelData.detached
                   iconText: "󰆍"; tooltipText: strings.t("action.takeOver")
                   onClicked: root.openView(modelData, true)
                 }
                 ActionButton {
                   sandboxIndex: index + root.approvals.length
-                  position: (modelData.windowPid > 0 ? 3 : 2) + (modelData.canFreeze ? 1 : 0) + (modelData.revocable ? 1 : 0) + (modelData.monitor !== "" ? 1 : 0) + (modelData.viewTmux && modelData.detached ? 1 : 0)
+                  position: (modelData.windowPid > 0 ? 3 : 2) + (modelData.canFreeze ? 1 : 0) + (modelData.revocable ? 1 : 0) + (modelData.monitor !== "" ? 1 : 0) + (modelData.relay ? 1 : 0) + (modelData.viewTmux && modelData.detached ? 1 : 0)
                   iconText: root.confirmId === modelData.id ? "󰗖" : "󰓛"
                   tooltipText: root.confirmId === modelData.id ? strings.t("action.confirmStop") : strings.t("action.stop")
                   foreground: root.confirmId === modelData.id ? root.urgent : root.fg

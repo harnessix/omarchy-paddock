@@ -1,0 +1,1 @@
+- New: A run on a terminal that no window shows gets a live view. paddock relays that terminal, and `paddock ps --json` reports `relay` and `watched`.

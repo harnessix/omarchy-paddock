@@ -815,6 +815,8 @@ fn ps_lists_children_under_their_parent() {
         agent: Vec::new(),
         secret_files: Vec::new(),
         kept_logins: Vec::new(),
+        watched: false,
+        relay: false,
     };
     let list = vec![
         r("a", None, 1),

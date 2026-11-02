@@ -792,6 +792,8 @@ mod tests {
             agent: Vec::new(),
             secret_files: Vec::new(),
             kept_logins: Vec::new(),
+            watched: false,
+            relay: false,
         }
     }
 

@@ -776,6 +776,8 @@ fn start_flatpak(
         agent: Vec::new(),
         secret_files: Vec::new(),
         kept_logins: Vec::new(),
+        watched: false,
+        relay: false,
     };
     if let Err(e) = running.register(env) {
         log::warn!("cannot list the app with the running sandboxes: {e:#}");

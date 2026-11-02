@@ -977,6 +977,8 @@ paddock view <id>           # a new terminal with a read-only live view
 paddock view <id> --write   # the same with keys
 ```
 
+A terminal that no window shows, such as the pty of a background process, gets this view too, and the panel says a background process started the run.
+
 - paddock copies the output of the harness byte for byte to the caller and to a run log, and the session shows that log. The script that started the sandbox gets the same output, exit code and input as without tmux.
 - The session uses paddock's own tmux server on `$XDG_RUNTIME_DIR/paddock/view.sock`, never your tmux server or your tmux configuration. No sandbox sees the socket or the logs. `paddock doctor --escape` checks this (`view-socket-hidden`).
 - In a run like this, the keys of `--write` only scroll the view (tmux copy mode) or close it. They do not reach the harness, which reads its input from the caller.

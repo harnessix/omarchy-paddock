@@ -614,7 +614,13 @@ pub fn run(
     // waits. A frozen sandbox is thawed first, so the signal is not left
     // pending. The old handlers come back when `run` returns.
     let forwarding = Forward::install();
-    let interactive = !capture && std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
+    // A terminal is watched only when a window the user can see belongs to
+    // this process chain. Without Hyprland, any terminal counts as watched.
+    let caller_terminal =
+        !capture && std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
+    let terminal_watched = caller_terminal && crate::relay::this_terminal_is_watched();
+    let relay_on = caller_terminal && !terminal_watched;
+    let interactive = caller_terminal;
     let mut end = EndOfRun {
         env,
         id: built.spec.id.clone(),
@@ -895,25 +901,17 @@ pub fn run(
             cmd.stdin(Stdio::piped());
         }
     }
-    if built.spawn.is_some() {
-        use std::os::unix::process::CommandExt;
-        // A child sandbox ends with the paddock process that runs it, even
-        // when that one is killed. SIGTERM, so a container CLI passes it on.
-        // SAFETY: prctl is async-signal-safe.
-        unsafe {
-            cmd.pre_exec(|| {
-                libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM);
-                Ok(())
-            });
-        }
-    }
     if forwarding.stop_requested() {
         bail!("paddock was asked to stop before the sandbox started");
     }
     // The live view of a run without a terminal (view.rs). paddock copies
     // each stream that is not a terminal to the caller and to the run log.
-    // A terminal stays the harness's own. Capture mode copies both.
-    let mut view = if built.view && !interactive {
+    // A watched terminal stays the harness's own. An invisible terminal is
+    // relayed: the harness gets a new pty, and the same bytes go to the
+    // caller and to the run log. Capture mode copies both streams.
+    let mut view = if relay_on {
+        crate::view::Live::start_relay(env, &spec.id, &spec.harness, quiet)
+    } else if built.view && !interactive {
         let (tee_out, tee_err) = crate::view::copy_streams(
             capture,
             std::io::stdout().is_terminal(),
@@ -932,9 +930,51 @@ pub fn run(
             cmd.stderr(Stdio::piped());
         }
     }
+    let mut relay = if relay_on {
+        let log = view.as_ref().map(|l| l.tee.sink());
+        Some(
+            crate::relay::Relay::start(libc::STDIN_FILENO, libc::STDOUT_FILENO, move |data| {
+                if let Some(s) = &log {
+                    s.append(data);
+                }
+            })
+            .context("cannot relay the terminal")?,
+        )
+    } else {
+        None
+    };
+    if let Some(r) = &relay {
+        let (stdin, stdout, stderr) = r.child_stdio()?;
+        cmd.stdin(stdin).stdout(stdout).stderr(stderr);
+    }
+    {
+        use std::os::unix::process::CommandExt;
+        let take_tty = relay.is_some();
+        // A child sandbox ends with the paddock process that runs it, even
+        // when that one is killed. SIGTERM, so a container CLI passes it on.
+        let deathsig = built.spawn.is_some();
+        if take_tty || deathsig {
+            // SAFETY: setsid, ioctl and prctl are async-signal-safe. The
+            // slave is fd 0 when `take_tty` is set.
+            unsafe {
+                cmd.pre_exec(move || {
+                    if take_tty {
+                        crate::relay::take_controlling_tty()?;
+                    }
+                    if deathsig {
+                        libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM);
+                    }
+                    Ok(())
+                });
+            }
+        }
+    }
     let mut child = cmd
         .spawn()
         .with_context(|| format!("cannot start {}", launch.program.display()))?;
+    if let Some(r) = relay.as_mut() {
+        r.close_slave();
+    }
     let unit = match new_scope {
         Some(name) => {
             let moved = crate::freeze::wait_stopped(child.id())
@@ -1003,6 +1043,8 @@ pub fn run(
         spawn_id: built.spawn.as_ref().map(|c| c.spawn_id.clone()),
         logins: auth.host_logins(),
         kept_logins: kept.clone(),
+        watched: terminal_watched,
+        relay: relay_on,
         unit,
         kv_project: Some(kv_project_path),
         pasture: kv_pasture,
@@ -1080,6 +1122,9 @@ pub fn run(
     let code = status
         .code()
         .unwrap_or_else(|| 128 + status.signal().unwrap_or(0));
+    if let Some(r) = relay.take() {
+        r.finish();
+    }
     if let Some(l) = view.take() {
         let kept = l.finish(code);
         if capture {

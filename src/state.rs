@@ -1057,6 +1057,15 @@ pub struct Running {
     /// new access token here.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub kept_logins: Vec<HeldLogin>,
+    /// The caller gave paddock a terminal, and a window the user can see
+    /// belongs to this process chain. False when there is no terminal, or
+    /// the terminal belongs to a background process.
+    #[serde(default)]
+    pub watched: bool,
+    /// paddock relays an invisible terminal. The harness has its own pty.
+    /// The caller still sends and receives bytes, and owns the input.
+    #[serde(default)]
+    pub relay: bool,
 }
 
 /// A host login file and the sandbox's copy of it.
