@@ -250,7 +250,7 @@ paddock undo claude-app-1a2b3c --yes
 The snapshot:
 
 - lives in `~/.local/share/paddock/snapshots/PROJECT/SESSION/`. paddock keeps the last 10 for each project.
-- leaves out `.git/`, which has its own history, and the folders that `.gitignore` ignores, such as `target` and `node_modules`. paddock asks its hardened host git for that list. Outside git, it leaves out `target`, `node_modules`, `.venv`, `dist` and `build`. `paddock undo` never touches these paths.
+- leaves out `.git/`, which has its own history, and the folders that `.gitignore` ignores, such as `target` and `node_modules`. paddock asks its hardened host git for that list. Outside git, it leaves out `target`, `node_modules`, `.venv`, `dist` and `build`. `paddock undo` never touches these paths, also when a folder became ignored only during the session.
 - shares the file data with the project on btrfs, xfs and bcachefs (`FICLONE`), so it takes almost no space. On other file systems, paddock copies the files only while the copy stays under `[snapshot] max`.
 - has a time limit of 20 seconds. A slower snapshot is dropped with a notice, and the sandbox starts anyway.
 

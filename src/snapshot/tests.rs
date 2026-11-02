@@ -98,6 +98,37 @@ fn git_skip_rules_take_ignored_folders_only() {
     assert!(s.skips("x/.git", ".git", false));
     assert!(!s.skips("a.log", "a.log", false));
     assert!(!s.skips("target", "target", true));
+    assert!(s.covers("out/x/y") && s.covers("web/node_modules/a") && s.covers("d/.git/x"));
+    assert!(!s.covers("outx/y") && !s.covers("a.log") && !s.covers("web/a"));
+}
+
+#[test]
+fn undo_leaves_a_folder_alone_that_became_ignored() {
+    // Review C-M4.
+    if !has_git() {
+        println!("skipped: no git");
+        return;
+    }
+    let t = tempfile::tempdir().unwrap();
+    let (p, root) = (t.path().join("p"), t.path().join("snaps"));
+    fs::create_dir_all(&p).unwrap();
+    git(&p, &["init", "-q"]);
+    write(&p, "notes/todo.md", "old");
+    write(&p, "a", "1");
+    let Taken::Done { dir, .. } = take(&root, &p, "s1", "fake", 1, &opts(1 << 20, false)).unwrap()
+    else {
+        panic!()
+    };
+    // The session ignores notes/, and the user edits the file later.
+    write(&p, ".gitignore", "notes/\n");
+    write(&p, "a", "agent");
+    finish(&root, &p, "s1", 2).unwrap();
+    write(&p, "notes/todo.md", "user edit");
+    let m = Meta::load(&dir).unwrap();
+    assert!(m.files.contains_key("notes/todo.md"));
+    let pl = undo_plan(&m, &p).unwrap();
+    let paths: Vec<&str> = pl.entries.iter().map(|e| e.path.as_str()).collect();
+    assert_eq!(paths, vec![".gitignore", "a"]);
 }
 
 #[test]

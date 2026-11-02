@@ -151,6 +151,12 @@ impl Skip {
             || (self.names && is_dir && NON_GIT_SKIP.contains(&name))
     }
 
+    /// `rel` or a folder above it is left out.
+    pub fn covers(&self, rel: &str) -> bool {
+        let parts: Vec<&str> = rel.split('/').collect();
+        (0..parts.len()).any(|i| self.skips(&parts[..=i].join("/"), parts[i], i + 1 < parts.len()))
+    }
+
     pub fn union(&self, other: &Skip) -> Skip {
         Skip {
             names: self.names || other.names,
@@ -601,6 +607,17 @@ pub fn plan(meta: &Meta, current: &BTreeMap<String, Fp>) -> Plan {
     Plan { entries }
 }
 
+/// What `paddock undo` would change in `project` now. Paths that the
+/// snapshot or today's rules leave out stay as they are, also when the
+/// snapshot has them: a folder can become ignored during the session.
+pub fn undo_plan(meta: &Meta, project: &Path) -> Result<Plan> {
+    let skip = meta.skip.union(&skip_rules(project, TIME_LIMIT));
+    let current = walk(project, &skip, None)?;
+    let mut meta = meta.clone();
+    meta.files.retain(|p, _| !skip.covers(p));
+    Ok(plan(&meta, &current))
+}
+
 /// What `restore` did.
 #[derive(Debug, Default, Serialize)]
 pub struct Restored {
@@ -874,9 +891,7 @@ pub fn undo_cmd(
     {
         bail!("a sandbox of this project runs; stop it first (`paddock ps`)");
     }
-    let skip = meta.skip.union(&skip_rules(&project, TIME_LIMIT));
-    let current = walk(&project, &skip, None)?;
-    let p = plan(meta, &current);
+    let p = undo_plan(meta, &project)?;
     if p.entries.is_empty() {
         println!("The project is the same as the snapshot of {}.", meta.id);
         return Ok(0);
