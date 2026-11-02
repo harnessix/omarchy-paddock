@@ -580,6 +580,8 @@ fn gc_yes_removes_only_the_automatic_tier_and_spares_running_homes() {
         agent: Vec::new(),
         secret_files: Vec::new(),
         kept_logins: Vec::new(),
+        watched: false,
+        relay: false,
     }
     .register(&env)
     .unwrap();
