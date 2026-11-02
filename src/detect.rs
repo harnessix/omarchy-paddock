@@ -408,30 +408,31 @@ pub fn is_secret_name(name: &str) -> bool {
 }
 
 fn walk_secrets(dir: &Path, depth: usize, left: &mut usize, out: &mut Vec<PathBuf>) {
-    if depth > SECRET_MAX_DEPTH || *left == 0 {
-        return;
-    }
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    let mut dirs = Vec::new();
-    for e in entries.flatten() {
-        if *left == 0 {
-            break;
+    // Breadth first: when a large build folder uses up the budget, the
+    // shallow folders next to it are already covered.
+    let mut queue = std::collections::VecDeque::from([(dir.to_path_buf(), depth)]);
+    while let Some((dir, depth)) = queue.pop_front() {
+        if depth > SECRET_MAX_DEPTH || *left == 0 {
+            continue;
         }
-        *left -= 1;
-        let name = e.file_name();
-        let Ok(ft) = e.file_type() else { continue };
-        if ft.is_dir() {
-            if name != ".git" {
-                dirs.push(e.path());
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for e in entries.flatten() {
+            if *left == 0 {
+                return;
             }
-        } else if ft.is_file() && is_secret_name(&name.to_string_lossy()) {
-            out.push(e.path());
+            *left -= 1;
+            let name = e.file_name();
+            let Ok(ft) = e.file_type() else { continue };
+            if ft.is_dir() {
+                if name != ".git" {
+                    queue.push_back((e.path(), depth + 1));
+                }
+            } else if ft.is_file() && is_secret_name(&name.to_string_lossy()) {
+                out.push(e.path());
+            }
         }
-    }
-    for d in dirs {
-        walk_secrets(&d, depth + 1, left, out);
     }
 }
 
@@ -709,6 +710,23 @@ mod tests {
         assert_eq!(kind(&data.join(".env")), Some(MountKind::MaskFile));
         assert_eq!(kind(&data.join("sub/tls.key")), None);
         assert_eq!(kind(&data.join("notes.txt")), None);
+    }
+
+    #[test]
+    fn a_large_build_folder_does_not_use_up_the_budget_before_a_shallow_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        // "a-target" sorts before "config" in most directory orders, and a
+        // depth-first walk spends the whole budget in it.
+        let big = tmp.path().join("a-target/x/y");
+        std::fs::create_dir_all(&big).unwrap();
+        for i in 0..50 {
+            std::fs::write(big.join(format!("f{i}")), "").unwrap();
+        }
+        std::fs::create_dir_all(tmp.path().join("config")).unwrap();
+        std::fs::write(tmp.path().join("config/.env"), "x").unwrap();
+        let (mut left, mut out) = (10, Vec::new());
+        walk_secrets(tmp.path(), 0, &mut left, &mut out);
+        assert_eq!(out, [tmp.path().join("config/.env")]);
     }
 
     #[test]
