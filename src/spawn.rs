@@ -55,7 +55,7 @@ pub const PROMPT_SHOWN: usize = 1000;
 /// from a file.
 pub const PROMPT_IN_HOME: &str = ".paddock-spawn/prompt.md";
 /// How long a stopped child gets to end before paddock kills it.
-const STOP_GRACE: Duration = Duration::from_secs(15);
+pub(crate) const STOP_GRACE: Duration = Duration::from_secs(15);
 
 /// `[spawn]` in the user configuration.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -782,6 +782,43 @@ impl TimeoutSeam for HostSeam {
     }
 }
 
+/// Wait for the sandbox process. A stop while it is frozen has to thaw it
+/// first: a frozen task keeps the signal pending, so the wait would not end.
+/// `stop` is set when this paddock is asked to end (its parent died, or a
+/// terminal closed). `seam` is the freezer seam, the same one that froze the
+/// child, so a test needs no systemd freezer.
+pub(crate) fn wait_outliving_parent(
+    child: &mut std::process::Child,
+    stop: &std::sync::atomic::AtomicBool,
+    env: &HostEnv,
+    sandbox: &str,
+    seam: &dyn TimeoutSeam,
+    grace: Duration,
+) -> std::io::Result<std::process::ExitStatus> {
+    use std::sync::atomic::Ordering;
+    let mut thawed = false;
+    let mut since: Option<Instant> = None;
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok(status);
+        }
+        if stop.load(Ordering::SeqCst) {
+            if !thawed {
+                thawed = true;
+                since = Some(Instant::now());
+                if crate::freeze::frozen(env, sandbox).is_some() {
+                    if let Err(e) = seam.thaw(sandbox) {
+                        log::warn!("cannot thaw {sandbox} after a stop: {e:#}");
+                    }
+                }
+            } else if since.is_some_and(|t| t.elapsed() > grace) {
+                let _ = child.kill();
+            }
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
 struct Entry {
     status: Status,
     /// The child's host process.
@@ -1067,9 +1104,10 @@ impl Spawner {
             // of the scope, frozen time included, so it would kill a child
             // that waits on the card or got more time. Raising it at each
             // answer needs a second D-Bus call that can fail, and then the
-            // child dies anyway. The backstop is not needed for safety:
-            // paddock's own timer stops the child, and when the parent's
-            // paddock dies, the parent-death signal below ends the child.
+            // child dies anyway. paddock's own timer stops the child. When the
+            // parent's paddock
+            // dies, the child gets the parent-death signal below and thaws
+            // its sandbox, so a freeze at this card cannot keep it alive.
             Some(tool) => {
                 let mut c = std::process::Command::new(tool);
                 c.args(["--user", "--scope", "--quiet", "--collect", "--unit", unit]);
