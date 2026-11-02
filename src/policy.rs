@@ -137,6 +137,23 @@ pub const HOST_ONLY_ENV: &[&str] = &[
     "CLAUDE_CODE_SSE_PORT",
 ];
 
+/// Variables that redirect package caches. Inheritance drops them so the
+/// sandbox uses the shared cache mounts. `[env] pass` can still hand one over.
+pub const CACHE_ENV: &[&str] = &[
+    "CARGO_HOME",
+    "CARGO_TARGET_DIR",
+    "RUSTUP_HOME",
+    "UV_CACHE_DIR",
+    "PIP_CACHE_DIR",
+    "npm_config_cache",
+    "NPM_CONFIG_CACHE",
+    "PNPM_STORE_DIR",
+    "YARN_CACHE_FOLDER",
+    "GOPATH",
+    "GOCACHE",
+    "GOMODCACHE",
+];
+
 /// Whether a host variable can be inherited. Besides the fixed list, any
 /// variable whose value is the path of a socket, or whose name says it holds
 /// one, is a host control channel and stays outside.
@@ -236,6 +253,7 @@ pub fn is_cloud_secret(name: &str) -> bool {
 
 pub fn inheritable(name: &str) -> bool {
     !HOST_ONLY_ENV.contains(&name)
+        && !CACHE_ENV.contains(&name)
         && !name.starts_with("__MISE")
         && !name.starts_with("PADDOCK_")
         && !name.starts_with("BASH_FUNC_")
@@ -469,6 +487,8 @@ mod tests {
             "/run/user/1000/cc-socks/1.sock"
         ));
         assert!(inheritable_var("EDITOR", "nvim"));
+        assert!(!inheritable_var("CARGO_HOME", "/host/cargo"));
+        assert!(!inheritable_var("UV_CACHE_DIR", "/host/uv"));
     }
 
     #[test]

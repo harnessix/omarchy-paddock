@@ -468,18 +468,20 @@ pub fn build_with(env: &HostEnv, opts: &Options, harness: Harness) -> Result<Bui
     for d in &harness.path_dirs {
         spec.add_path(d.clone());
     }
-    for (k, v) in &profile.launch.env {
-        spec.set_env(k, v.clone(), &porigin);
-    }
-    // The host environment, first, so profile, manifest and detectors override it.
+    // The host environment first, so profile, manifest and detectors override it.
     let inherit = opts.inherit_env.or(m.env.inherit).unwrap_or(true);
     if inherit {
         let mut withheld = Vec::new();
         let mut dropped = Vec::new();
         let mut count = 0;
+        let account_var = profile.state.account.as_ref().map(|a| a.env.as_str());
         for (k, v) in &env.vars {
             if m.env.hide.contains(k) {
                 spec.deny(crate::boundary::ENV, k, "env hide");
+                continue;
+            }
+            if account_var == Some(k.as_str()) {
+                spec.deny(crate::boundary::ENV, k, "account folder of the harness");
                 continue;
             }
             if !policy::inheritable_var(k, v) || k.starts_with("LC_") {
@@ -561,6 +563,9 @@ pub fn build_with(env: &HostEnv, opts: &Options, harness: Harness) -> Result<Bui
             );
             spec.notices.push(note);
         }
+    }
+    for (k, v) in &profile.launch.env {
+        spec.set_env(k, v.clone(), &porigin);
     }
     // The host proxy, in every env mode: sandbox traffic must leave the way host
     // traffic does. A proxy on the host loopback is the one loopback port the
