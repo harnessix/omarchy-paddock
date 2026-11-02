@@ -527,6 +527,46 @@ fn answers_go_through_the_approvals_directory() {
 }
 
 #[test]
+fn the_first_answer_wins_and_is_written_whole() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut vars = BTreeMap::new();
+    vars.insert(
+        "XDG_RUNTIME_DIR".into(),
+        tmp.path().join("rt").display().to_string(),
+    );
+    let env = HostEnv::from_parts(tmp.path().join("home"), "t".into(), 1, 1, vars);
+    let p = Pending {
+        id: "r-2-abc".into(),
+        sandbox: "s".into(),
+        harness: "claude".into(),
+        project: tmp.path().into(),
+        capability: "exec".into(),
+        summary: "run".into(),
+        detail: "run".into(),
+        reason: String::new(),
+        created: 1,
+        expires: 11,
+        session_allowed: true,
+        choices: Vec::new(),
+        started_by: vec![],
+    };
+    write_pending(&env, &p).unwrap();
+    answer(&env, "r-2-abc", Answer::Deny).unwrap();
+    let e = answer(&env, "r-2-abc", Answer::Once).unwrap_err();
+    assert!(format!("{e:#}").contains("already answered"), "{e:#}");
+    let dir = approvals_dir(&env);
+    let t = std::fs::read_to_string(dir.join("r-2-abc.answer")).unwrap();
+    assert_eq!(AnswerFile::parse(&t).map(|(a, _)| a), Some(Answer::Deny));
+    // No temporary file stays behind.
+    let left: Vec<_> = std::fs::read_dir(&dir)
+        .unwrap()
+        .flatten()
+        .filter(|e| e.file_name().to_string_lossy().contains("paddock-tmp"))
+        .collect();
+    assert!(left.is_empty(), "{left:?}");
+}
+
+#[test]
 fn the_client_talks_to_the_broker_over_the_socket() {
     let (t, b, _) = setup(Some(Answer::Once), HostPolicy::default());
     let sock = t.path().join("host.sock");

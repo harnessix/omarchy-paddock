@@ -106,6 +106,22 @@ pub fn write_atomic(path: &Path, bytes: impl AsRef<[u8]>) -> io::Result<()> {
     Ok(())
 }
 
+/// Write a file atomically, only when it does not exist yet: the first
+/// writer wins, and readers never see half a file. Fails with
+/// `AlreadyExists` for the others.
+pub fn write_new(path: &Path, bytes: impl AsRef<[u8]>) -> io::Result<()> {
+    static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = path.with_extension(format!("{}-{n}.paddock-tmp", std::process::id()));
+    let mut f = open(&tmp, OpenOptions::new().write(true).create_new(true))?;
+    let written = f.write_all(bytes.as_ref());
+    drop(f);
+    // A hard link never replaces a file that is there.
+    let linked = written.and_then(|()| std::fs::hard_link(&tmp, path));
+    let _ = std::fs::remove_file(&tmp);
+    linked
+}
+
 /// Open a log file for appending, with 0600 in a 0700 folder.
 pub fn append(path: &Path) -> io::Result<File> {
     open(path, OpenOptions::new().create(true).append(true))

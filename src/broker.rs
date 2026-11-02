@@ -457,11 +457,20 @@ pub fn answer_with_note(env: &HostEnv, id: &str, a: Answer, note: Option<&str>) 
         Some(note) => AnswerFile::Noted { answer: a, note },
         None => AnswerFile::Plain(a),
     };
-    crate::privfs::write(
-        &dir.join(format!("{id}.answer")),
-        serde_json::to_string(&file)?,
-    )?;
+    write_answer(&dir, id, serde_json::to_string(&file)?)?;
     Ok(())
+}
+
+/// Write the answer file of `id` whole, at once, and only the first time:
+/// a poller never reads half an answer, and a second answer does not
+/// replace the first.
+fn write_answer(dir: &Path, id: &str, text: String) -> Result<()> {
+    match crate::privfs::write_new(&dir.join(format!("{id}.answer")), text) {
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            bail!("{id} was already answered")
+        }
+        r => Ok(r?),
+    }
 }
 
 /// Answer a question from `/dev/paddock/ask` with text. The text goes to
@@ -485,8 +494,9 @@ pub fn answer_reply(env: &HostEnv, id: &str, text: &str) -> Result<()> {
                 p.choices.join(", ")
             );
         }
-        crate::privfs::write(
-            &dir.join(format!("{id}.answer")),
+        write_answer(
+            &dir,
+            id,
             serde_json::json!({ "reply": text.trim() }).to_string(),
         )?;
         return Ok(());
@@ -500,10 +510,7 @@ pub fn answer_reply(env: &HostEnv, id: &str, text: &str) -> Result<()> {
     if text.chars().count() > MAX_REPLY {
         bail!("the answer is longer than {MAX_REPLY} characters");
     }
-    crate::privfs::write(
-        &dir.join(format!("{id}.answer")),
-        serde_json::json!({ "reply": text }).to_string(),
-    )?;
+    write_answer(&dir, id, serde_json::json!({ "reply": text }).to_string())?;
     Ok(())
 }
 
