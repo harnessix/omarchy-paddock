@@ -481,11 +481,19 @@ fn set_mtime(f: &std::fs::File, mtime: i64) -> Result<()> {
 }
 
 /// Copy the scanned entries of `src` into `dst`. Bytes that cannot be
-/// reflinked count against `max`.
-fn copy_tree(src: &Path, dst: &Path, entries: &BTreeMap<String, Entry>, max: u64) -> Result<u64> {
+/// reflinked count against `max`. The source can be sandbox-writable, so
+/// it is walked through `safefs`: a symlink on the way is an error.
+fn copy_tree(
+    src: &crate::safefs::Root,
+    dst: &Path,
+    entries: &BTreeMap<String, Entry>,
+    max: u64,
+) -> Result<u64> {
     let mut plain = 0u64;
+    // The folder of the last file: entries come sorted, so neighbours share it.
+    let mut last: Option<(String, crate::safefs::Dir)> = None;
     for (r, e) in entries {
-        let (from, to) = (src.join(r), dst.join(r));
+        let to = dst.join(r);
         match e.kind {
             Kind::Dir => {
                 std::fs::create_dir(&to)?;
@@ -495,8 +503,14 @@ fn copy_tree(src: &Path, dst: &Path, entries: &BTreeMap<String, Entry>, max: u64
                 std::os::unix::fs::symlink(e.target.as_deref().unwrap_or(Path::new("")), &to)?
             }
             Kind::File => {
-                let f = std::fs::File::open(&from)
-                    .with_context(|| format!("cannot read {}", from.display()))?;
+                let (parent, name) = r.rsplit_once('/').unwrap_or(("", r));
+                if last.as_ref().is_none_or(|(p, _)| p != parent) {
+                    last = Some((parent.to_string(), src.dir(Path::new(parent), false)?));
+                }
+                let d = &last.as_ref().expect("set above").1;
+                let f = d
+                    .open_read(OsStr::new(name))?
+                    .with_context(|| format!("{r} is gone from the original"))?;
                 let t = std::fs::OpenOptions::new()
                     .write(true)
                     .create_new(true)
@@ -531,7 +545,11 @@ pub fn borrow(env: &HostEnv, id: &str, p: &BorrowPlan, max: u64) -> Result<serde
     crate::privfs::dir(&m)?;
     let stage = m.join(format!("stage-{}", nonce()));
     std::fs::create_dir(&stage)?;
-    let plain = match copy_tree(&src, &stage, &entries, max) {
+    let plain = match p
+        .src
+        .root()
+        .and_then(|r| copy_tree(&r, &stage, &entries, max))
+    {
         Ok(n) => n,
         Err(e) => {
             let _ = std::fs::remove_dir_all(&stage);

@@ -296,6 +296,17 @@ impl Source {
         PathBuf::from(fd_path(&self.fd))
     }
 
+    /// The open folder as a `Root`, to walk it without following a symlink.
+    pub fn root(&self) -> Result<Root> {
+        if self.kind != Kind::Dir {
+            bail!("not a folder");
+        }
+        Ok(Root {
+            fd: reopen_dir(&self.fd)?,
+            path: self.real_path()?,
+        })
+    }
+
     /// The device and inode of the open file or folder.
     pub fn id(&self) -> Result<(u64, u64)> {
         let st = fstat(&self.fd)?;

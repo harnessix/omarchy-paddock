@@ -145,13 +145,31 @@ fn without_reflinks_the_size_limit_holds() {
     std::fs::write(o.join("big"), vec![7u8; 4096]).unwrap();
     let p = plan_borrow(&e, &o, no_check).unwrap();
     // A file system with reflinks copies it anyway; others refuse.
-    let src = p.src.proc_path();
     let stage = t.path().join("stage");
     std::fs::create_dir(&stage).unwrap();
-    let entries = scan(&src).unwrap();
-    if let Err(err) = copy_tree(&src, &stage, &entries, 100) {
+    let entries = scan(&p.src.proc_path()).unwrap();
+    if let Err(err) = copy_tree(&p.src.root().unwrap(), &stage, &entries, 100) {
         assert!(format!("{err:#}").contains("[borrow] max"), "{err:#}");
     }
+}
+
+#[test]
+fn a_borrow_never_copies_through_a_folder_swapped_for_a_symlink() {
+    // Review C-H2: the sandbox swaps a folder for a link after the scan.
+    let t = tempfile::tempdir().unwrap();
+    let e = env(t.path());
+    let o = original(t.path());
+    let p = plan_borrow(&e, &o, no_check).unwrap();
+    let entries = scan(&p.src.proc_path()).unwrap();
+    let secret = t.path().join("secret");
+    std::fs::create_dir(&secret).unwrap();
+    std::fs::write(secret.join("a.rs"), "key").unwrap();
+    std::fs::rename(o.join("src"), t.path().join("moved")).unwrap();
+    symlink(&secret, o.join("src")).unwrap();
+    let stage = t.path().join("stage");
+    std::fs::create_dir(&stage).unwrap();
+    assert!(copy_tree(&p.src.root().unwrap(), &stage, &entries, DEFAULT_MAX).is_err());
+    assert!(std::fs::read_to_string(stage.join("src/a.rs")).map_or(true, |s| s != "key"));
 }
 
 #[test]
