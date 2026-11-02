@@ -121,8 +121,9 @@ impl Run {
             return false;
         }
         let (lo, hi) = (a.max(self.started), b.min(self.stopped.unwrap_or(b)));
+        // A stop on the sample boundary is the next step, not this one.
         if hi <= lo {
-            return true;
+            return false;
         }
         let frozen: u64 = self
             .frozen
@@ -998,6 +999,16 @@ mod tests {
             stopped,
             frozen: frozen.to_vec(),
         }
+    }
+
+    #[test]
+    fn review_e_a_timer_stopped_at_sample_boundary_does_not_run_in_next_step() {
+        let r = Run {
+            started: 100,
+            stopped: Some(200),
+            frozen: vec![],
+        };
+        assert!(!r.ran(200, 300));
     }
 
     fn quota(share: f64, base: f64, base_at: u64) -> Quota {
