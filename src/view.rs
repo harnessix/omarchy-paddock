@@ -13,7 +13,7 @@
 use crate::env::HostEnv;
 use anyhow::{bail, Context, Result};
 use std::ffi::OsString;
-use std::io::{Read, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -27,6 +27,10 @@ pub const MAX_AGE: u64 = 24 * 3600;
 pub const HISTORY_LIMIT: &str = "100000";
 /// The run log stops growing at this size.
 const LOG_CAP: u64 = 64 << 20;
+/// `paddock ps` reads only this much of the end of a view log.
+pub const ACTIVITY_TAIL: u64 = 8 << 10;
+/// The activity line keeps at most this many characters.
+pub const ACTIVITY_CHARS: usize = 120;
 /// The capture of a spawn keeps the last 4 MiB, as without the view.
 const CAPTURE_KEEP: usize = 4 << 20;
 
@@ -180,6 +184,24 @@ impl Tmux {
 
     pub fn kill(&self, id: &str) -> bool {
         valid_id(id) && self.run(&["kill-session", "-t", &format!("={id}")])
+    }
+
+    /// The last lines of pane `id`. A detached run has no view log. Its
+    /// output is this pane.
+    pub fn pane_tail(&self, id: &str) -> Option<String> {
+        if !valid_id(id) || !self.sock.exists() {
+            return None;
+        }
+        let target = format!("={id}");
+        let out = self
+            .cmd()
+            .args(["capture-pane", "-p", "-t", &target, "-S", "-120"])
+            .stdout(Stdio::piped())
+            .output()
+            .ok()?;
+        out.status
+            .success()
+            .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
     }
 
     /// Start the session of a sandbox: a pane that prints `header` and then
@@ -677,6 +699,147 @@ pub fn gc_items(env: &HostEnv, now: u64) -> Vec<crate::storage::Item> {
             }
         })
         .collect()
+}
+
+/// The last visible line of the view log, for `paddock ps --json`.
+///
+/// Reads only the last 8 KiB. ANSI sequences and other control characters
+/// go. The line is trimmed and cut at 120 characters. None when the sandbox
+/// has no log, or the tail has no visible text.
+///
+/// A detached run keeps its output in the tmux pane, not in a view log.
+/// The line then comes from that pane.
+pub fn activity(env: &HostEnv, id: &str) -> Option<String> {
+    if !valid_id(id) {
+        return None;
+    }
+    if crate::detach::is_detached(env, id) {
+        if let Some(tmux) = Tmux::find(env).filter(|t| t.has(id)) {
+            if let Some(text) = tmux.pane_tail(id) {
+                return last_visible(&text);
+            }
+        }
+    }
+    read_tail(&log_file(env, id))
+        .as_deref()
+        .and_then(last_visible)
+}
+
+/// Drop ANSI sequences and other control characters. The result is at most
+/// `max` characters, cut on a character boundary.
+pub fn plain_limit(text: &str, max: usize) -> String {
+    take_chars(strip_controls(text).trim(), max)
+}
+
+fn read_tail(path: &Path) -> Option<String> {
+    let mut f = std::fs::File::open(path).ok()?;
+    let len = f.metadata().ok()?.len();
+    if len == 0 {
+        return None;
+    }
+    let start = len.saturating_sub(ACTIVITY_TAIL);
+    f.seek(SeekFrom::Start(start)).ok()?;
+    let mut buf = Vec::new();
+    f.read_to_end(&mut buf).ok()?;
+    if start > 0 {
+        if let Some(i) = buf.iter().position(|b| *b == b'\n') {
+            buf.drain(..=i);
+        }
+        let skip = buf
+            .iter()
+            .position(|b| is_utf8_start(*b))
+            .unwrap_or(buf.len());
+        buf.drain(..skip);
+    }
+    if buf.is_empty() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&buf).into_owned())
+}
+
+/// A byte that can start a UTF-8 character. A continuation byte is `10xxxxxx`.
+fn is_utf8_start(b: u8) -> bool {
+    (b & 0b1100_0000) != 0b1000_0000
+}
+
+fn last_visible(text: &str) -> Option<String> {
+    let mut found = None;
+    // `\r` starts the line again, as on a terminal. The last piece is the
+    // visible one.
+    for line in text.split(['\n', '\r']) {
+        let clean = strip_controls(line);
+        let clean = clean.trim();
+        if !clean.is_empty() {
+            found = Some(take_chars(clean, ACTIVITY_CHARS));
+        }
+    }
+    found
+}
+
+fn take_chars(text: &str, n: usize) -> String {
+    if text.chars().count() <= n {
+        text.to_string()
+    } else {
+        text.chars().take(n).collect()
+    }
+}
+
+/// ANSI escape sequences and other control characters, removed.
+fn strip_controls(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' {
+            skip_escape(&mut chars);
+            continue;
+        }
+        if c == '\u{9b}' {
+            skip_csi(&mut chars);
+            continue;
+        }
+        if c.is_control() {
+            continue;
+        }
+        out.push(c);
+    }
+    out
+}
+
+fn skip_escape(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) {
+    match chars.peek().copied() {
+        Some('[') => {
+            chars.next();
+            skip_csi(chars);
+        }
+        Some(']') => {
+            chars.next();
+            while let Some(c) = chars.next() {
+                if c == '\u{7}' {
+                    break;
+                }
+                if c == '\u{1b}' && chars.peek() == Some(&'\\') {
+                    chars.next();
+                    break;
+                }
+            }
+        }
+        Some('(' | ')' | '*' | '+' | '-' | '.' | '/') => {
+            chars.next();
+            chars.next();
+        }
+        Some(_) => {
+            chars.next();
+        }
+        None => {}
+    }
+}
+
+fn skip_csi(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) {
+    for c in chars.by_ref() {
+        if ('\u{40}'..='\u{7e}').contains(&c) {
+            break;
+        }
+    }
 }
 
 /// What a sandbox row can open: `(view, tmux)`. `view` is a session or a
