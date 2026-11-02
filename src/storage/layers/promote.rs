@@ -161,6 +161,17 @@ enum Check {
     },
 }
 
+impl Check {
+    fn kind(&self) -> &'static str {
+        match self {
+            Check::Crate => "crate",
+            Check::Content(..) => "content",
+            Check::GoZip { .. } => "zip",
+            Check::GoMod { .. } => "mod",
+        }
+    }
+}
+
 /// The record of checked files, so a package version is fetched once.
 fn record_path(env: &HostEnv) -> PathBuf {
     env.paddock_state().join("layers-checked.json")
@@ -285,7 +296,7 @@ fn promote_one(
         Err(_) => return Ok(Some("refused: the shared layer has no file there".into())),
     }
     let sha = crate::manifest::hex(&Sha256::digest(&data));
-    let key = format!("{}|{}|{}|{sha}", c.cache, c.package, c.version);
+    let key = format!("{}|{}|{}|{}|{sha}", c.cache, c.check.kind(), c.package, c.version);
     let verdict = match record.get(&key) {
         Some(v) => v.clone(),
         None => {
@@ -1195,6 +1206,28 @@ mod tests {
         assert!(low.join(v).join("v1.0.0.mod").is_file());
         assert!(!low.join(v).join("list").exists());
         assert!(!low.join(w).exists());
+    }
+
+    #[test]
+    fn the_same_bytes_are_not_promoted_as_both_a_mod_and_a_zip() {
+        let t = tempfile::tempdir().unwrap();
+        let (env, proj) = project(t.path(), "go-mod");
+        let up = upper(&env, &proj, "go-mod");
+        let v = "cache/download/example.com/m/@v";
+        put(&up, &format!("{v}/v1.0.0.mod"), GO_MOD);
+        put(&up, &format!("{v}/v1.0.0.zip"), GO_MOD);
+        let srv = serve(HashMap::from([(
+            "/lookup/example.com/m@v1.0.0".to_string(),
+            format!("1\nexample.com/m v1.0.0 {ZIP_H1}\nexample.com/m v1.0.0/go.mod {MOD_H1}\n\nsig\n"),
+        )]));
+        let src = Sources { crates_index: String::new(), sumdb: srv.base.clone() };
+        let r = run(&env, &proj, &src, &http(), later());
+        let zip = lower(&env, "go-mod").join(v).join("v1.0.0.zip");
+        assert!(
+            !zip.exists(),
+            "shared zip is the go.mod bytes, which are not {ZIP_H1}: {r:?} bytes={:?}",
+            std::fs::read(&zip).ok()
+        );
     }
 
     #[test]
