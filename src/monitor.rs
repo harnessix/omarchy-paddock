@@ -634,9 +634,40 @@ const SKIP_NAMES: &[&str] = &[
     ".git",
     ".rustup",
     "site-packages",
+    ".m2",
+    ".gradle",
 ];
 /// Folders that the check skips by their path relative to the home.
-const SKIP_PATHS: &[&str] = &[".cargo/registry", ".local/share/mise"];
+const SKIP_PATHS: &[&str] = &[
+    ".cargo/registry",
+    ".cargo/git",
+    "go/pkg/mod",
+    ".local/share/mise",
+];
+/// Extensions of source code files that are not credential files.
+const SOURCE_EXTS: &[&str] = &[
+    "c", "cc", "cpp", "cxx", "h", "hh", "hpp", "rs", "go", "py", "js", "mjs", "cjs", "ts", "tsx",
+    "jsx", "java", "kt", "kts", "scala", "rb", "php", "cs", "swift", "sh", "bash", "zsh", "html",
+    "css", "scss", "sass", "less", "sql",
+];
+
+fn is_skipped(rel: &str) -> bool {
+    let parts: Vec<&str> = rel.split('/').collect();
+    if parts.iter().any(|p| SKIP_NAMES.contains(p)) {
+        return true;
+    }
+    SKIP_PATHS
+        .iter()
+        .any(|p| rel == *p || rel.starts_with(&format!("{p}/")))
+}
+
+fn is_source(name: &str) -> bool {
+    let p = Path::new(name);
+    let Some(ext) = p.extension().and_then(|e| e.to_str()) else {
+        return false;
+    };
+    SOURCE_EXTS.contains(&ext.to_ascii_lowercase().as_str())
+}
 
 /// A new credential file: its path relative to the sandbox home and its size.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -647,10 +678,16 @@ pub struct CredFile {
 
 /// Whether a path relative to the home names a credential file.
 pub fn is_credential(rel: &str) -> bool {
+    if is_skipped(rel) {
+        return false;
+    }
     if rel.starts_with(".ssh/") || CRED_PATHS.contains(&rel) {
         return true;
     }
     let name = base(rel);
+    if is_source(name) {
+        return false;
+    }
     let low = name.to_ascii_lowercase();
     crate::detect::is_secret_name(name) || CRED_WORDS.iter().any(|w| low.contains(w))
 }
@@ -1750,7 +1787,15 @@ Inter-|   Receive                                                |  Transmit
         ] {
             assert!(is_credential(yes), "{yes}");
         }
-        for no in [".bashrc", ".config/x/config.json", ".gitconfig"] {
+        for no in [
+            ".bashrc",
+            ".config/x/config.json",
+            ".gitconfig",
+            "go/pkg/mod/golang.org/x/oauth2@v0.21.0/token.go",
+            "token.go",
+            "src/token.rs",
+            "lib/secret.py",
+        ] {
             assert!(!is_credential(no), "{no}");
         }
     }
@@ -1777,6 +1822,14 @@ Inter-|   Receive                                                |  Transmit
         put(&home, ".ssh/authorized_keys", "ssh-ed25519 AAA");
         put(&home, ".cache/x/token", "t");
         put(&home, "proj/node_modules/m/secret.js", "s");
+        put(
+            &home,
+            "go/pkg/mod/golang.org/x/oauth2@v0.21.0/token.go",
+            "package oauth2",
+        );
+        put(&home, ".cargo/git/checkouts/pkg/token.txt", "token");
+        put(&home, ".m2/repository/pkg/secret.txt", "secret");
+        put(&home, ".gradle/caches/secret.txt", "secret");
         let (found, n) = c.check();
         assert_eq!(n, 0);
         assert_eq!(paths(&found), [".ssh/authorized_keys", ".ssh/id_ed25519"]);
