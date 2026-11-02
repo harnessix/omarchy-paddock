@@ -1807,6 +1807,7 @@ pub fn create_worktree(
         &path.display().to_string(),
         &base,
     ])?;
+    crate::storage::record_worktree_branch(env, &path, &plan.branch);
     Ok(crate::build::Worktree {
         repo: repo.to_path_buf(),
         path,

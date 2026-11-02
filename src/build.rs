@@ -128,6 +128,7 @@ pub fn create_worktree(env: &HostEnv, repo: &Path, app: Option<&str>) -> Result<
             &base,
         ],
     )?;
+    crate::storage::record_worktree_branch(env, &path, &branch);
     Ok(Worktree {
         repo: repo.to_path_buf(),
         path,

@@ -306,6 +306,37 @@ mod tests {
     }
 
     #[test]
+    fn a_branch_switch_in_the_worktree_does_not_change_its_branch() {
+        let (_t, env, repo) = setup();
+        let wt = crate::build::create_worktree(&env, &repo, None).unwrap();
+        // The sandbox makes a branch of its own and switches to it.
+        git(&wt.path, &["switch", "-q", "-c", "feature-x"]);
+        git(&wt.path, &["commit", "-q", "--allow-empty", "-m", "x"]);
+        git(&repo, &["branch", "-q", "pushed", "feature-x"]);
+        let w = find(&list(&env), &wt.path.display().to_string()).unwrap();
+        assert_eq!(w.branch.as_deref(), Some(wt.branch.as_str()));
+        assert_eq!(w.unmerged, Some(0));
+        let t = remove(&env, &w, false).unwrap();
+        assert!(t.contains(&wt.branch), "{t}");
+        let branches = git(&repo, &["branch", "--format=%(refname:short)"]);
+        assert!(branches.contains("feature-x"), "{branches}");
+        assert!(!branches.contains(&wt.branch), "{branches}");
+    }
+
+    #[test]
+    fn without_a_record_only_a_paddock_branch_counts() {
+        let (_t, env, repo) = setup();
+        let wt = crate::build::create_worktree(&env, &repo, None).unwrap();
+        std::fs::remove_dir_all(env.paddock_state().join("worktree-branches")).unwrap();
+        assert_eq!(list(&env)[0].branch.as_deref(), Some(wt.branch.as_str()));
+        git(&wt.path, &["switch", "-q", "-c", "feature-x"]);
+        assert_eq!(list(&env)[0].branch, None);
+        remove(&env, &list(&env)[0], false).unwrap();
+        let branches = git(&repo, &["branch", "--format=%(refname:short)"]);
+        assert!(branches.contains("feature-x"), "{branches}");
+    }
+
+    #[test]
     fn remove_takes_a_merged_worktree_without_force() {
         let (_t, env, repo) = setup();
         let wt = crate::build::create_worktree(&env, &repo, None).unwrap();
