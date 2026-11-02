@@ -1,11 +1,8 @@
 name = "agy"
 description = "Google Antigravity CLI"
 
-# Entries that come from documentation, not from a test. paddock doctor lists them.
-unverified = [
-  "a full run inside paddock",
-  "state.seed: settings and the MCP tool cache",
-]
+# Tested inside paddock: a login, full one-shot runs, the seeded settings and
+# MCP tool cache, and the onboarding flags.
 
 [locate]
 mise = "agy"
