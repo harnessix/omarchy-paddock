@@ -17,6 +17,41 @@ fn u32le(d: &[u8], at: usize) -> Result<usize> {
     Ok(u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as usize)
 }
 
+fn u32raw(d: &[u8], at: usize) -> Result<u32> {
+    let b = d.get(at..at + 4).context("zip: short")?;
+    Ok(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+}
+
+const CRC_TABLE: [u32; 256] = {
+    let mut table = [0u32; 256];
+    let mut i = 0;
+    while i < 256 {
+        let mut c = i as u32;
+        let mut j = 0;
+        while j < 8 {
+            if c & 1 != 0 {
+                c = 0xedb8_8320 ^ (c >> 1);
+            } else {
+                c >>= 1;
+            }
+            j += 1;
+        }
+        table[i] = c;
+        i += 1;
+    }
+    table
+};
+
+/// CRC-32 (IEEE 802.3), as used in zip files.
+pub fn crc32(data: &[u8]) -> u32 {
+    let mut crc = 0xffff_ffffu32;
+    for &b in data {
+        let idx = ((crc ^ (b as u32)) & 0xff) as usize;
+        crc = CRC_TABLE[idx] ^ (crc >> 8);
+    }
+    !crc
+}
+
 /// The (name, content) of each entry, in the order of the central directory.
 pub fn files(d: &[u8]) -> Result<Vec<(String, Vec<u8>)>> {
     let min = d.len().saturating_sub(22 + 65535);
@@ -33,6 +68,7 @@ pub fn files(d: &[u8]) -> Result<Vec<(String, Vec<u8>)>> {
             bail!("zip: bad central record");
         }
         let method = u16le(d, at + 10)?;
+        let crc = u32raw(d, at + 16)?;
         let csize = u32le(d, at + 20)?;
         let usize_ = u32le(d, at + 24)?;
         let (nlen, xlen, clen) = (u16le(d, at + 28)?, u16le(d, at + 30)?, u16le(d, at + 32)?);
@@ -59,6 +95,9 @@ pub fn files(d: &[u8]) -> Result<Vec<(String, Vec<u8>)>> {
         };
         if data.len() != usize_ {
             bail!("zip: {name} has the wrong size");
+        }
+        if crc32(&data) != crc {
+            bail!("zip: {name} has a bad CRC-32");
         }
         out.push((name, data));
     }
@@ -292,5 +331,10 @@ mod tests {
         );
         assert!(inflate(d, 1000).is_err());
         assert!(inflate(&d[..d.len() / 2], 1 << 20).is_err());
+    }
+
+    #[test]
+    fn crc32_matches_standard_test_vector() {
+        assert_eq!(crc32(b"123456789"), 0xcbf43926);
     }
 }
