@@ -375,6 +375,11 @@ pub struct Setting {
     /// Key path. `{project}` is the project path.
     pub path: Vec<String>,
     pub value: toml::Value,
+    /// Only when the harness starts with its auto-approval flags
+    /// (`yolo_args`), for example the acceptance of a bypass warning. With
+    /// `--no-yolo` the harness keeps asking.
+    #[serde(default)]
+    pub yolo_only: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]

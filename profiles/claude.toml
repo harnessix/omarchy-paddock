@@ -17,7 +17,6 @@ env = { DISABLE_AUTOUPDATER = "1" }
 auth = [".claude/.credentials.json"]
 auth_expiry = { ".claude/.credentials.json" = "claudeAiOauth.expiresAt" }
 import_ro = [
-  ".claude/settings.json",
   ".claude/CLAUDE.md",
   ".claude/agents",
   ".claude/commands",
@@ -25,6 +24,9 @@ import_ro = [
   ".claude/output-styles",
   ".agents/skills",
 ]
+# A writable copy, so paddock can record the answers below. Edits made in the
+# sandbox are not copied back, and the host copy replaces them each start.
+seed = [".claude/settings.json"]
 env_pass = ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL", "ANTHROPIC_MODEL", "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX"]
 
 # Omarchy's account switch: CLAUDE_CONFIG_DIR replaces ~/.claude, and
@@ -87,3 +89,18 @@ prompt = "stdin"
 # `claude --help`: "Usage: claude [options] [command] [prompt]".
 [detach]
 args = ["Read the file {prompt_file} and do the task that it describes."]
+
+# paddock is the external sandbox, so Claude Code's own two questions only
+# stop a run that has no terminal (paddock run --detach): the warning about
+# --dangerously-skip-permissions, and the trust question for the project.
+# The bypass answer is set only when the run uses the auto-approval flag.
+[[state.settings]]
+file = ".claude/settings.json"
+path = ["skipDangerousModePermissionPrompt"]
+value = true
+yolo_only = true
+
+[[state.settings]]
+file = ".claude.json"
+path = ["projects", "{project}", "hasTrustDialogAccepted"]
+value = true
