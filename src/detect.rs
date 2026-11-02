@@ -126,6 +126,16 @@ impl Detector for Git {
                 false,
                 "detector git: hooks run on the host",
             ));
+            // Submodule git directories: one that the agent creates here
+            // would get no binds, and the host's `git status` reads its
+            // config when it recurses. The ones that exist now are mounted
+            // read-write above, below this read-only folder.
+            crate::safefs::Root::open(&dir)?.dir(Path::new("modules"), true)?;
+            spec.add_mount(Mount::same(
+                dir.join("modules"),
+                false,
+                "detector git: new submodule git directories steer host git",
+            ));
             let linked = dir.join("commondir").is_file();
             for f in crate::hostgit::PROTECTED_FILES {
                 let p = dir.join(f);
@@ -582,7 +592,7 @@ mod tests {
         let dot = project.join(".git");
         // Its own mount point, so it cannot be renamed in the sandbox.
         assert_eq!(kind(&dot), Some(MountKind::Rw));
-        for f in ["hooks", "config", "config.worktree", "commondir"] {
+        for f in ["hooks", "config", "config.worktree", "commondir", "modules"] {
             assert_eq!(kind(&dot.join(f)), Some(MountKind::Ro), "{f}");
         }
         assert_eq!(
@@ -600,6 +610,32 @@ mod tests {
             std::fs::read_to_string(dot.join("config.worktree")).unwrap(),
             ""
         );
+    }
+
+    #[test]
+    fn a_new_submodule_git_dir_cannot_be_planted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("repo");
+        std::fs::create_dir_all(project.join(".git/modules/old")).unwrap();
+        run_git(&project, &["init", "-q", "-b", "main"]);
+        // An existing submodule git directory stays writable.
+        let old = project.join(".git/modules/old");
+        run_git(&old, &["init", "-q", "--bare"]);
+        let spec = git_mounts(&project);
+        let kind = |p: &Path| spec.mounts.iter().find(|m| m.dst == p).map(|m| m.kind);
+        let modules = project.join(".git/modules");
+        assert_eq!(kind(&modules), Some(MountKind::Ro));
+        assert_eq!(kind(&old), Some(MountKind::Rw));
+        assert_eq!(kind(&old.join("config")), Some(MountKind::Ro));
+        assert_eq!(kind(&old.join("modules")), Some(MountKind::Ro));
+        // The read-only folder is bound before the one inside it.
+        let order: Vec<&Path> = spec
+            .ordered_mounts()
+            .iter()
+            .map(|m| m.dst.as_path())
+            .collect();
+        let at = |p: &Path| order.iter().position(|d| *d == p).unwrap();
+        assert!(at(&modules) < at(&old));
     }
 
     #[test]

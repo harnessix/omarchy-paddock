@@ -203,7 +203,7 @@ A sandbox uses your existing login of the harness. See [Logins and MCP](#logins-
 | :--- | :--- |
 | The project (git root), read-write | the project directory |
 | `.git`, read-write, its own mount point | the same directory. A mount point cannot be renamed, so the read-only files below it stay in place. |
-| `.git/hooks`, `.git/config`, `.git/config.worktree`, `.git/commondir`, `.git/objects/info/alternates`, read-only | the same files. Git on the host reads them, and they can name a program or another directory. |
+| `.git/hooks`, `.git/config`, `.git/config.worktree`, `.git/commondir`, `.git/objects/info/alternates`, `.git/modules`, read-only | the same files. Git on the host reads them, and they can name a program or another directory. The git directories of submodules that exist at the start stay writable below `.git/modules`, with the same read-only files. |
 | `$HOME`, read-write | a private directory per harness, login and project, under `$XDG_DATA_HOME/paddock/homes` |
 | Credential files of the harness | copied from your home directory, or from an isolated store |
 | Harness settings and skills, read-only | the files that the harness profile lists in `import_ro` |
@@ -223,6 +223,7 @@ Git takes commands from the repository it reads. `core.fsmonitor`, `core.hooksPa
 - Work-tree state, such as the list of uncommitted changes, comes from a `git status` that runs in a sandbox of its own, with no network. A `filter` driver cannot be turned off with a flag, so it runs in there, where it can do no more than the agent already can. On a host without bubblewrap, paddock says the state is unknown instead of guessing, and `paddock gc` then asks for `--force` before it removes such a worktree.
 - `git worktree add` and `git worktree remove` write a work tree. Before one of them runs, paddock reads the repository configuration as text. If it holds a key that starts a program, paddock stops and prints the file and the key.
 - Your own `git` commands in the project are protected by the read-only binds in the table above, as long as paddock started the sandbox. A repository that the agent creates inside the project is new, so it has no such binds: paddock's own calls stay safe, but take care with your own.
+- `.git/modules` is read-only, so the agent cannot plant the git directory of a new submodule there, whose config your `git status` would read. `git submodule add` and the first `git submodule update --init` of a submodule therefore fail in the sandbox; run them on the host.
 - The first start in a repository creates `.git/commondir` with `.`, and empty `.git/config.worktree` and `.git/objects/info/alternates` files, if they are missing. Git treats all three as no-ops. They exist so that paddock can bind them read-only; otherwise the agent could create them and point git elsewhere. While a repository is bound this way, `git config --worktree` cannot write.
 - `paddock doctor --escape` checks all of this on every backend: that `.git` cannot be renamed in the sandbox, that the pointer files are read-only, and that a planted setting or hook does not run during paddock's host git calls.
 
