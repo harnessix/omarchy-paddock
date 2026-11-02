@@ -210,7 +210,7 @@ fn a_run_folder_on_another_file_system_is_refused() {
 
 #[test]
 fn links_stay_inside_their_root_or_are_skipped() {
-    let h = Path::new("/home/u");
+    let h = Path::new("/home/demo");
     let root = Path::new(".fake");
     let rel = Path::new(".fake/a/link");
     assert!(link_stays_inside(h, rel, Path::new("b"), root));
@@ -227,10 +227,10 @@ fn links_stay_inside_their_root_or_are_skipped() {
     assert!(link_stays_inside(
         h,
         rel,
-        Path::new("/home/u/.fake/x"),
+        Path::new("/home/demo/.fake/x"),
         root
     ));
-    assert!(!link_stays_inside(h, rel, Path::new("/home/u/.ssh"), root));
+    assert!(!link_stays_inside(h, rel, Path::new("/home/demo/.ssh"), root));
     assert!(!link_stays_inside(h, rel, Path::new("/etc/passwd"), root));
 }
 
