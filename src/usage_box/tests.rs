@@ -112,26 +112,136 @@ fn the_view_merges_host_and_sandbox_homes_and_nothing_else() {
     );
 }
 
+fn overlay_of<'a>(v: &'a View, name: &str) -> &'a Vec<PathBuf> {
+    v.mounts
+        .iter()
+        .find_map(|m| match m {
+            Mount::Overlay { dest, lowers } if dest.ends_with(name) => Some(lowers),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("no overlay for {name}"))
+}
+
+/// 60 sandbox homes of one profile, with long project names: one mount
+/// cannot take them all, so the stage merges them in groups first.
 #[test]
-fn many_sandbox_homes_stay_within_the_mount_option_limit() {
+fn sixty_sandbox_homes_are_all_in_the_view() {
+    let t = tempfile::tempdir().unwrap();
+    let e = env(t.path());
+    let homes = e.paddock_data().join("homes/grok/shared");
+    let mut all = Vec::new();
+    for n in 0..60 {
+        let d = homes.join(format!(
+            "a-project-with-a-rather-long-folder-name-{n:04}/.grok"
+        ));
+        std::fs::create_dir_all(&d).unwrap();
+        all.push(d);
+    }
+    std::fs::create_dir_all(e.home.join(".grok")).unwrap();
+    let mut v = view(&e);
+    assert_eq!(overlay_of(&v, ".grok").len(), 61);
+    let dir = t.path().join("run/l");
+    let groups = stage::split(&mut v, &dir);
+    assert_eq!(v.left_out, 0);
+    assert!(groups.len() > 1, "{groups:?}");
+    // Every group and the box's own overlay fit in one mount.
+    for g in &groups {
+        assert!(g.dest.starts_with(&dir));
+        assert!(g.lowers.iter().map(|p| stage::cost(p)).sum::<usize>() <= LOWER_BUDGET);
+    }
+    let lowers = overlay_of(&v, ".grok").clone();
+    assert!(lowers.iter().map(|p| stage::cost(p)).sum::<usize>() <= LOWER_BUDGET);
+    assert_eq!(
+        lowers,
+        groups.iter().map(|g| g.dest.clone()).collect::<Vec<_>>()
+    );
+    // Each home is in exactly one group, the host folder on top.
+    let merged: Vec<PathBuf> = groups.iter().flat_map(|g| g.lowers.clone()).collect();
+    assert_eq!(merged.len(), 61);
+    assert_eq!(merged.last(), Some(&e.home.join(".grok")));
+    for d in &all {
+        assert_eq!(merged.iter().filter(|m| *m == d).count(), 1, "{d:?}");
+    }
+    // The stage sees the host read-only and starts the box's bwrap.
+    let cmd = box_command(
+        &e,
+        Path::new("/usr/bin/bwrap"),
+        &v,
+        &groups,
+        Path::new("/x/u"),
+        &[],
+    );
+    let at = cmd.iter().position(|a| a == "/usr/bin/bwrap").unwrap();
+    let (outer, inner) = cmd.split_at(at);
+    assert_eq!(
+        &outer[..5],
+        &["--die-with-parent", "--unshare-user", "--ro-bind", "/", "/"]
+    );
+    assert!(!outer
+        .iter()
+        .any(|a| a == "--tmp-overlay" || a == "--overlay"));
+    // Writable in the stage: /proc, and only the folders that the box
+    // writes too (the panel's records and cache). Never a session folder
+    // and never a login.
+    let rw: Vec<String> = v
+        .mounts
+        .iter()
+        .filter_map(|m| match m {
+            Mount::Rw(p) => Some(p.display().to_string()),
+            _ => None,
+        })
+        .collect();
+    assert!(outer
+        .windows(2)
+        .filter(|w| w[0] == "--bind")
+        .all(|w| w[1] == "/proc" || rw.contains(&w[1])));
+    assert!(!inner.join(" ").contains("rather-long"));
+    assert!(inner
+        .join(" ")
+        .contains(&format!("--tmp-overlay {}", e.home.join(".grok").display())));
+}
+
+/// Without a stage, the newest layers that fit stay and the rest are
+/// counted.
+#[test]
+fn without_a_stage_the_oldest_layers_are_counted_as_left_out() {
     let t = tempfile::tempdir().unwrap();
     let e = env(t.path());
     let homes = e.paddock_data().join("homes/grok/shared");
     for n in 0..200 {
         std::fs::create_dir_all(homes.join(format!("project-{n:04}/.grok"))).unwrap();
     }
-    let v = view(&e);
-    let lowers = v
-        .mounts
-        .iter()
-        .find_map(|m| match m {
-            Mount::Overlay { dest, lowers } if dest.ends_with(".grok") => Some(lowers),
-            _ => None,
-        })
-        .unwrap();
-    let size: usize = lowers.iter().map(|p| p.as_os_str().len() + 10).sum();
+    let mut v = view(&e);
+    stage::trim(&mut v);
+    let lowers = overlay_of(&v, ".grok");
+    let size: usize = lowers.iter().map(|p| stage::cost(p)).sum();
     assert!(size <= LOWER_BUDGET);
     assert_eq!(lowers.len() + v.left_out, 200);
+}
+
+/// Session folders are writable overlays with a tmpfs on top; every login
+/// file is bound read-only after them, also when the host copy is the
+/// newest.
+#[test]
+fn harness_folders_are_writable_in_the_box_and_logins_stay_read_only() {
+    let t = tempfile::tempdir().unwrap();
+    let e = env(t.path());
+    std::fs::create_dir_all(e.home.join(".codex/sessions")).unwrap();
+    std::fs::write(e.home.join(".codex/auth.json"), r#"{"OPENAI_API_KEY":"k"}"#).unwrap();
+    let v = view(&e);
+    let args = home_args(&e, &v);
+    let codex = e.home.join(".codex").display().to_string();
+    let login = e.home.join(".codex/auth.json").display().to_string();
+    let ov = args
+        .windows(2)
+        .position(|w| w[0] == "--tmp-overlay" && w[1] == codex)
+        .expect("no writable overlay for .codex");
+    let lb = args
+        .windows(3)
+        .position(|w| w[0] == "--ro-bind" && w[1] == login && w[2] == login)
+        .expect("the login is not bound read-only");
+    assert!(lb > ov, "the login must go on top of the overlay");
+    assert!(!args.iter().any(|a| a == "--ro-overlay"));
 }
 
 #[test]
@@ -290,8 +400,11 @@ fn check_collector_entry(id: &str) {
                 std::fs::create_dir_all(&host_d).unwrap();
                 let v = view(&e);
                 assert!(
-                    v.mounts.contains(&Mount::Ro(host_d)),
-                    "{id}: host folder {root} not mounted Ro"
+                    v.mounts.contains(&Mount::Overlay {
+                        dest: host_d.clone(),
+                        lowers: vec![host_d],
+                    }),
+                    "{id}: host folder {root} not in an overlay"
                 );
             }
         }

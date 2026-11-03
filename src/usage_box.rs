@@ -7,14 +7,19 @@
 //!
 //! - the system read-only, an empty home (tmpfs), its own `/tmp`, and the
 //!   user's runtime folders and session bus hidden (no host keyring);
-//! - for each harness data folder from `COLLECTORS` and the profiles: a
-//!   read-only overlay at its place in the home. The lower layers are the
-//!   same folder in every non-isolated sandbox home of that harness, and the
-//!   host folder on top;
+//! - for each harness data folder from `COLLECTORS` and the profiles: an
+//!   overlay at its place in the home. The lower layers are the same folder
+//!   in every non-isolated sandbox home of that harness, and the host folder
+//!   on top. The upper layer is a tmpfs inside the box: a collector can
+//!   write there (`codex app-server` keeps a database in `~/.codex`), and
+//!   the writes end with the box. When the layers do not fit in one mount,
+//!   bwrap merges them in two steps (stage.rs);
 //! - for each login file of `[state] auth` and `COLLECTORS`: the newest copy
 //!   across the host and every non-isolated sandbox home (by token expiry when
 //!   the file names one, otherwise by modification time, and from the keeper's
-//!   copy for a kept login), mounted read-only;
+//!   copy for a kept login), mounted read-only on top of the overlays.
+//!   Before the view is built, a lapsed login can get one renewal in a
+//!   sandbox of its profile (refresh.rs);
 //! - read-only: Omarchy's tree and the tool folders on PATH when they are in
 //!   the home (mise's data folder and config with them, so a collector finds
 //!   `codex`), and the panel's own settings in `~/.config/omarchy/agents`;
@@ -26,7 +31,11 @@
 //! When the box cannot start, the command does not run on the host either.
 
 mod collectors;
+mod expiry;
+pub mod refresh;
+pub mod stage;
 pub use collectors::{collector, Collector, COLLECTORS};
+pub use expiry::token_expiry;
 
 use crate::env::HostEnv;
 use anyhow::{bail, Context, Result};
@@ -134,104 +143,11 @@ pub fn login_files(env: &HostEnv) -> BTreeMap<String, (BTreeSet<String>, Option<
     out
 }
 
-fn as_epoch_seconds(v: &serde_json::Value) -> Option<u64> {
-    let raw = if let Some(n) = v.as_u64() {
-        n
-    } else if let Some(n) = v.as_i64() {
-        u64::try_from(n).ok()?
-    } else if let Some(f) = v.as_f64().filter(|f| f.is_finite() && *f > 0.0) {
-        f as u64
-    } else {
-        let s = v.as_str().map(str::trim)?;
-        if let Ok(n) = s.parse::<u64>() {
-            n
-        } else if let Ok(f) = s
-            .parse::<f64>()
-            .ok()
-            .filter(|f| f.is_finite() && *f > 0.0)
-            .ok_or(())
-        {
-            f as u64
-        } else {
-            return crate::keeper::parse_rfc3339_utc(s);
-        }
-    };
-    (raw > 0).then_some(if raw >= 100_000_000_000 {
-        raw / 1000
-    } else {
-        raw
-    })
-}
-
-fn jwt_exp(token: &str) -> Option<u64> {
-    use base64::Engine as _;
-    let payload = token.split('.').nth(1)?;
-    let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .decode(payload.trim_end_matches('='))
-        .ok()?;
-    as_epoch_seconds(&serde_json::from_slice::<serde_json::Value>(&raw).ok()?["exp"])
-}
-
-fn object_expiry(obj: &serde_json::Map<String, serde_json::Value>) -> Option<u64> {
-    for k in ["expiresAt", "expires_at", "expiry_date", "expiry", "exp"] {
-        if let Some(exp) = obj.get(k).and_then(as_epoch_seconds) {
-            return Some(exp);
-        }
-    }
-    for k in ["access_token", "id_token"] {
-        if let Some(exp) = obj.get(k).and_then(|v| v.as_str()).and_then(jwt_exp) {
-            return Some(exp);
-        }
-    }
-    None
-}
-
-/// Extract the token expiry (in Unix seconds) from a login file when the
-/// file names one.
-pub fn token_expiry(bytes: &[u8], configured_path: Option<&str>) -> Option<u64> {
-    if let Some(exp) = crate::keeper::access_expiry(bytes) {
-        return Some(exp);
-    }
-    let doc: serde_json::Value = serde_json::from_slice(bytes).ok()?;
-    if let Some(path) = configured_path {
-        let mut cur = Some(&doc);
-        for part in path.split('.') {
-            cur = cur.and_then(|c| c.get(part));
-        }
-        if let Some(exp) = cur.and_then(as_epoch_seconds) {
-            return Some(exp);
-        }
-    }
-    let obj = doc.as_object()?;
-    if let Some(exp) = object_expiry(obj) {
-        return Some(exp);
-    }
-    for sub in ["claudeAiOauth", "tokens", "oauth"] {
-        if let Some(exp) = obj
-            .get(sub)
-            .and_then(|v| v.as_object())
-            .and_then(object_expiry)
-        {
-            return Some(exp);
-        }
-    }
-    if obj.len() == 1 {
-        if let Some(exp) = obj
-            .values()
-            .next()
-            .and_then(|v| v.as_object())
-            .and_then(object_expiry)
-        {
-            return Some(exp);
-        }
-    }
-    None
-}
-
 /// One part of the view.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Mount {
-    /// Read-only overlay at `dest`; `lowers` from the bottom to the top.
+    /// Overlay at `dest`; `lowers` from the bottom to the top. Writes go to a
+    /// tmpfs in the box and end with it.
     Overlay { dest: PathBuf, lowers: Vec<PathBuf> },
     /// The newest copy of a login file `src`, mounted read-only at `dest`.
     Login { src: PathBuf, dest: PathBuf },
@@ -417,34 +333,22 @@ pub fn view(env: &HostEnv) -> View {
             let holds_login = login_sources.iter().any(|s| s.starts_with(p));
             (std::cmp::Reverse(holds_login), std::cmp::Reverse(mtime(p)))
         });
-        let cost = |p: &Path| p.as_os_str().len() + 10;
-        let mut used = if host_dir { cost(&host) } else { 0 };
-        let mut lowers = Vec::new();
-        for p in theirs {
-            if used + cost(&p) > LOWER_BUDGET {
-                v.left_out += 1;
-                continue;
-            }
-            used += cost(&p);
-            lowers.push(p);
-        }
+        let mut lowers = theirs;
         lowers.reverse();
         if host_dir {
             lowers.push(host.clone());
         }
-        match lowers.len() {
-            0 => {}
-            1 if lowers[0] == host => v.mounts.push(Mount::Ro(host)),
-            _ => v.mounts.push(Mount::Overlay { dest: host, lowers }),
+        if !lowers.is_empty() {
+            v.mounts.push(Mount::Overlay { dest: host, lowers });
         }
     }
+    // Every login file goes on top of the overlays, read-only, also when the
+    // host file is the newest: the overlays are writable.
     for (dest, src) in &v.logins {
-        if src != dest
-            && !v
-                .mounts
-                .iter()
-                .any(|m| matches!(m, Mount::Login { dest: d, .. } if d == dest))
-        {
+        if !v.mounts.iter().any(|m| match m {
+            Mount::Login { dest: d, .. } | Mount::Ro(d) => d == dest,
+            _ => false,
+        }) {
             v.mounts.push(Mount::Login {
                 src: src.clone(),
                 dest: dest.clone(),
@@ -529,14 +433,11 @@ pub fn home_args(env: &HostEnv, view: &View) -> Vec<String> {
     let mut a = vec!["--tmpfs".to_string(), s(&env.home)];
     for m in &view.mounts {
         match m {
-            Mount::Overlay { dest, lowers } if lowers.len() == 1 => {
-                a.extend(["--ro-bind".into(), s(&lowers[0]), s(dest)]);
-            }
             Mount::Overlay { dest, lowers } => {
                 for l in lowers {
                     a.extend(["--overlay-src".into(), s(l)]);
                 }
-                a.extend(["--ro-overlay".into(), s(dest)]);
+                a.extend(["--tmp-overlay".into(), s(dest)]);
             }
             Mount::Login { src, dest } => a.extend(["--ro-bind".into(), s(src), s(dest)]),
             Mount::Ro(p) => a.extend(["--ro-bind".into(), s(p), s(p)]),
@@ -627,6 +528,34 @@ pub fn bwrap_args(env: &HostEnv, view: &View, program: &Path, args: &[String]) -
     a
 }
 
+/// The arguments of bwrap for the box. With `groups`, bwrap starts the
+/// stage first, and the stage starts the box (stage.rs).
+pub fn box_command(
+    env: &HostEnv,
+    bwrap: &Path,
+    view: &View,
+    groups: &[stage::Group],
+    program: &Path,
+    args: &[String],
+) -> Vec<String> {
+    let inner = bwrap_args(env, view, program, args);
+    if groups.is_empty() {
+        return inner;
+    }
+    let rw: Vec<PathBuf> = view
+        .mounts
+        .iter()
+        .filter_map(|m| match m {
+            Mount::Rw(p) => Some(p.clone()),
+            _ => None,
+        })
+        .collect();
+    let mut a = stage::args(groups, &rw);
+    a.push(bwrap.display().to_string());
+    a.extend(inner);
+    a
+}
+
 /// The variables in the box. `DBUS_SESSION_BUS_ADDRESS` is never passed.
 pub fn box_env(env: &HostEnv) -> BTreeMap<String, String> {
     let mut out = BTreeMap::new();
@@ -691,13 +620,13 @@ pub fn probe(env: &HostEnv) -> Result<PathBuf> {
         "/usr",
         "--overlay-src",
         "/etc",
-        "--ro-overlay",
+        "--tmp-overlay",
         "/tmp/o",
         "true",
     ];
     if !quiet(&[&base[..], &overlay[..]].concat()) {
         bail!(
-            "{} cannot mount a read-only overlay here (bwrap 0.10 or newer, and overlayfs in a user namespace)",
+            "{} cannot mount an overlay here (bwrap 0.10 or newer, and overlayfs in a user namespace)",
             bwrap.display()
         );
     }
@@ -732,16 +661,34 @@ pub fn run(env: &HostEnv, program: &Path, args: &[String]) -> Result<Option<i32>
     for d in [state_dir(env), cache_dir(env)] {
         std::fs::create_dir_all(&d).with_context(|| format!("cannot create {}", d.display()))?;
     }
+    let tried = refresh::run_due(env, crate::state::now(), &refresh::sandbox_runner);
+    if !tried.is_empty() {
+        log::info!(
+            "refreshed the logins of {} for the usage box",
+            tried.join(", ")
+        );
+    }
     let mut view = view(env);
+    let run_dir = env
+        .paddock_run()
+        .join(format!("usage-box-{}", std::process::id()));
+    let layer_dir = run_dir.join("l");
+    let mut groups = stage::split(&mut view, &layer_dir);
+    if !groups.is_empty() {
+        let ready = stage::probe(&bwrap, &layer_dir).and_then(|()| stage::prepare(&groups));
+        if let Err(e) = ready {
+            log::warn!("{e:#}");
+            view = self::view(env);
+            stage::trim(&mut view);
+            groups.clear();
+        }
+    }
     if view.left_out > 0 {
         eprintln!(
             "paddock: {} sandbox homes are left out of the usage view (too many layers); the panel counts the newest ones",
             view.left_out
         );
     }
-    let run_dir = env
-        .paddock_run()
-        .join(format!("usage-box-{}", std::process::id()));
     if let Ok(paddock) = crate::launchers::launcher_exe(env) {
         let sock = run_dir.join("api-proxy.sock");
         if start_proxy(env, &sock).is_ok() {
@@ -749,7 +696,7 @@ pub fn run(env: &HostEnv, program: &Path, args: &[String]) -> Result<Option<i32>
         }
     }
     let mut child = Command::new(&bwrap)
-        .args(bwrap_args(env, &view, program, args))
+        .args(box_command(env, &bwrap, &view, &groups, program, args))
         .env_clear()
         .envs(box_env(env))
         .stdin(Stdio::null())
