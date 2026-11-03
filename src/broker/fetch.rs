@@ -1,7 +1,7 @@
 //! Copy one host file into the project inbox.
 
 use super::describe::{arg_str, safe_name};
-use super::{Context, Request};
+use super::{Context, Request, INBOX};
 use crate::env::HostEnv;
 use crate::policy;
 use anyhow::{bail, Context as _, Result};
@@ -21,6 +21,16 @@ pub(crate) fn inbox(project: &Path) -> Result<crate::safefs::Dir> {
         f.write_all(b"*\n")?;
     }
     dot.subdir(std::ffi::OsStr::new("inbox"), true)
+}
+
+/// The inbox of a sandbox of `project`. With the `.paddock` link of the
+/// loft, it is in the loft's notes, opened from the loft, not the link.
+pub(crate) fn inbox_for(env: &HostEnv, project: &Path) -> Result<crate::safefs::Dir> {
+    if crate::loft::host::linked(env, project) {
+        let tree = crate::loft::Loft::of(env, project).tree();
+        return crate::safefs::Root::open(&tree)?.dir(Path::new(INBOX), true);
+    }
+    inbox(project)
 }
 
 /// A fetch source, opened before the user is asked. The copy reads from the
@@ -94,7 +104,7 @@ pub(in crate::broker) fn fetch(
     // reads what was opened, which is what the user saw.
     let asked = PathBuf::from(arg_str(req, "path").unwrap_or(""));
     check_fetch(env, &asked, &f.src.real_path()?, f.src.is_dir())?;
-    let dir = inbox(&ctx.project)?;
+    let dir = inbox_for(env, &ctx.project)?;
     let want = safe_name(&f.real.to_string_lossy(), "fetched");
     // Never remove what is there: a free name instead.
     let name = dir.copy_source(&f.src, &want, MAX_FETCH)?;

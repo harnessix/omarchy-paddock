@@ -38,6 +38,14 @@ pub(crate) fn ps(env: &HostEnv, json: bool) -> Result<i32> {
                     if let Some(since) = paddock::detach::idle_since(env, &r.id) {
                         o.insert("idle_since".into(), since.into());
                     }
+                    if let Some(rec) = paddock::detach::Record::load(env, &r.id) {
+                        if !rec.notes.is_empty() {
+                            o.insert("notes".into(), rec.notes.into());
+                        }
+                        if let Some(s) = rec.stuck {
+                            o.insert("stuck".into(), serde_json::to_value(s).unwrap_or_default());
+                        }
+                    }
                     o.insert(
                         "activity".into(),
                         match paddock::view::activity(env, &r.id) {
@@ -132,8 +140,13 @@ pub(crate) fn ps(env: &HostEnv, json: bool) -> Result<i32> {
             let task = spec_task(env, &r.id)
                 .map(|t| format!("  task {}", t.id))
                 .unwrap_or_default();
+            let rec = paddock::detach::Record::load(env, &r.id);
+            let stuck = match rec.as_ref().and_then(|d| d.stuck.as_ref()) {
+                Some(s) => format!("  stuck {}m", now.saturating_sub(s.since) / 60),
+                None => String::new(),
+            };
             println!(
-                "{:<28} {:<8} {:<7} {:<7} {:>5}m  {}{pasture}{task}{frozen}",
+                "{:<28} {:<8} {:<7} {:<7} {:>5}m  {}{pasture}{task}{frozen}{stuck}",
                 id,
                 r.harness,
                 r.backend,
@@ -141,6 +154,9 @@ pub(crate) fn ps(env: &HostEnv, json: bool) -> Result<i32> {
                 (now.saturating_sub(r.started)) / 60,
                 r.project.display()
             );
+            for n in rec.map(|d| d.notes).unwrap_or_default() {
+                println!("{:<28} {n}", "");
+            }
         }
     }
     Ok(0)

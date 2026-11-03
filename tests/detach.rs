@@ -23,6 +23,13 @@ case "$(cat "$f")" in
   late) while [ ! -e .go ]; do sleep 0.2; done; paddock-host done "late but fine" ;;
   idle) echo idle-line; exec sleep 180 ;;
   again) echo first-line; while [ ! -e .more ]; do sleep 0.2; done; echo second-line; exec sleep 180 ;;
+  screen)
+    printf "  Hooks need review\n  1 hook is new or changed.\n  Hooks can run outside the sandbox after you trust them.\n› 1. Review hooks\n  2. Trust all and continue\n  3. Continue without trusting (hooks won't run)\n  enter confirm · esc skip\n"
+    stty -icanon -echo min 1
+    c=$(dd bs=1 count=1 2>/dev/null)
+    printf '\033[2J\033[Hgot %s\n' "$c"
+    echo "key $c" > .screen-answer
+    paddock-host done "continued after $c" ;;
 esac
 exec sleep 120
 "#;
@@ -34,6 +41,11 @@ struct World {
 
 impl World {
     fn new(detach: bool) -> Self {
+        Self::with(detach, "")
+    }
+
+    /// `extra` goes at the end of the fake profile.
+    fn with(detach: bool, extra: &str) -> Self {
         let tmp = common::tempdir();
         let root = tmp.path().to_path_buf();
         let cfg = root.join("cfg/paddock/harness.d");
@@ -51,7 +63,7 @@ impl World {
         std::fs::write(
             cfg.join("fake.toml"),
             format!(
-                "name = \"fake\"\n[locate]\ncommands = [\"sh\"]\n[launch]\nargs = [\"-c\", {}]\n{table}",
+                "name = \"fake\"\n[locate]\ncommands = [\"sh\"]\n[launch]\nargs = [\"-c\", {}]\n{table}{extra}",
                 serde_json::to_string(SCRIPT).unwrap()
             ),
         )
@@ -435,7 +447,12 @@ fn a_quiet_pane_becomes_idle_and_then_ends() {
     assert!(w.wait_idle(&id) > 0);
     let (code, out) = w.wait(&id, "40s");
     assert_eq!(code, Some(1), "{out}");
-    assert_eq!(out.trim(), "idle: ended after 10 seconds without output");
+    assert!(
+        out.trim()
+            .starts_with("idle: ended after 10 seconds without output\nlast screen:\n"),
+        "{out}"
+    );
+    assert!(out.contains("idle-line"), "{out}");
 }
 
 #[test]
@@ -499,7 +516,11 @@ fn a_write_client_keeps_an_idle_run_and_hears_about_it() {
     let _ = client.wait();
     let (code, out) = w.wait(&id, "30s");
     assert_eq!(code, Some(1), "{out}");
-    assert_eq!(out.trim(), "idle: ended after 6 seconds without output");
+    assert!(
+        out.trim()
+            .starts_with("idle: ended after 6 seconds without output"),
+        "{out}"
+    );
 }
 
 #[test]
@@ -522,4 +543,60 @@ fn idle_timeout_zero_never_ends_the_run() {
     let (code, out) = w.wait(&id, "2s");
     assert_eq!(code, Some(124), "{out}");
     assert!(w.has_session(&id));
+}
+
+/// The Codex hooks review screen and its safe answer, as in codex.toml.
+const SCREEN_RULE: &str = r#"
+[[screens.rule]]
+id = "codex-hooks-review"
+name = "Codex hooks review"
+send = ["3"]
+answer = "3. Continue without trusting (hooks won't run)"
+note = "continued without trusting {n} hook"
+rows = [
+  "Hooks need review",
+  "{n} hook is new or changed.",
+  "Hooks can run outside the sandbox after you trust them.",
+  "› 1. Review hooks",
+  "2. Trust all and continue",
+  "3. Continue without trusting (hooks won't run)",
+  "enter confirm · esc skip",
+]
+"#;
+
+#[test]
+fn a_detached_run_answers_a_known_start_screen_and_records_it() {
+    if !common::bwrap_works() || !has_tmux() {
+        eprintln!("skipped: needs bwrap with a user namespace and tmux");
+        return;
+    }
+    let w = World::with(true, SCREEN_RULE);
+    let id = w.detach("screen");
+    let out = w
+        .paddock()
+        .args(["wait", &id, "--timeout", "60s"])
+        .output()
+        .unwrap();
+    let (stdout, stderr) = (
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    assert_eq!(out.status.code(), Some(0), "{stdout}\n{stderr}");
+    assert_eq!(stdout.trim(), "ok: continued after 3");
+    assert!(
+        stderr.contains("paddock: answered Codex hooks review: continued without trusting 1 hook"),
+        "{stderr}"
+    );
+    let key = std::fs::read_to_string(w.root.join("project/.screen-answer")).unwrap();
+    assert_eq!(key.trim(), "key 3");
+    let out = w.paddock().args(["ps", "--json"]).output().unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let ended = v["ended"]
+        .as_array()
+        .and_then(|a| a.iter().find(|e| e["id"] == id.as_str()).cloned())
+        .expect("the run is in the ended list");
+    assert_eq!(
+        ended["notes"][0],
+        "answered Codex hooks review: continued without trusting 1 hook"
+    );
 }

@@ -235,6 +235,7 @@ pub(crate) fn explain(env: &HostEnv, a: &RunArgs, json: bool) -> Result<()> {
                 }
             }
         }
+        v["screens"] = paddock::screens::explain(&built.profile).into();
         v["backend"] = match &backend {
             Ok(b) => b.name().into(),
             Err(e) => format!("unavailable: {e}").into(),
@@ -323,10 +324,23 @@ pub(crate) fn explain(env: &HostEnv, a: &RunArgs, json: bool) -> Result<()> {
             );
         }
     }
+    println!("\nprivate paths (the loft keeps them out of git):");
+    for l in paddock::loft::host::explain(env, &s.project) {
+        println!("{l}");
+    }
     let hooks = paddock::hooks::explain(s);
     if !hooks.is_empty() {
         println!("\nhooks in the sandbox copies (the host files stay as they are):");
         for l in hooks {
+            println!("{l}");
+        }
+    }
+    let screens = paddock::screens::explain(&built.profile);
+    if !screens.is_empty() {
+        println!(
+            "\nstart screens that paddock answers, and errors it names (README \"Start screens\"):"
+        );
+        for l in screens {
             println!("{l}");
         }
     }

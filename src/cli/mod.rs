@@ -12,6 +12,7 @@ pub(crate) mod env;
 pub(crate) mod forage;
 pub(crate) mod gateway;
 pub(crate) mod kv;
+pub(crate) mod loft;
 pub(crate) mod logins;
 pub(crate) mod monitor;
 pub(crate) mod pasture;
@@ -330,6 +331,11 @@ pub(crate) enum Cmd {
         plugin: bool,
         #[arg(long)]
         no_plugin: bool,
+        /// Make a loft for every project ([loft] auto = true).
+        #[arg(long, conflicts_with = "no_loft")]
+        loft: bool,
+        #[arg(long)]
+        no_loft: bool,
         /// The default backend: auto, bwrap, podman, docker or srt.
         #[arg(long)]
         backend: Option<String>,
@@ -438,6 +444,11 @@ pub(crate) enum Cmd {
         /// How many recent entries to show.
         #[arg(short = 'n', long, default_value_t = 20)]
         lines: usize,
+    },
+    /// The loft: a private store with its own history for the agents' notes, instruction files and specs of a repository.
+    Loft {
+        #[command(subcommand)]
+        cmd: loft::LoftCmd,
     },
     /// Spec Kit projects: the tasks of the active feature, and the external spec store.
     Spec {

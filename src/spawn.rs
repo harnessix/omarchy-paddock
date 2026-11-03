@@ -1463,7 +1463,7 @@ impl Spawner {
     }
 
     fn write_inbox(&self, s: &Status, r: &ChildResult) -> Result<String> {
-        let inbox = crate::broker::inbox(&self.project)?;
+        let inbox = crate::broker::inbox_for(&self.env, &self.project)?;
         let (dir, name) = inbox.new_subdir(&inbox_name(&s.id))?;
         let summary = serde_json::json!({
             "id": s.id,

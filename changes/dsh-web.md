@@ -1,0 +1,1 @@
+- Fix: dsh 0.2.1 and later start again. The launcher needs a profile name, and paddock now starts `dsh web`.

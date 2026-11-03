@@ -233,7 +233,7 @@ impl Tmux {
         if !valid_id(id) || !self.sock.exists() {
             return None;
         }
-        let target = format!("={id}");
+        let target = format!("={id}:");
         let out = self
             .cmd()
             .args(["capture-pane", "-p", "-t", &target, "-S", "-120"])
