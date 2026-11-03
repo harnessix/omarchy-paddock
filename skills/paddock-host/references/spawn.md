@@ -18,6 +18,7 @@ With several children, share the work in paddock kv `--scope tree`:
 
 - Before you start the children, write one `task:NAME` for each part in `tree`. Put context for them in your own scope: they read it with `--scope parent`.
 - Wait with `paddock-host kv watch --prefix result: --scope tree --timeout 100`. Pass the printed `cursor N` as `--version N` to the next watch. When a child ends, paddock writes `result:SPAWN-ID` there, with `status`, `summary` and `ref` (its branch).
+- A child whose context was compacted can lose details of its task. paddock writes `compacted:SPAWN-ID` into `tree` each time. Watch for it with `paddock-host kv watch --prefix compacted: --scope tree`, and check that child's work with more care.
 
 ## As a child
 
