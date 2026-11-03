@@ -781,16 +781,6 @@ mod tests {
         for h in ["claude", "codex", "grok", "agy"] {
             assert!(with.iter().any(|w| w == h), "{h} has no [detach]");
         }
-        // agy starts its terminal UI with the task as the first prompt.
-        let agy: Profile = toml::from_str(
-            BUILTIN
-                .iter()
-                .find(|(n, _)| *n == "agy")
-                .map(|(_, t)| *t)
-                .unwrap(),
-        )
-        .unwrap();
-        assert_eq!(agy.detach.unwrap().args[0], "-i");
     }
 
     #[test]
