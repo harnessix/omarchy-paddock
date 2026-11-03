@@ -20,6 +20,11 @@ seed = [".gemini/antigravity-cli/settings.json", ".gemini/antigravity-cli/mcp"]
 # Antigravity's finished onboarding. Only true values are carried, in both directions.
 done_flags = { ".gemini/antigravity-cli/cache/onboarding.json" = ["onboardingComplete", "consumerOnboardingComplete"] }
 env_pass = ["GEMINI_API_KEY", "GOOGLE_API_KEY", "GOOGLE_CLOUD_PROJECT"]
+# agy renews its access token only while it runs. `agy models` lists the
+# models of the account from the server, so it needs a valid login and
+# renews a lapsed one. It does no model work. The agents panel runs it when
+# the newest copy of the login has lapsed (usage_box/refresh.rs).
+refresh = ["agy", "models"]
 
 [network]
 endpoints = ["generativelanguage.googleapis.com", "oauth2.googleapis.com", "cloudcode-pa.googleapis.com"]

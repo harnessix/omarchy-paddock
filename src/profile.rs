@@ -248,6 +248,13 @@ pub struct State {
     /// (shadow.rs). The `auth` files inside them stay out of the snapshot.
     #[serde(default)]
     pub data: Vec<String>,
+    /// A short command of the harness that renews its login and does no
+    /// model work, for example `["agy", "models"]`. When the Omarchy agents
+    /// panel asks for limits and the newest copy of a login has lapsed,
+    /// paddock runs it once in a sandbox with the shared login
+    /// (usage_box/refresh.rs).
+    #[serde(default)]
+    pub refresh: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]

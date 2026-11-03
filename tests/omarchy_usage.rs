@@ -362,7 +362,8 @@ fn two_agents_see_merged_sessions_freshest_logins_no_isolated_and_no_session_bus
     let claude = w.record("claude");
     assert_eq!(claude["sessions"], "host.jsonl,sb1.jsonl,sb2.jsonl");
     assert_eq!(claude["login"]["which"], "sb1");
-    assert_eq!(claude["sess_w"], "ro");
+    // Session folders take writes into the box's tmpfs; logins stay read-only.
+    assert_eq!(claude["sess_w"], "rw");
     assert_eq!(claude["login_w"], "ro");
     assert_eq!(claude["ssh"], "absent");
     assert_eq!(claude["secret"], "absent");
@@ -372,8 +373,14 @@ fn two_agents_see_merged_sessions_freshest_logins_no_isolated_and_no_session_bus
     let grok = w.record("grok");
     assert_eq!(grok["sessions"], "host.jsonl,sb1.jsonl,sb2.jsonl");
     assert_eq!(grok["login"]["which"], "sb2");
-    assert_eq!(grok["sess_w"], "ro");
+    assert_eq!(grok["sess_w"], "rw");
     assert_eq!(grok["login_w"], "ro");
+    for d in [&c_host, &c_sb1, &c_sb2] {
+        assert!(!d.join("projects/write-test").exists());
+    }
+    for d in [&g_host, &g_sb1, &g_sb2] {
+        assert!(!d.join("sessions/write-test").exists());
+    }
 }
 
 #[test]
@@ -468,6 +475,12 @@ mkdir -p "$s/usage"
 } > "$s/seen.txt"
 touch "$HOME/.codex/written" || true
 touch "$HOME/.codex/sessions/written" || true
+# Codex's app-server keeps a database in ~/.codex: the write works in the box.
+if echo db > "$HOME/.codex/state_5.sqlite" && [ "$(cat "$HOME/.codex/state_5.sqlite")" = db ]; then
+  echo codex-db-written >> "$s/seen.txt"
+fi
+# The login stays read-only.
+echo x >> "$HOME/.codex/auth.json" || true
 printf '{"id":"fake"}\n' > "$s/usage/fake.json"
 echo "out $*"
 echo "err line" >&2
@@ -482,6 +495,11 @@ fn box_world() -> World {
     );
     std::fs::create_dir_all(w.home.join(".codex/sessions")).unwrap();
     std::fs::write(w.home.join(".codex/sessions/host-1.jsonl"), "{}\n").unwrap();
+    std::fs::write(
+        w.home.join(".codex/auth.json"),
+        "{\"OPENAI_API_KEY\":\"k\"}",
+    )
+    .unwrap();
     let sb = w
         .home
         .join(".local/share/paddock/homes/codex/shared/proj/.codex/sessions");
@@ -588,8 +606,15 @@ fn the_usage_box_merges_sessions_and_hides_the_rest_of_the_home() {
             "{v} reached the box: {vars:?}"
         );
     }
-    // The record landed, and nothing was written into the inherited folders.
+    // The record landed. The writes into the harness folders worked in the
+    // box, and none of them reached the host or a sandbox home.
+    assert!(seen.contains("codex-db-written"), "{seen}");
     assert!(state.join("usage/fake.json").is_file());
+    assert!(!w.home.join(".codex/state_5.sqlite").exists());
+    assert_eq!(
+        std::fs::read_to_string(w.home.join(".codex/auth.json")).unwrap(),
+        "{\"OPENAI_API_KEY\":\"k\"}"
+    );
     assert!(!w.home.join(".codex/written").exists());
     assert!(!w.home.join(".codex/sessions/written").exists());
     assert!(!w
