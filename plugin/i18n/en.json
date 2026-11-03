@@ -286,6 +286,7 @@
   "keys.wtRow": "↵ or W worktrees",
   "row.kindRelay": "started by a background process, open the live view",
   "row.kindDetached": "in the background, take over from the view",
+  "row.waiting": "waiting for input",
   "row.kindView": "no terminal, open the live view",
   "row.kindWindow": "in its own window",
   "row.kindTerminal": "in a terminal",

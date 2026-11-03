@@ -21,6 +21,8 @@ case "$(cat "$f")" in
   ok) paddock-host done --status ok "all good" ;;
   failed) paddock-host done --status failed "it broke" ;;
   late) while [ ! -e .go ]; do sleep 0.2; done; paddock-host done "late but fine" ;;
+  idle) echo idle-line; exec sleep 180 ;;
+  again) echo first-line; while [ ! -e .more ]; do sleep 0.2; done; echo second-line; exec sleep 180 ;;
 esac
 exec sleep 120
 "#;
@@ -164,6 +166,49 @@ impl World {
             std::thread::sleep(Duration::from_millis(100));
         }
     }
+
+    /// `[detach]` and `[view]` in the user configuration, not the harness profile.
+    fn user_config(&self, text: &str) {
+        let dir = self.root.join("cfg/paddock");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("config.toml"), text).unwrap();
+    }
+
+    fn sandbox(&self, id: &str) -> serde_json::Value {
+        let out = self.paddock().args(["ps", "--json"]).output().unwrap();
+        assert!(out.status.success(), "{out:?}");
+        let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        v["sandboxes"]
+            .as_array()
+            .and_then(|a| a.iter().find(|s| s["id"] == id).cloned())
+            .unwrap_or(serde_json::Value::Null)
+    }
+
+    /// Poll until `ps --json` reports `idle_since` for this run.
+    fn wait_idle(&self, id: &str) -> u64 {
+        let start = Instant::now();
+        loop {
+            let sb = self.sandbox(id);
+            if let Some(t) = sb.get("idle_since").and_then(|v| v.as_u64()) {
+                assert!(t > 0, "{sb}");
+                return t;
+            }
+            assert!(
+                start.elapsed() < Duration::from_secs(40),
+                "the run never became idle: {sb}"
+            );
+            std::thread::sleep(Duration::from_millis(300));
+        }
+    }
+
+    fn messages(&self) -> String {
+        let out = self.tmux().args(["show-messages"]).output().unwrap();
+        format!(
+            "{}\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        )
+    }
 }
 
 impl Drop for World {
@@ -298,4 +343,106 @@ fn a_write_client_keeps_the_run_open_after_done() {
     let (code, out) = w.wait(&id, "60s");
     assert_eq!(code, Some(0), "{out}");
     assert_eq!(out.trim(), "ok: late but fine");
+}
+
+#[test]
+fn a_quiet_pane_becomes_idle_and_then_ends() {
+    if !common::bwrap_works() || !has_tmux() {
+        eprintln!("skipped: needs bwrap with a user namespace and tmux");
+        return;
+    }
+    let w = World::new(true);
+    w.user_config("[detach]\nidle_after = \"2s\"\nidle_timeout = \"8s\"\n");
+    let id = w.detach("idle");
+    w.result();
+    assert!(w.wait_idle(&id) > 0);
+    let (code, out) = w.wait(&id, "40s");
+    assert_eq!(code, Some(1), "{out}");
+    assert_eq!(out.trim(), "idle: ended after 10 seconds without output");
+}
+
+#[test]
+fn output_before_the_idle_timeout_clears_the_idle_state() {
+    if !common::bwrap_works() || !has_tmux() {
+        eprintln!("skipped: needs bwrap with a user namespace and tmux");
+        return;
+    }
+    let w = World::new(true);
+    w.user_config("[detach]\nidle_after = \"8s\"\nidle_timeout = \"40s\"\n");
+    let id = w.detach("again");
+    w.result();
+    let _ = w.wait_idle(&id);
+    std::fs::write(w.root.join("project/.more"), "").unwrap();
+    let start = Instant::now();
+    loop {
+        let sb = w.sandbox(&id);
+        if sb.get("idle_since").is_none() {
+            break;
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(20),
+            "output did not clear idle_since: {sb}"
+        );
+        std::thread::sleep(Duration::from_millis(300));
+    }
+    let (code, out) = w.wait(&id, "3s");
+    assert_eq!(code, Some(124), "{out}");
+    assert!(w.has_session(&id));
+}
+
+#[test]
+fn a_write_client_keeps_an_idle_run_and_hears_about_it() {
+    if !common::bwrap_works() || !has_tmux() {
+        eprintln!("skipped: needs bwrap with a user namespace and tmux");
+        return;
+    }
+    let w = World::new(true);
+    w.user_config("[detach]\nidle_after = \"2s\"\nidle_timeout = \"4s\"\n");
+    let id = w.detach("idle");
+    let mut client = w.attach(&id);
+    w.result();
+    let start = Instant::now();
+    let mut told = false;
+    while start.elapsed() < Duration::from_secs(45) {
+        let (code, out) = w.wait(&id, "1s");
+        assert_eq!(
+            code,
+            Some(124),
+            "idle timeout ended a run with a write client: {out}"
+        );
+        if w.messages().contains("this run is idle") {
+            told = true;
+            break;
+        }
+    }
+    let note = w.messages();
+    assert!(told, "the write client was not told: {note}");
+    assert!(w.has_session(&id));
+    let _ = client.kill();
+    let _ = client.wait();
+    let (code, out) = w.wait(&id, "30s");
+    assert_eq!(code, Some(1), "{out}");
+    assert_eq!(out.trim(), "idle: ended after 6 seconds without output");
+}
+
+#[test]
+fn idle_timeout_zero_never_ends_the_run() {
+    if !common::bwrap_works() || !has_tmux() {
+        eprintln!("skipped: needs bwrap with a user namespace and tmux");
+        return;
+    }
+    let w = World::new(true);
+    w.user_config("[detach]\nidle_after = \"2s\"\nidle_timeout = \"0\"\n");
+    let id = w.detach("idle");
+    w.result();
+    let _ = w.wait_idle(&id);
+    std::thread::sleep(Duration::from_secs(8));
+    let sb = w.sandbox(&id);
+    assert!(
+        sb.get("idle_since").and_then(|v| v.as_u64()).is_some(),
+        "{sb}"
+    );
+    let (code, out) = w.wait(&id, "2s");
+    assert_eq!(code, Some(124), "{out}");
+    assert!(w.has_session(&id));
 }

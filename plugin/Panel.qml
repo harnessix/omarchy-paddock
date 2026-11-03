@@ -1041,6 +1041,8 @@ Panel {
             }).join(" · ") : "",
             // The last line of its live view (paddock ps: activity).
             activity: root.plain(r.activity || "", 120),
+            // A detached run with no pane output for idle_after.
+            idleSince: Number(r.idle_since || 0),
             parentHarness: "",
             depth: 0,
             children: 0,
@@ -1767,7 +1769,8 @@ Panel {
                   ? strings.t("row.childTitle").arg(modelData.harness).arg(modelData.parentHarness || modelData.parent)
                   : modelData.harness
                 // What it does now, else where its output goes; then how long it runs.
-                caption: root.uptime(modelData.started) + " · " + (modelData.activity !== "" ? modelData.activity : root.kindText(modelData))
+                // An idle detached run waits for input, ahead of its last line.
+                caption: root.uptime(modelData.started) + " · " + (modelData.idleSince > 0 ? strings.t("row.waiting") : (modelData.activity !== "" ? modelData.activity : root.kindText(modelData)))
                 // Frozen and warnings first, then monitoring, then timers.
                 caption2: modelData.frozenSince > 0 ? strings.t("row.frozen").arg(root.uptime(modelData.frozenSince))
                   : modelData.warning !== "" ? modelData.warning
