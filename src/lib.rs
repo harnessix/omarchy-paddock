@@ -52,6 +52,7 @@ pub mod relay;
 pub mod report;
 pub mod run;
 pub mod safefs;
+pub mod screens;
 pub mod setup;
 pub mod shadow;
 pub mod shims;

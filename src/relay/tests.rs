@@ -227,3 +227,63 @@ fn wait_child(child: &mut std::process::Child, timeout: Duration) -> std::proces
         std::thread::sleep(Duration::from_millis(20));
     }
 }
+
+/// The start screen watcher (screens.rs) on a live relay: a shell prints
+/// the Codex hooks review screen and waits for one key.
+#[test]
+fn the_screen_watcher_answers_through_the_relay() {
+    let (caller_m, caller_s) = caller_pty();
+    set_size(caller_m, 24, 100);
+    let profile: crate::profile::Profile =
+        toml::from_str(include_str!("../../profiles/codex.toml")).unwrap();
+    let rules = crate::screens::valid("codex", &profile.screens.rule);
+    let w = crate::screens::live::Watcher::new(rules, || false, |_| {});
+    let logged = Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+    let l = logged.clone();
+    let mut relay = Relay::start(
+        caller_s,
+        caller_s,
+        move |data| l.lock().unwrap().extend_from_slice(data),
+        Taps::of(None, Some(w.clone())),
+    )
+    .unwrap();
+    let script = "printf '  Hooks need review\\n  1 hook is new or changed.\\n  Hooks can run outside the sandbox after you trust them.\\n› 1. Review hooks\\n  2. Trust all and continue\\n  3. Continue without trusting (hooks won'\\''t run)\\n  enter confirm · esc skip\\n'; \
+                  stty -icanon -echo min 1; c=$(dd bs=1 count=1 2>/dev/null); \
+                  printf '\\033[2J\\033[Hgot:%s\\n' \"$c\"; sleep 1; exit 0";
+    let (stdin, stdout, stderr) = relay.child_stdio().unwrap();
+    let mut cmd = Command::new("sh");
+    cmd.args(["-c", script])
+        .stdin(stdin)
+        .stdout(stdout)
+        .stderr(stderr);
+    // SAFETY: take_controlling_tty uses setsid and ioctl, which are safe
+    // in pre_exec. The slave is fd 0.
+    unsafe {
+        cmd.pre_exec(take_controlling_tty);
+    }
+    let mut child = cmd.spawn().unwrap();
+    relay.close_slave();
+    let out = read_until(caller_m, b"got:3", Duration::from_secs(10));
+    let text = String::from_utf8_lossy(&out);
+    assert!(text.contains("got:3"), "{text}");
+    let status = wait_child(&mut child, Duration::from_secs(10));
+    assert_eq!(status.code(), Some(0));
+    relay.finish();
+    let r = w.reports();
+    assert_eq!(r.len(), 1, "{r:?}");
+    assert!(r[0].ok, "{r:?}");
+    assert_eq!(
+        r[0].text,
+        "answered Codex hooks review: continued without trusting 1 hook"
+    );
+    let log = String::from_utf8_lossy(&logged.lock().unwrap()).into_owned();
+    assert!(
+        log.contains("[paddock: answered Codex hooks review: continued without trusting 1 hook]"),
+        "{log}"
+    );
+    // SAFETY: close the test caller pty.
+    unsafe {
+        libc::close(caller_m);
+        libc::close(caller_s);
+    }
+}
