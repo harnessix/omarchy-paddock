@@ -183,7 +183,8 @@ pub fn parse_rfc3339_utc(s: &str) -> Option<u64> {
 }
 
 fn parse_rfc3339(s: &str) -> Option<u64> {
-    // YYYY-MM-DDTHH:MM:SS, the rest ignored: enough for a 7-day rule.
+    // YYYY-MM-DDTHH:MM:SS, then fractional seconds (ignored), then `Z`, an
+    // offset `+HH:MM` or `-HH:MM`, or nothing (read as UTC).
     let b = s.as_bytes();
     if b.len() < 19 {
         return None;
@@ -199,7 +200,21 @@ fn parse_rfc3339(s: &str) -> Option<u64> {
     let doy = (153 * mp + 2) / 5 + d - 1;
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
     let days = era * 146097 + doe - 719468;
-    u64::try_from(days * 86400 + hh * 3600 + mm * 60 + ss).ok()
+    let rest = s[19..].trim_start_matches(|c: char| c == '.' || c.is_ascii_digit());
+    let offset = match rest.as_bytes().first() {
+        Some(sign @ (b'+' | b'-')) => {
+            let oh = rest.get(1..3)?.parse::<i64>().ok()?;
+            let om = rest.get(4..6)?.parse::<i64>().ok()?;
+            let o = oh * 3600 + om * 60;
+            if *sign == b'+' {
+                o
+            } else {
+                -o
+            }
+        }
+        _ => 0,
+    };
+    u64::try_from(days * 86400 + hh * 3600 + mm * 60 + ss - offset).ok()
 }
 
 fn hash(b: &[u8]) -> String {

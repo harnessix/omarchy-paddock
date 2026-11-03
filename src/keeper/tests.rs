@@ -58,6 +58,15 @@ fn dates_and_settings() {
     assert_eq!(parse_rfc3339("1970-01-01T00:00:00Z"), Some(0));
     assert_eq!(parse_rfc3339("2000-03-01T12:30:15.123Z"), Some(951_913_815));
     assert!(parse_rfc3339("yesterday").is_none());
+    // An offset moves the time to UTC. agy writes this form.
+    assert_eq!(
+        parse_rfc3339("2026-11-03T13:33:52.237172342+08:00"),
+        parse_rfc3339("2026-11-03T05:33:52Z")
+    );
+    assert_eq!(
+        parse_rfc3339("2026-11-02T21:00:00-03:30"),
+        parse_rfc3339("2026-11-03T00:30:00Z")
+    );
     assert_eq!(Cfg::parse("").unwrap(), Cfg::default());
     let c = Cfg::parse("[logins]\nrefresh_margin = 3600\ncheck_interval = 5\n").unwrap();
     assert_eq!((c.margin, c.interval, c.enabled), (3600, 5, true));
