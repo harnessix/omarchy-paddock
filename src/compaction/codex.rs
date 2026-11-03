@@ -2,7 +2,7 @@
 //! hash for it. The user approves a hook with `/hooks`, and Codex writes
 //!
 //! ```toml
-//! [hooks.state."/home/me/.codex/hooks.json:session_start:0:0"]
+//! [hooks.state."/home/demo/.codex/hooks.json:session_start:0:0"]
 //! trusted_hash = "sha256:..."
 //! ```
 //!
