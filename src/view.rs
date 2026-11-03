@@ -22,7 +22,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 /// `paddock gc` removes the view of a sandbox that ended this long ago.
-pub const MAX_AGE: u64 = 24 * 3600;
+/// `[view] keep_ended` replaces it. Default 2 hours.
+pub const KEEP_ENDED: u64 = 2 * 3600;
 /// The scrollback of a view pane, in lines.
 pub const HISTORY_LIMIT: &str = "100000";
 /// The run log stops growing at this size.
@@ -63,11 +64,16 @@ pub fn valid_id(id: &str) -> bool {
 pub struct Config {
     /// Show the run in a tmux pane when tmux is on PATH. Default true.
     pub tmux: bool,
+    /// Drop a view this many seconds after the run ended. Default 2 hours.
+    pub keep_ended: u64,
 }
 
 impl Default for Config {
     fn default() -> Self {
-        Config { tmux: true }
+        Config {
+            tmux: true,
+            keep_ended: KEEP_ENDED,
+        }
     }
 }
 
@@ -75,6 +81,7 @@ impl Default for Config {
 #[serde(deny_unknown_fields)]
 struct RawConfig {
     tmux: Option<bool>,
+    keep_ended: Option<String>,
 }
 
 impl Config {
@@ -92,12 +99,46 @@ impl Config {
             Some(t) => t
                 .clone()
                 .try_into()
-                .context("[view] has one key: tmux = true or false")?,
+                .context("[view] keys: tmux = true or false, keep_ended = \"2h\"")?,
             None => RawConfig::default(),
+        };
+        let keep_ended = match raw.keep_ended {
+            None => KEEP_ENDED,
+            Some(s) => crate::timer::parse_duration(&s)
+                .context("keep_ended is not a duration, for example 2h")?,
         };
         Ok(Config {
             tmux: raw.tmux.unwrap_or(true),
+            keep_ended,
         })
+    }
+}
+
+/// What tmux reports for the last output of a pane.
+#[derive(Debug, PartialEq, Eq)]
+pub enum PaneOutput {
+    /// The session is gone.
+    Missing,
+    /// tmux did not answer. Leave the idle state as it is.
+    Unknown,
+    /// The pane has not produced output.
+    Quiet,
+    /// Unix time of the last output.
+    At(u64),
+}
+
+/// One line of `#{pane_last_output_time},#{window_activity}`.
+pub fn parse_last_output(line: &str) -> PaneOutput {
+    let (pane, window) = line.trim().split_once(',').unwrap_or((line.trim(), ""));
+    let pick = if pane.trim().is_empty() { window } else { pane };
+    let pick = pick.trim();
+    if pick.is_empty() {
+        return PaneOutput::Quiet;
+    }
+    match pick.parse::<u64>() {
+        Ok(0) => PaneOutput::Quiet,
+        Ok(t) => PaneOutput::At(t),
+        Err(_) => PaneOutput::Unknown,
     }
 }
 
@@ -202,6 +243,37 @@ impl Tmux {
         out.status
             .success()
             .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+    }
+
+    /// When the pane last wrote output. `pane_last_output_time` is empty
+    /// until the pane writes something, and tmux before 3.5 does not know it.
+    /// Then `window_activity` counts: each run has one window, and tmux sets
+    /// that time when the window starts and on each output.
+    pub fn last_output(&self, id: &str) -> PaneOutput {
+        if !valid_id(id) || !self.sock.exists() {
+            return PaneOutput::Missing;
+        }
+        let target = format!("={id}");
+        let out = self
+            .cmd()
+            .args([
+                "list-panes",
+                "-t",
+                &target,
+                "-F",
+                "#{pane_last_output_time},#{window_activity}",
+            ])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .output();
+        let Ok(out) = out else {
+            return PaneOutput::Unknown;
+        };
+        if !out.status.success() {
+            return PaneOutput::Missing;
+        }
+        let text = String::from_utf8_lossy(&out.stdout);
+        parse_last_output(text.lines().next().unwrap_or(""))
     }
 
     /// Start the session of a sandbox: a pane that prints `header` and then
@@ -585,6 +657,7 @@ impl Live {
         if !valid_id(id) || !(relay || tee_out || tee_err) {
             return None;
         }
+        reap(env);
         let log = log_file(env, id);
         let end = end_file(env, id);
         let _ = std::fs::remove_file(&end);
@@ -681,9 +754,45 @@ pub fn remove(env: &HostEnv, id: &str) -> Result<()> {
     Ok(())
 }
 
-/// The views whose sandbox ended more than `MAX_AGE` before `now`: the
-/// sessions and the logs. `running` are the ids of the running sandboxes.
+/// When a view ended, for `stale`.
+enum EndedAt {
+    /// Ended at this Unix time.
+    At(u64),
+    /// A run record exists and the run has not ended.
+    Open,
+    /// No end file, no log and no run record.
+    Unknown,
+}
+
+fn ended_at(env: &HostEnv, id: &str) -> EndedAt {
+    let file = [end_file(env, id), log_file(env, id)]
+        .iter()
+        .find_map(|f| std::fs::metadata(f).ok())
+        .map(|m| m.mtime().max(0) as u64);
+    if let Some(t) = file {
+        return EndedAt::At(t);
+    }
+    if let Some(rec) = crate::detach::Record::load(env, id) {
+        return match rec.ended {
+            Some(t) => EndedAt::At(t),
+            None => EndedAt::Open,
+        };
+    }
+    EndedAt::Unknown
+}
+
+fn keep_ended(env: &HostEnv) -> u64 {
+    Config::load(env)
+        .map(|c| c.keep_ended)
+        .unwrap_or(KEEP_ENDED)
+}
+
+/// The views whose sandbox ended more than `[view] keep_ended` before
+/// `now`: the sessions and the logs. `running` are the ids of the running
+/// sandboxes. A detached run with no view log uses the end time in its
+/// run record. A record that is still open stays.
 pub fn stale(env: &HostEnv, sessions: &[String], running: &[String], now: u64) -> Vec<String> {
+    let keep = keep_ended(env);
     let mut ids: std::collections::BTreeSet<String> =
         sessions.iter().filter(|s| valid_id(s)).cloned().collect();
     if let Ok(rd) = std::fs::read_dir(dir(env)) {
@@ -701,17 +810,30 @@ pub fn stale(env: &HostEnv, sessions: &[String], running: &[String], now: u64) -
     }
     ids.into_iter()
         .filter(|id| !running.contains(id))
-        .filter(|id| {
-            // The end of the sandbox; without the end line (paddock was
-            // killed), the last write of the log. A session without files
-            // has no time at all: it goes.
-            let ended = [end_file(env, id), log_file(env, id)]
-                .iter()
-                .find_map(|f| std::fs::metadata(f).ok())
-                .map(|m| m.mtime().max(0) as u64);
-            ended.is_none_or(|t| now.saturating_sub(t) > MAX_AGE)
+        .filter(|id| match ended_at(env, id) {
+            // The end of the sandbox. Without the end line (paddock was
+            // killed), the last write of the log. A session with no files
+            // and no run record has no time at all: it goes.
+            EndedAt::At(t) => now.saturating_sub(t) > keep,
+            EndedAt::Open => false,
+            EndedAt::Unknown => true,
         })
         .collect()
+}
+
+/// Remove view sessions of runs that ended longer ago than `keep_ended`.
+/// The start of a new view session calls this. `paddock gc` lists the same
+/// sessions and removes them when the user agrees.
+pub fn reap(env: &HostEnv) {
+    let now = crate::state::now();
+    let sessions = Tmux::find(env).map(|t| t.sessions()).unwrap_or_default();
+    let running: Vec<String> = crate::state::Running::list(env)
+        .into_iter()
+        .map(|r| r.id)
+        .collect();
+    for id in stale(env, &sessions, &running, now) {
+        let _ = remove(env, &id);
+    }
 }
 
 /// The `paddock gc` items: one per stale view.
@@ -731,7 +853,7 @@ pub fn gc_items(env: &HostEnv, now: u64) -> Vec<crate::storage::Item> {
                 what: format!("the view of {id} (tmux session and run log)"),
                 tier: crate::storage::Tier::Auto,
                 bytes,
-                reason: "the sandbox ended more than a day ago".into(),
+                reason: "the sandbox ended longer ago than keep_ended".into(),
                 warning: None,
                 needs: vec![],
                 action: crate::storage::Action::View { id },

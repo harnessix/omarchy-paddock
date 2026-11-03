@@ -475,3 +475,185 @@ fn a_view_run_records_its_end_and_a_stop() {
     assert_eq!(rec.harness, "fake");
     assert_eq!(rec.done.unwrap().text, "kept");
 }
+
+#[test]
+fn idle_durations_parse_and_the_end_text_names_the_quiet_time() {
+    let c = IdleCfg::parse("[detach]\nidle_after = \"10m\"\nidle_timeout = \"30m\"\n").unwrap();
+    assert_eq!((c.after, c.timeout), (600, 1800));
+    let c = IdleCfg::parse("[detach]\nidle_timeout = \"0\"\n").unwrap();
+    assert_eq!(c.after, IDLE_AFTER);
+    assert_eq!(c.timeout, 0);
+    let c = IdleCfg::parse("[detach]\nidle_after = \"0s\"\nidle_timeout = \"1h30m\"\n").unwrap();
+    assert_eq!((c.after, c.timeout), (0, 5400));
+    assert!(IdleCfg::parse("[detach]\nidle_after = \"soon\"\n").is_err());
+    assert!(IdleCfg::parse("[detach]\nextra = true\n").is_err());
+    assert_eq!(IdleCfg::parse("").unwrap(), IdleCfg::default());
+    assert_eq!(
+        idle_end_text(40 * 60),
+        "ended after 40 minutes without output"
+    );
+    assert_eq!(idle_end_text(60), "ended after 1 minutes without output");
+    assert_eq!(idle_end_text(10), "ended after 10 seconds without output");
+    assert_eq!(idle_end_text(90), "ended after 90 seconds without output");
+    assert!("idle".parse::<Status>().is_err());
+    assert!("ok".parse::<Status>().is_ok());
+}
+
+fn write_idle_cfg(env: &HostEnv, after: &str, timeout: &str) {
+    let dir = env.paddock_config();
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("config.toml"),
+        format!("[detach]\nidle_after = \"{after}\"\nidle_timeout = \"{timeout}\"\n"),
+    )
+    .unwrap();
+}
+
+fn until(what: &str, limit: Duration, mut f: impl FnMut() -> bool) {
+    let start = Instant::now();
+    while !f() {
+        assert!(start.elapsed() < limit, "timed out: {what}");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+fn quiet_session(tmux: &Tmux, id: &str, script: &str) {
+    tmux.new_session(id, &["sh".into(), "-c".into(), script.into()])
+        .unwrap();
+}
+
+/// The idle watcher against a real pane. No sandbox: nested user namespaces
+/// are not available in every test environment, and the loop only needs tmux.
+#[test]
+fn a_quiet_pane_goes_idle_then_the_timeout_stops_it() {
+    let t = tempfile::tempdir().unwrap();
+    let env = env_in(t.path());
+    let Some(tmux) = Tmux::find(&env) else {
+        eprintln!("skipped: needs tmux");
+        return;
+    };
+    let _server = Server(tmux.clone());
+    write_idle_cfg(&env, "2s", "3s");
+    let id = "idle-pane-1";
+    quiet_session(&tmux, id, "echo once; exec sleep 60");
+    record(&env, id);
+    let (c, stops) = ctl(&env, id);
+    c.watch();
+    until("idle_since", Duration::from_secs(15), || {
+        idle_since(&env, id).is_some()
+    });
+    assert_eq!(stops.load(Ordering::SeqCst), 0);
+    until("the idle stop", Duration::from_secs(15), || {
+        stops.load(Ordering::SeqCst) == 1
+    });
+    let done = Record::load(&env, id).unwrap().done.unwrap();
+    assert_eq!(done.status, Status::Idle);
+    assert_eq!(done.text, "ended after 5 seconds without output");
+}
+
+#[test]
+fn output_clears_idle_before_the_timeout() {
+    let t = tempfile::tempdir().unwrap();
+    let env = env_in(t.path());
+    let Some(tmux) = Tmux::find(&env) else {
+        eprintln!("skipped: needs tmux");
+        return;
+    };
+    let _server = Server(tmux.clone());
+    write_idle_cfg(&env, "8s", "40s");
+    let flag = t.path().join("more");
+    let id = "idle-pane-2";
+    quiet_session(
+        &tmux,
+        id,
+        &format!(
+            "echo first; while [ ! -e {} ]; do sleep 0.2; done; echo second; exec sleep 60",
+            flag.display()
+        ),
+    );
+    record(&env, id);
+    let (c, stops) = ctl(&env, id);
+    c.watch();
+    until("idle_since", Duration::from_secs(15), || {
+        idle_since(&env, id).is_some()
+    });
+    std::fs::write(&flag, "").unwrap();
+    until("idle cleared", Duration::from_secs(15), || {
+        idle_since(&env, id).is_none()
+    });
+    assert_eq!(stops.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn a_write_client_is_told_and_the_run_stops_when_it_leaves() {
+    let t = tempfile::tempdir().unwrap();
+    let env = env_in(t.path());
+    let Some(tmux) = Tmux::find(&env) else {
+        eprintln!("skipped: needs tmux");
+        return;
+    };
+    let server = Server(tmux.clone());
+    write_idle_cfg(&env, "2s", "3s");
+    let id = "idle-pane-3";
+    quiet_session(&tmux, id, "echo once; exec sleep 60");
+    record(&env, id);
+    let mut writer = Command::new(&server.0.exe)
+        .arg("-S")
+        .arg(&server.0.sock)
+        .args(["-C", "attach", "-t", id])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    wait_for("the write client", || tmux.write_clients(id) == 1);
+    let (c, stops) = ctl(&env, id);
+    c.watch();
+    until("the idle notice", Duration::from_secs(20), || {
+        let out = Command::new(&server.0.exe)
+            .arg("-S")
+            .arg(&server.0.sock)
+            .arg("show-messages")
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).contains("this run is idle")
+    });
+    assert_eq!(
+        stops.load(Ordering::SeqCst),
+        0,
+        "a write client did not keep the run"
+    );
+    let _ = writer.kill();
+    let _ = writer.wait();
+    until(
+        "the stop after the view closed",
+        Duration::from_secs(15),
+        || stops.load(Ordering::SeqCst) == 1,
+    );
+    let done = Record::load(&env, id).unwrap().done.unwrap();
+    assert_eq!(done.status, Status::Idle);
+    assert_eq!(done.text, "ended after 5 seconds without output");
+}
+
+#[test]
+fn a_zero_idle_timeout_never_stops_the_run() {
+    let t = tempfile::tempdir().unwrap();
+    let env = env_in(t.path());
+    let Some(tmux) = Tmux::find(&env) else {
+        eprintln!("skipped: needs tmux");
+        return;
+    };
+    let _server = Server(tmux.clone());
+    write_idle_cfg(&env, "2s", "0");
+    let id = "idle-pane-4";
+    quiet_session(&tmux, id, "echo once; exec sleep 60");
+    record(&env, id);
+    let (c, stops) = ctl(&env, id);
+    c.watch();
+    until("idle_since", Duration::from_secs(15), || {
+        idle_since(&env, id).is_some()
+    });
+    std::thread::sleep(Duration::from_secs(6));
+    assert_eq!(stops.load(Ordering::SeqCst), 0);
+    assert!(idle_since(&env, id).is_some());
+}
