@@ -83,11 +83,16 @@ pub(in crate::broker) struct Prepared {
 pub(in crate::broker) fn prepare(env: &HostEnv, ctx: &Context, req: &Request) -> Result<Prepared> {
     match req.cap.as_str() {
         "git-push" => {
-            let plan = git::plan(
+            let mut plan = git::plan(
                 ctx.repo.as_ref(),
                 &env.paddock_run().join(&ctx.id),
                 &req.args,
             )?;
+            if plan.spec_files
+                && crate::speckit::git::default_store(&crate::speckit::Cfg::load(env))
+            {
+                plan.notes.push(crate::speckit::git::PUSH_NOTICE.into());
+            }
             let session_allowed = plan.session_allowed();
             Ok(Prepared {
                 summary: plan.summary(),

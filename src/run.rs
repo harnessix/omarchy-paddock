@@ -608,16 +608,16 @@ pub fn run(
     capture: bool,
     quiet: bool,
 ) -> Result<Outcome> {
-    // From here on, a SIGTERM (`kill`, a spawn parent that ends) or a SIGHUP
-    // (a closed terminal) must not end paddock before its exit steps: the
-    // device mount, the login and history copies, the session record.
-    // Before the sandbox starts, paddock notes it and does not start it;
-    // after, it passes SIGTERM to the sandbox, as `paddock stop` does, and
-    // waits. A frozen sandbox is thawed first, so the signal is not left
-    // pending. The old handlers come back when `run` returns.
+    // SIGTERM and SIGHUP must leave time for the device mount, login and
+    // history copies, and session record to finish.
+    // Before launch, paddock notes the signal and stops. After launch it
+    // forwards the signal and waits. A frozen sandbox is thawed first.
+    // The old handlers come back when `run` returns.
+    if built.parent.is_none() && built.spawn.is_none() {
+        crate::speckit::git::notice(env, &built.home_key);
+    }
     let forwarding = Forward::install();
-    // A terminal is watched only when a window the user can see belongs to
-    // this process chain. Without Hyprland, any terminal counts as watched.
+    // Without Hyprland, any terminal counts as watched.
     let caller_terminal =
         !capture && std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
     let terminal_watched = caller_terminal && crate::relay::this_terminal_is_watched();

@@ -2,3 +2,4 @@
 - New: `paddock-host spec status|review|note` and `paddock spec status` show and review the tasks. `paddock ps` and `paddock wait` show the task of a worker, and the session and compaction notes name the feature, the task and its acceptance text.
 - New: `[speckit] store = "external"` keeps `.specify/` and `specs/` in paddock's data folder, mounts them into every sandbox of the repository, and keeps them out of git with `.git/info/exclude`. `paddock spec adopt` moves existing files there.
 - Changed: `paddock-host done` in a worker of a task records its report in the task record.
+- New: Spec Kit runs remind you when the default repo store exposes specs and plans to git. Push approval requests flag commits with Spec Kit files, and `paddock spec status` shows the store and git tracking. Set `store = "repo"` explicitly to silence the notices.

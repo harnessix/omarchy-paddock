@@ -64,8 +64,15 @@ pub(crate) fn run(env: &HostEnv, cmd: SpecCmd) -> Result<i32> {
                 let mut j = flow::to_json(&v, &spot.layout);
                 j["api_version"] = "paddock.spec/v1".into();
                 j["run"] = root.into();
+                j["store_path"] = serde_json::json!(layout.root);
+                j["git_tracked"] = if layout.external {
+                    serde_json::Value::Null
+                } else {
+                    serde_json::json!(paddock::speckit::git::tracked(&layout.root))
+                };
                 println!("{j}");
             } else {
+                println!("{}", paddock::speckit::git::location(&layout));
                 println!("{}", flow::to_text(&v));
                 if root.is_none() {
                     println!(

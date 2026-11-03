@@ -263,6 +263,7 @@ pub struct PushPlan {
     /// The remote existed on the host before the sandbox started.
     pub known: bool,
     pub notes: Vec<String>,
+    pub spec_files: bool,
     pub refs: Vec<PlannedRef>,
     scratch: Scratch,
     /// The repository whose objects the scratch repository borrows.
@@ -607,6 +608,7 @@ pub fn plan(
         .collect();
 
     let mut planned = Vec::new();
+    let mut spec_files = false;
     for r in refs {
         let old = remote_refs.get(&r.dst).cloned();
         let mut commits = Vec::new();
@@ -624,8 +626,14 @@ pub fn plan(
                 _ => known_tips.iter().collect(),
             };
             if !not.is_empty() {
-                c.arg("--not").args(not);
+                c.arg("--not").args(&not);
             }
+            let mut check = scratch_git(&scratch.0);
+            check.arg("log").arg(&r.sha);
+            if !not.is_empty() {
+                check.arg("--not").args(&not);
+            }
+            spec_files |= crate::speckit::git::push_contains(check)?;
             c.arg("--");
             commits = capture(c, 20)?.lines().map(clean).collect();
             if commits.len() > MAX_COMMITS {
@@ -649,6 +657,7 @@ pub fn plan(
         known,
         notes,
         refs: planned,
+        spec_files,
         scratch,
         common_dir: repo.common_dir.clone(),
         store,

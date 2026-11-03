@@ -1280,7 +1280,9 @@ A task is ready when all tasks of the earlier phases are done, all tasks before 
 
 ### The external spec store
 
-Spec Kit keeps `.specify/` and `specs/` in the repository. To keep them out of the repository, set:
+Spec Kit keeps `.specify/` and `specs/` in the repository. With the default store, paddock reminds you at the start of a run that a push publishes committed specs and plans, and adds a note to push approval requests that contain Spec Kit files. Set `store = "repo"` explicitly to keep the files there and silence these notices, or move them to the external store below.
+
+To keep them out of the repository, set:
 
 ```toml
 [speckit]

@@ -405,7 +405,8 @@ fn the_config_is_user_only_and_has_defaults() {
         Cfg::parse("").unwrap(),
         Cfg {
             enabled: true,
-            store: Store::Repo
+            store: Store::Repo,
+            store_explicit: false
         }
     );
     let c = Cfg::parse("[speckit]\nenabled = false\nstore = \"external\"\n").unwrap();
@@ -413,7 +414,8 @@ fn the_config_is_user_only_and_has_defaults() {
         c,
         Cfg {
             enabled: false,
-            store: Store::External
+            store: Store::External,
+            store_explicit: true
         }
     );
     assert!(Cfg::parse("[speckit]\nstore = \"cloud\"\n").is_err());

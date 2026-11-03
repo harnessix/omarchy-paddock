@@ -22,6 +22,7 @@
 pub mod adopt;
 pub mod board;
 pub mod flow;
+pub mod git;
 pub mod prompt;
 pub mod tasks;
 
@@ -54,6 +55,8 @@ pub enum Store {
 pub struct Cfg {
     pub enabled: bool,
     pub store: Store,
+    #[serde(skip)]
+    pub store_explicit: bool,
 }
 
 impl Default for Cfg {
@@ -61,6 +64,7 @@ impl Default for Cfg {
         Self {
             enabled: true,
             store: Store::Repo,
+            store_explicit: false,
         }
     }
 }
@@ -69,7 +73,11 @@ impl Cfg {
     pub fn parse(text: &str) -> Result<Self> {
         let v: toml::Value = toml::from_str(text)?;
         Ok(match v.get("speckit") {
-            Some(t) => t.clone().try_into()?,
+            Some(t) => {
+                let mut cfg: Self = t.clone().try_into()?;
+                cfg.store_explicit = t.get("store").is_some();
+                cfg
+            }
             None => Self::default(),
         })
     }
