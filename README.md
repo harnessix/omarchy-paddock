@@ -1310,7 +1310,7 @@ A task is ready when all tasks of the earlier phases are done, all tasks before 
 
 ### The external spec store
 
-Spec Kit keeps `.specify/` and `specs/` in the repository. The external store is [the loft](#the-loft): with the loft on, the Spec Kit folders go there too, and `[speckit] store` is the short form for the Spec Kit folders alone. With the default store, paddock reminds you at the start of a run that a push publishes committed specs and plans, and adds a note to push approval requests that contain Spec Kit files. Set `store = "repo"` explicitly to keep the files there and silence these notices, or move them to the external store below.
+Spec Kit keeps `.specify/` and `specs/` in the repository. The external store is [the loft](#the-loft): with the loft on, the Spec Kit folders go there too, and `[speckit] store` is the short form for the Spec Kit folders alone. With the default store, paddock reminds you at the start of a run that a push publishes committed specs and plans, and adds a note to push approval requests that contain Spec Kit files. Set `store = "repo"` explicitly to keep the files there and silence these notices, or turn on the loft and move them there.
 
 To keep them out of the repository, set:
 
