@@ -7,6 +7,7 @@ unverified = [
   "state.auth .grok/mcp_credentials.json: the file store for MCP OAuth tokens",
   "privacy.env: the false values of the GROK_TELEMETRY_* variables",
   "network.endpoints: the hosts for the allowlist network mode",
+  "compaction: the note on the first PostToolUse after a PostCompact, from the source of grok-build",
 ]
 
 [locate]
@@ -69,6 +70,23 @@ url = "https://github.com/xai-org/grok-build/blob/main/crates/codegen/xai-grok-p
 
 [network]
 endpoints = ["api.x.ai", "x.ai", "grok.com"]
+
+# Grok Build discards the output of its PreCompact and PostCompact hooks,
+# and of an allowing UserPromptSubmit hook. A PostToolUse hook's
+# hookSpecificOutput.additionalContext reaches the model. So PostCompact
+# records the compaction and keeps the note, and the next PostToolUse hook
+# adds it. Hooks in ~/.grok/hooks/*.json are always trusted. paddock owns
+# this file in the sandbox home. User guide, Hooks:
+# https://github.com/xai-org/grok-build/blob/main/crates/codegen/xai-grok-pager/docs/user-guide/10-hooks.md
+[[compaction.settings]]
+file = ".grok/hooks/paddock-compaction.json"
+path = ["hooks", "PostCompact"]
+value = [{ hooks = [{ type = "command", command = "paddock-host compacted --harness grok", timeout = 20 }] }]
+
+[[compaction.settings]]
+file = ".grok/hooks/paddock-compaction.json"
+path = ["hooks", "PostToolUse"]
+value = [{ hooks = [{ type = "command", command = "paddock-host compacted --harness grok", timeout = 10 }] }]
 
 # One task without a terminal, for `paddock-host spawn`. `grok --help`:
 # --prompt-file runs one turn with the prompt from a file and prints the

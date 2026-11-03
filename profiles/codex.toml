@@ -4,6 +4,7 @@ description = "OpenAI Codex CLI"
 # Entries that come from documentation, not from a test. paddock doctor lists them.
 unverified = [
   "state.auth .codex/.credentials.json: the file store for MCP OAuth tokens",
+  "compaction: the trusted hash of paddock's hook, from the source of codex 0.166.0",
 ]
 
 [locate]
@@ -63,6 +64,24 @@ value = false
 [privacy.training]
 setting = "ChatGPT Settings, Data controls, Improve the model for everyone"
 url = "https://chatgpt.com/#settings/DataControls"
+
+# After a context compaction, Codex runs the SessionStart hooks with the
+# source "compact" (the matcher selects it), and the hook's
+# hookSpecificOutput.additionalContext reaches the context. Codex runs a hook
+# from ~/.codex/hooks.json only with a trusted hash in [hooks.state] of
+# config.toml, which /hooks writes when the user approves it. No user is in
+# the sandbox to approve, so paddock writes the hash of this hook, and of no
+# other hook, into the sandbox copy of config.toml (codex_trust). The rules
+# for the hash and the key come from the Codex source, see
+# src/compaction/codex.rs. https://developers.openai.com/codex/hooks
+[compaction]
+codex_trust = ".codex/config.toml"
+
+[[compaction.settings]]
+file = ".codex/hooks.json"
+path = ["hooks", "SessionStart"]
+append = true
+value = { matcher = "compact", hooks = [{ type = "command", command = "paddock-host compacted --harness codex", timeout = 20 }] }
 
 # One task without a terminal, for `paddock-host spawn`. `codex exec --help`:
 # with `-` as the prompt, codex reads the instructions from stdin.

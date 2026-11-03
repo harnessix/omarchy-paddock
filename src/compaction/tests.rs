@@ -1,5 +1,13 @@
 use super::*;
 
+/// The event of a hook input that is a compaction with a direct note.
+fn hook_event(harness: &str, input: &serde_json::Value) -> Option<String> {
+    match action(harness, input)? {
+        Action::Direct { event } => Some(event),
+        _ => None,
+    }
+}
+
 #[test]
 fn the_configuration_has_defaults_and_rejects_unknown_keys() {
     assert_eq!(Cfg::parse("").unwrap(), Cfg::default());
@@ -68,13 +76,13 @@ fn the_count_goes_up_per_run() {
 
 /// A host world with every XDG folder outside the home, so a test can
 /// check that the host home stays as it was.
-struct World {
+pub(super) struct World {
     _tmp: tempfile::TempDir,
-    env: HostEnv,
-    project: std::path::PathBuf,
+    pub(super) env: HostEnv,
+    pub(super) project: std::path::PathBuf,
 }
 
-fn world(config: &str) -> World {
+pub(super) fn world(config: &str) -> World {
     let tmp = tempfile::tempdir().unwrap();
     let home = tmp.path().join("home");
     let project = tmp.path().join("proj");
@@ -101,7 +109,9 @@ fn world(config: &str) -> World {
 }
 
 /// Every file under a folder with its bytes.
-fn tree(dir: &std::path::Path) -> std::collections::BTreeMap<std::path::PathBuf, Vec<u8>> {
+pub(super) fn tree(
+    dir: &std::path::Path,
+) -> std::collections::BTreeMap<std::path::PathBuf, Vec<u8>> {
     let mut out = std::collections::BTreeMap::new();
     let mut todo = vec![dir.to_path_buf()];
     while let Some(d) = todo.pop() {
@@ -119,7 +129,13 @@ fn tree(dir: &std::path::Path) -> std::collections::BTreeMap<std::path::PathBuf,
 
 /// Build a sandbox of a built-in profile, write its settings into the
 /// sandbox home as a start does, and return the sandbox home.
-fn sandbox_home(w: &World, name: &str) -> std::path::PathBuf {
+pub(super) fn sandbox_home(w: &World, name: &str) -> std::path::PathBuf {
+    sandbox_spec(w, name, &[]).home_src
+}
+
+/// `sandbox_home`, with `extra` host files copied in first as a snapshot of
+/// the host data does. Returns the spec.
+pub(super) fn sandbox_spec(w: &World, name: &str, extra: &[&str]) -> crate::spec::SandboxSpec {
     let h = crate::profile::Harness {
         profile: crate::profile::builtin(name).unwrap(),
         exe: "/usr/bin/true".into(),
@@ -135,7 +151,8 @@ fn sandbox_home(w: &World, name: &str) -> std::path::PathBuf {
     };
     let b = crate::build::build_with(&w.env, &opts, h).unwrap();
     // A start copies the `seed` files first.
-    for rel in &crate::profile::builtin(name).unwrap().state.seed {
+    let seed = crate::profile::builtin(name).unwrap().state.seed;
+    for rel in seed.iter().map(String::as_str).chain(extra.iter().copied()) {
         if let Ok(bytes) = std::fs::read(w.env.home.join(rel)) {
             let dst = b.spec.home_src.join(rel);
             std::fs::create_dir_all(dst.parent().unwrap()).unwrap();
@@ -143,7 +160,7 @@ fn sandbox_home(w: &World, name: &str) -> std::path::PathBuf {
         }
     }
     crate::privacy::write_settings(&b.spec.home_src, &b.spec.home_settings).unwrap();
-    b.spec.home_src
+    b.spec
 }
 
 /// The hook command of each supported harness: its settings file in the
@@ -241,13 +258,13 @@ fn claude_reads_the_note_from_its_session_start_hook() {
 
 /// The broker of a spawn child and the kv services of the child and its
 /// parent, all in this process.
-struct Tree {
-    w: World,
-    parent: crate::kv::Service,
-    broker: crate::broker::Broker,
+pub(super) struct Tree {
+    pub(super) w: World,
+    pub(super) parent: crate::kv::Service,
+    pub(super) broker: crate::broker::Broker,
 }
 
-fn spawn_tree(config: &str, harness: &str) -> Tree {
+pub(super) fn spawn_tree(config: &str, harness: &str) -> Tree {
     use std::sync::Arc;
     let w = world(config);
     let root = crate::kv::kv_root(&w.env);
@@ -311,7 +328,7 @@ fn spawn_tree(config: &str, harness: &str) -> Tree {
     Tree { w, parent, broker }
 }
 
-fn compacted(harness: &str) -> crate::broker::Request {
+pub(super) fn compacted(harness: &str) -> crate::broker::Request {
     crate::broker::Request {
         v: crate::broker::PROTOCOL,
         cap: "compacted".into(),
@@ -321,7 +338,7 @@ fn compacted(harness: &str) -> crate::broker::Request {
 }
 
 /// What the parent reads at `compacted:abc` in the tree scope.
-fn parent_sees(t: &Tree) -> Option<serde_json::Value> {
+pub(super) fn parent_sees(t: &Tree) -> Option<serde_json::Value> {
     let r = t.parent.handle(
         &crate::kv::Request {
             v: crate::kv::PROTOCOL,
@@ -412,16 +429,19 @@ fn qwen_reads_the_note_from_its_session_start_hook() {
     assert_eq!(render("gemini", "PreCompress", "NOTE"), None);
 }
 
-#[test]
-fn a_pasture_member_records_its_compaction_in_the_pasture() {
+/// The broker of a pasture member "claude-p-1" in pasture "team" and its kv
+/// service.
+pub(super) fn pasture_member(
+    w: &World,
+    harness: &str,
+) -> (crate::broker::Broker, std::sync::Arc<crate::kv::Service>) {
     use std::sync::Arc;
-    let w = world("");
     let root = crate::kv::kv_root(&w.env);
     crate::kv::store::Store::open(&crate::kv::shard::registry(&root))
         .unwrap()
         .register(
             "claude-p-1",
-            "claude",
+            harness,
             &w.project,
             None,
             Some("team"),
@@ -431,7 +451,7 @@ fn a_pasture_member_records_its_compaction_in_the_pasture() {
     let id = crate::kv::Identity {
         tree: None,
         sandbox: "claude-p-1".into(),
-        harness: "claude".into(),
+        harness: harness.into(),
         project: w.project.clone(),
         pasture: Some("team".into()),
         parent: None,
@@ -449,7 +469,7 @@ fn a_pasture_member_records_its_compaction_in_the_pasture() {
     );
     let ctx = crate::broker::Context {
         id: "claude-p-1".into(),
-        harness: "claude".into(),
+        harness: harness.into(),
         project: w.project.clone(),
         repo: None,
         chain: vec![],
@@ -464,10 +484,12 @@ fn a_pasture_member_records_its_compaction_in_the_pasture() {
     );
     b.run.pasture = Some("team".into());
     let _ = b.kv.set(svc.clone());
-    let r = b.handle(&compacted("claude"));
-    assert_eq!(r.result["kv"]["scope"], "pasture", "{:?}", r);
-    assert_eq!(r.result["role"], serde_json::Value::Null);
-    let got = svc.handle(
+    (b, svc)
+}
+
+/// The record at `compacted:claude-p-1` in the pasture scope.
+pub(super) fn pasture_sees(svc: &crate::kv::Service) -> Option<serde_json::Value> {
+    let r = svc.handle(
         &crate::kv::Request {
             v: crate::kv::PROTOCOL,
             op: "get".into(),
@@ -477,5 +499,17 @@ fn a_pasture_member_records_its_compaction_in_the_pasture() {
         },
         None,
     );
-    assert_eq!(got.status, crate::kv::Status::Done, "{}", got.message);
+    (r.status == crate::kv::Status::Done)
+        .then(|| serde_json::from_str(r.result["value"].as_str()?).ok())
+        .flatten()
+}
+
+#[test]
+fn a_pasture_member_records_its_compaction_in_the_pasture() {
+    let w = world("");
+    let (b, svc) = pasture_member(&w, "claude");
+    let r = b.handle(&compacted("claude"));
+    assert_eq!(r.result["kv"]["scope"], "pasture", "{:?}", r);
+    assert_eq!(r.result["role"], serde_json::Value::Null);
+    assert_eq!(pasture_sees(&svc).unwrap()["count"], 1);
 }

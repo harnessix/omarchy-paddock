@@ -1304,11 +1304,23 @@ hooks = false
 
 ### After a context compaction
 
-A long run replaces its conversation with a summary, and the agent can forget its role, its task file, or that a detached run ends with `paddock-host done`. For Claude Code and Qwen Code, paddock adds a `SessionStart` hook with the source `compact` to the settings file in the sandbox home (never the host file). After a compaction, the hook runs `paddock-host compacted` and the agent gets a short note: the sandbox, the harness, the role, the parent, the pasture and the task file, with the request to read the task file again.
+A long run replaces its conversation with a summary, and the agent can forget its role, its task file, or that a detached run ends with `paddock-host done`. paddock adds a hook to a file in the sandbox home (never the host file). After a compaction, the hook runs `paddock-host compacted` and the agent gets a short note: the sandbox, the harness, the role, the parent, the pasture and the task file, with the request to read the task file again.
+
+These harnesses get the note:
+
+| Harness | Hook file in the sandbox home | When the note goes in |
+|---|---|---|
+| Claude Code | `~/.claude/settings.json` | `SessionStart` with the source `compact` |
+| Qwen Code | `~/.qwen/settings.json` | `SessionStart` with the source `compact` |
+| Codex | `~/.codex/hooks.json` | `SessionStart` with the source `compact` |
+| Grok Build | `~/.grok/hooks/paddock-compaction.json` | `PostCompact` records the compaction, and the next `PostToolUse` adds the note |
+| agy | `~/.gemini/config/hooks.json` | `PreInvocation` finds a new `CHECKPOINT` step in the transcript |
+
+Codex runs a hook only when `config.toml` has a trusted hash for it, and a user approves a hook with `/hooks`. No user is in a sandbox to approve, so paddock writes the hash of its own hook into the sandbox copy of `config.toml`. It trusts no other hook.
 
 paddock also records the compaction. A spawn child writes `compacted:SPAWN-ID` into the `tree` scope of paddock kv, with the time and the count so far, so a parent can watch with `paddock-host kv watch --prefix compacted: --scope tree`. A pasture member writes `compacted:RUN-ID` into `pasture`. The audit log gets one line, and `paddock ps --json` shows `compactions` for each run.
 
-Other harnesses have no hook that runs after a compaction and can add text to the context, or they ask the user to trust each hook first (Codex). They get no note.
+Other harnesses have no hook that runs after a compaction and can add text to the context. They get no note.
 
 ```toml
 [compaction]
