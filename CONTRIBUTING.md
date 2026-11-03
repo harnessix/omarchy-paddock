@@ -56,10 +56,10 @@ To report a bug, use the issue form. It asks for the output of `paddock doctor -
 - `src/cli/` holds one module per command area. `cli/mod.rs` has `Cli`, `Cmd` and shared argument types.
 - `plugin/` is the Omarchy bar widget (QML).
 - `profiles/` is the harness and app profiles.
-- `skills/` is the paddock-host skill for agents.
+- `skills/` holds the `paddock` and `paddock-host` skills for agents.
 - `tests/` is the integration tests.
 
-A tracked `.rs` or `.qml` file must stay at or under 800 lines, unless it is listed in `.github/file-size-baseline.txt`. A listed file must not grow past the size in that list. Split a file that is too long. Change the baseline only in a separate pull request, with a reason.
+A tracked `.rs` or `.qml` file must stay at or under 800 lines, unless it is listed in `.github/file-size-baseline`. A listed file must not grow past the size in that list. Split a file that is too long. Change the baseline only in a separate pull request, with a reason.
 
 ## Tests
 

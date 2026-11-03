@@ -87,7 +87,7 @@ fn file_size_rules_on_a_temporary_repository() {
     assert!(!text.contains("file-size: ok"), "{text}");
 
     git(root, &["rm", "-f", "src/too_long.rs"]);
-    write(root, ".github/file-size-baseline.txt", "1000 src/big.rs\n");
+    write(root, ".github/file-size-baseline", "1000 src/big.rs\n");
     write(root, "src/big.rs", &n_lines(1000));
     commit(root, "listed at limit");
     let (code, text) = run_script(root);
@@ -113,7 +113,7 @@ fn file_size_rules_on_a_temporary_repository() {
     assert_eq!(code, 0, "{text}");
     assert!(
         text.contains(
-            "src/big.rs shrank to 900 lines (baseline 1000). Put 900 in .github/file-size-baseline.txt"
+            "src/big.rs shrank to 900 lines (baseline 1000). Put 900 in .github/file-size-baseline"
         ),
         "{text}"
     );

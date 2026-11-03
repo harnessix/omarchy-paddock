@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Check that tracked Rust and QML files stay within their size limits.
 #
-# A file listed in .github/file-size-baseline.txt (`<lines> <path>`) must
+# A file listed in .github/file-size-baseline (`<lines> <path>`) must
 # not grow past that size. A file that is not listed must not be longer
 # than 800 lines. When a listed file shrinks, the script prints the lower
 # number to put in the baseline, and does not fail.
@@ -16,7 +16,7 @@ root=$(git rev-parse --show-toplevel 2>/dev/null) || {
 cd "$root"
 
 default_limit=800
-baseline_file=".github/file-size-baseline.txt"
+baseline_file=".github/file-size-baseline"
 status=0
 
 declare -A baseline=()
