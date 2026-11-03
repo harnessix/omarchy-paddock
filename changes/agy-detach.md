@@ -1,0 +1,1 @@
+- New: `paddock run agy --detach` starts the terminal UI of agy with the task as its first prompt, so `paddock view` can show and take over an agy run.
