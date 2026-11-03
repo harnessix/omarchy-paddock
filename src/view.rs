@@ -1101,4 +1101,4 @@ pub fn open(env: &HostEnv, id: &str, write: bool) -> Result<()> {
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
