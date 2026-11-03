@@ -253,10 +253,10 @@ pub fn known_agents(env: &HostEnv) -> Vec<String> {
 
 /// The Omarchy agent whose limits a harness uses.
 pub fn agent_of(harness: &str) -> String {
-    crate::omarchy_usage::AGENTS
+    crate::usage_box::COLLECTORS
         .iter()
-        .find(|a| a.profile == harness)
-        .map(|a| a.id.to_string())
+        .find(|c| c.profile == Some(harness))
+        .map(|c| c.id.to_string())
         .unwrap_or_else(|| harness.to_string())
 }
 

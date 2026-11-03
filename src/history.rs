@@ -4,8 +4,9 @@
 //! - Claude Code keeps one folder per project under `~/.claude/projects`.
 //!   paddock binds the host folder of this project, read-write, at the same
 //!   place in the sandbox home. The sandbox sees no other project's folder.
-//! - Agents that keep history by date (Codex `sessions/YYYY/MM/DD`) get new
-//!   history copied back at exit. paddock reads the sandbox home through
+//! - A profile with `copy_back` gets new history copied back at exit. No
+//!   built-in profile uses it: the agents panel reads sandbox homes through
+//!   the usage box (usage_box.rs). paddock reads the sandbox home through
 //!   `safefs`, so no symlink there is followed, and writes the host folder
 //!   the same way. A file is copied only when the host has none, or when the
 //!   sandbox only appended to it.

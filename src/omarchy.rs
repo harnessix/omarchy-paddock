@@ -15,6 +15,13 @@
 //!   paths (only its last line differs), so paddock never copies its logic,
 //!   also not the case of a user install in `~/.local/bin`.
 //!
+//! - The same block declares a wrapper for the agents panel's
+//!   `omarchy-agent-usage-update`. It reaches `paddock shims exec
+//!   omarchy-agent-usage-update`, which runs Omarchy's command in the usage
+//!   box (usage_box.rs), so the panel also counts sessions in sandbox homes.
+//!   The panel itself reaches it through the Hyprland hook of
+//!   omarchy_usage.rs; this wrapper covers shells and scripts.
+//!
 //! Commands that the user types and scripts do not change: nothing else is on
 //! PATH, and Omarchy's own files stay as they are.
 
@@ -81,17 +88,30 @@ fn sh_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', r"'\''"))
 }
 
-/// The block for the mise config. The wrapper runs paddock while it is
-/// installed, and the real `omarchy-agent` otherwise (mise takes its own
-/// wrapper folder off PATH first), so a removed paddock never stops the key.
-pub fn block(paddock: &Path) -> String {
+/// The command of the agents panel that the block also wraps.
+pub const USAGE: &str = crate::omarchy_usage::COMMAND;
+
+/// One wrapper of the block: it runs paddock while it is installed, and the
+/// real command otherwise (mise takes its own wrapper folder off PATH
+/// first), so a removed paddock never stops the key or the panel.
+fn wrapper(paddock: &Path, name: &str) -> String {
     let script = format!(
-        "p={}; if [ -x \"$p\" ] && [ -z \"${{PADDOCK_BYPASS:-}}\" ]; then exec \"$p\" shims exec omarchy-agent \"$@\"; fi; exec omarchy-agent \"$@\"",
+        "p={}; if [ -x \"$p\" ] && [ -z \"${{PADDOCK_BYPASS:-}}\" ]; then exec \"$p\" shims exec {name} \"$@\"; fi; exec {name} \"$@\"",
         sh_quote(&paddock.display().to_string())
     );
     format!(
-        "{BEGIN}\n[wrappers.omarchy-agent]\ncommand = \"sh\"\nargs = [\"-c\", {}, \"omarchy-agent\"]\n{END}\n",
+        "[wrappers.{name}]\ncommand = \"sh\"\nargs = [\"-c\", {}, \"{name}\"]\n",
         toml_str(&script)
+    )
+}
+
+/// The block for the mise config: `omarchy-agent`, and the panel's
+/// `omarchy-agent-usage-update`, which runs in the usage box.
+pub fn block(paddock: &Path) -> String {
+    format!(
+        "{BEGIN}\n{}{}{END}\n",
+        wrapper(paddock, SCOPE),
+        wrapper(paddock, USAGE)
     )
 }
 
@@ -128,18 +148,27 @@ pub fn insert(text: &str, block: &str) -> String {
     format!("{base}\n{block}")
 }
 
-/// Whether the mise config, outside paddock's block, declares its own
-/// wrapper for `omarchy-agent`.
-pub fn user_wrapper(text: &str) -> Result<bool> {
+/// The wrapper that the mise config, outside paddock's block, declares
+/// itself for `omarchy-agent` or the panel's command.
+pub fn user_wrapper_name(text: &str) -> Result<Option<&'static str>> {
     let rest = strip_block(text);
     let doc: toml_edit::DocumentMut = rest.parse().context("the mise config is not valid TOML")?;
-    Ok(doc.get("wrappers").and_then(|w| w.get(SCOPE)).is_some())
+    Ok([SCOPE, USAGE]
+        .into_iter()
+        .find(|n| doc.get("wrappers").and_then(|w| w.get(n)).is_some()))
+}
+
+pub fn user_wrapper(text: &str) -> Result<bool> {
+    Ok(user_wrapper_name(text)?.is_some())
 }
 
 /// The state of the scope.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Status {
     pub block: bool,
+    /// The block has the wrapper for the panel's command (older blocks
+    /// have only `omarchy-agent`).
+    pub usage: bool,
     pub shims: bool,
     /// The user's own `[wrappers.omarchy-agent]` outside the block.
     pub user_wrapper: bool,
@@ -149,7 +178,7 @@ pub struct Status {
 
 impl Status {
     pub fn on(&self) -> bool {
-        self.block && self.shims && !self.user_wrapper
+        self.block && self.usage && self.shims && !self.user_wrapper
     }
 }
 
@@ -157,6 +186,7 @@ pub fn status(env: &HostEnv) -> Status {
     let text = std::fs::read_to_string(mise_config(env)).unwrap_or_default();
     Status {
         block: text.contains(BEGIN),
+        usage: text.contains(BEGIN) && text.contains(&format!("[wrappers.{USAGE}]")),
         shims: shim_bin(env).join("omarchy-launch-tui").is_file(),
         user_wrapper: user_wrapper(&text).unwrap_or(false),
         dispatch: std::fs::symlink_metadata(mise_wrapper_dir(env).join(SCOPE)).is_ok(),
@@ -219,9 +249,9 @@ pub fn install(env: &HostEnv) -> Result<Report> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
         Err(e) => return Err(e).with_context(|| format!("cannot read {}", config.display())),
     };
-    if user_wrapper(&text).with_context(|| config.display().to_string())? {
+    if let Some(name) = user_wrapper_name(&text).with_context(|| config.display().to_string())? {
         bail!(
-            "{} already has its own [wrappers.omarchy-agent]. paddock does not replace it. \
+            "{} already has its own [wrappers.{name}]. paddock does not replace it. \
              Remove it, or keep it and start agents with `paddock wrap -- COMMAND` from it",
             config.display()
         );
@@ -476,7 +506,7 @@ pub fn doctor_lines(env: &HostEnv) -> Vec<String> {
     let config = config.replacen(&env.home.display().to_string(), "~", 1);
     if s.user_wrapper {
         out.push(format!(
-            "  CHECK    {config} has its own [wrappers.omarchy-agent]; paddock does not replace it"
+            "  CHECK    {config} has its own wrapper for omarchy-agent or {USAGE}; paddock does not replace it"
         ));
     }
     if !s.block && !s.shims {
@@ -487,6 +517,15 @@ pub fn doctor_lines(env: &HostEnv) -> Vec<String> {
     out.push(format!(
         "{} the omarchy-agent wrapper in {config}",
         mark(s.block && !s.user_wrapper)
+    ));
+    out.push(format!(
+        "{} the {USAGE} wrapper in {config}{}",
+        mark(s.usage && !s.user_wrapper),
+        if s.usage {
+            ""
+        } else {
+            ": run paddock shims install --scope omarchy-agent again"
+        }
     ));
     out.push(format!(
         "{} the shim folder {}",
@@ -604,6 +643,11 @@ mod tests {
         assert!(args[1].contains("shims exec omarchy-agent \"$@\""));
         assert!(args[1].ends_with("exec omarchy-agent \"$@\""));
         assert_eq!(args[2], "omarchy-agent");
+        let u = &doc["wrappers"][USAGE];
+        let script = u["args"][1].as_str().unwrap();
+        assert!(script.contains(&format!("shims exec {USAGE} \"$@\"")));
+        assert!(script.ends_with(&format!("exec {USAGE} \"$@\"")));
+        assert_eq!(u["args"][2].as_str(), Some(USAGE));
         // The user's content is not paddock's block.
         assert!(!user_wrapper(&text).unwrap());
     }
@@ -616,6 +660,9 @@ mod tests {
         let inline = "[wrappers]\nomarchy-agent = { command = \"mine\" }\n";
         assert!(user_wrapper(inline).unwrap());
         assert!(!user_wrapper("[wrappers.claude]\ncommand = \"x\"\n").unwrap());
+        let usage = format!("[wrappers.{USAGE}]\ncommand = \"mine\"\n");
+        assert_eq!(user_wrapper_name(&usage).unwrap(), Some(USAGE));
+        assert_eq!(user_wrapper_name(&insert("", &blk())).unwrap(), None);
         assert!(user_wrapper("not toml [").is_err());
     }
 
