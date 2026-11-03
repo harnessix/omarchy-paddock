@@ -105,3 +105,33 @@ fn install_root_rules() {
         PathBuf::from("/x/node/26")
     );
 }
+
+#[test]
+fn a_user_profile_names_builtin_training_rules_and_cannot_bring_its_own() {
+    let t = tempfile::tempdir().unwrap();
+    let env = HostEnv::from_parts(t.path().join("home"), "u".into(), 1, 1, Default::default());
+    let dir = env.paddock_config().join("harness.d");
+    std::fs::create_dir_all(&dir).unwrap();
+    let base = "name = \"mine\"\n[locate]\ncommands = [\"sh\"]\n[privacy.training]\nsetting = \"s\"\nurl = \"https://example.com\"\n";
+    std::fs::write(
+        dir.join("mine.toml"),
+        format!("{base}rules = [\"agy-1.4-data-use\"]\n"),
+    )
+    .unwrap();
+    let f = HarnessFactory::new(&env).unwrap();
+    let rules = f.profile("mine").unwrap().training_rules();
+    assert_eq!(rules.len(), 1);
+    assert_eq!(rules[0].id, "agy-1.4-data-use");
+
+    std::fs::write(
+        dir.join("mine.toml"),
+        format!("{base}rules = [\"no-such-rule\"]\n"),
+    )
+    .unwrap();
+    assert!(HarnessFactory::new(&env).is_err());
+
+    let own = "[[privacy.training.rule]]\nid = \"x\"\nurl = \"u\"\ntitle = \"T\"\n[[privacy.training.rule.state]]\nid = \"a\"\nrows = [\"T\"]\nsend = \"enter\"\nnext = [\"gone\"]\n";
+    std::fs::write(dir.join("mine.toml"), format!("{base}{own}")).unwrap();
+    let e = HarnessFactory::new(&env).err().unwrap();
+    assert!(format!("{e:#}").contains("built-in"), "{e:#}");
+}

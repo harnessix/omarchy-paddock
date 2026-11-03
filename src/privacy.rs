@@ -292,20 +292,30 @@ pub fn onboarding_lines(env: &HostEnv) -> Result<Vec<String>> {
         .collect())
 }
 
-fn onboarding_line(home: &Path, p: &Profile) -> Option<String> {
-    let open = p.state.done_flags.iter().find(|(rel, keys)| {
-        let v: Option<serde_json::Value> = std::fs::read(home.join(rel))
-            .ok()
-            .filter(|b| b.len() <= 64 * 1024)
-            .and_then(|b| serde_json::from_slice(&b).ok());
-        !v.is_some_and(|v| {
-            keys.iter()
-                .all(|k| v.get(k) == Some(&serde_json::Value::Bool(true)))
+/// The first `[state] done_flags` file in `home` that is missing or not
+/// done. None when the harness's onboarding is over (or it has none).
+pub fn open_onboarding<'a>(home: &Path, p: &'a Profile) -> Option<&'a String> {
+    p.state
+        .done_flags
+        .iter()
+        .find(|(rel, keys)| {
+            let v: Option<serde_json::Value> = std::fs::read(home.join(rel))
+                .ok()
+                .filter(|b| b.len() <= 64 * 1024)
+                .and_then(|b| serde_json::from_slice(&b).ok());
+            !v.is_some_and(|v| {
+                keys.iter()
+                    .all(|k| v.get(k) == Some(&serde_json::Value::Bool(true)))
+            })
         })
-    })?;
+        .map(|(rel, _)| rel)
+}
+
+fn onboarding_line(home: &Path, p: &Profile) -> Option<String> {
+    let open = open_onboarding(home, p)?;
     let mut line = format!(
         "{} shows its onboarding in a new sandbox: ~/{} is missing or not done.",
-        p.name, open.0
+        p.name, open
     );
     if let Some(o) = p
         .privacy

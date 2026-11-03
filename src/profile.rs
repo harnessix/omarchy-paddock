@@ -411,6 +411,67 @@ pub struct Training {
     /// doctor` shows it while a `[state] done_flags` file on the host is
     /// missing or not done, so the onboarding comes in the next sandbox.
     pub onboarding: Option<String>,
+    /// How paddock refuses the training opt-in in the harness's own screens
+    /// (training.rs). Only a built-in profile can have rules.
+    #[serde(default)]
+    pub rule: Vec<crate::training::Rule>,
+    /// Built-in rules by id, for a user profile of the same harness.
+    #[serde(default)]
+    pub rules: Vec<String>,
+}
+
+impl Profile {
+    /// The training rules of this profile: its own, and the built-in rules
+    /// that it names. Only valid rules.
+    pub fn training_rules(&self) -> Vec<crate::training::Rule> {
+        let Some(t) = &self.privacy.training else {
+            return Vec::new();
+        };
+        let mut out: Vec<crate::training::Rule> = t.rule.clone();
+        for id in &t.rules {
+            if let Some(r) = builtin_rule(id) {
+                out.push(r);
+            }
+        }
+        out.retain(|r| match r.check() {
+            Ok(()) => true,
+            Err(e) => {
+                log::warn!("profile {}: {e:#}", self.name);
+                false
+            }
+        });
+        out
+    }
+}
+
+/// A training rule of a built-in profile, by id.
+pub fn builtin_rule(id: &str) -> Option<crate::training::Rule> {
+    BUILTIN
+        .iter()
+        .filter_map(|(_, text)| toml::from_str::<Profile>(text).ok())
+        .filter_map(|p| p.privacy.training)
+        .flat_map(|t| t.rule)
+        .find(|r| r.id == id)
+}
+
+/// A user profile cannot bring its own training rules: rows and keys come
+/// only with paddock. It can name a built-in rule.
+fn check_user_rules(p: &Profile, file: &Path) -> Result<()> {
+    let Some(t) = &p.privacy.training else {
+        return Ok(());
+    };
+    if !t.rule.is_empty() {
+        bail!(
+            "profile {}: [[privacy.training.rule]] comes only with the built-in profiles. Name a built-in rule in [privacy.training] rules = [...]",
+            file.display()
+        );
+    }
+    for id in &t.rules {
+        if builtin_rule(id).is_none() {
+            bail!("profile {}: no built-in training rule {id}", file.display());
+        }
+    }
+    Ok(())
 }
 
 pub(crate) const BUILTIN: &[(&str, &str)] = &[
@@ -500,6 +561,7 @@ impl<'a> HarnessFactory<'a> {
                 let text = std::fs::read_to_string(&file)?;
                 let p: Profile = toml::from_str(&text)
                     .with_context(|| format!("profile {} is invalid", file.display()))?;
+                check_user_rules(&p, &file)?;
                 profiles.insert(p.name.clone(), (p, file.display().to_string()));
             }
         }

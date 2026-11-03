@@ -769,6 +769,31 @@ To keep the vendor defaults, set this in `~/.config/paddock/config.toml`. A proj
 telemetry = "vendor"   # default: "off"
 ```
 
+#### The training question in a harness's setup
+
+Some harnesses ask at a new login whether the vendor can use your data for training, with the box already checked. Antigravity (`agy`) asks it on its "Terms of Service & Data Use" screen. The answer goes to your account, so no file can preset it. By default, paddock unchecks that box and presses [Done] for you. It does this only while the harness sets up, before your task starts:
+
+- paddock gives the harness a terminal of its own and reads the visible screen. It acts only when the whole dialog matches a rule of the built-in profile, row for row. It sends one key, reads the screen again, and presses [Done] only when the box shows unchecked.
+- paddock answers only this question. It never answers terms, login, folder trust, billing or tool approvals.
+- A screen that differs from the rule, a resize of your terminal, or a key that you press on the dialog stops paddock. The screen is then yours. Keys on the login and theme screens before the dialog go to the harness as usual.
+- While it waits for the dialog, paddock gives the harness the terminal width of the rule (49 columns for agy). The harness gets the full width back when the dialog is done. A terminal that is narrower gets no help.
+- The audit log (`paddock log`) gets one line with the rule, the keys and the outcome, never the screen text. paddock prints the outcome when the run ends.
+
+Choose the behavior in `~/.config/paddock/config.toml`. A project `paddock.toml` cannot change it.
+
+```toml
+[privacy]
+training = "manual"   # default: "deny"
+```
+
+| Value | What paddock does |
+|---|---|
+| `deny` | It unchecks the training box in the harness's setup. |
+| `manual` | It types nothing. A run without a terminal stops while the harness's setup can still ask, so that you answer it once in a terminal. |
+| `vendor` | It does not touch the question. Use this to opt in. |
+
+paddock skips this when the harness has finished its onboarding (`[state] done_flags`). The rules come only with paddock's built-in profiles. A profile in `harness.d` can name one with `rules = ["agy-1.4-data-use"]` in `[privacy.training]`.
+
 ### The machine identity
 
 A sandbox does not show the identity of your machine to the programs in it. The host name is always `paddock`. What else a program can read depends on the login:
