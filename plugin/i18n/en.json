@@ -314,5 +314,27 @@
   "panel.sumRunning": {
     "one": "%1 running",
     "other": "%1 running"
-  }
+  },
+  "win.row": "Protected windows",
+  "win.title": "Protected windows",
+  "win.count": {
+    "one": "%1 protected window",
+    "other": "%1 protected windows"
+  },
+  "win.intro": "Windows that show a sandbox. The border is sage when traffic goes only through paddock's proxy, and amber for a wider network. Click a window to go to it.",
+  "win.empty": "No protected windows. App, display and terminal windows of sandboxes appear here.",
+  "win.proxy": "through the proxy",
+  "win.wide": "wider network",
+  "win.workspace": "workspace %1",
+  "win.kind.app": "app",
+  "win.kind.display": "display",
+  "win.kind.terminal": "terminal",
+  "msg.noWindow": "That window is gone.",
+  "keys.win": "↵ go to window · Esc back",
+  "keys.winRow": "↵ or P protected windows",
+  "bar.protected": {
+    "one": "%1 protected window",
+    "other": "%1 protected windows"
+  },
+  "badge.open": "Open in the paddock panel"
 }

@@ -4150,8 +4150,9 @@ fn protected_windows(
         .map(windows::Run::from_running)
         .collect();
     if runs.is_empty() {
-        // No run: still read the windows, so --mark can take old borders off.
-        return (vec![], windows::hypr_clients());
+        // No run: read the windows only when --mark has borders to take off.
+        let marked = env.paddock_run().join("window-marks.json").exists();
+        return (vec![], marked.then(windows::hypr_clients).flatten());
     }
     let Some(clients) = windows::hypr_clients() else {
         return (vec![], None);

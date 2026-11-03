@@ -24,6 +24,7 @@ fn both_languages_have_every_string_the_plugin_uses() {
         "plugin/Panel.qml",
         "plugin/Service.qml",
         "plugin/BarWidget.qml",
+        "plugin/Badge.qml",
     ] {
         for k in string_keys(&read(f)) {
             // Keys built at run time ("recent." + outcome) are not literals.
@@ -181,6 +182,7 @@ fn no_qml_root_object_has_two_functions_of_one_name() {
         "plugin/Panel.qml",
         "plugin/Service.qml",
         "plugin/BarWidget.qml",
+        "plugin/Badge.qml",
     ] {
         let mut seen = BTreeSet::new();
         for line in read(file).lines() {
@@ -197,4 +199,78 @@ fn no_qml_root_object_has_two_functions_of_one_name() {
             );
         }
     }
+}
+
+/// The protected windows commands that the plugin runs parse, and the
+/// plugin draws the same level colors as the border (windows.rs).
+#[test]
+fn the_window_commands_of_the_plugin_parse_and_colors_match() {
+    let t = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(t.path().join("bin")).unwrap();
+    // A hyprctl that cannot reach a compositor: no real window changes.
+    let hyprctl = t.path().join("bin/hyprctl");
+    std::fs::write(&hyprctl, "#!/bin/sh\nexit 1\n").unwrap();
+    std::fs::set_permissions(
+        &hyprctl,
+        std::os::unix::fs::PermissionsExt::from_mode(0o755),
+    )
+    .unwrap();
+    let run = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_paddock"))
+            .args(args)
+            .env_clear()
+            .env("HOME", t.path())
+            .env("USER", "demo")
+            .env(
+                "PATH",
+                format!("{}:/usr/bin:/bin", t.path().join("bin").display()),
+            )
+            .env("XDG_RUNTIME_DIR", t.path())
+            .output()
+            .unwrap()
+    };
+    assert!(read("plugin/Service.qml").contains(r#""paddock", "windows", "--mark", "--json""#));
+    assert!(read("plugin/Panel.qml").contains(r#""paddock", "windows", "--json""#));
+    assert!(read("plugin/Panel.qml").contains(r#"["windows", "--focus", w.address]"#));
+    for args in [&["windows", "--mark", "--json"][..], &["windows", "--json"]] {
+        let out = run(args);
+        assert!(out.status.success(), "{args:?}: {out:?}");
+        let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(v["api_version"], "paddock.windows/v1");
+    }
+    let out = run(&["windows", "--focus", "0x1"]);
+    assert!(!out.status.success(), "no protected window 0x1");
+
+    use paddock::windows::Level;
+    for file in ["plugin/Badge.qml", "plugin/Panel.qml"] {
+        let text = read(file);
+        for (level, light) in [
+            (Level::Proxy, false),
+            (Level::Proxy, true),
+            (Level::Wide, false),
+            (Level::Wide, true),
+        ] {
+            let border = level.border(light).0;
+            let hex = &border[4..10];
+            assert!(text.contains(&format!("\"#{hex}\"")), "{file} lacks #{hex}");
+        }
+    }
+}
+
+/// The badge never takes the keyboard, takes the pointer only on the pill,
+/// and puts only a checked sandbox id on the command line.
+#[test]
+fn the_badge_stays_out_of_the_way() {
+    let badge = read("plugin/Badge.qml");
+    assert!(badge.contains("WlrLayershell.keyboardFocus: WlrKeyboardFocus.None"));
+    assert!(badge.contains("mask: Region { item: surface.here ? pill : null }"));
+    assert!(badge.contains("holdTimer"));
+    assert!(badge.contains(r#"if (/^[A-Za-z0-9._-]{1,96}$/.test(id))"#));
+    assert!(badge.contains(r#"["omarchy-shell", "harnessix.paddock", "show", id]"#));
+    let bar = read("plugin/BarWidget.qml");
+    assert!(bar.contains("function show(id: string): void"));
+    assert!(bar.contains("function windows(): void"));
+    let panel = read("plugin/Panel.qml");
+    assert!(panel.contains(r#"if (!/^[A-Za-z0-9._-]{1,96}$/.test(id))"#));
+    assert!(read("plugin/Service.qml").contains("Badge {"));
 }

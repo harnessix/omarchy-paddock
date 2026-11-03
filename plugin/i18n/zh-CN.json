@@ -287,5 +287,25 @@
   },
   "panel.sumRunning": {
     "other": "%1 个运行中"
-  }
+  },
+  "win.row": "受保护的窗口",
+  "win.title": "受保护的窗口",
+  "win.count": {
+    "other": "%1 个受保护的窗口"
+  },
+  "win.intro": "显示沙箱的窗口。流量只经过 paddock 代理时边框为灰绿色，网络更宽时为琥珀色。点击窗口即可跳转。",
+  "win.empty": "没有受保护的窗口。沙箱的应用、显示和终端窗口会显示在这里。",
+  "win.proxy": "经过代理",
+  "win.wide": "更宽的网络",
+  "win.workspace": "工作区 %1",
+  "win.kind.app": "应用",
+  "win.kind.display": "显示",
+  "win.kind.terminal": "终端",
+  "msg.noWindow": "这个窗口已经关闭。",
+  "keys.win": "↵ 跳转到窗口 · Esc 返回",
+  "keys.winRow": "↵ 或 P 查看受保护的窗口",
+  "bar.protected": {
+    "other": "%1 个受保护的窗口"
+  },
+  "badge.open": "在 paddock 面板中打开"
 }

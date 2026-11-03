@@ -74,12 +74,20 @@ Panel {
   readonly property bool worktreesVisible: worktrees.length > 0
   readonly property int worktreesUnmerged: worktrees.filter(function(w) { return w.unmerged !== 0 }).length
   property var harnesses: []
+  // Protected windows, from `paddock windows --json`: app windows, window
+  // mode displays and the terminal windows of runs.
+  property var protectedWindows: []
+  property bool lightTheme: false
+  readonly property int protectedCount: protectedWindows.length
+  readonly property bool windowsVisible: protectedWindows.length > 0
+  // A sandbox to select after the next read of paddock ps (IPC show).
+  property string pendingSelect: ""
   // "ok", "missing" (paddock is not on PATH), or "error"
   property string pluginState: "ok"
   property bool loaded: false
 
   // View and cursor.
-  property string view: "list"          // list | project | harness | kv | keys | key | worktrees
+  property string view: "list"          // list | project | harness | kv | keys | key | worktrees | windows
   property int selectedIndex: 0
   property int actionIndex: -1           // -1: the row itself; 0..n: a row action
   property bool cursorActive: false
@@ -193,7 +201,8 @@ Panel {
     if (view === "keys") return kvRows.length
     if (view === "key") return 0
     if (view === "worktrees") return worktrees.length
-    return approvals.length + sandboxes.length + artifacts.length + (kvVisible ? 1 : 0) + (worktreesVisible ? 1 : 0)
+    if (view === "windows") return protectedWindows.length
+    return approvals.length + sandboxes.length + artifacts.length + (kvVisible ? 1 : 0) + (worktreesVisible ? 1 : 0) + (windowsVisible ? 1 : 0)
   }
 
   // In the list view, approvals come first, then sandboxes, in one cursor order.
@@ -202,9 +211,13 @@ Panel {
   // File rows follow the sandboxes.
   function isArtifactRow(i) { return view === "list" && artifacts.length > 0 && i >= approvals.length + sandboxes.length && i < approvals.length + sandboxes.length + artifacts.length }
   // The shared data row comes last.
-  function isKvRow(i) { return view === "list" && kvVisible && i === approvals.length + sandboxes.length + artifacts.length }
+  // The protected windows row comes right after the files, then shared data.
+  function windowsRowIndex() { return approvals.length + sandboxes.length + artifacts.length }
+  function isWindowsRow(i) { return view === "list" && windowsVisible && i === windowsRowIndex() }
+  function kvRowIndex() { return windowsRowIndex() + (windowsVisible ? 1 : 0) }
+  function isKvRow(i) { return view === "list" && kvVisible && i === kvRowIndex() }
   // The worktrees row follows it.
-  function worktreesRowIndex() { return approvals.length + sandboxes.length + artifacts.length + (kvVisible ? 1 : 0) }
+  function worktreesRowIndex() { return kvRowIndex() + (kvVisible ? 1 : 0) }
   function isWorktreesRow(i) { return view === "list" && worktreesVisible && i === worktreesRowIndex() }
   function artifactAt(i) { return artifacts[i - approvals.length - sandboxes.length] }
   function dirName(path) {
@@ -317,6 +330,7 @@ Panel {
 
   function refresh() {
     if (!psProc.running) { psProc.buffer = ""; psProc.running = true }
+    if (!windowsProc.running) { windowsProc.buffer = ""; windowsProc.running = true }
     refreshFiles()
     refreshKv()
   }
@@ -566,6 +580,7 @@ Panel {
     if (view === "keys") { view = "kv"; kvKeys = []; kvTarget = null; selectedIndex = 0; return true }
     if (view === "kv") { view = "list"; selectedIndex = 0; return true }
     if (view === "worktrees") { view = "list"; selectedIndex = 0; actionIndex = -1; return true }
+    if (view === "windows") { view = "list"; selectedIndex = 0; actionIndex = -1; return true }
     if (view === "harness") { view = "project"; selectedIndex = 0; return true }
     if (view === "project") { view = "list"; selectedIndex = 0; return true }
     return false
@@ -738,6 +753,49 @@ Panel {
     root.confirmId = ""
     refreshWorktrees(true)
   }
+  // Protected windows. The border color tells the network level: sage when
+  // traffic goes only through the proxy, amber for a wider network. Light
+  // themes get deeper tones, as the border does (windows.rs).
+  function levelColor(level) {
+    if (level === "proxy") return root.lightTheme ? "#4f7a55" : "#9fb8a0"
+    return root.lightTheme ? "#a8701a" : "#e0a33a"
+  }
+  function openWindows() {
+    root.view = "windows"
+    root.selectedIndex = 0
+    root.actionIndex = -1
+    root.confirmId = ""
+    refresh()
+  }
+  function windowCaption(w) {
+    return w.label + " · " + w.network + " · " + root.span(Date.now() / 1000 - w.started)
+      + " · " + strings.t("win.kind." + w.kind)
+  }
+  function focusWindow(w) {
+    runPaddock(["windows", "--focus", w.address], function(code) {
+      if (code === 0) root.close()
+      else root.say(strings.t("msg.noWindow"))
+    })
+  }
+  // IPC show: open the panel at one sandbox (a click on a window badge).
+  function showSandbox(id) {
+    if (!/^[A-Za-z0-9._-]{1,96}$/.test(id)) { open(""); return }
+    open("")
+    root.pendingSelect = id
+    selectPending()
+  }
+  function selectPending() {
+    if (root.pendingSelect === "") return
+    for (var i = 0; i < root.sandboxes.length; i++) {
+      if (root.sandboxes[i].id === root.pendingSelect) {
+        root.cursorActive = true
+        root.selectedIndex = root.approvals.length + i
+        root.actionIndex = -1
+        root.pendingSelect = ""
+        return
+      }
+    }
+  }
   function wtSafePath(p) { return typeof p === "string" && p.charAt(0) === "/" && p.length <= 1024 && !/[\u0000-\u001f\u007f]/.test(p) }
   function wtCaption(w) {
     var parts = [w.branch !== "" ? w.branch : strings.t("wt.noBranch")]
@@ -811,7 +869,7 @@ Panel {
     }
     if (view !== "list" || rowCount() === 0) return
     root.cursorActive = true
-    if (isApprovalRow(selectedIndex) || isKvRow(selectedIndex) || isWorktreesRow(selectedIndex)) return
+    if (isApprovalRow(selectedIndex) || isKvRow(selectedIndex) || isWorktreesRow(selectedIndex) || isWindowsRow(selectedIndex)) return
     var n = isArtifactRow(selectedIndex) ? 2 : actionsFor(sandboxAt(selectedIndex)).length
     root.actionIndex = Math.max(-1, Math.min(n - 1, root.actionIndex + dx))
   }
@@ -839,9 +897,15 @@ Panel {
       if (w) wtAction(w, actionIndex)
       return
     }
+    if (view === "windows") {
+      var pw = protectedWindows[selectedIndex]
+      if (pw) focusWindow(pw)
+      return
+    }
     if (isApprovalRow(selectedIndex)) { answerOnCard(); return }
     if (isKvRow(selectedIndex)) { openKv(); return }
     if (isWorktreesRow(selectedIndex)) { openWorktrees(); return }
+    if (isWindowsRow(selectedIndex)) { openWindows(); return }
     if (isArtifactRow(selectedIndex)) {
       var f = artifactAt(selectedIndex)
       if (actionIndex === 1) revealFile(f); else recoverFile(f)
@@ -1002,6 +1066,7 @@ Panel {
         root.pluginState = "ok"
         root.lastWarning = ""
         if (root.view === "list" && root.selectedIndex >= clean.length) root.selectedIndex = Math.max(0, clean.length - 1)
+        root.selectPending()
       } catch (e) {
         root.warnOnce("cannot read paddock ps --json (exit " + exitCode + "), showing an error: " + e)
         root.pluginState = "error"
@@ -1232,6 +1297,44 @@ Panel {
       } catch (e) {
         root.debugLog("cannot read paddock kv overview: " + e)
         root.kvScopes = []
+      }
+    }
+  }
+
+  JsonProc {
+    id: windowsProc
+    command: ["sh", "-c", root.launcher, "paddock", "windows", "--json"]
+    onExited: function(exitCode) {
+      // An older paddock, or no Hyprland: no protected windows to show.
+      if (exitCode !== 0) { root.protectedWindows = []; return }
+      try {
+        var p = JSON.parse(buffer)
+        if (!p || p.api_version !== "paddock.windows/v1") throw "version"
+        root.lightTheme = p.theme === "light"
+        var raw = Array.isArray(p.windows) ? p.windows.slice(0, 64) : []
+        var clean = []
+        for (var i = 0; i < raw.length; i++) {
+          var w = raw[i] || {}
+          var address = String(w.address || "")
+          if (!/^0x[0-9a-fA-F]{1,16}$/.test(address)) continue
+          clean.push({
+            sandbox: root.plain(w.sandbox, 64),
+            harness: root.plain(w.harness || w.app, 24),
+            label: root.plain(w.label || w.harness || w.app, 32),
+            kind: ["app", "display", "terminal"].indexOf(w.kind) >= 0 ? w.kind : "app",
+            address: address,
+            network: root.plain(w.network || "", 12),
+            level: w.level === "proxy" ? "proxy" : "wide",
+            started: Number(w.started || 0),
+            title: root.plain(w.title || w["class"] || "", 120),
+            workspace: root.plain(w.workspace || "", 32)
+          })
+        }
+        root.protectedWindows = clean
+        if (root.view === "windows" && root.selectedIndex >= clean.length) root.selectedIndex = Math.max(0, clean.length - 1)
+      } catch (e) {
+        root.debugLog("cannot read paddock windows: " + e)
+        root.protectedWindows = []
       }
     }
   }
@@ -1477,7 +1580,7 @@ Panel {
           return
         }
         if (root.view !== "list" || root.rowCount() === 0) return
-        if (root.isKvRow(root.selectedIndex) || root.isWorktreesRow(root.selectedIndex)) return
+        if (root.isKvRow(root.selectedIndex) || root.isWorktreesRow(root.selectedIndex) || root.isWindowsRow(root.selectedIndex)) return
         if (root.isApprovalRow(root.selectedIndex)) root.answer(root.approvals[root.selectedIndex], "deny")
         else if (root.isArtifactRow(root.selectedIndex)) return
         else root.stop(root.sandboxAt(root.selectedIndex))
@@ -1487,6 +1590,7 @@ Panel {
         else if (text === "r" || text === "R") root.refresh()
         else if (root.view === "list" && root.kvVisible && (text === "k" || text === "K")) root.openKv()
         else if (root.view === "list" && root.worktreesVisible && (text === "w" || text === "W")) root.openWorktrees()
+        else if (root.view === "list" && root.windowsVisible && (text === "p" || text === "P")) root.openWindows()
         else if (root.view === "key" && (text === "c" || text === "C")) root.kvCopy()
       }
 
@@ -1506,11 +1610,12 @@ Panel {
             width: parent.width
             foreground: root.fg
             fontFamily: root.fontFamily
-            iconComponent: Component { PlainText { text: "󱞚"; font.pixelSize: Style.font.display } }
+            iconComponent: Component { PlainText { text: root.view === "windows" ? "󰕥" : "󱞚"; font.pixelSize: Style.font.display } }
             title: root.view === "project" ? strings.t("new.chooseProject")
               : root.view === "harness" ? strings.t("new.chooseHarness")
               : root.view === "kv" ? strings.t("kv.title")
               : root.view === "worktrees" ? strings.t("wt.title")
+              : root.view === "windows" ? strings.t("win.title")
               : root.view === "keys" ? root.kvScopeTitle(root.kvTarget)
               : root.view === "key" && root.kvEntry ? root.kvEntry.key
               : strings.t("panel.title")
@@ -1518,6 +1623,7 @@ Panel {
               if (root.view === "project") return strings.t("new.stepProject")
               if (root.view === "harness") return strings.t("new.stepHarness")
               if (root.view === "worktrees") return root.worktreesCaption()
+              if (root.view === "windows") return strings.tn("win.count", root.protectedCount).arg(Commons.I18n.formatNumber(root.protectedCount))
               if (root.view === "kv")
                 return (root.kvPastureCount > 0 ? strings.tn("kv.rowPastures", root.kvPastureCount).arg(Commons.I18n.formatNumber(root.kvPastureCount)) + " · " : "")
                   + strings.tn("kv.keys", root.kvKeyTotal).arg(Commons.I18n.formatNumber(root.kvKeyTotal))
@@ -1838,13 +1944,28 @@ Panel {
             }
           }
 
+          // Protected windows: one row that opens their list.
+          Column {
+            width: parent.width
+            spacing: Style.space(2)
+            visible: root.view === "list" && root.windowsVisible
+            ListRow {
+              rowIndex: root.windowsRowIndex()
+              glyph: "󰕥"
+              glyphColor: root.protectedWindows.some(function(w) { return w.level !== "proxy" }) ? root.levelColor("wide") : root.levelColor("proxy")
+              title: strings.t("win.row")
+              caption: strings.tn("win.count", root.protectedCount).arg(Commons.I18n.formatNumber(root.protectedCount))
+              onActivated: root.openWindows()
+            }
+          }
+
           // Shared data in paddock kv: one row that opens the kv view.
           Column {
             width: parent.width
             spacing: Style.space(2)
             visible: root.view === "list" && root.kvVisible
             ListRow {
-              rowIndex: root.approvals.length + root.sandboxes.length + root.artifacts.length
+              rowIndex: root.kvRowIndex()
               glyph: "󰆼"
               title: strings.t("kv.row")
               caption: (root.kvPastureCount > 0 ? strings.tn("kv.rowPastures", root.kvPastureCount).arg(Commons.I18n.formatNumber(root.kvPastureCount)) + " · " : "")
@@ -1913,6 +2034,37 @@ Panel {
                   iconText: "󰉋"; tooltipText: strings.t("wt.open")
                   onClicked: root.wtOpen(modelData)
                 }
+              }
+            }
+          }
+
+          // The protected windows view: a click focuses the window.
+          Column {
+            width: parent.width
+            spacing: Style.space(2)
+            visible: root.view === "windows"
+            PlainText {
+              width: parent.width
+              wrapMode: Text.WordWrap
+              color: root.dim
+              font.pixelSize: Style.font.caption
+              bottomPadding: Style.space(6)
+              text: root.protectedWindows.length === 0 ? strings.t("win.empty") : strings.t("win.intro")
+            }
+            Repeater {
+              model: root.view === "windows" ? root.protectedWindows : []
+              delegate: ListRow {
+                required property var modelData
+                required property int index
+                rowIndex: index
+                glyph: modelData.kind === "terminal" ? "󰆍" : modelData.kind === "display" ? "󰍹" : "󰣆"
+                glyphColor: root.levelColor(modelData.level)
+                title: modelData.title !== "" ? modelData.title : modelData.harness
+                caption: root.windowCaption(modelData)
+                caption2: (modelData.level === "proxy" ? strings.t("win.proxy") : strings.t("win.wide"))
+                  + (modelData.workspace !== "" ? " · " + strings.t("win.workspace").arg(modelData.workspace) : "")
+                caption2Color: root.levelColor(modelData.level)
+                onActivated: root.focusWindow(modelData)
               }
             }
           }
@@ -2156,6 +2308,7 @@ Panel {
               wrapMode: Text.WordWrap
               text: root.view === "kv" ? strings.t("keys.kv")
                 : root.view === "worktrees" ? strings.t("keys.wt")
+                : root.view === "windows" ? strings.t("keys.win")
                 : root.view === "keys" ? strings.t("keys.kvKeys")
                 : root.view === "key" ? strings.t("keys.kvKey")
                 : root.view !== "list" ? strings.t("keys.new")
@@ -2163,6 +2316,7 @@ Panel {
                 : root.isArtifactRow(root.selectedIndex) && root.artifacts.length > 0 ? strings.t("keys.files")
                 : root.isKvRow(root.selectedIndex) ? strings.t("keys.kvRow")
                 : root.isWorktreesRow(root.selectedIndex) ? strings.t("keys.wtRow")
+                : root.isWindowsRow(root.selectedIndex) ? strings.t("keys.winRow")
                 : strings.t("keys.list")
             }
             Button {

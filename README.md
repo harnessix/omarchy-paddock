@@ -1462,7 +1462,26 @@ unprotected_workspaces = true
 
 This works only in `~/.config/paddock/config.toml`, never in a project's `paddock.toml`. paddock then prints a warning with the files on every start, `paddock app list` shows the setting, and the bar panel marks the running app.
 
-Windows of app sandboxes get a sage green border, so you can tell a protected app at a glance. paddock sets the border on each window at run time (Hyprland), and your Hyprland configuration does not change. App sandboxes appear in the bar panel with the other sandboxes. Enter on one focuses its window.
+Windows of app sandboxes get a colored border, so you can tell a protected app at a glance. "Protected windows" below describes the border. App sandboxes appear in the bar panel with the other sandboxes. Enter on one focuses its window.
+
+### Protected windows
+
+On Omarchy (Hyprland), each window that shows a sandbox gets a border, always: an app sandbox window, the display of window mode, and the terminal window of a terminal run. A terminal window counts when its terminal emulator holds the terminal of the run. A run in tmux, a detached run and a spawned child have no window of their own and get no border.
+
+- Sage green: the sandbox reaches the network only through paddock's proxy, or not at all (network modes `none`, `api` and `egress`).
+- Amber: the sandbox has a wider network (`host` and `allowlist`).
+
+paddock sets the border on each window at run time, and your Hyprland configuration does not change. After a run ends, its terminal window gets its own border back. On a light Omarchy theme, both colors take a deeper tone.
+
+When a protected window gets focus, a small badge shows on its top edge for a few seconds, for example `paddock · dev · egress · 2h`: the pasture or the harness, the network mode, and the run time. The badge stays while the pointer is on it. A click opens that sandbox in the bar panel. The badge never takes the keyboard, and only the badge itself takes the pointer.
+
+The bar widget shows a shield with the number of protected windows. The "Protected windows" row of the panel lists them, and a click on one focuses it. Bind a key to `omarchy-shell harnessix.paddock windows` to open the list directly.
+
+```sh
+paddock windows                  # the protected windows
+paddock windows --json           # with level, badge text and geometry
+paddock windows --focus 0x55d0   # focus one protected window
+```
 
 Known limits:
 
