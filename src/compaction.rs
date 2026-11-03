@@ -246,8 +246,8 @@ pub fn record_value(f: &Facts, time: u64) -> String {
 /// - Grok Build discards the output of its compaction hooks and of an
 ///   allowing UserPromptSubmit hook. PostCompact marks the compaction, and
 ///   the next PostToolUse hook adds the note (`Mark`, then `Deliver`).
-/// - agy has no compaction hook. A compaction adds a CHECKPOINT step to the
-///   transcript, and a PreInvocation hook looks for a new one (`Scan`).
+/// - agy has hooks but no compaction event. Compaction adds a CHECKPOINT
+///   step to the transcript. PreInvocation scans for a new one (`Scan`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
     /// A compaction: record it and print the note for `event`.

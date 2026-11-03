@@ -465,6 +465,7 @@ fn a_run_changes_only_its_snapshot_and_the_run_folder_goes() {
     let b = built(&env, t.path(), fake_profile()).unwrap();
     let dir = b.spec.shadow.as_ref().unwrap().dir.clone();
     let proj = b.spec.project.clone();
+    let _server = crate::view::tests::Server(crate::view::Tmux::find(&env));
     let out = crate::run::run(&env, b, &FakeOverlay, true, true).unwrap();
     assert_eq!(out.code, 0);
     // The credential delivery put the login into the upper folder.
