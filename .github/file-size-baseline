@@ -2,10 +2,6 @@
 1745 src/app.rs
 894 src/backend/docker.rs
 1137 src/borrow.rs
-2574 src/broker.rs
-1790 src/broker/forge.rs
-1107 src/broker/git.rs
-1450 src/broker/tests.rs
 1693 src/build.rs
 1397 src/credentials.rs
 993 src/credentials/gateway.rs
