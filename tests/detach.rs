@@ -346,6 +346,8 @@ fn wait_and_stop_take_the_short_id() {
     }
     let w = World::new(true);
     let id = w.detach("hang");
+    // The sandbox shows in ps once it runs.
+    w.result();
     let short = paddock::ids::short(&id);
     assert_eq!(w.sandbox(&id)["short"], short);
     let (code, _) = w.wait(&short[..4], "2s");
