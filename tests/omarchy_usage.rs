@@ -429,7 +429,7 @@ fn forage_refreshes_at_most_once_in_five_minutes_and_keeps_a_ledger() {
         r#"#!/bin/sh
 mkdir -p "$HOME/.local/state/omarchy/agents"
 printf '%s\n' "$*" >> "$HOME/.local/state/omarchy/agents/real.log"
-n=$(wc -l < "$HOME/.local/state/omarchy/agents/real.log")
+n=$(wc -l < "$HOME/.local/state/omarchy/agents/real.log" | tr -d ' ')
 mkdir -p "$HOME/.local/state/omarchy/agents/usage"
 printf '{"id":"grok","limitsFetchedAt":%s000,"limitsStale":false,"limits":[{"label":"Weekly","percent":0.%s,"resetsAt":"2099-01-01T00:00:00+00:00"}]}\n' "$(date +%s)" "$n" > "$HOME/.local/state/omarchy/agents/usage/grok.json"
 "#,

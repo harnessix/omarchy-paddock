@@ -847,6 +847,7 @@ mod tests {
         assert!(!valid_address("0x12\"; rm"));
     }
 
+    #[cfg(target_os = "linux")] // the pty index and /proc are Linux only
     #[test]
     fn finds_the_holder_of_a_pty() {
         // SAFETY: plain libc calls on a new pty master that this test owns.
@@ -860,8 +861,7 @@ mod tests {
             (fd, n)
         };
         let found = pty_holders(&[index.1].into());
-        // SAFETY: the fd from above.
-        unsafe { libc::close(index.0) };
+        unsafe { libc::close(index.0) }; // SAFETY: the fd from above.
         assert_eq!(found.get(&index.1), Some(&std::process::id()));
         assert!(pty_holders(&HashSet::new()).is_empty());
     }

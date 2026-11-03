@@ -32,6 +32,9 @@ pub(in crate::broker::tests) fn setup(
     let home = tmp.path().join("home");
     let project = tmp.path().join("work/app");
     std::fs::create_dir_all(&project).unwrap();
+    // The child runs /bin/pwd. That is getcwd, the canonical path.
+    // On macOS /var is /private/var. On Linux this is the same path.
+    let project = std::fs::canonicalize(&project).unwrap();
     let mut vars = BTreeMap::new();
     vars.insert("PATH".into(), std::env::var("PATH").unwrap_or_default());
     let env = HostEnv::from_parts(home, "tester".into(), 1000, 1000, vars);

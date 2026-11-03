@@ -252,7 +252,11 @@ fn a_tool_runs_allowed_shapes_with_a_clean_environment() {
     let out = r.result["stdout"].as_str().unwrap();
     assert!(out.contains("args:compose up -d\n"), "{out}");
     assert!(
-        out.contains(&format!("pwd:{}\n", b.ctx.project.display())),
+        // The tool prints the physical path (macOS: /var is /private/var).
+        out.contains(&format!(
+            "pwd:{}\n",
+            b.ctx.project.canonicalize().unwrap().display()
+        )),
         "{out}"
     );
     assert!(!out.contains(SECRET), "{out}");
@@ -277,10 +281,10 @@ fn a_tool_runs_allowed_shapes_with_a_clean_environment() {
         .unwrap()
         .contains("args:compose logs web\n"));
     let r = b.handle(&tool("home", &[]));
-    assert!(r.result["stdout"]
-        .as_str()
-        .unwrap()
-        .contains(&format!("pwd:{}\n", b.env.home.display())));
+    assert!(r.result["stdout"].as_str().unwrap().contains(&format!(
+        "pwd:{}\n",
+        b.env.home.canonicalize().unwrap().display()
+    )));
 
     let lines = audit_lines(&b);
     assert_eq!(lines[0]["capability"], "tool");

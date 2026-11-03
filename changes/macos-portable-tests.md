@@ -1,0 +1,1 @@
+- Changed: the code builds and the tests run on macOS too. The two pty holder tests read `/proc`, so they run on Linux only. `.github/scripts/file-size.sh` runs on bash 3.

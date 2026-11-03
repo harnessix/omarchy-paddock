@@ -190,7 +190,9 @@ pub fn take_controlling_tty() -> io::Result<()> {
         if libc::setsid() < 0 {
             return Err(io::Error::last_os_error());
         }
-        if libc::ioctl(0, libc::TIOCSCTTY, 0) < 0 {
+        // The request type differs between Linux and macOS.
+        #[allow(clippy::useless_conversion)]
+        if libc::ioctl(0, libc::TIOCSCTTY as _, 0) < 0 {
             return Err(io::Error::last_os_error());
         }
     }
@@ -700,6 +702,7 @@ mod tests {
         assert!(terminal_watched(Some(&[]), Some(&tmux), &chain));
     }
 
+    #[cfg(target_os = "linux")] // the pty index and /proc are Linux only
     #[test]
     fn the_holder_of_a_real_pty_is_found() {
         let (master, slave) = super::open_pty().unwrap();
@@ -714,10 +717,7 @@ mod tests {
         let holder = super::pty_master_holder(index).expect("holder");
         assert_eq!(holder.pid, std::process::id());
         // SAFETY: closing the two descriptors this test opened.
-        unsafe {
-            libc::close(master);
-            libc::close(slave);
-        }
+        unsafe { (libc::close(master), libc::close(slave)) };
     }
 
     #[test]
