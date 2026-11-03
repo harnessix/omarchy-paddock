@@ -60,3 +60,14 @@ url = "https://qwenlm.github.io/qwen-code-docs/en/users/configuration/auth/"
 [oneshot]
 args = ["--yolo", "-p", "Do the task that the text above describes."]
 prompt = "stdin"
+
+# After a context compaction, Qwen Code runs the SessionStart hooks with the
+# source "compact" (the matcher selects it), and the hook's
+# hookSpecificOutput.additionalContext reaches the context. User hooks load
+# without a folder trust step.
+# https://github.com/QwenLM/qwen-code/blob/main/docs/users/features/hooks.md
+[[compaction.settings]]
+file = ".qwen/settings.json"
+path = ["hooks", "SessionStart"]
+append = true
+value = { matcher = "compact", hooks = [{ type = "command", name = "paddock-compacted", command = "paddock-host compacted --harness qwen" }] }

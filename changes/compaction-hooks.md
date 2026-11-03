@@ -1,0 +1,3 @@
+- New: After a context compaction, Claude Code and Qwen Code get a short note from paddock with the sandbox, role, parent, pasture and task file of the run. A hook in the settings file of the sandbox home runs `paddock-host compacted`. The host settings are never changed.
+- New: Each compaction is recorded: `compacted:SPAWN-ID` in the `tree` scope for a spawn child, `compacted:RUN-ID` in `pasture` for a pasture member, one audit line, and `compactions` in `paddock ps --json`. `[compaction]` in the user configuration turns it off (`enabled`), adds a text (`note`) or a desktop notification (`notify`).
+- Changed: A spawn child that reads its prompt on stdin also gets it as `.paddock-spawn/ID/prompt.md` in its home, so it can read the task again.

@@ -54,6 +54,7 @@
 pub mod escape;
 pub mod host;
 pub mod principal;
+mod served;
 pub mod shard;
 pub mod store;
 
@@ -61,6 +62,7 @@ use crate::broker::{Answer, Approver, Mode, Pending};
 use crate::env::HostEnv;
 use anyhow::{Context as _, Result};
 use serde::{Deserialize, Serialize};
+pub use served::Served;
 use shard::Ns;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::fd::AsRawFd;
@@ -1842,43 +1844,6 @@ pub fn pasture_ns(id: &Identity) -> Ns {
     }
 }
 
-/// A running service. `finish` records the end of the run in the store.
-pub struct Served {
-    root: PathBuf,
-    sandbox: String,
-    monitor: Option<crate::monitor::Watch>,
-}
-
-impl Served {
-    /// Start the credential check of the sandbox home (its host path), with
-    /// the login files of the harness profile (`state.auth`).
-    pub fn watch_credentials(&self, home: PathBuf, login: Vec<String>) {
-        if let Some(m) = &self.monitor {
-            m.credentials(home, login);
-        }
-    }
-
-    pub fn finish(self) {
-        if let Some(m) = &self.monitor {
-            m.finish();
-        }
-        // A sandbox that ends while it is frozen: its kept leases expire
-        // again, with the time that they had left.
-        if let Err(e) = resume_leases(&self.root, &self.sandbox, crate::state::now()) {
-            log::debug!("cannot resume the leases of {}: {e:#}", self.sandbox);
-        }
-        if let Err(e) = Store::open(&shard::registry(&self.root))
-            .and_then(|s| s.finish(&self.sandbox, crate::state::now()))
-        {
-            log::debug!(
-                "cannot record the end of {} in the kv store: {e:#}",
-                self.sandbox
-            );
-        }
-    }
-}
-
-/// Serve requests on `socket` until the process exits.
 pub fn serve(socket: &Path, svc: Service) -> Result<Served> {
     shard::check_id(&svc.id.sandbox)?;
     let st = svc.registry()?;
@@ -1897,12 +1862,13 @@ pub fn serve(socket: &Path, svc: Service) -> Result<Served> {
     }
     let listener = UnixListener::bind(socket)
         .with_context(|| format!("cannot listen on {}", socket.display()))?;
+    let svc = Arc::new(svc);
     let served = Served {
         root: svc.root.clone(),
         sandbox: svc.id.sandbox.clone(),
         monitor: None,
+        svc: svc.clone(),
     };
-    let svc = Arc::new(svc);
     std::thread::spawn(move || {
         for conn in listener.incoming().flatten() {
             if svc.connections.fetch_add(1, Ordering::SeqCst) >= MAX_CONNECTIONS {

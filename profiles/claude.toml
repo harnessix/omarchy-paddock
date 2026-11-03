@@ -106,3 +106,14 @@ yolo_only = true
 file = ".claude.json"
 path = ["projects", "{project}", "hasTrustDialogAccepted"]
 value = true
+
+# After a context compaction, Claude Code runs the SessionStart hooks with
+# the source "compact" (the matcher selects it). The hook prints JSON, and
+# hookSpecificOutput.additionalContext reaches the context. Hooks in
+# ~/.claude/settings.json need no trust step beyond the project trust above.
+# https://code.claude.com/docs/en/hooks
+[[compaction.settings]]
+file = ".claude/settings.json"
+path = ["hooks", "SessionStart"]
+append = true
+value = { matcher = "compact", hooks = [{ type = "command", command = "paddock-host compacted --harness claude", timeout = 20 }] }
