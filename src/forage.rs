@@ -84,25 +84,15 @@ fn safe_agent(a: &str) -> bool {
 }
 
 /// An ISO 8601 time with an offset (`2026-11-08T03:54:00+00:00`, `...Z`).
+/// keeper's parser applies the offset. This one also refuses a time with
+/// anything else after the seconds.
 pub fn parse_time(s: &str) -> Option<u64> {
-    let base = crate::keeper::parse_rfc3339_utc(s)?;
     let rest = s.get(19..)?;
     let rest = rest.trim_start_matches(|c: char| c == '.' || c.is_ascii_digit());
-    let offset: i64 = match rest.as_bytes().first() {
-        None | Some(b'Z') | Some(b'z') => 0,
-        Some(&sign) if sign == b'+' || sign == b'-' => {
-            let h: i64 = rest.get(1..3)?.parse().ok()?;
-            let m: i64 = rest.get(4..6).and_then(|m| m.parse().ok()).unwrap_or(0);
-            let o = h * 3600 + m * 60;
-            if sign == b'+' {
-                o
-            } else {
-                -o
-            }
-        }
-        _ => return None,
-    };
-    u64::try_from(base as i64 - offset).ok()
+    match rest.as_bytes().first() {
+        None | Some(b'Z' | b'z' | b'+' | b'-') => crate::keeper::parse_rfc3339_utc(s),
+        _ => None,
+    }
 }
 
 /// The record of one agent: its fetch time, whether it is stale, and its
