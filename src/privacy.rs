@@ -117,6 +117,7 @@ pub fn push_settings(
             value,
             origin: origin.to_string(),
             append: s.append,
+            codex_trust: None,
         });
     }
     Ok(())
@@ -159,6 +160,14 @@ pub fn write_settings(home_src: &Path, settings: &[HomeSetting]) -> Result<Vec<S
                 "telemetry stays at the vendor default in ~/{}: {e:#}",
                 rel.display()
             )),
+        }
+    }
+    for s in settings.iter().filter(|s| s.codex_trust.is_some()) {
+        if let Err(e) = crate::compaction::codex::trust(&home, s) {
+            warnings.push(format!(
+                "Codex skips paddock's hook in ~/{}: {e:#}",
+                s.file.display()
+            ));
         }
     }
     Ok(warnings)
@@ -220,7 +229,7 @@ fn toml_value(v: &serde_json::Value) -> Result<toml_edit::Value> {
     })
 }
 
-fn set_toml(text: &str, entries: &[&HomeSetting]) -> Result<String> {
+pub(crate) fn set_toml(text: &str, entries: &[&HomeSetting]) -> Result<String> {
     let mut doc: toml_edit::DocumentMut = text.parse().context("the file is not valid TOML")?;
     for e in entries {
         let Some((last, parents)) = e.path.split_last() else {
@@ -330,6 +339,7 @@ mod tests {
             value,
             origin: "test".into(),
             append: false,
+            codex_trust: None,
         }
     }
 

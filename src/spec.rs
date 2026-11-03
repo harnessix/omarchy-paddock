@@ -158,6 +158,19 @@ pub struct HomeSetting {
     /// Add the value to the array at `path` (profile.rs `Setting::append`).
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub append: bool,
+    /// Trust the hook that this value adds, in Codex's `config.toml`
+    /// (compaction/codex.rs).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub codex_trust: Option<CodexTrust>,
+}
+
+/// Where Codex keeps the trust of a hook that paddock adds.
+#[derive(Debug, Clone, Serialize)]
+pub struct CodexTrust {
+    /// Codex's `config.toml`, relative to the sandbox home.
+    pub config: PathBuf,
+    /// The hooks file as Codex names it: its absolute path in the sandbox.
+    pub source: String,
 }
 
 #[derive(Debug, Clone, Serialize)]

@@ -5,9 +5,10 @@
 //! when paddock cannot answer, it prints nothing and exits 0.
 
 use crate::broker::{Request, Status, PROTOCOL};
-use crate::compaction::{self, Facts};
+use crate::compaction::{self, Action, Facts};
 use std::collections::BTreeMap;
 use std::io::Read;
+use std::path::{Path, PathBuf};
 
 pub const HELP: &str = r#"paddock-host compacted --harness NAME: the hook after a context compaction.
 
@@ -40,10 +41,86 @@ pub fn main(args: &[String]) -> i32 {
     let mut raw = String::new();
     let _ = std::io::stdin().take(MAX_INPUT).read_to_string(&mut raw);
     let input: serde_json::Value = serde_json::from_str(raw.trim()).unwrap_or_default();
-    let Some(event) = compaction::hook_event(&harness, &input) else {
-        // Not a compaction: a hook that also fires on other events.
-        return 0;
-    };
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_default();
+    if let Some(out) = run(&harness, &input, &home, &mut |event| ask(&harness, event)) {
+        println!("{out}");
+    }
+    0
+}
+
+/// Do what the hook input asks, with `record` for the broker. Returns the
+/// text to print. Every failure is silent: a hook never fails.
+pub fn run(
+    harness: &str,
+    input: &serde_json::Value,
+    home: &Path,
+    record: &mut dyn FnMut(&str) -> Option<Facts>,
+) -> Option<String> {
+    let dir = compaction::state_dir(home);
+    match compaction::action(harness, input)? {
+        Action::Direct { event } => {
+            let f = record(&event)?;
+            compaction::render(harness, &event, &compaction::note(&f))
+        }
+        Action::Mark { session } => {
+            // The harness discards this output: keep the note for the next
+            // event that can carry it.
+            let f = record("PostCompact")?;
+            let file = dir.join(compaction::file_name("note", &session));
+            if let Err(e) =
+                crate::privfs::dir(&dir).and_then(|_| std::fs::write(&file, compaction::note(&f)))
+            {
+                log::debug!("cannot keep the compaction note: {e:#}");
+            }
+            None
+        }
+        Action::Deliver { session, event } => {
+            let file = dir.join(compaction::file_name("note", &session));
+            let note = std::fs::read_to_string(&file).ok()?;
+            let _ = std::fs::remove_file(&file);
+            compaction::render(harness, &event, &note)
+        }
+        Action::Scan {
+            conversation,
+            transcript,
+            event,
+        } => {
+            let path = match transcript.strip_prefix("~/") {
+                Some(rest) => home.join(rest),
+                None => PathBuf::from(&transcript),
+            };
+            let name = path.file_name()?.to_str()?;
+            if !matches!(name, "transcript.jsonl" | "transcript_full.jsonl") {
+                return None;
+            }
+            let src = std::fs::File::open(compaction::transcript_file(&path)).ok()?;
+            let now = compaction::checkpoints(std::io::BufReader::new(src));
+            let file = dir.join(compaction::file_name("checkpoints", &conversation));
+            let seen: Option<u64> = std::fs::read_to_string(&file)
+                .ok()
+                .and_then(|t| t.trim().parse().ok());
+            if seen != Some(now) {
+                let _ = crate::privfs::dir(&dir).map(|_| std::fs::write(&file, format!("{now}\n")));
+            }
+            // The first look at a conversation only takes the count: a
+            // resumed one can have older checkpoints.
+            let new = now.saturating_sub(seen?).min(MAX_AT_ONCE);
+            let mut last = None;
+            for _ in 0..new {
+                last = record(&event).or(last);
+            }
+            compaction::render(harness, &event, &compaction::note(&last?))
+        }
+    }
+}
+
+/// The most compactions that one hook records, when several were missed.
+const MAX_AT_ONCE: u64 = 5;
+
+/// Ask the broker to record one compaction, and return the facts.
+fn ask(harness: &str, event: &str) -> Option<Facts> {
     let mut a = BTreeMap::new();
     a.insert("harness".into(), serde_json::json!(harness));
     a.insert("event".into(), serde_json::json!(event));
@@ -53,21 +130,15 @@ pub fn main(args: &[String]) -> i32 {
         args: a,
         reason: String::new(),
     };
-    let facts = match super::send(&req) {
-        Ok(r) if r.status == Status::Done => {
-            serde_json::from_value::<Facts>(r.result).unwrap_or_default()
-        }
+    match super::send(&req) {
+        Ok(r) if r.status == Status::Done => serde_json::from_value::<Facts>(r.result).ok(),
         Ok(r) => {
             log::debug!("no compaction note: {}", r.message);
-            return 0;
+            None
         }
         Err(e) => {
             log::debug!("no compaction note: {e}");
-            return 0;
+            None
         }
-    };
-    if let Some(out) = compaction::render(&harness, &event, &compaction::note(&facts)) {
-        println!("{out}");
     }
-    0
 }

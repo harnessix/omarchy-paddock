@@ -34,6 +34,10 @@ pub struct Hook {
     /// `append = true` that adds the hook beside the user's own hooks.
     #[serde(default)]
     pub settings: Vec<crate::profile::Setting>,
+    /// Codex's `config.toml`, relative to HOME: paddock trusts the hooks of
+    /// `settings` there, and no other hook (compaction/codex.rs).
+    #[serde(default)]
+    pub codex_trust: Option<String>,
 }
 
 /// Add the hook of a profile to the sandbox home, unless `[compaction]
@@ -49,12 +53,36 @@ pub fn apply(
     if !Cfg::load(env).enabled {
         return Ok(());
     }
+    let first = spec.home_settings.len();
     crate::privacy::push_settings(
         profile,
         &h.settings,
         &format!("profile {} compaction hook", profile.name),
         spec,
-    )
+    )?;
+    if let Some(config) = &h.codex_trust {
+        let rel = PathBuf::from(config);
+        if !rel
+            .components()
+            .all(|c| matches!(c, std::path::Component::Normal(_)))
+        {
+            anyhow::bail!(
+                "profile {}: compaction codex_trust {config} must be a path inside the home",
+                profile.name
+            );
+        }
+        let home = spec.home.clone();
+        for s in spec.home_settings[first..]
+            .iter_mut()
+            .filter(|s| s.format == "json")
+        {
+            s.codex_trust = Some(crate::spec::CodexTrust {
+                config: rel.clone(),
+                source: home.join(&s.file).display().to_string(),
+            });
+        }
+    }
+    Ok(())
 }
 
 /// `[compaction]` of the user configuration.
@@ -203,17 +231,71 @@ pub fn record_value(f: &Facts, time: u64) -> String {
     .to_string()
 }
 
-/// The event of a hook input when it is a compaction, for the note. None:
-/// the hook fired for something else (Claude Code's SessionStart also
-/// fires at startup, resume and clear), so paddock records nothing.
-pub fn hook_event(harness: &str, input: &serde_json::Value) -> Option<String> {
+/// What a hook input asks for. Harnesses differ in where a note can go:
+///
+/// - Claude Code, Qwen Code and Codex: a SessionStart hook with the source
+///   "compact" runs after the compaction, and its output reaches the
+///   context (`Direct`).
+/// - Grok Build discards the output of its compaction hooks and of an
+///   allowing UserPromptSubmit hook. PostCompact marks the compaction, and
+///   the next PostToolUse hook adds the note (`Mark`, then `Deliver`).
+/// - agy has no compaction hook. A compaction adds a CHECKPOINT step to the
+///   transcript, and a PreInvocation hook looks for a new one (`Scan`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Action {
+    /// A compaction: record it and print the note for `event`.
+    Direct { event: String },
+    /// A compaction: record it and keep the note for the session.
+    Mark { session: String },
+    /// Print the kept note of the session for `event`, if there is one.
+    Deliver { session: String, event: String },
+    /// Count the CHECKPOINT steps of a transcript. New ones are compactions.
+    Scan {
+        conversation: String,
+        transcript: String,
+        event: String,
+    },
+}
+
+/// The action for a hook input. None: the hook fired for something else
+/// (Claude Code's SessionStart also fires at startup, resume and clear), so
+/// paddock records nothing.
+pub fn action(harness: &str, input: &serde_json::Value) -> Option<Action> {
     let s = |k: &str| input.get(k).and_then(|v| v.as_str());
     match harness {
-        // The same SessionStart hook with the source "compact".
-        "claude" | "qwen" => match (s("hook_event_name"), s("source")) {
-            (Some("SessionStart"), Some("compact")) => Some("SessionStart".into()),
+        "claude" | "qwen" | "codex" => match (s("hook_event_name"), s("source")) {
+            (Some("SessionStart"), Some("compact")) => Some(Action::Direct {
+                event: "SessionStart".into(),
+            }),
             _ => None,
         },
+        // `hook_event_name` has the PascalCase name, `sessionId` and
+        // `session_id` the session.
+        "grok" => {
+            let session = s("sessionId")
+                .or(s("session_id"))
+                .unwrap_or_default()
+                .to_string();
+            match s("hook_event_name") {
+                Some("PostCompact") => Some(Action::Mark { session }),
+                Some("PostToolUse") => Some(Action::Deliver {
+                    session,
+                    event: "PostToolUse".into(),
+                }),
+                _ => None,
+            }
+        }
+        // agy's input has no event name: only PreInvocation (and
+        // PostInvocation) have `invocationNum`, and paddock adds the hook to
+        // PreInvocation only.
+        "agy" => {
+            input.get("invocationNum")?;
+            Some(Action::Scan {
+                conversation: s("conversationId")?.to_string(),
+                transcript: s("transcriptPath")?.to_string(),
+                event: "PreInvocation".into(),
+            })
+        }
         _ => None,
     }
 }
@@ -221,13 +303,67 @@ pub fn hook_event(harness: &str, input: &serde_json::Value) -> Option<String> {
 /// The note in the form that the harness reads into its context.
 pub fn render(harness: &str, event: &str, note: &str) -> Option<String> {
     match harness {
-        "claude" | "qwen" => Some(
+        "claude" | "qwen" | "codex" | "grok" => Some(
             serde_json::json!({"hookSpecificOutput": {"hookEventName": event, "additionalContext": note}})
                 .to_string(),
         ),
+        "agy" => Some(serde_json::json!({"injectSteps": [{"ephemeralMessage": note}]}).to_string()),
         _ => None,
     }
 }
 
+/// Where the hook keeps its state in the sandbox home: the kept notes of
+/// Grok Build and the CHECKPOINT counts of agy.
+pub fn state_dir(home: &std::path::Path) -> PathBuf {
+    home.join(".local/state/paddock/compaction")
+}
+
+/// A session or conversation id as a file name.
+pub fn file_name(prefix: &str, id: &str) -> String {
+    let id: String = id
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
+        .take(128)
+        .collect();
+    format!("{prefix}-{}", if id.is_empty() { "none" } else { &id })
+}
+
+/// agy writes the whole transcript to `transcript_full.jsonl` when it cuts
+/// `transcript.jsonl`. The full one counts when it exists.
+pub fn transcript_file(path: &std::path::Path) -> PathBuf {
+    let full = path.with_file_name("transcript_full.jsonl");
+    if full.is_file() {
+        full
+    } else {
+        path.to_path_buf()
+    }
+}
+
+/// The CHECKPOINT steps of an agy transcript, one JSON object per line. A
+/// step counts when its type (`type`, `step_type` or `stepType`, at the top
+/// or in `step`) is CHECKPOINT, also with a prefix such as
+/// `CORTEX_STEP_TYPE_CHECKPOINT`.
+pub fn checkpoints(transcript: impl std::io::BufRead) -> u64 {
+    fn is_checkpoint(v: &serde_json::Value) -> bool {
+        ["type", "step_type", "stepType"].iter().any(|k| {
+            v.get(k).and_then(|t| t.as_str()).is_some_and(|t| {
+                let t = t.to_ascii_uppercase();
+                t == "CHECKPOINT" || t.ends_with("_CHECKPOINT")
+            })
+        })
+    }
+    transcript
+        .split(b'\n')
+        .map_while(|l| l.ok())
+        .filter(|l| l.windows(10).any(|w| w.eq_ignore_ascii_case(b"checkpoint")))
+        .filter_map(|l| serde_json::from_slice::<serde_json::Value>(&l).ok())
+        .filter(|v| is_checkpoint(v) || v.get("step").is_some_and(is_checkpoint))
+        .count() as u64
+}
+
+pub mod codex;
+
+#[cfg(test)]
+mod harness_tests;
 #[cfg(test)]
 mod tests;
