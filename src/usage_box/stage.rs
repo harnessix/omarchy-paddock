@@ -100,8 +100,13 @@ pub fn trim(view: &mut View) {
 }
 
 /// The stage's bwrap arguments before the box's own bwrap command: the host
-/// read-only, `/proc` as it is (the box mounts its own), and the groups.
-pub fn args(groups: &[Group]) -> Vec<String> {
+/// read-only, `/proc` as it is (the box mounts its own), a fresh `/dev`, the
+/// folders `rw` that the box writes, and the groups.
+///
+/// In a user namespace, the device nodes of a bound host `/dev` cannot be
+/// opened, so the stage needs its own. The box binds `rw` writable, which
+/// works only when the stage has them writable too.
+pub fn args(groups: &[Group], rw: &[PathBuf]) -> Vec<String> {
     let s = |p: &Path| p.display().to_string();
     let mut a: Vec<String> = [
         "--die-with-parent",
@@ -109,12 +114,17 @@ pub fn args(groups: &[Group]) -> Vec<String> {
         "--ro-bind",
         "/",
         "/",
+        "--dev",
+        "/dev",
         "--bind",
         "/proc",
         "/proc",
     ]
     .map(String::from)
     .to_vec();
+    for p in rw {
+        a.extend(["--bind".into(), s(p), s(p)]);
+    }
     for g in groups {
         if g.lowers.len() == 1 {
             a.extend(["--ro-bind".into(), s(&g.lowers[0]), s(&g.dest)]);
@@ -145,7 +155,7 @@ pub fn probe(bwrap: &Path, dir: &Path) -> Result<()> {
         lowers: vec!["/usr".into(), "/etc".into()],
     };
     prepare(std::slice::from_ref(&g))?;
-    let mut a = args(std::slice::from_ref(&g));
+    let mut a = args(std::slice::from_ref(&g), &[]);
     a.push(bwrap.display().to_string());
     a.extend(
         [

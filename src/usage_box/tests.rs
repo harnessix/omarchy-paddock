@@ -180,9 +180,21 @@ fn sixty_sandbox_homes_are_all_in_the_view() {
     assert!(!outer
         .iter()
         .any(|a| a == "--tmp-overlay" || a == "--overlay"));
-    assert!(!outer
+    // Writable in the stage: /proc, and only the folders that the box
+    // writes too (the panel's records and cache). Never a session folder
+    // and never a login.
+    let rw: Vec<String> = v
+        .mounts
+        .iter()
+        .filter_map(|m| match m {
+            Mount::Rw(p) => Some(p.display().to_string()),
+            _ => None,
+        })
+        .collect();
+    assert!(outer
         .windows(2)
-        .any(|w| w[0] == "--bind" && w[1] != "/proc"));
+        .filter(|w| w[0] == "--bind")
+        .all(|w| w[1] == "/proc" || rw.contains(&w[1])));
     assert!(!inner.join(" ").contains("rather-long"));
     assert!(inner
         .join(" ")

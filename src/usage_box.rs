@@ -542,7 +542,15 @@ pub fn box_command(
     if groups.is_empty() {
         return inner;
     }
-    let mut a = stage::args(groups);
+    let rw: Vec<PathBuf> = view
+        .mounts
+        .iter()
+        .filter_map(|m| match m {
+            Mount::Rw(p) => Some(p.clone()),
+            _ => None,
+        })
+        .collect();
+    let mut a = stage::args(groups, &rw);
     a.push(bwrap.display().to_string());
     a.extend(inner);
     a

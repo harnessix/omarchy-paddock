@@ -172,5 +172,7 @@ fn a_lapsed_login_is_renewed_once_by_the_profile_s_refresh_command() {
     let out = w.update();
     assert!(out.status.success(), "{out:?}");
     assert_eq!(std::fs::read_to_string(&runs).unwrap().lines().count(), 1);
-    assert!(w.seen().contains("lapsed"));
+    // The renewed copy in paddock's login store is still the newest, so the
+    // panel keeps seeing it.
+    assert!(w.seen().contains("renewed"));
 }
