@@ -1,0 +1,1 @@
+- Changed: the leak guard in CI fails on any tracked document that is not part of the user documentation (README, CHANGELOG, CONTRIBUTING, SECURITY, changelog fragments, skills, images in `docs/assets/`).
