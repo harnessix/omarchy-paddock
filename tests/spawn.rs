@@ -291,12 +291,15 @@ fn a_sigterm_to_paddock_still_runs_its_exit_steps() {
         eprintln!("skipped: bwrap cannot create a user namespace here");
         return;
     }
-    let w = world("sleep 300");
+    let w = world("touch ready; sleep 300");
     let mut parent = start_parent(&w);
     let id = wait_for("the sandbox", 90, || {
         ps(&w)
             .first()
             .and_then(|s| s["id"].as_str().map(str::to_string))
+    });
+    wait_for("the harness to start", 90, || {
+        w.repo.join("ready").exists().then_some(())
     });
     let had_devices = !device_mounts(&w.root).is_empty();
     // SAFETY: a plain kill(2) on the paddock process of this test.
