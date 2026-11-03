@@ -232,13 +232,17 @@ pub fn run_args(env: &HostEnv, d: &Due) -> Vec<String> {
 /// Run `program ARGS` and stop it after `limit`: SIGTERM first, so paddock
 /// can copy the login back, then SIGKILL after 5 more seconds.
 pub fn run_with_limit(program: &Path, args: &[String], limit: Duration) -> Result<()> {
+    #[cfg(target_os = "linux")]
     use std::os::unix::process::CommandExt;
     let mut cmd = Command::new(program);
     cmd.args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
-    // SAFETY: only async-signal-safe calls between fork and exec.
+    // SAFETY: only async-signal-safe calls between fork and exec. Linux
+    // only: macOS has no parent-death signal, and the time limit below
+    // ends the run there too.
+    #[cfg(target_os = "linux")]
     unsafe {
         cmd.pre_exec(|| {
             libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM);

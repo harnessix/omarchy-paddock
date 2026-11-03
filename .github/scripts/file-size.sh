@@ -19,7 +19,8 @@ default_limit=800
 baseline_file=".github/file-size-baseline"
 status=0
 
-declare -A baseline=()
+# Check the baseline lines. bash 3 (macOS) has no associative arrays, so
+# limit_for reads the file again for each lookup.
 if [ -f "$baseline_file" ]; then
   while read -r lines path; do
     case "${lines:-}" in
@@ -29,9 +30,14 @@ if [ -f "$baseline_file" ]; then
       echo "file-size: bad baseline line: ${lines}" >&2
       exit 2
     fi
-    baseline["$path"]=$lines
   done <"$baseline_file"
 fi
+
+# The baseline size of a file, or nothing when the file is not listed.
+limit_for() {
+  [ -f "$baseline_file" ] || return 0
+  awk -v p="$1" '$1 !~ /^#/ && $2 == p { print $1; exit }' "$baseline_file"
+}
 
 count_lines() {
   # wc -l counts newline characters. Files in this repo end with a newline.
@@ -40,8 +46,8 @@ count_lines() {
 
 while IFS= read -r -d '' file; do
   size=$(count_lines "$file")
-  if [ -n "${baseline[$file]+x}" ]; then
-    limit=${baseline[$file]}
+  limit=$(limit_for "$file")
+  if [ -n "$limit" ]; then
     if [ "$size" -gt "$limit" ]; then
       echo "file-size: ${file} has ${size} lines; the limit is ${limit}"
       echo "file-size: split the file, or change the baseline in a separate PR with a reason"
