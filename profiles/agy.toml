@@ -225,6 +225,12 @@ prompt = "file"
 [detach]
 args = ["-i", "Read the file {prompt_file} and do the task that it describes."]
 
+# A message that stops a run (src/screens.rs). A detached agy run once sat
+# on it until the idle end. paddock names it in the done text.
+[[screens.error]]
+text = "Individual quota reached"
+says = "agy says the individual quota is used up"
+
 # The user's own hooks (src/hooks.rs). Each user entry keeps its name with
 # the prefix "user-", so paddock's entry comes first.
 [hooks]

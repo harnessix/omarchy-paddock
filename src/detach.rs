@@ -24,6 +24,9 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
+mod stuck;
+pub use stuck::{add_note, idle_done_text, Detector, Event, Stuck, STUCK_AFTER};
+
 /// The `done` text keeps at most this many bytes.
 pub const MAX_TEXT: usize = 4096;
 /// The largest prompt.
@@ -59,6 +62,8 @@ pub struct IdleCfg {
     pub after: u64,
     /// Seconds of idleness before paddock ends the run. `0` never ends it.
     pub timeout: u64,
+    /// Seconds with the same screen before the run is stuck. `0`: never.
+    pub stuck: u64,
 }
 
 impl Default for IdleCfg {
@@ -66,6 +71,7 @@ impl Default for IdleCfg {
         IdleCfg {
             after: IDLE_AFTER,
             timeout: IDLE_TIMEOUT,
+            stuck: STUCK_AFTER,
         }
     }
 }
@@ -75,6 +81,7 @@ impl Default for IdleCfg {
 struct RawIdle {
     idle_after: Option<String>,
     idle_timeout: Option<String>,
+    stuck_after: Option<String>,
 }
 
 impl IdleCfg {
@@ -95,10 +102,9 @@ impl IdleCfg {
     pub fn parse(text: &str) -> Result<Self> {
         let v: toml::Value = toml::from_str(text)?;
         let raw: RawIdle = match v.get("detach") {
-            Some(t) => t
-                .clone()
-                .try_into()
-                .context("[detach] keys: idle_after and idle_timeout, for example 10m or 0")?,
+            Some(t) => t.clone().try_into().context(
+                "[detach] keys: idle_after, idle_timeout and stuck_after, for example 10m or 0",
+            )?,
             None => RawIdle::default(),
         };
         let dur = |key: &str, raw: Option<String>, default: u64| -> Result<u64> {
@@ -111,6 +117,7 @@ impl IdleCfg {
         Ok(IdleCfg {
             after: dur("idle_after", raw.idle_after, IDLE_AFTER)?,
             timeout: dur("idle_timeout", raw.idle_timeout, IDLE_TIMEOUT)?,
+            stuck: dur("stuck_after", raw.stuck_after, STUCK_AFTER)?,
         })
     }
 }
@@ -203,6 +210,12 @@ pub struct Record {
     /// produces output.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub idle_since: Option<u64>,
+    /// What paddock did on its own, such as an answered start screen.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub notes: Vec<String>,
+    /// The screen did not change for `[detach] stuck_after`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stuck: Option<Stuck>,
 }
 
 static RECORD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -321,6 +334,7 @@ pub fn recent_ended(env: &HostEnv, now: u64) -> Vec<serde_json::Value> {
             "ended": ended,
             "status": status,
             "text": text,
+            "notes": rec.notes,
         }));
     }
     rows.sort_by(|a, b| {
@@ -485,6 +499,8 @@ pub struct Ctl {
     watching: AtomicBool,
     /// The idle poll runs once per run.
     idling: AtomicBool,
+    /// `[[screens.error]]` of the profile, for the stuck and idle texts.
+    errors: std::sync::Mutex<Vec<crate::screens::ErrorRule>>,
     /// How the run ends. The real one signals this process, as `paddock
     /// stop` signals the sandbox: SIGTERM, then the normal end steps.
     stop: Box<dyn Fn() + Send + Sync>,
@@ -512,6 +528,7 @@ impl Ctl {
             notified: AtomicBool::new(false),
             watching: AtomicBool::new(false),
             idling: AtomicBool::new(false),
+            errors: Default::default(),
             stop,
         }
     }
@@ -568,10 +585,11 @@ impl Ctl {
 
     /// Poll the pane of this run. A quiet pane becomes idle, then ends the
     /// run the same way `done` does, unless a write client is attached.
-    pub fn watch(self: &std::sync::Arc<Self>) {
+    pub fn watch(self: &std::sync::Arc<Self>, errors: Vec<crate::screens::ErrorRule>) {
         if self.idling.swap(true, Ordering::SeqCst) {
             return;
         }
+        *self.errors.lock().unwrap_or_else(|e| e.into_inner()) = errors;
         let me = self.clone();
         std::thread::spawn(move || me.idle_loop());
     }
@@ -579,6 +597,7 @@ impl Ctl {
     fn idle_loop(&self) {
         let mut told = false;
         let mut held = false;
+        let mut det = Detector::default();
         loop {
             std::thread::sleep(POLL);
             let Some(rec) = Record::load(&self.env, &self.id) else {
@@ -590,6 +609,8 @@ impl Ctl {
             let Some(tmux) = self.tmux() else {
                 continue;
             };
+            let cfg = IdleCfg::load(&self.env);
+            self.poll_stuck(&tmux, &mut det, &rec, cfg.stuck);
             let last = match tmux.last_output(&self.id) {
                 // A failed tmux query is not an end. The run record ends the loop.
                 crate::view::PaneOutput::Missing | crate::view::PaneOutput::Unknown => continue,
@@ -599,7 +620,6 @@ impl Ctl {
                 }
                 crate::view::PaneOutput::At(t) => t,
             };
-            let cfg = IdleCfg::load(&self.env);
             let now = crate::state::now();
             if last > now || now.saturating_sub(last) < cfg.after {
                 self.clear_idle(&mut told, &mut held);
@@ -641,22 +661,11 @@ impl Ctl {
     }
 
     fn notify_idle(&self, rec: &Record) {
-        let project = rec
-            .project
-            .file_name()
-            .and_then(|n| n.to_str())
-            .filter(|n| !n.is_empty())
-            .unwrap_or("a project");
-        let harness = if rec.harness.is_empty() {
-            "a harness"
-        } else {
-            rec.harness.as_str()
-        };
         let _ = crate::broker::notify::show(
             &self.env,
             &crate::broker::notify::Note {
                 summary: "paddock".into(),
-                body: format!("{harness} in {project} waits for input: view it or stop it"),
+                body: format!("{} waits for input: view it or stop it", who(rec)),
                 actions: Vec::new(),
                 critical: false,
             },
@@ -664,7 +673,7 @@ impl Ctl {
     }
 
     fn end_idle(&self, quiet: u64) {
-        let text = idle_end_text(quiet);
+        let text = self.idle_text(quiet);
         let mut stop = false;
         let _ = Record::update(&self.env, &self.id, |r| {
             if r.done.is_none() && r.ended.is_none() {
@@ -680,6 +689,22 @@ impl Ctl {
             (self.stop)();
         }
     }
+}
+
+/// `codex in my-project`, for a notification.
+fn who(rec: &Record) -> String {
+    let project = rec
+        .project
+        .file_name()
+        .and_then(|n| n.to_str())
+        .filter(|n| !n.is_empty())
+        .unwrap_or("a project");
+    let harness = if rec.harness.is_empty() {
+        "a harness"
+    } else {
+        rec.harness.as_str()
+    };
+    format!("{harness} in {project}")
 }
 
 fn alive(pid: u32) -> bool {
@@ -732,6 +757,9 @@ pub fn wait(env: &HostEnv, id: &str, timeout: Option<Duration>) -> Result<i32> {
 }
 
 fn report(id: &str, rec: Option<&Record>) -> i32 {
+    for n in rec.map(|r| r.notes.as_slice()).unwrap_or_default() {
+        eprintln!("paddock: {n}");
+    }
     match rec.and_then(|r| r.done.as_ref()) {
         Some(d) => {
             if d.text.is_empty() {

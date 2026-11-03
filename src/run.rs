@@ -11,7 +11,9 @@ use anyhow::{bail, Context, Result};
 use sha2::{Digest, Sha256};
 use std::io::{IsTerminal, Read};
 
+mod capped;
 mod host_tools;
+use capped::read_capped;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -960,6 +962,15 @@ pub fn run(
     if gate.is_some() && !quiet {
         eprintln!("paddock: {}", crate::training::notice(&spec.harness));
     }
+    let screens = crate::screens::prepare(
+        env,
+        &built.profile,
+        spec,
+        caller_terminal,
+        relay_on || built.detach,
+        built.detach,
+    );
+    let tap = crate::relay::Taps::of(gate.clone(), screens);
     // The live view of a run without a terminal (view.rs). paddock copies
     // each stream that is not a terminal to the caller and to the run log.
     // A watched terminal stays the harness's own. An invisible terminal is
@@ -986,7 +997,7 @@ pub fn run(
             cmd.stderr(Stdio::piped());
         }
     }
-    let mut relay = if relay_on || gate.is_some() {
+    let mut relay = if relay_on || tap.is_some() {
         let log = view.as_ref().map(|l| l.tee.sink());
         Some(
             crate::relay::Relay::start(
@@ -997,7 +1008,7 @@ pub fn run(
                         s.append(data);
                     }
                 },
-                gate.clone(),
+                tap,
             )
             .context("cannot relay the terminal")?,
         )
@@ -1456,7 +1467,7 @@ fn start_broker(
     };
     if built.detach {
         let ctl = std::sync::Arc::new(crate::detach::Ctl::new(env.clone(), built.spec.id.clone()));
-        ctl.watch();
+        ctl.watch(built.profile.screens.error.clone());
         broker.detach = Some(ctl);
     }
     // One broker for the socket and the gateway device: the same policy,
@@ -1466,29 +1477,6 @@ fn start_broker(
     built.spec.host_socket = Some(sock);
     host_tools::add(env, built, &run_dir)?;
     Ok((repo, spawner, Some(broker)))
-}
-
-/// The captured output of a sandbox. Everything is read, so the sandbox
-/// never blocks on a full pipe, but only the last 4 MiB are kept.
-fn read_capped(mut r: impl Read) -> String {
-    const KEEP: usize = 4 << 20;
-    let mut kept: Vec<u8> = Vec::new();
-    let mut buf = [0u8; 64 * 1024];
-    loop {
-        match r.read(&mut buf) {
-            Ok(0) | Err(_) => break,
-            Ok(n) => {
-                kept.extend_from_slice(&buf[..n]);
-                if kept.len() > 2 * KEEP {
-                    kept.drain(..kept.len() - KEEP);
-                }
-            }
-        }
-    }
-    if kept.len() > KEEP {
-        kept.drain(..kept.len() - KEEP);
-    }
-    String::from_utf8_lossy(&kept).into_owned()
 }
 
 /// Run one provision sandbox to the end. Its output goes to stderr. Returns

@@ -1072,6 +1072,25 @@ paddock starts the run as if you typed `paddock run codex ~/src/app` in that ses
 - A task timer (`paddock timer`) works as for any other run.
 - The harness profile says how the interface takes a first prompt, in a `[detach]` table. claude, codex and grok have one. Other harnesses refuse `--detach`. `--detach` needs tmux.
 
+#### Start screens and stuck runs
+
+A harness can stop at a screen that waits for a choice before it starts the task. An example is the Codex screen `Hooks need review`, which comes when one of your hooks changed. In a detached run nobody is there to answer it.
+
+- The harness profile names such screens in `[[screens.rule]]`, each with a safe answer. For the Codex hooks review, paddock chooses `3. Continue without trusting (hooks won't run)`. The changed hooks do not run. paddock never chooses an answer that trusts, approves, accepts terms or logs in. A rule with such an answer does not load.
+- paddock answers in detached runs and on terminals that no window shows. In a run that you watch, paddock does not answer, so you see the screen. A rule with `always = true` is the exception. When you are attached with `paddock view ID --write`, or when you press a key, paddock answers no more screens in that run.
+- paddock tells you about each answer. It writes one line in the view log and one line in the audit log. For a detached run, `paddock wait` and `paddock ps` show a note such as `answered Codex hooks review: continued without trusting 1 hook`.
+- When the screen of a detached run does not change for `[detach] stuck_after` (default `3m`), paddock puts the last screen into the run record (`stuck` in `paddock ps --json`) and sends one desktop notification. For a spawn child it writes `stuck:<RUN-ID>` into the tree scope of kv, and for a pasture member into the pasture scope, so a parent can `paddock-host kv watch` for it. `stuck_after = "0"` turns this off.
+- The idle end keeps working. Its done text also shows the last lines of the screen. A known message on the screen, such as `Individual quota reached` or a rate limit, gets clear words in the done text.
+- `paddock explain HARNESS` lists the screen rules and the known messages of the harness.
+
+```toml
+# ~/.config/paddock/config.toml
+[detach]
+idle_after = "10m"
+idle_timeout = "30m"
+stuck_after = "3m"
+```
+
 You can let an agent on the host answer requests for you (`paddock approver`). paddock trusts that setting only from a root-owned file (`sudo paddock approver enable --system`) or from a file signed with a password that you type when a sandbox starts, so that a process on your computer cannot turn it on for itself. The agent approver can only answer the capabilities that you list, the rules above still hold, and if it does not answer clearly, the request comes to you.
 
 ## Shared state: paddock kv

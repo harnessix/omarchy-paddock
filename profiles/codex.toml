@@ -101,3 +101,42 @@ args = ["Read the file {prompt_file} and do the task that it describes."]
 files = [".codex/hooks.json"]
 into = ".codex/hooks.json"
 codex_trust = ".codex/config.toml"
+
+# Start screens (src/screens.rs). Codex 0.166.0 stops at "Hooks need review"
+# when a hook of the user changed since the last trust. In a run that nobody
+# watches, paddock chooses "Continue without trusting": the changed hooks do
+# not run, and paddock's own trusted hook still does. paddock never chooses
+# "Trust all". The screen was recorded on 2026-11-03 in a detached run.
+[[screens.rule]]
+id = "codex-hooks-review"
+name = "Codex hooks review"
+send = ["3"]
+answer = "3. Continue without trusting (hooks won't run)"
+note = "continued without trusting {n} hook"
+rows = [
+  "Hooks need review",
+  "{n} hook is new or changed.",
+  "Hooks can run outside the sandbox after you trust them.",
+  "› 1. Review hooks",
+  "2. Trust all and continue",
+  "3. Continue without trusting (hooks won't run)",
+  "enter confirm · esc skip",
+]
+
+# The same screen for more than one hook. Only the count row differs from
+# the recording.
+[[screens.rule]]
+id = "codex-hooks-review-many"
+name = "Codex hooks review"
+send = ["3"]
+answer = "3. Continue without trusting (hooks won't run)"
+note = "continued without trusting {n} hooks"
+rows = [
+  "Hooks need review",
+  "{n} hooks are new or changed.",
+  "Hooks can run outside the sandbox after you trust them.",
+  "› 1. Review hooks",
+  "2. Trust all and continue",
+  "3. Continue without trusting (hooks won't run)",
+  "enter confirm · esc skip",
+]

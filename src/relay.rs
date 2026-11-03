@@ -12,6 +12,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread::JoinHandle;
 
+mod fd;
+mod tap;
+use fd::{cloexec, dup_fd, pipe, set_nonblock};
+pub use tap::{Log, Tap, Taps};
+
 /// One process in the chain from paddock up to init.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Ancestor {
@@ -211,26 +216,27 @@ pub struct Relay {
     input: Option<JoinHandle<()>>,
     output: Option<JoinHandle<()>>,
     closed_slave: bool,
-    gate: Option<Arc<crate::training::live::Gate>>,
+    gate: Option<Arc<dyn Tap>>,
 }
 
 impl Relay {
     /// `caller_in` and `caller_out` are the terminal the caller gave paddock.
     /// They are often the same pty. `log` receives every byte the harness writes.
-    /// With a `gate` (training.rs), it reads a copy of the output and
-    /// decides on each user key before the key goes to the harness.
+    /// With a `gate` (tap.rs), it reads a copy of the output and decides
+    /// on each user key before the key goes to the harness.
     pub fn start(
         caller_in: RawFd,
         caller_out: RawFd,
-        log: impl Fn(&[u8]) + Send + 'static,
-        gate: Option<Arc<crate::training::live::Gate>>,
+        log: impl Fn(&[u8]) + Send + Sync + 'static,
+        gate: Option<Arc<dyn Tap>>,
     ) -> Result<Relay> {
         let (master, slave) = open_pty().context("cannot open a terminal for the harness")?;
         let _ = cloexec(master);
         let _ = cloexec(slave);
         copy_winsize(caller_in, master);
+        let log: Log = Arc::new(log);
         if let Some(g) = &gate {
-            g.attach(caller_in, master);
+            g.attach(caller_in, master, log.clone());
         }
         let (gate_in, gate_out) = (gate.clone(), gate.clone());
         let log = move |data: &[u8]| {
@@ -383,56 +389,10 @@ fn open_pty() -> io::Result<(RawFd, RawFd)> {
     Ok((master, slave))
 }
 
-fn pipe() -> io::Result<(RawFd, RawFd)> {
-    let mut fds = [0; 2];
-    // SAFETY: pipe writes two new fds.
-    if unsafe { libc::pipe(fds.as_mut_ptr()) } < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok((fds[0], fds[1]))
-}
-
-fn dup_fd(fd: RawFd) -> io::Result<RawFd> {
-    // SAFETY: dup of an open fd returns a new fd or -1.
-    let d = unsafe { libc::dup(fd) };
-    if d < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(d)
-}
-
 fn owned_stdio(fd: RawFd) -> io::Result<std::process::Stdio> {
     let d = dup_fd(fd)?;
     // SAFETY: `d` is a new fd this process owns, and Stdio takes that ownership.
     Ok(unsafe { std::process::Stdio::from_raw_fd(d) })
-}
-
-fn cloexec(fd: RawFd) -> io::Result<()> {
-    // SAFETY: fcntl on an open fd of this process.
-    unsafe {
-        let flags = libc::fcntl(fd, libc::F_GETFD);
-        if flags < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        if libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) < 0 {
-            return Err(io::Error::last_os_error());
-        }
-    }
-    Ok(())
-}
-
-fn set_nonblock(fd: RawFd) -> io::Result<()> {
-    // SAFETY: fcntl on an open fd of this process.
-    unsafe {
-        let flags = libc::fcntl(fd, libc::F_GETFL);
-        if flags < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        if libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) < 0 {
-            return Err(io::Error::last_os_error());
-        }
-    }
-    Ok(())
 }
 
 fn enter_raw(fd: RawFd) -> io::Result<libc::termios> {
@@ -521,10 +481,10 @@ fn copy_in(
     master: RawFd,
     wake: RawFd,
     stop: Arc<AtomicBool>,
-    gate: Option<Arc<crate::training::live::Gate>>,
+    gate: Option<Arc<dyn Tap>>,
 ) {
     let mut buf = [0u8; 8192];
-    let winch = |gate: &Option<Arc<crate::training::live::Gate>>| {
+    let winch = |gate: &Option<Arc<dyn Tap>>| {
         if take_winch() {
             if let Some(g) = gate {
                 g.resize();
