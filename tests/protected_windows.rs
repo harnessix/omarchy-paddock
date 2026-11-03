@@ -12,18 +12,23 @@ struct World {
     _tmp: tempfile::TempDir,
     root: PathBuf,
     window: Child,
+    host_window: Child,
 }
 
 impl Drop for World {
     fn drop(&mut self) {
-        let _ = self.window.kill();
-        let _ = self.window.wait();
+        for c in [&mut self.window, &mut self.host_window] {
+            let _ = c.kill();
+            let _ = c.wait();
+        }
     }
 }
 
 impl World {
-    /// A world with one window. Its process is a child of this test
-    /// process, which plays the paddock process of an app sandbox.
+    /// A world with three windows. This test process plays the paddock
+    /// process of an app sandbox. Its child in a mount namespace of its own
+    /// plays the app. Its child in the host namespace plays a host program
+    /// that a host helper started, such as the gateway daemon.
     fn new() -> Self {
         let tmp = common::tempdir();
         let root = tmp.path().to_path_buf();
@@ -34,11 +39,27 @@ impl World {
         std::fs::create_dir_all(&run).unwrap();
         std::fs::set_permissions(&run, std::os::unix::fs::PermissionsExt::from_mode(0o700))
             .unwrap();
-        let window = Command::new("sleep").arg("60").spawn().unwrap();
+        let window = Command::new("unshare")
+            .args(["--user", "--map-root-user", "--mount", "sleep", "60"])
+            .spawn()
+            .unwrap();
+        let host_window = Command::new("sleep").arg("60").spawn().unwrap();
+        // Wait until unshare has made its namespace and run sleep.
+        let own = format!("/proc/{}/ns/mnt", window.id());
+        for _ in 0..100 {
+            if std::fs::read_link(&own).ok() != std::fs::read_link("/proc/self/ns/mnt").ok()
+                && std::fs::read_to_string(format!("/proc/{}/comm", window.id()))
+                    .is_ok_and(|c| c.trim() == "sleep")
+            {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
         let w = World {
             _tmp: tmp,
             root,
             window,
+            host_window,
         };
         w.set_clients(serde_json::json!([
             {"address": "0xa1", "pid": w.window.id(), "at": [10, 50], "size": [800, 600],
@@ -46,7 +67,10 @@ impl World {
              "title": "Visual Studio Code", "class": "code"},
             {"address": "0xb2", "pid": 1, "at": [820, 50], "size": [700, 600],
              "workspace": {"id": 1, "name": "1"}, "focusHistoryID": 1,
-             "title": "host terminal", "class": "Alacritty"}
+             "title": "host terminal", "class": "Alacritty"},
+            {"address": "0xc3", "pid": w.host_window.id(), "at": [0, 0], "size": [400, 300],
+             "workspace": {"id": 2, "name": "2"}, "focusHistoryID": 2,
+             "title": "host browser", "class": "firefox"}
         ]));
         let hyprctl = w.root.join("bin/hyprctl");
         std::fs::write(
@@ -160,6 +184,10 @@ fn lists_and_marks_protected_windows_by_network_level() {
     assert!(
         !log.contains("0xb2"),
         "the host terminal keeps its border: {log}"
+    );
+    assert!(
+        !log.contains("0xc3"),
+        "a host program in the app's tree: {log}"
     );
 
     // A wider network: amber.

@@ -51,4 +51,6 @@ An unknown network mode counts as wide. A wrong "protected" signal is worse than
 | Bar shows a shield with the window count | User brief | One glance tells how many windows are protected. |
 | Panel row "Protected windows" opens a list. A click focuses | User brief | The same row pattern as "Shared data" and "Worktrees". |
 | A terminal counts only if its terminal emulator holds the pty of the run | `src/relay.rs` | A background pty of a desktop app must not make that app look protected. |
+| A terminal process with several windows marks none of them | Review | Ghostty and `foot --server` draw all windows from one process. A wrong mark is worse than no mark. |
+| An app window must run in another mount namespace than paddock | Review | A host helper in the app's process tree, such as the gateway daemon, must not mark its host programs. |
 | After the run ends, the mark goes away | Craft | A terminal outlives its run. A stale border tells a lie. |

@@ -265,6 +265,11 @@ fn the_badge_stays_out_of_the_way() {
     assert!(badge.contains("WlrLayershell.keyboardFocus: WlrKeyboardFocus.None"));
     assert!(badge.contains("mask: Region { item: surface.here ? pill : null }"));
     assert!(badge.contains("holdTimer"));
+    // Text from profiles and window titles is never markup.
+    assert_eq!(
+        badge.matches("Text {").count(),
+        badge.matches("textFormat: Text.PlainText").count()
+    );
     assert!(badge.contains(r#"if (/^[A-Za-z0-9._-]{1,96}$/.test(id))"#));
     assert!(badge.contains(r#"["omarchy-shell", "harnessix.paddock", "show", id]"#));
     let bar = read("plugin/BarWidget.qml");

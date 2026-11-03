@@ -191,6 +191,7 @@ Item {
           }
           Text {
             anchors.verticalCenter: parent.verticalCenter
+            textFormat: Text.PlainText
             text: "paddock"
             color: pill.tone
             font.family: Style.font.family
@@ -199,6 +200,7 @@ Item {
           }
           Text {
             anchors.verticalCenter: parent.verticalCenter
+            textFormat: Text.PlainText
             text: "· " + pill.details
             color: Qt.alpha(Commons.Color.foreground, 0.82)
             font.family: Style.font.family

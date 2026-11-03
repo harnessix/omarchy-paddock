@@ -4159,7 +4159,12 @@ fn protected_windows(
     };
     let ttys = runs.iter().filter_map(|r| r.tty).collect();
     let holders = windows::pty_holders(&ttys);
-    let found = windows::find(&runs, &clients, &state::parent_pid, &holders);
+    let procs = windows::Procs {
+        parent: &state::parent_pid,
+        mnt_ns: &windows::mnt_ns,
+        holders: &holders,
+    };
+    let found = windows::find(&runs, &clients, &procs);
     (found, Some(clients))
 }
 

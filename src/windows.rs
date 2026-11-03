@@ -197,17 +197,39 @@ pub struct Protected {
     pub client: Client,
 }
 
-/// Match windows to runs. `parent` gives the parent of a process, and
-/// `holders` maps a pts number to the process that holds its master.
+/// What `find` reads about host processes. Tests give fakes.
+pub struct Procs<'a> {
+    /// The parent of a process.
+    pub parent: &'a dyn Fn(u32) -> Option<u32>,
+    /// The mount namespace of a process (`/proc/PID/ns/mnt`).
+    pub mnt_ns: &'a dyn Fn(u32) -> Option<String>,
+    /// The process that holds the master of each pts.
+    pub holders: &'a HashMap<u32, u32>,
+}
+
+/// The mount namespace of a process, from the `/proc/PID/ns/mnt` link.
+pub fn mnt_ns(pid: u32) -> Option<String> {
+    std::fs::read_link(format!("/proc/{pid}/ns/mnt"))
+        .ok()
+        .map(|l| l.to_string_lossy().into_owned())
+}
+
+/// Match windows to runs. When in doubt, a window is not protected: a wrong
+/// "protected" signal is worse than a missing one.
+///
+/// - A display window: its process is the run's `window_pid`.
+/// - An app window: its process descends from the run's paddock process and
+///   runs in another mount namespace than that paddock process. Host
+///   programs that a host helper started from inside the app's process tree
+///   (for example the gateway daemon) stay in the host namespace.
+/// - A terminal window: its process holds the master of the run's pty, and
+///   owns no other window. One process that draws several terminal windows
+///   (Ghostty, `foot --server`, kitty single instance) cannot tell which
+///   window holds the pty, so none of its windows counts.
 ///
 /// One window shows one sandbox: an app or display window first, then the
 /// newest terminal run in that terminal.
-pub fn find(
-    runs: &[Run],
-    clients: &[Client],
-    parent: &dyn Fn(u32) -> Option<u32>,
-    holders: &HashMap<u32, u32>,
-) -> Vec<Protected> {
+pub fn find(runs: &[Run], clients: &[Client], procs: &Procs) -> Vec<Protected> {
     let mut out = Vec::new();
     let make = |r: &Run, kind: Kind, c: &Client| Protected {
         sandbox: r.id.clone(),
@@ -225,13 +247,20 @@ pub fn find(
             continue;
         }
         let apps: Vec<&Run> = runs.iter().filter(|r| r.app && r.host_pid > 1).collect();
-        if let Some(r) = owner(c.pid, &apps, parent) {
-            out.push(make(r, Kind::App, c));
+        if let Some(r) = owner(c.pid, &apps, procs.parent) {
+            let host = (procs.mnt_ns)(r.host_pid);
+            let own = (procs.mnt_ns)(c.pid);
+            if host.is_some() && own.is_some() && host != own {
+                out.push(make(r, Kind::App, c));
+            }
+            continue;
+        }
+        if clients.iter().filter(|o| o.pid == c.pid).count() != 1 {
             continue;
         }
         let terminal = runs
             .iter()
-            .filter(|r| r.tty.and_then(|t| holders.get(&t)) == Some(&c.pid))
+            .filter(|r| r.tty.and_then(|t| procs.holders.get(&t)) == Some(&c.pid))
             .max_by_key(|r| r.started);
         if let Some(r) = terminal {
             out.push(make(r, Kind::Terminal, c));
@@ -560,7 +589,14 @@ mod tests {
             client(30, "0x3"),
             client(40, "0x4"),
         ];
-        let found = find(&[app, display, term], &clients, &parent, &holders);
+        // The app's window runs in the sandbox's own mount namespace.
+        let ns = |p: u32| Some(if p == 12 { "mnt:[2]" } else { "mnt:[1]" }.to_string());
+        let procs = Procs {
+            parent: &parent,
+            mnt_ns: &ns,
+            holders: &holders,
+        };
+        let found = find(&[app, display, term], &clients, &procs);
         let got: Vec<(&str, &str, Kind, Level)> = found
             .iter()
             .map(|p| {
@@ -593,11 +629,78 @@ mod tests {
         term.host_pid = 60;
         term.tty = Some(3);
         let holders: HashMap<u32, u32> = [(3, 51)].into();
-        assert!(find(&[term.clone()], &[client(50, "0x5")], &parent, &holders).is_empty());
+        let procs = Procs {
+            parent: &parent,
+            mnt_ns: &|_| None,
+            holders: &holders,
+        };
+        assert!(find(&[term.clone()], &[client(50, "0x5")], &procs).is_empty());
         // Without a terminal (relay, detached, spawned): nothing either.
         term.tty = None;
         let holders: HashMap<u32, u32> = [(3, 50)].into();
-        assert!(find(&[term], &[client(50, "0x5")], &parent, &holders).is_empty());
+        let procs = Procs {
+            parent: &parent,
+            mnt_ns: &|_| None,
+            holders: &holders,
+        };
+        assert!(find(&[term], &[client(50, "0x5")], &procs).is_empty());
+    }
+
+    #[test]
+    fn a_terminal_process_with_several_windows_marks_none() {
+        // One Ghostty process (pid 30) draws the sandbox terminal and a
+        // plain shell window. paddock cannot tell them apart.
+        let mut term = run("t", "egress");
+        term.tty = Some(7);
+        let holders: HashMap<u32, u32> = [(7, 30)].into();
+        let procs = Procs {
+            parent: &|_| None,
+            mnt_ns: &|_| None,
+            holders: &holders,
+        };
+        let clients = [client(30, "0xsandbox"), client(30, "0xplainshell")];
+        assert!(find(&[term.clone()], &clients, &procs).is_empty());
+        // One window: it counts.
+        assert_eq!(find(&[term], &clients[..1], &procs).len(), 1);
+    }
+
+    #[test]
+    fn an_app_window_must_run_in_the_sandbox_namespace() {
+        // A host helper (pid 13) that descends from the app's paddock
+        // process (10), for example the gateway daemon, starts a host
+        // program with a window (14). It stays in the host namespace.
+        let parents: HashMap<u32, u32> = [(14, 13), (13, 10), (12, 10), (10, 1)].into();
+        let parent = |p: u32| parents.get(&p).copied();
+        let ns = |p: u32| match p {
+            12 => Some("mnt:[2]".to_string()),
+            99 => None,
+            _ => Some("mnt:[1]".to_string()),
+        };
+        let mut app = run("app", "egress");
+        app.app = true;
+        app.host_pid = 10;
+        let holders = HashMap::new();
+        let procs = Procs {
+            parent: &parent,
+            mnt_ns: &ns,
+            holders: &holders,
+        };
+        let found = find(
+            &[app.clone()],
+            &[client(12, "0xapp"), client(14, "0xhost")],
+            &procs,
+        );
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].client.address, "0xapp");
+        // An unreadable namespace counts as not protected.
+        let parents: HashMap<u32, u32> = [(99, 10)].into();
+        let parent = |p: u32| parents.get(&p).copied();
+        let procs = Procs {
+            parent: &parent,
+            mnt_ns: &ns,
+            holders: &holders,
+        };
+        assert!(find(&[app], &[client(99, "0x99")], &procs).is_empty());
     }
 
     #[test]
@@ -609,7 +712,12 @@ mod tests {
         new.tty = Some(4);
         new.started = 20;
         let holders: HashMap<u32, u32> = [(4, 9)].into();
-        let found = find(&[old, new], &[client(9, "0x9")], &|_| None, &holders);
+        let procs = Procs {
+            parent: &|_| None,
+            mnt_ns: &|_| None,
+            holders: &holders,
+        };
+        let found = find(&[old, new], &[client(9, "0x9")], &procs);
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].sandbox, "new");
         assert_eq!(found[0].level, Level::Wide);

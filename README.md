@@ -1466,7 +1466,7 @@ Windows of app sandboxes get a colored border, so you can tell a protected app a
 
 ### Protected windows
 
-On Omarchy (Hyprland), each window that shows a sandbox gets a border, always: an app sandbox window, the display of window mode, and the terminal window of a terminal run. A terminal window counts when its terminal emulator holds the terminal of the run. A run in tmux, a detached run and a spawned child have no window of their own and get no border.
+On Omarchy (Hyprland), each window that shows a sandbox gets a border, always: an app sandbox window, the display of window mode, and the terminal window of a terminal run. A terminal window counts when its terminal emulator holds the terminal of the run. Some terminal emulators draw several windows from one process, for example Ghostty, `foot --server` and kitty with a single instance. paddock cannot tell which of those windows holds the run, so none of them gets a border. An app window counts only when its process runs in the sandbox. A run in tmux, a detached run and a spawned child have no window of their own and get no border.
 
 - Sage green: the sandbox reaches the network only through paddock's proxy, or not at all (network modes `none`, `api` and `egress`).
 - Amber: the sandbox has a wider network (`host` and `allowlist`).
