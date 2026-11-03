@@ -17,6 +17,7 @@ BarWidget {
   readonly property int runningCount: panelLoader.item ? panelLoader.item.runningCount : 0
   readonly property string pluginState: panelLoader.item ? panelLoader.item.pluginState : "ok"
   readonly property int pendingCount: panelLoader.item ? panelLoader.item.pendingCount : 0
+  readonly property int protectedCount: panelLoader.item ? panelLoader.item.protectedCount : 0
   readonly property var endedNotice: panelLoader.item ? panelLoader.item.endedNotice : null
   readonly property bool popoutSwitchClosing: panelLoader.item ? panelLoader.item.popoutSwitchClosing === true : false
 
@@ -55,6 +56,10 @@ BarWidget {
     function open(): void { root.open("") }
     function close(): void { root.close() }
     function toggle(): void { root.togglePanel() }
+    // Open the panel at one sandbox: a click on a window badge.
+    function show(id: string): void { if (panelLoader.item) panelLoader.item.showSandbox(id) }
+    // Open the panel at the list of protected windows.
+    function windows(): void { if (panelLoader.item) { panelLoader.item.open(""); panelLoader.item.openWindows() } }
   }
 
   WidgetButton {
@@ -65,6 +70,8 @@ BarWidget {
     // request, the fence with an alert mark ("gate-alert").
     readonly property string glyph: "󱞚"
     readonly property string alertGlyph: "󱟸"
+    // Protected windows: a shield with a check ("shield-check").
+    readonly property string shieldGlyph: "󰕥"
     readonly property bool iconOnly: root.vertical
       || (root.runningCount === 0 && root.pendingCount === 0 && root.settings && root.settings.hideWhenIdle === "Icon only")
     // Running sandboxes, then requests that wait for an answer, then for a
@@ -73,6 +80,7 @@ BarWidget {
       if (root.pluginState === "missing") return glyph + " !"
       var parts = []
       if (root.runningCount > 0) parts.push(glyph + " " + Commons.I18n.formatNumber(root.runningCount))
+      if (root.protectedCount > 0) parts.push(shieldGlyph + " " + Commons.I18n.formatNumber(root.protectedCount))
       if (root.pendingCount > 0) parts.push(alertGlyph + " " + Commons.I18n.formatNumber(root.pendingCount))
       if (root.endedNotice !== null && !root.iconOnly)
         parts.push((root.endedNotice.status === "failed" ? "󰅙 " : "󰄬 ") + root.endedNotice.harness
@@ -86,6 +94,7 @@ BarWidget {
       : root.pendingCount > 0
       ? strings.tn("approve.header", root.pendingCount).arg(Commons.I18n.formatNumber(root.pendingCount))
       : strings.tn("bar.running", root.runningCount).arg(Commons.I18n.formatNumber(root.runningCount))
+        + (root.protectedCount > 0 ? "\n" + strings.tn("bar.protected", root.protectedCount).arg(Commons.I18n.formatNumber(root.protectedCount)) : "")
     // The urgent color is for requests that need an answer, not for running sandboxes.
     active: root.pendingCount > 0 || (root.endedNotice !== null && root.endedNotice.status === "failed")
     onPressed: function(b) { root.togglePanel() }
