@@ -201,8 +201,8 @@ rows = [
   "[Previous]    > [Done]",
 ]
 
-# agy has no compaction hook. A compaction adds a CHECKPOINT step to the
-# transcript (transcriptPath in the hook input). The PreInvocation hook runs
+# agy has hooks but no compaction event. Compaction adds a CHECKPOINT step
+# to the transcript (transcriptPath in the hook input). PreInvocation runs
 # before each model call, counts these steps, and puts the note in with
 # injectSteps[].ephemeralMessage. agy loads ~/.gemini/config/hooks.json
 # without a trust step, and paddock owns the "paddock-compaction" entry in
