@@ -42,6 +42,93 @@ const START_GRACE: u64 = 20;
 pub const EXIT_TIMEOUT: i32 = 124;
 
 pub const NOTICE_WRITER: &str = "paddock: the agent says it is done; close the view to end the run";
+/// Shown in the view when an idle run has a write client, so the run stays.
+pub const NOTICE_IDLE: &str = "paddock: this run is idle. Close the view to end it.";
+/// How often a detached run reads its pane.
+const POLL: Duration = Duration::from_secs(2);
+/// Quiet time before a detached run counts as idle. `[detach] idle_after`.
+pub const IDLE_AFTER: u64 = 10 * 60;
+/// Quiet time after it is idle before paddock ends it. `0` leaves it.
+/// `[detach] idle_timeout`.
+pub const IDLE_TIMEOUT: u64 = 30 * 60;
+
+/// `[detach]` of the user configuration. Durations are `10m` or `2h`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IdleCfg {
+    /// Seconds with no pane output before the run is idle.
+    pub after: u64,
+    /// Seconds of idleness before paddock ends the run. `0` never ends it.
+    pub timeout: u64,
+}
+
+impl Default for IdleCfg {
+    fn default() -> Self {
+        IdleCfg {
+            after: IDLE_AFTER,
+            timeout: IDLE_TIMEOUT,
+        }
+    }
+}
+
+#[derive(Debug, Default, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawIdle {
+    idle_after: Option<String>,
+    idle_timeout: Option<String>,
+}
+
+impl IdleCfg {
+    pub fn load(env: &HostEnv) -> Self {
+        let file = env.paddock_config().join("config.toml");
+        let Ok(text) = std::fs::read_to_string(&file) else {
+            return Self::default();
+        };
+        match Self::parse(&text) {
+            Ok(c) => c,
+            Err(e) => {
+                log::warn!("{e:#}");
+                Self::default()
+            }
+        }
+    }
+
+    pub fn parse(text: &str) -> Result<Self> {
+        let v: toml::Value = toml::from_str(text)?;
+        let raw: RawIdle = match v.get("detach") {
+            Some(t) => t
+                .clone()
+                .try_into()
+                .context("[detach] keys: idle_after and idle_timeout, for example 10m or 0")?,
+            None => RawIdle::default(),
+        };
+        let dur = |key: &str, raw: Option<String>, default: u64| -> Result<u64> {
+            match raw {
+                None => Ok(default),
+                Some(s) => crate::timer::parse_duration(&s)
+                    .with_context(|| format!("{key} is not a duration")),
+            }
+        };
+        Ok(IdleCfg {
+            after: dur("idle_after", raw.idle_after, IDLE_AFTER)?,
+            timeout: dur("idle_timeout", raw.idle_timeout, IDLE_TIMEOUT)?,
+        })
+    }
+}
+
+/// `ended after N minutes without output`. A quiet time that is not a whole
+/// number of minutes is written in seconds.
+pub fn idle_end_text(secs: u64) -> String {
+    if secs >= 60 && secs.is_multiple_of(60) {
+        format!("ended after {} minutes without output", secs / 60)
+    } else {
+        format!("ended after {secs} seconds without output")
+    }
+}
+
+/// Unix time when the detached run became idle, if it is idle now.
+pub fn idle_since(env: &HostEnv, id: &str) -> Option<u64> {
+    Record::load(env, id).and_then(|r| r.idle_since)
+}
 
 /// Where the jobs and prompts wait for their pane: hidden in every sandbox.
 pub fn jobs_dir(env: &HostEnv) -> PathBuf {
@@ -59,6 +146,8 @@ pub fn record_file(env: &HostEnv, id: &str) -> PathBuf {
 pub enum Status {
     Ok,
     Failed,
+    /// The pane stayed quiet until `[detach] idle_timeout`.
+    Idle,
 }
 
 impl std::str::FromStr for Status {
@@ -77,6 +166,7 @@ impl Status {
         match self {
             Status::Ok => "ok",
             Status::Failed => "failed",
+            Status::Idle => "idle",
         }
     }
 }
@@ -109,6 +199,10 @@ pub struct Record {
     /// `paddock stop` ended this run.
     #[serde(default)]
     pub stopped: bool,
+    /// Unix time when the pane became idle. Absent while the pane still
+    /// produces output.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idle_since: Option<u64>,
 }
 
 static RECORD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -211,6 +305,7 @@ pub fn recent_ended(env: &HostEnv, now: u64) -> Vec<serde_json::Value> {
             match rec.done.as_ref().map(|d| d.status) {
                 Some(Status::Ok) => "ok",
                 Some(Status::Failed) => "failed",
+                Some(Status::Idle) => "idle",
                 None => "unknown",
             }
         };
@@ -290,6 +385,7 @@ pub fn launch(
         bail!("a tmux session {} exists already", job.id);
     }
     prune(env);
+    crate::view::reap(env);
     let dir = jobs_dir(env);
     crate::privfs::dir(&dir)?;
     let job_file = dir.join(format!("{}.job", job.id));
@@ -387,6 +483,8 @@ pub struct Ctl {
     pub id: String,
     notified: AtomicBool,
     watching: AtomicBool,
+    /// The idle poll runs once per run.
+    idling: AtomicBool,
     /// How the run ends. The real one signals this process, as `paddock
     /// stop` signals the sandbox: SIGTERM, then the normal end steps.
     stop: Box<dyn Fn() + Send + Sync>,
@@ -413,6 +511,7 @@ impl Ctl {
             id,
             notified: AtomicBool::new(false),
             watching: AtomicBool::new(false),
+            idling: AtomicBool::new(false),
             stop,
         }
     }
@@ -464,6 +563,121 @@ impl Ctl {
                 (self.stop)();
                 return;
             }
+        }
+    }
+
+    /// Poll the pane of this run. A quiet pane becomes idle, then ends the
+    /// run the same way `done` does, unless a write client is attached.
+    pub fn watch(self: &std::sync::Arc<Self>) {
+        if self.idling.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let me = self.clone();
+        std::thread::spawn(move || me.idle_loop());
+    }
+
+    fn idle_loop(&self) {
+        let mut told = false;
+        let mut held = false;
+        loop {
+            std::thread::sleep(POLL);
+            let Some(rec) = Record::load(&self.env, &self.id) else {
+                return;
+            };
+            if rec.ended.is_some() || rec.done.is_some() {
+                return;
+            }
+            let Some(tmux) = self.tmux() else {
+                continue;
+            };
+            let last = match tmux.last_output(&self.id) {
+                // A failed tmux query is not an end. The run record ends the loop.
+                crate::view::PaneOutput::Missing | crate::view::PaneOutput::Unknown => continue,
+                crate::view::PaneOutput::Quiet => {
+                    self.clear_idle(&mut told, &mut held);
+                    continue;
+                }
+                crate::view::PaneOutput::At(t) => t,
+            };
+            let cfg = IdleCfg::load(&self.env);
+            let now = crate::state::now();
+            if last > now || now.saturating_sub(last) < cfg.after {
+                self.clear_idle(&mut told, &mut held);
+                continue;
+            }
+            let since = last.saturating_add(cfg.after);
+            if rec.idle_since != Some(since) {
+                let _ = Record::update(&self.env, &self.id, |r| {
+                    if r.ended.is_none() && r.done.is_none() {
+                        r.idle_since = Some(since);
+                    }
+                });
+            }
+            if !told {
+                told = true;
+                self.notify_idle(&rec);
+            }
+            if cfg.timeout == 0 || now.saturating_sub(since) < cfg.timeout {
+                continue;
+            }
+            if tmux.write_clients(&self.id) > 0 {
+                if !held {
+                    held = true;
+                    tmux.message(&self.id, NOTICE_IDLE);
+                }
+                continue;
+            }
+            self.end_idle(cfg.after.saturating_add(cfg.timeout));
+            return;
+        }
+    }
+
+    fn clear_idle(&self, told: &mut bool, held: &mut bool) {
+        if *told || *held || idle_since(&self.env, &self.id).is_some() {
+            let _ = Record::update(&self.env, &self.id, |r| r.idle_since = None);
+        }
+        *told = false;
+        *held = false;
+    }
+
+    fn notify_idle(&self, rec: &Record) {
+        let project = rec
+            .project
+            .file_name()
+            .and_then(|n| n.to_str())
+            .filter(|n| !n.is_empty())
+            .unwrap_or("a project");
+        let harness = if rec.harness.is_empty() {
+            "a harness"
+        } else {
+            rec.harness.as_str()
+        };
+        let _ = crate::broker::notify::show(
+            &self.env,
+            &crate::broker::notify::Note {
+                summary: "paddock".into(),
+                body: format!("{harness} in {project} waits for input: view it or stop it"),
+                actions: Vec::new(),
+                critical: false,
+            },
+        );
+    }
+
+    fn end_idle(&self, quiet: u64) {
+        let text = idle_end_text(quiet);
+        let mut stop = false;
+        let _ = Record::update(&self.env, &self.id, |r| {
+            if r.done.is_none() && r.ended.is_none() {
+                r.done = Some(Done {
+                    status: Status::Idle,
+                    text: text.clone(),
+                    at: crate::state::now(),
+                });
+                stop = true;
+            }
+        });
+        if stop {
+            (self.stop)();
         }
     }
 }
@@ -527,7 +741,7 @@ fn report(id: &str, rec: Option<&Record>) -> i32 {
             }
             match d.status {
                 Status::Ok => 0,
-                Status::Failed => 1,
+                Status::Failed | Status::Idle => 1,
             }
         }
         None => {

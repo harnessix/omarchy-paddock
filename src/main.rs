@@ -2304,6 +2304,9 @@ fn real_main() -> Result<i32> {
                                 "detached".into(),
                                 paddock::detach::is_detached(&env, &r.id).into(),
                             );
+                            if let Some(since) = paddock::detach::idle_since(&env, &r.id) {
+                                o.insert("idle_since".into(), since.into());
+                            }
                             o.insert(
                                 "activity".into(),
                                 match paddock::view::activity(&env, &r.id) {
