@@ -836,7 +836,7 @@ pub fn render_list(all: &[(PathBuf, Meta)]) -> String {
             m.harness,
             crate::storage::human(m.bytes),
             if m.reflink { " shared" } else { "       " },
-            m.id
+            crate::ids::short(&m.id)
         ));
     }
     t

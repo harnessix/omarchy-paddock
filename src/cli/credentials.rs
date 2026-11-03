@@ -18,6 +18,7 @@ pub(crate) enum CredentialsCmd {
 pub(crate) fn run(env: &HostEnv, cmd: CredentialsCmd) -> Result<i32> {
     match cmd {
         CredentialsCmd::Revoke { id, name } => {
+            let id = paddock::ids::resolve(env, &id)?;
             let names = paddock::credentials::revoke(env, &id, name.as_deref())?;
             println!(
                 "Revoked for {id}: {}. The gateway refuses their next request with 403, the ssh agent channel signs no more, and their secret files are gone.",

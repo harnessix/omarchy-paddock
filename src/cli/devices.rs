@@ -31,6 +31,7 @@ pub(crate) fn run(env: &HostEnv, cmd: DevicesCmd) -> Result<i32> {
     use paddock::devices::ledger;
     match cmd {
         DevicesCmd::Budget { id, device, add } => {
+            let id = paddock::ids::resolve(env, &id)?;
             let add = ledger::parse_amount(&add)?;
             let (root, budget) = ledger::raise(env, &id, &device, add)?;
             println!(

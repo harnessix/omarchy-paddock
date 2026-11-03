@@ -40,6 +40,15 @@ pub fn resolve(env: &HostEnv, input: &str) -> Result<String> {
                 .map(str::to_owned)
         }));
     }
+    if let Ok(projects) = std::fs::read_dir(crate::snapshot::root(env)) {
+        for project in projects.flatten() {
+            ids.extend(
+                crate::snapshot::list(&project.path())
+                    .into_iter()
+                    .map(|(_, m)| m.id),
+            );
+        }
+    }
     resolve_from(input, ids.iter().map(String::as_str))
 }
 
@@ -58,5 +67,20 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains(ids[0]) && err.contains("fake-other-1a2b3c"));
+    }
+    #[test]
+    fn resolves_ended_record() {
+        let tmp = tempfile::tempdir().unwrap();
+        let env = HostEnv::from_parts(
+            tmp.path().to_path_buf(),
+            "test".into(),
+            1,
+            1,
+            Default::default(),
+        );
+        let dir = env.paddock_state().join("detach");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("fake-project-123abc.json"), "{}").unwrap();
+        assert_eq!(resolve(&env, "123a").unwrap(), "fake-project-123abc");
     }
 }

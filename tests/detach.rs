@@ -285,7 +285,7 @@ fn done_ends_the_run_and_wait_reports_it() {
     }
     let w = World::new(true);
     let id = w.detach("ok");
-    let (code, out) = w.wait(&id, "60s");
+    let (code, out) = w.wait(paddock::ids::short(&id), "60s");
     assert_eq!(code, Some(0), "{out}");
     assert_eq!(out.trim(), "ok: all good");
     let r = w.result();

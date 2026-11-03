@@ -1,1 +1,1 @@
-- New: Accept short sandbox IDs in common sandbox commands.
+- New: Use a sandbox ID or a unique prefix of at least four hex digits in sandbox commands. Lists and hints show short IDs, and JSON keeps full IDs with a short field.

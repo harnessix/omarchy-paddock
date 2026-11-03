@@ -148,7 +148,8 @@ pub(crate) fn ps(env: &HostEnv, json: bool) -> Result<i32> {
 
 pub(crate) fn freeze(env: &HostEnv, id: String, tree: bool, reason: String) -> Result<i32> {
     for f in paddock::freeze::freeze(env, &id, tree, &reason)? {
-        println!("Froze {f}. Thaw it with: paddock thaw {f}");
+        let short = paddock::ids::short(&f);
+        println!("Froze {short}. Thaw it with: paddock thaw {short}");
     }
     Ok(0)
 }
