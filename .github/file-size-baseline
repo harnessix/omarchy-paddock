@@ -12,12 +12,12 @@
 1317 src/doctor.rs
 1208 src/gatewayd.rs
 1009 src/hostcli.rs
-903 src/keeper.rs
+752 src/keeper.rs
 2253 src/kv.rs
 1007 src/kv/store.rs
 2241 src/kv/tests.rs
 2140 src/monitor.rs
-990 src/omarchy_usage.rs
+478 src/omarchy_usage.rs
 1345 src/pasture/bridge.rs
 817 src/profile.rs
 969 src/proxy.rs

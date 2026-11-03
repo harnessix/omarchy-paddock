@@ -1,25 +1,32 @@
 //! The box for Omarchy's `omarchy-agent-usage-update`.
 //!
-//! The agents panel counts sessions from the harness folders in the home.
-//! Sessions made in a paddock sandbox stay in its sandbox home. paddock runs
-//! Omarchy's command, unchanged, in a bwrap box that shows both as one tree:
+//! The agents panel counts sessions from the harness folders in the home and
+//! checks rate limits online. Sessions and fresh logins made in a paddock
+//! sandbox stay in its sandbox home. paddock runs Omarchy's command,
+//! unchanged, in a bwrap box that shows every agent's data in one place:
 //!
 //! - the system read-only, an empty home (tmpfs), its own `/tmp`, and the
-//!   user's runtime folders hidden;
-//! - for each harness data folder that a profile names (`[state] auth`,
-//!   `[state.account]`, `[state.history]`): a read-only overlay at its place
-//!   in the home. The lower layers are the same folder in every sandbox home
-//!   of that harness, and the host folder on top. A single file, such as
-//!   `.claude.json`, is the host file, read-only;
+//!   user's runtime folders and session bus hidden (no host keyring);
+//! - for each harness data folder from `COLLECTORS` and the profiles: a
+//!   read-only overlay at its place in the home. The lower layers are the
+//!   same folder in every non-isolated sandbox home of that harness, and the
+//!   host folder on top;
+//! - for each login file of `[state] auth` and `COLLECTORS`: the newest copy
+//!   across the host and every non-isolated sandbox home (by token expiry when
+//!   the file names one, otherwise by modification time, and from the keeper's
+//!   copy for a kept login), mounted read-only;
 //! - read-only: Omarchy's tree and the tool folders on PATH when they are in
 //!   the home (mise's data folder and config with them, so a collector finds
 //!   `codex`), and the panel's own settings in `~/.config/omarchy/agents`;
 //! - read-write: only the record and cache folders of the panel;
-//! - the network of the host, and only HOME, PATH, OMARCHY_PATH, LANG,
-//!   XDG_STATE_HOME and XDG_CACHE_HOME.
+//! - network egress only through paddock's proxy (`proxy.rs`), restricted to
+//!   the endpoints of the profiles and the hosts of `COLLECTORS`.
 //!
 //! The rest of the home (`~/.ssh`, documents, other projects) is absent.
 //! When the box cannot start, the command does not run on the host either.
+
+mod collectors;
+pub use collectors::{collector, Collector, COLLECTORS};
 
 use crate::env::HostEnv;
 use anyhow::{bail, Context, Result};
@@ -28,18 +35,11 @@ use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-/// The folders that the ticket's collectors read, also without a profile.
-const BASE: &[&str] = &[".claude", ".claude.json", ".codex", ".grok", ".gemini"];
-
-/// The longest list of lower layers for one overlay, in bytes. The kernel
-/// takes the mount options in one page, and bwrap adds a prefix to each
-/// path.
+/// The longest list of lower layers for one overlay, in bytes.
 const LOWER_BUDGET: usize = 3000;
 
 /// Where a harness keeps its data, from a path in its profile (relative to
 /// HOME): the first part of the path that is not a shared XDG folder.
-/// `.codex/auth.json` gives `.codex`, `.local/share/opencode/auth.json`
-/// gives `.local/share/opencode`. None for a path that is not in the home.
 pub fn data_root(rel: &str) -> Option<String> {
     let rel = rel.trim_end_matches('/');
     if rel.is_empty() || rel.starts_with('/') {
@@ -62,15 +62,28 @@ pub fn data_root(rel: &str) -> Option<String> {
 }
 
 /// The harness data folders, each with the harnesses whose sandbox homes
-/// hold the same folder. A folder inside another one is left out: the outer
-/// overlay already shows it.
+/// hold the same folder. A folder inside another one is left out.
 pub fn folders(env: &HostEnv) -> BTreeMap<String, BTreeSet<String>> {
     let mut out: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for c in COLLECTORS {
+        for r in c.folders.iter().filter_map(|f| data_root(f)) {
+            let set = out.entry(r).or_default();
+            if let Some(p) = c.profile {
+                set.insert(p.to_string());
+            }
+        }
+    }
     if let Ok(f) = crate::profile::HarnessFactory::new(env) {
         for name in f.names() {
             let Some(p) = f.profile(&name) else { continue };
             let s = &p.state;
-            let mut rels: Vec<&str> = s.auth.iter().map(String::as_str).collect();
+            let mut rels: Vec<&str> = s
+                .data
+                .iter()
+                .chain(s.auth.iter())
+                .chain(s.seed.iter())
+                .map(String::as_str)
+                .collect();
             if let Some(a) = &s.account {
                 rels.push(&a.dir);
                 rels.extend(a.also.iter().map(String::as_str));
@@ -84,9 +97,6 @@ pub fn folders(env: &HostEnv) -> BTreeMap<String, BTreeSet<String>> {
             }
         }
     }
-    for b in BASE {
-        out.entry(b.to_string()).or_default();
-    }
     let keys: Vec<String> = out.keys().cloned().collect();
     out.retain(|k, _| {
         !keys
@@ -96,11 +106,135 @@ pub fn folders(env: &HostEnv) -> BTreeMap<String, BTreeSet<String>> {
     out
 }
 
+/// Login files (relative to HOME) mapped to the profiles that own them and
+/// any configured token-expiry JSON path.
+pub fn login_files(env: &HostEnv) -> BTreeMap<String, (BTreeSet<String>, Option<String>)> {
+    let mut out: BTreeMap<String, (BTreeSet<String>, Option<String>)> = BTreeMap::new();
+    for c in COLLECTORS {
+        let Some(p) = c.profile else { continue };
+        for f in c.login_files.iter().filter(|f| !f.ends_with('/')) {
+            out.entry((*f).to_string())
+                .or_default()
+                .0
+                .insert(p.to_string());
+        }
+    }
+    if let Ok(f) = crate::profile::HarnessFactory::new(env) {
+        for name in f.names() {
+            let Some(p) = f.profile(&name) else { continue };
+            for a in p.state.auth.iter().filter(|a| !a.ends_with('/')) {
+                let entry = out.entry(a.clone()).or_default();
+                entry.0.insert(name.clone());
+                if entry.1.is_none() {
+                    entry.1 = p.state.auth_expiry.get(a).cloned();
+                }
+            }
+        }
+    }
+    out
+}
+
+fn as_epoch_seconds(v: &serde_json::Value) -> Option<u64> {
+    let raw = if let Some(n) = v.as_u64() {
+        n
+    } else if let Some(n) = v.as_i64() {
+        u64::try_from(n).ok()?
+    } else if let Some(f) = v.as_f64().filter(|f| f.is_finite() && *f > 0.0) {
+        f as u64
+    } else {
+        let s = v.as_str().map(str::trim)?;
+        if let Ok(n) = s.parse::<u64>() {
+            n
+        } else if let Ok(f) = s
+            .parse::<f64>()
+            .ok()
+            .filter(|f| f.is_finite() && *f > 0.0)
+            .ok_or(())
+        {
+            f as u64
+        } else {
+            return crate::keeper::parse_rfc3339_utc(s);
+        }
+    };
+    (raw > 0).then_some(if raw >= 100_000_000_000 {
+        raw / 1000
+    } else {
+        raw
+    })
+}
+
+fn jwt_exp(token: &str) -> Option<u64> {
+    use base64::Engine as _;
+    let payload = token.split('.').nth(1)?;
+    let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload.trim_end_matches('='))
+        .ok()?;
+    as_epoch_seconds(&serde_json::from_slice::<serde_json::Value>(&raw).ok()?["exp"])
+}
+
+fn object_expiry(obj: &serde_json::Map<String, serde_json::Value>) -> Option<u64> {
+    for k in ["expiresAt", "expires_at", "expiry_date", "expiry", "exp"] {
+        if let Some(exp) = obj.get(k).and_then(as_epoch_seconds) {
+            return Some(exp);
+        }
+    }
+    for k in ["access_token", "id_token"] {
+        if let Some(exp) = obj.get(k).and_then(|v| v.as_str()).and_then(jwt_exp) {
+            return Some(exp);
+        }
+    }
+    None
+}
+
+/// Extract the token expiry (in Unix seconds) from a login file when the
+/// file names one.
+pub fn token_expiry(bytes: &[u8], configured_path: Option<&str>) -> Option<u64> {
+    if let Some(exp) = crate::keeper::access_expiry(bytes) {
+        return Some(exp);
+    }
+    let doc: serde_json::Value = serde_json::from_slice(bytes).ok()?;
+    if let Some(path) = configured_path {
+        let mut cur = Some(&doc);
+        for part in path.split('.') {
+            cur = cur.and_then(|c| c.get(part));
+        }
+        if let Some(exp) = cur.and_then(as_epoch_seconds) {
+            return Some(exp);
+        }
+    }
+    let obj = doc.as_object()?;
+    if let Some(exp) = object_expiry(obj) {
+        return Some(exp);
+    }
+    for sub in ["claudeAiOauth", "tokens", "oauth"] {
+        if let Some(exp) = obj
+            .get(sub)
+            .and_then(|v| v.as_object())
+            .and_then(object_expiry)
+        {
+            return Some(exp);
+        }
+    }
+    if obj.len() == 1 {
+        if let Some(exp) = obj
+            .values()
+            .next()
+            .and_then(|v| v.as_object())
+            .and_then(object_expiry)
+        {
+            return Some(exp);
+        }
+    }
+    None
+}
+
 /// One part of the view.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Mount {
     /// Read-only overlay at `dest`; `lowers` from the bottom to the top.
     Overlay { dest: PathBuf, lowers: Vec<PathBuf> },
+    /// The newest copy of a login file `src`, mounted read-only at `dest`.
+    Login { src: PathBuf, dest: PathBuf },
     /// A host path, read-only, at the same place.
     Ro(PathBuf),
     /// A host folder, read-write, at the same place.
@@ -110,8 +244,12 @@ pub enum Mount {
 #[derive(Debug, Default)]
 pub struct View {
     pub mounts: Vec<Mount>,
+    /// The newest copy chosen for each login file (`dest` in home -> `src`).
+    pub logins: BTreeMap<PathBuf, PathBuf>,
     /// Sandbox homes left out because an overlay had too many layers.
     pub left_out: usize,
+    /// `(paddock_exe, proxy_socket)` when the proxy relay runs inside the box.
+    pub proxy: Option<(PathBuf, PathBuf)>,
 }
 
 /// A real folder (or file) in a sandbox home: no symlink from the home on.
@@ -119,8 +257,7 @@ fn real_in_home(home: &Path, rel: &str, dir: bool) -> Option<PathBuf> {
     let mut p = home.to_path_buf();
     for part in rel.split('/') {
         p.push(part);
-        let m = std::fs::symlink_metadata(&p).ok()?;
-        if m.file_type().is_symlink() {
+        if std::fs::symlink_metadata(&p).ok()?.file_type().is_symlink() {
             return None;
         }
     }
@@ -128,8 +265,23 @@ fn real_in_home(home: &Path, rel: &str, dir: bool) -> Option<PathBuf> {
     (if dir { m.is_dir() } else { m.is_file() }).then_some(p)
 }
 
-/// The sandbox homes of a harness: `homes/HARNESS/LOGIN/PROJECT`.
-fn sandbox_homes(env: &HostEnv, harness: &str) -> Vec<PathBuf> {
+fn is_isolated_home(login_dir: &Path, home_dir: &Path) -> bool {
+    let name = login_dir
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or_default();
+    if name == "isolated" || name.starts_with("isolated-") {
+        return true;
+    }
+    std::fs::read_to_string(home_dir.join(".paddock-origin"))
+        .ok()
+        .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+        .and_then(|v| v.get("auth")?.as_str().map(str::to_string))
+        .is_some_and(|a| a == "isolated" || a.starts_with("isolated:"))
+}
+
+/// The non-isolated sandbox homes of a harness: `homes/HARNESS/LOGIN/PROJECT`.
+pub fn sandbox_homes(env: &HostEnv, harness: &str) -> Vec<PathBuf> {
     let root = env.paddock_data().join("homes").join(harness);
     let mut out = Vec::new();
     let dirs = |p: &Path| -> Vec<PathBuf> {
@@ -143,7 +295,11 @@ fn sandbox_homes(env: &HostEnv, harness: &str) -> Vec<PathBuf> {
             .unwrap_or_default()
     };
     for login in dirs(&root) {
-        out.extend(dirs(&login));
+        for home in dirs(&login) {
+            if !is_isolated_home(&login, &home) {
+                out.push(home);
+            }
+        }
     }
     out
 }
@@ -152,6 +308,54 @@ fn mtime(p: &Path) -> std::time::SystemTime {
     std::fs::metadata(p)
         .and_then(|m| m.modified())
         .unwrap_or(std::time::UNIX_EPOCH)
+}
+
+/// Choose the freshest copy of `rel` across the host, the credential keeper,
+/// and every non-isolated sandbox home of `harnesses`.
+pub fn newest_login(
+    env: &HostEnv,
+    rel: &str,
+    harnesses: &BTreeSet<String>,
+    expiry_field: Option<&str>,
+) -> Option<PathBuf> {
+    let is_kept_kind = harnesses
+        .iter()
+        .any(|h| crate::keeper::kind_for(h).is_some_and(|k| k.file == rel));
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if let Some(host_file) = real_in_home(&env.home, rel, false) {
+        candidates.push(host_file);
+    }
+    if is_kept_kind {
+        if let Ok(entries) = std::fs::read_dir(env.paddock_state().join("keepers")) {
+            for e in entries.flatten() {
+                if let Some(kf) = real_in_home(&e.path().join("home"), rel, false) {
+                    if !candidates.contains(&kf) {
+                        candidates.push(kf);
+                    }
+                }
+            }
+        }
+    }
+    for h in harnesses {
+        for sb in sandbox_homes(env, h) {
+            if let Some(f) = real_in_home(&sb, rel, false) {
+                if !candidates.contains(&f) {
+                    candidates.push(f);
+                }
+            }
+        }
+    }
+    let mut loaded: Vec<(PathBuf, Vec<u8>)> = candidates
+        .into_iter()
+        .filter_map(|p| std::fs::read(&p).ok().map(|b| (p, b)))
+        .collect();
+    if is_kept_kind && loaded.iter().any(|(_, b)| crate::keeper::keepable(b)) {
+        loaded.retain(|(_, b)| crate::keeper::keepable(b));
+    }
+    loaded
+        .into_iter()
+        .max_by_key(|(p, b)| (token_expiry(b, expiry_field), mtime(p)))
+        .map(|(p, _)| p)
 }
 
 /// The panel's record and cache folders, as Omarchy's scripts compute them.
@@ -183,15 +387,25 @@ pub fn box_path(env: &HostEnv) -> Vec<PathBuf> {
 pub fn view(env: &HostEnv) -> View {
     let home = &env.home;
     let mut v = View::default();
-    // Tools first: a harness overlay inside one of them stays on top.
+    for (rel, (harnesses, expiry_field)) in login_files(env) {
+        if let Some(src) = newest_login(env, &rel, &harnesses, expiry_field.as_deref()) {
+            v.logins.insert(home.join(&rel), src);
+        }
+    }
+    let login_sources: BTreeSet<PathBuf> = v.logins.values().cloned().collect();
     v.mounts
         .extend(tool_folders(env).into_iter().map(Mount::Ro));
     for (rel, harnesses) in folders(env) {
         let host = home.join(&rel);
         let host_dir = std::fs::symlink_metadata(&host).is_ok_and(|m| m.is_dir());
-        let host_file = !host_dir && host.is_file();
-        if host_file {
-            v.mounts.push(Mount::Ro(host));
+        if !host_dir && host.is_file() {
+            match v.logins.get(&host) {
+                Some(src) if src != &host => v.mounts.push(Mount::Login {
+                    src: src.clone(),
+                    dest: host,
+                }),
+                _ => v.mounts.push(Mount::Ro(host)),
+            }
             continue;
         }
         let mut theirs: Vec<PathBuf> = harnesses
@@ -199,8 +413,10 @@ pub fn view(env: &HostEnv) -> View {
             .flat_map(|h| sandbox_homes(env, h))
             .filter_map(|h| real_in_home(&h, &rel, true))
             .collect();
-        // The newest first, so a full budget leaves out the oldest homes.
-        theirs.sort_by_key(|p| std::cmp::Reverse(mtime(p)));
+        theirs.sort_by_key(|p| {
+            let holds_login = login_sources.iter().any(|s| s.starts_with(p));
+            (std::cmp::Reverse(holds_login), std::cmp::Reverse(mtime(p)))
+        });
         let cost = |p: &Path| p.as_os_str().len() + 10;
         let mut used = if host_dir { cost(&host) } else { 0 };
         let mut lowers = Vec::new();
@@ -220,6 +436,19 @@ pub fn view(env: &HostEnv) -> View {
             0 => {}
             1 if lowers[0] == host => v.mounts.push(Mount::Ro(host)),
             _ => v.mounts.push(Mount::Overlay { dest: host, lowers }),
+        }
+    }
+    for (dest, src) in &v.logins {
+        if src != dest
+            && !v
+                .mounts
+                .iter()
+                .any(|m| matches!(m, Mount::Login { dest: d, .. } if d == dest))
+        {
+            v.mounts.push(Mount::Login {
+                src: src.clone(),
+                dest: dest.clone(),
+            });
         }
     }
     v.mounts.push(Mount::Rw(state_dir(env)));
@@ -251,12 +480,8 @@ fn tool_folders(env: &HostEnv) -> Vec<PathBuf> {
     let paddock = env.paddock_data();
     let mut out: Vec<PathBuf> = Vec::new();
     for p in want {
-        // Never paddock's data, nor a folder that holds it.
         let ours = p.starts_with(&paddock) || paddock.starts_with(&p);
-        if !p.starts_with(home) || ours || !p.exists() {
-            continue;
-        }
-        if out.iter().any(|o| p.starts_with(o)) {
+        if !p.starts_with(home) || ours || !p.exists() || out.iter().any(|o| p.starts_with(o)) {
             continue;
         }
         out.retain(|o| !o.starts_with(&p));
@@ -265,24 +490,75 @@ fn tool_folders(env: &HostEnv) -> Vec<PathBuf> {
     out
 }
 
-/// The bwrap arguments for the home of the view: an empty home, and the
-/// mounts of the view over it.
+/// The hosts that the usage box proxy lets through: every collector host in
+/// `COLLECTORS` and every `[network] endpoints` entry of the profiles.
+pub fn allowed_hosts(env: &HostEnv) -> Vec<String> {
+    let mut set = BTreeSet::new();
+    for c in COLLECTORS {
+        set.extend(c.hosts.iter().map(|h| (*h).to_string()));
+    }
+    if let Ok(f) = crate::profile::HarnessFactory::new(env) {
+        for name in f.names() {
+            if let Some(p) = f.profile(&name) {
+                set.extend(p.network.endpoints.iter().cloned());
+            }
+        }
+    }
+    set.into_iter().collect()
+}
+
+/// Start the usage box proxy on `sock`. A connection to a host outside
+/// `allowed_hosts(env)` is refused and named on standard error.
+pub fn start_proxy(env: &HostEnv, sock: &Path) -> Result<()> {
+    use crate::proxy::allow::{Allowlist, ApiPolicy, Refusals};
+    let (list, _) = Allowlist::parse(&allowed_hosts(env));
+    let refusals = Refusals::new(std::sync::Arc::new(|host: &str, why: &str| {
+        eprintln!("paddock: the usage box refused a connection to {host} ({why})");
+    }));
+    let mut cfg = crate::proxy::HostProxy::from_vars(|k| env.var(k).map(str::to_string));
+    cfg.api = Some(ApiPolicy {
+        list,
+        refusals: Some(refusals),
+    });
+    crate::proxy::serve(sock, cfg)
+}
+
+/// The bwrap arguments for the home of the view.
 pub fn home_args(env: &HostEnv, view: &View) -> Vec<String> {
     let s = |p: &Path| p.display().to_string();
     let mut a = vec!["--tmpfs".to_string(), s(&env.home)];
     for m in &view.mounts {
         match m {
+            Mount::Overlay { dest, lowers } if lowers.len() == 1 => {
+                a.extend(["--ro-bind".into(), s(&lowers[0]), s(dest)]);
+            }
             Mount::Overlay { dest, lowers } => {
                 for l in lowers {
                     a.extend(["--overlay-src".into(), s(l)]);
                 }
                 a.extend(["--ro-overlay".into(), s(dest)]);
             }
+            Mount::Login { src, dest } => a.extend(["--ro-bind".into(), s(src), s(dest)]),
             Mount::Ro(p) => a.extend(["--ro-bind".into(), s(p), s(p)]),
             Mount::Rw(p) => a.extend(["--bind".into(), s(p), s(p)]),
         }
     }
     a
+}
+
+fn dbus_socket_dir(env: &HostEnv) -> Option<PathBuf> {
+    let raw = env.var("DBUS_SESSION_BUS_ADDRESS")?;
+    for part in raw.split(';') {
+        for kv in part.strip_prefix("unix:")?.split(',') {
+            if let Some(p) = kv.strip_prefix("path=") {
+                let dir = Path::new(p).parent()?;
+                if dir.is_dir() && dir != Path::new("/") && !dir.starts_with("/tmp") {
+                    return Some(dir.to_path_buf());
+                }
+            }
+        }
+    }
+    None
 }
 
 /// The bwrap arguments for `program ARGS` in the view.
@@ -295,6 +571,7 @@ pub fn bwrap_args(env: &HostEnv, view: &View, program: &Path, args: &[String]) -
         "--unshare-pid",
         "--unshare-ipc",
         "--unshare-uts",
+        "--unshare-net",
         "--unshare-cgroup-try",
         "--disable-userns",
         "--ro-bind",
@@ -315,17 +592,42 @@ pub fn bwrap_args(env: &HostEnv, view: &View, program: &Path, args: &[String]) -
         a.extend(["--tmpfs".into(), s(&d)]);
     }
     if let Some(rt) = &env.runtime_dir {
-        if rt.is_dir() && !a.contains(&s(rt)) {
+        if rt.is_dir() && !rt.starts_with("/tmp") && !a.contains(&s(rt)) {
             a.extend(["--tmpfs".into(), s(rt)]);
         }
     }
+    if let Some(bus_dir) = dbus_socket_dir(env) {
+        if !a.contains(&s(&bus_dir)) {
+            a.extend(["--tmpfs".into(), s(&bus_dir)]);
+        }
+    }
     a.extend(home_args(env, view));
-    a.extend(["--chdir".into(), s(&env.home), "--".into(), s(program)]);
+    if let Some((paddock, sock)) = &view.proxy {
+        a.extend([
+            "--ro-bind".into(),
+            s(paddock),
+            "/tmp/.paddock-bin".into(),
+            "--ro-bind".into(),
+            s(sock),
+            "/tmp/.paddock-proxy.sock".into(),
+        ]);
+    }
+    a.extend(["--chdir".into(), s(&env.home), "--".into()]);
+    if view.proxy.is_some() {
+        let script = format!(
+            "/tmp/.paddock-bin relay --listen 127.0.0.1:{} --socket /tmp/.paddock-proxy.sock --ready-file /tmp/.paddock-ready >/dev/null 2>&1 &\n\
+             i=0; while [ ! -e /tmp/.paddock-ready ] && [ $i -lt 100 ]; do sleep 0.02; i=$((i+1)); done\n\
+             exec \"$@\"",
+            crate::proxy::API_PORT
+        );
+        a.extend(["/bin/sh".into(), "-c".into(), script, "paddock".into()]);
+    }
+    a.push(s(program));
     a.extend(args.iter().cloned());
     a
 }
 
-/// The variables in the box.
+/// The variables in the box. `DBUS_SESSION_BUS_ADDRESS` is never passed.
 pub fn box_env(env: &HostEnv) -> BTreeMap<String, String> {
     let mut out = BTreeMap::new();
     out.insert("HOME".into(), env.home.display().to_string());
@@ -339,6 +641,20 @@ pub fn box_env(env: &HostEnv) -> BTreeMap<String, String> {
         if let Some(v) = env.var(k) {
             out.insert(k.into(), v.into());
         }
+    }
+    let url = format!("http://127.0.0.1:{}", crate::proxy::API_PORT);
+    for k in [
+        "HTTPS_PROXY",
+        "https_proxy",
+        "HTTP_PROXY",
+        "http_proxy",
+        "ALL_PROXY",
+        "all_proxy",
+    ] {
+        out.insert(k.into(), url.clone());
+    }
+    for k in ["NO_PROXY", "no_proxy"] {
+        out.insert(k.into(), "127.0.0.1,localhost".into());
     }
     out
 }
@@ -395,8 +711,6 @@ pub fn fail_line(e: &anyhow::Error) -> String {
     )
 }
 
-/// A line of the box's standard error that says a collector could not
-/// write a read-only file.
 fn read_only_write(line: &str) -> bool {
     line.contains("Read-only file system") || line.contains("EROFS")
 }
@@ -418,12 +732,21 @@ pub fn run(env: &HostEnv, program: &Path, args: &[String]) -> Result<Option<i32>
     for d in [state_dir(env), cache_dir(env)] {
         std::fs::create_dir_all(&d).with_context(|| format!("cannot create {}", d.display()))?;
     }
-    let view = view(env);
+    let mut view = view(env);
     if view.left_out > 0 {
         eprintln!(
             "paddock: {} sandbox homes are left out of the usage view (too many layers); the panel counts the newest ones",
             view.left_out
         );
+    }
+    let run_dir = env
+        .paddock_run()
+        .join(format!("usage-box-{}", std::process::id()));
+    if let Ok(paddock) = crate::launchers::launcher_exe(env) {
+        let sock = run_dir.join("api-proxy.sock");
+        if start_proxy(env, &sock).is_ok() {
+            view.proxy = Some((paddock, sock));
+        }
     }
     let mut child = Command::new(&bwrap)
         .args(bwrap_args(env, &view, program, args))
@@ -450,6 +773,7 @@ pub fn run(env: &HostEnv, program: &Path, args: &[String]) -> Result<Option<i32>
     });
     let status = child.wait()?;
     let _ = relay.join();
+    let _ = std::fs::remove_dir_all(&run_dir);
     use std::os::unix::process::ExitStatusExt;
     Ok(Some(
         status
@@ -459,152 +783,4 @@ pub fn run(env: &HostEnv, program: &Path, args: &[String]) -> Result<Option<i32>
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn data_roots_skip_shared_xdg_folders() {
-        assert_eq!(data_root(".codex/auth.json").as_deref(), Some(".codex"));
-        assert_eq!(data_root(".claude.json").as_deref(), Some(".claude.json"));
-        assert_eq!(
-            data_root(".local/share/opencode/auth.json").as_deref(),
-            Some(".local/share/opencode")
-        );
-        assert_eq!(
-            data_root(".config/cursor/auth.json").as_deref(),
-            Some(".config/cursor")
-        );
-        assert_eq!(
-            data_root(".kimi-code/credentials/").as_deref(),
-            Some(".kimi-code")
-        );
-        assert_eq!(
-            data_root(".gemini/antigravity-cli/x").as_deref(),
-            Some(".gemini")
-        );
-        for bad in [
-            "",
-            "/etc/passwd",
-            "../x",
-            ".local/bin/x",
-            ".cache/x",
-            ".config",
-        ] {
-            assert_eq!(data_root(bad), None, "{bad}");
-        }
-    }
-
-    fn env(t: &Path) -> HostEnv {
-        let mut vars = BTreeMap::new();
-        vars.insert("PATH".into(), "/usr/bin".into());
-        HostEnv::from_parts(t.join("home"), "demo".into(), 1, 1, vars)
-    }
-
-    #[test]
-    fn the_view_merges_host_and_sandbox_homes_and_nothing_else() {
-        let t = tempfile::tempdir().unwrap();
-        let e = env(t.path());
-        let home = &e.home;
-        std::fs::create_dir_all(home.join(".codex/sessions")).unwrap();
-        std::fs::create_dir_all(home.join(".ssh")).unwrap();
-        std::fs::write(home.join(".claude.json"), "{}").unwrap();
-        let homes = e.paddock_data().join("homes/codex");
-        let a = homes.join("shared/proj-a/.codex");
-        let b = homes.join("shared/proj-b/.codex");
-        std::fs::create_dir_all(&a).unwrap();
-        std::fs::create_dir_all(&b).unwrap();
-        // A link that a sandbox planted is never a layer.
-        let c = homes.join("shared/proj-c");
-        std::fs::create_dir_all(&c).unwrap();
-        std::os::unix::fs::symlink(home.join(".ssh"), c.join(".codex")).unwrap();
-        let v = view(&e);
-        let codex = v
-            .mounts
-            .iter()
-            .find_map(|m| match m {
-                Mount::Overlay { dest, lowers } if dest.ends_with(".codex") => Some(lowers),
-                _ => None,
-            })
-            .expect("no overlay for .codex");
-        assert_eq!(codex.len(), 3, "{codex:?}");
-        assert_eq!(
-            codex.last(),
-            Some(&home.join(".codex")),
-            "the host is on top"
-        );
-        assert!(codex.contains(&a) && codex.contains(&b));
-        assert!(v.mounts.contains(&Mount::Ro(home.join(".claude.json"))));
-        let args = bwrap_args(&e, &v, Path::new("/x/update"), &["--force".into()]);
-        let joined = args.join(" ");
-        assert!(!joined.contains(".ssh"), "{joined}");
-        assert!(joined.contains(&format!("--tmpfs {}", home.display())));
-        assert!(joined.contains(&format!("--bind {0} {0}", state_dir(&e).display())));
-        assert!(joined.ends_with("-- /x/update --force"));
-        // Only the bind of the record and cache folders is writable.
-        let rw: Vec<_> = args
-            .windows(2)
-            .filter(|w| w[0] == "--bind")
-            .map(|w| w[1].clone())
-            .collect();
-        assert_eq!(
-            rw,
-            vec![
-                state_dir(&e).display().to_string(),
-                cache_dir(&e).display().to_string()
-            ]
-        );
-    }
-
-    #[test]
-    fn many_sandbox_homes_stay_within_the_mount_option_limit() {
-        let t = tempfile::tempdir().unwrap();
-        let e = env(t.path());
-        let homes = e.paddock_data().join("homes/grok/shared");
-        for n in 0..200 {
-            std::fs::create_dir_all(homes.join(format!("project-{n:04}/.grok"))).unwrap();
-        }
-        let v = view(&e);
-        let lowers = v
-            .mounts
-            .iter()
-            .find_map(|m| match m {
-                Mount::Overlay { dest, lowers } if dest.ends_with(".grok") => Some(lowers),
-                _ => None,
-            })
-            .unwrap();
-        let size: usize = lowers.iter().map(|p| p.as_os_str().len() + 10).sum();
-        assert!(size <= LOWER_BUDGET);
-        assert_eq!(lowers.len() + v.left_out, 200);
-    }
-
-    #[test]
-    fn only_the_listed_variables_pass() {
-        let t = tempfile::tempdir().unwrap();
-        let mut vars = BTreeMap::new();
-        for (k, v) in [
-            ("PATH", "/usr/bin"),
-            ("LANG", "C"),
-            ("OMARCHY_PATH", "/o"),
-            ("SSH_AUTH_SOCK", "/s"),
-            ("OPENAI_API_KEY", "k"),
-        ] {
-            vars.insert(k.to_string(), v.to_string());
-        }
-        let e = HostEnv::from_parts(t.path().join("h"), "demo".into(), 1, 1, vars);
-        let keys: Vec<String> = box_env(&e).into_keys().collect();
-        assert_eq!(keys, ["HOME", "LANG", "OMARCHY_PATH", "PATH"]);
-    }
-
-    #[test]
-    fn without_bwrap_the_box_fails_closed() {
-        let t = tempfile::tempdir().unwrap();
-        let e = env(t.path());
-        let mut e = e;
-        e.path = vec![t.path().join("nothing")];
-        let err = probe(&e).unwrap_err();
-        let line = fail_line(&err);
-        assert!(line.contains("bwrap is not on PATH"), "{line}");
-        assert!(line.contains("paddock shims remove"));
-        assert!(!line.contains('\n'));
-    }
-}
+mod tests;

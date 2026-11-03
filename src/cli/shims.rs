@@ -72,7 +72,7 @@ pub(crate) fn run(env: &HostEnv, cmd: ShimsCmd) -> Result<i32> {
             );
             match paddock::omarchy_usage::install(env) {
                 Ok(_) => println!(
-                    "Added one marked block to {}: the agents panel checks the limits of a login that a sandbox holds from paddock's side. It takes effect at your next login.",
+                    "Added one marked block to {}: the agents panel runs its usage update inside paddock's usage box. It takes effect at your next login.",
                     paddock::omarchy_usage::hypr_config(env).display()
                 ),
                 Err(e) => println!("The agents panel keeps checking limits on the host: {e:#}"),

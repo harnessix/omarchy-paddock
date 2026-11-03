@@ -1,3 +1,0 @@
-- Changed: The Omarchy agents panel's `omarchy-agent-usage-update` runs in a box. Each harness folder there is one read-only tree of the host folder and the same folder of every sandbox home, so the panel counts sandbox sessions. The box sees nothing else of the home. If the box cannot start, the command does not run on the host.
-- New: `paddock shims install --scope omarchy-agent` also writes a mise wrapper for `omarchy-agent-usage-update`. `paddock shims remove` takes it out.
-- Removed: Codex and Grok Build no longer copy new sessions back to the home at exit.

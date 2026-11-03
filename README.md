@@ -1595,20 +1595,22 @@ paddock has a profile for every agent that `omarchy-agent` can start. `paddock d
 
 #### Usage statistics in the Omarchy agents panel
 
-The agents panel reads the session history of each agent from fixed places in your home folder. A sandbox keeps its history in its own home. The panel's command runs in the usage box (see above), which shows the host folders and the sandbox homes as one tree, so the panel counts both. paddock copies no session back to your home: a transcript that a sandbox wrote and that your host harness loads later, for example with `claude --resume`, could carry instructions out of the sandbox.
+The agents panel reads the session history of each agent from fixed places in your home folder. A sandbox keeps its history in its own home. The panel's command runs in the usage box (see above), which shows the host folders and the sandbox homes as one tree, so the panel counts both. paddock copies no session back to your home: a transcript that a sandbox wrote and that your host harness loads later, for example with `claude --resume`, can carry instructions out of the sandbox.
 
 - Claude Code keeps one folder per project in `~/.claude/projects`. paddock binds the host folder of the current project into the sandbox, read-write. The sandbox sees only this one folder, no other project's. `claude --resume` on the host also finds these sessions.
 - Codex (`~/.codex/sessions`) and Grok Build (`~/.grok/sessions`) keep their history in the sandbox home. The usage box shows it to the panel. A folder in a sandbox home that is a symlink is not part of the tree.
 - With an account folder (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `GROK_HOME`), Claude Code's project folder is in that folder, the same as on the host.
 - The panel's collectors count the sessions the same way as sessions on the host. `paddock gc` deletes a sandbox home with its sessions, and the panel stops counting them.
 
-The panel also shows each agent's limits. Its collectors ask the vendor, with the login on the host. While a sandbox runs, it has a copy of that login, so a check from the host would use one login in two places at once. With this scope, a login is checked from one side only:
+The panel also shows each agent's limits. Its collectors check limits online with the agent's login. Inside the usage box, every agent uses the same rule:
 
 - paddock adds one marked block at the end of `~/.config/hypr/hyprland.lua`, where Omarchy asks for your own configuration. The block loads a file of paddock, which puts one folder first on the `PATH` of the programs that Hyprland starts, ahead of Omarchy's `bin` folder. The folder has one command in it: `omarchy-agent-usage-update`, which the panel runs for each refresh. Hyprland puts Omarchy's `bin` folder ahead of mise's wrappers, and the panel runs the command without a shell, so the panel reaches the usage box through this folder, not through the mise wrapper. Before paddock writes the file, `luac -p` (if installed) checks that it still compiles. It takes effect at your next login.
-- If no sandbox holds a login, Omarchy's command runs in the usage box.
-- If a sandbox holds the login of Claude Code or Grok Build, the usage box skips that agent (`--except`), and paddock runs Omarchy's own collector in a sandbox instead. That sandbox has network mode egress, sees the home of the usage box, and sees the sandbox's copy of the login in place of the host file. Its record goes where Omarchy's goes. These collectors only read a login. They never refresh it.
-- The Codex collector starts `codex app-server`, which can refresh the login itself. So while a sandbox holds a Codex login, nobody checks it. The panel shows the last numbers, marked "Limits paused", until the sandbox exits.
-- In the usage box, login files are read-only. If a collector tries to save a refreshed login, the write fails, and paddock prints one line about it.
+- For each login file of `[state] auth` in a profile and each collector login file, the usage box mounts the newest copy read-only. The copies are the host file and the same file in every non-isolated sandbox home of that profile. When the file names a token expiry, the newest copy is the one with the latest expiry. Otherwise it is the one with the latest modification time.
+- A login that the credential keeper manages (Codex) comes from the keeper's copy, and paddock holds the keeper's refresh lock while the usage box runs.
+- An isolated login (`--auth isolated`) belongs to its sandbox only and never appears in the usage box.
+- Inside the box, there is no session bus and no host keyring (`DBUS_SESSION_BUS_ADDRESS` is unset and the runtime folders are hidden), so collectors read the mounted login files instead.
+- Network traffic in the usage box goes through paddock's proxy. The proxy allows only the `[network] endpoints` of the profiles and the vendor hosts that the collectors call. If a collector calls a host outside that list, the proxy refuses the connection and prints the host name to standard error.
+- Login files are read-only in the usage box. paddock never writes a login back to the host home from the box. If a collector tries to write into a read-only folder, the write fails and paddock prints one line about it.
 - paddock checks only when the panel asks. It adds no timer of its own.
 - `paddock shims remove` removes the block, byte for byte, and the folder. `paddock doctor` shows whether the panel's checks go through paddock.
 

@@ -1,35 +1,16 @@
 //! `paddock omarchy-usage-update` end to end, with a fake Omarchy tree (its
 //! update command and collectors) in a temporary home. The fake collectors
-//! never use the network, and no test here talks to a vendor.
-//!
-//! - Without a held login, Omarchy's command runs with the same arguments.
-//! - A Claude Code login that a sandbox holds: the host command gets
-//!   `--except claude`, and the collector runs in a paddock sandbox that sees
-//!   the sandbox's copy of the login in place of the host file, and the home
-//!   read-only.
-//! - A held Codex login without a keeper is not checked: the record keeps
-//!   its numbers, marked as paused. With a keeper, Omarchy's collector runs
-//!   in the keeper sandbox, and a refresh that it makes goes back to the
-//!   host and into the sandbox.
+//! never contact a vendor endpoint, and never use a real harness or Omarchy's
+//! real scripts.
 
 mod common;
 
 use paddock::env::HostEnv;
 use paddock::state::{HeldLogin, Running};
+use paddock::usage_box::Mount;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-
-fn tools_work() -> bool {
-    let _g = EXEC.lock().unwrap_or_else(|e| e.into_inner());
-    let bwrap = common::bwrap_works();
-    let pasta = Command::new("pasta")
-        .arg("--version")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false);
-    bwrap && pasta
-}
 
 /// Writing a script while another test thread starts a process lets the
 /// child inherit the open file, and running the script then fails with
@@ -44,6 +25,18 @@ fn write_exec(p: &Path, text: &str) {
     std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o755)).unwrap();
 }
 
+fn set_mtime(p: &Path, secs: u64) {
+    let c_path = std::ffi::CString::new(p.as_os_str().as_encoded_bytes()).unwrap();
+    let t = libc::timespec {
+        tv_sec: secs as libc::time_t,
+        tv_nsec: 0,
+    };
+    let times = [t, t];
+    unsafe {
+        libc::utimensat(libc::AT_FDCWD, c_path.as_ptr(), times.as_ptr(), 0);
+    }
+}
+
 /// Records its arguments in the panel's state folder, the one place of the
 /// home that the usage box can write.
 const FAKE_UPDATE: &str =
@@ -55,16 +48,10 @@ fn box_works(w: &World) -> bool {
     paddock::usage_box::probe(&w.env()).is_ok()
 }
 
-/// Prints a record with the login that it sees, its arguments, and whether
-/// it can write the home.
-const FAKE_CLAUDE: &str = r#"#!/bin/sh
-if touch "$HOME/.claude/written" 2>/dev/null; then home=rw; else home=ro; fi
-printf '{"id":"claude","login":%s,"args":"%s","home":"%s"}\n' "$(cat "$HOME/.claude/.credentials.json")" "$*" "$home"
-"#;
-
 struct World {
     _tmp: tempfile::TempDir,
     home: PathBuf,
+    run: PathBuf,
     vars: BTreeMap<String, String>,
 }
 
@@ -74,7 +61,6 @@ fn world() -> World {
     let home = tmp.path().join("home");
     let omarchy = home.join("omarchy");
     write_exec(&omarchy.join("bin/omarchy-agent-usage-update"), FAKE_UPDATE);
-    write_exec(&omarchy.join("bin/omarchy-agent-usage-claude"), FAKE_CLAUDE);
     std::fs::create_dir_all(home.join(".claude")).unwrap();
     std::fs::write(home.join(".claude/.credentials.json"), r#"{"t":"host"}"#).unwrap();
     let run = tmp.path().join("run");
@@ -88,6 +74,7 @@ fn world() -> World {
     World {
         _tmp: tmp,
         home,
+        run,
         vars,
     }
 }
@@ -127,8 +114,7 @@ impl World {
         serde_json::from_str(&std::fs::read_to_string(f).unwrap()).unwrap()
     }
 
-    /// A running sandbox that holds a copy of a login. The test process
-    /// stands in for its process, so it counts as running.
+    /// A running sandbox that holds a copy of a login.
     fn hold(&self, id: &str, harness: &str, sandbox: &Path, rel: &str, store: &Path) {
         Running {
             id: id.into(),
@@ -167,24 +153,21 @@ impl World {
 }
 
 #[test]
-fn without_a_held_login_omarchy_s_command_runs_as_asked() {
+fn the_except_patch_is_gone_and_the_panel_hook_still_installs_and_removes() {
     let w = world();
-    if !box_works(&w) {
-        eprintln!("skipped: the usage box cannot start here");
-        return;
-    }
-    let out = w.update(&["--limits-only", "--except", "kimi"]);
-    assert!(out.status.success(), "{out:?}");
-    assert_eq!(w.real_log(), "--limits-only --except kimi\n");
-}
+    let e = w.env();
+    let hypr = paddock::omarchy_usage::hypr_config(&e);
+    std::fs::create_dir_all(hypr.parent().unwrap()).unwrap();
+    std::fs::write(&hypr, "require(\"default.hypr.omarchy\")\n").unwrap();
+    paddock::omarchy_usage::install(&e).unwrap();
+    assert!(paddock::omarchy_usage::status(&e).block);
+    assert!(paddock::omarchy_usage::status(&e).files);
+    paddock::omarchy_usage::remove(&e).unwrap();
+    assert!(!paddock::omarchy_usage::status(&e).block);
+    assert!(!paddock::omarchy_usage::status(&e).files);
 
-#[test]
-fn a_held_claude_login_is_checked_only_from_paddock_s_side() {
-    let w = world();
-    if !tools_work() || !box_works(&w) {
-        eprintln!("skipped: bwrap, pasta or the usage box does not work here");
-        return;
-    }
+    // Even when a running sandbox holds a Claude login, paddock never adds
+    // `--except claude`: the whole update runs in the usage box.
     let sb = w.home.join(".local/share/paddock/homes/claude/shared/p");
     std::fs::create_dir_all(sb.join(".claude")).unwrap();
     std::fs::write(sb.join(".claude/.credentials.json"), r#"{"t":"sandbox"}"#).unwrap();
@@ -197,251 +180,233 @@ fn a_held_claude_login_is_checked_only_from_paddock_s_side() {
         &host_login,
     );
 
+    if !box_works(&w) {
+        eprintln!("skipped: the usage box cannot start here");
+        return;
+    }
     let out = w.update(&["--force"]);
     assert!(out.status.success(), "{out:?}");
-    assert_eq!(w.real_log(), "--force --except claude\n");
-    let r = w.record("claude");
-    assert_eq!(r["login"]["t"], "sandbox", "{r}");
-    assert_eq!(r["args"], "--force");
-    assert_eq!(r["home"], "ro");
-    assert_eq!(
-        std::fs::read_to_string(&host_login).unwrap(),
-        r#"{"t":"host"}"#
-    );
-    assert!(!w.home.join(".claude/written").exists());
+    assert_eq!(w.real_log(), "--force\n");
+}
 
-    // An agent that the panel did not ask for is left alone.
-    std::fs::remove_file(w.home.join(".local/state/omarchy/agents/real.log")).unwrap();
-    let out = w.update(&["grok"]);
-    assert!(out.status.success(), "{out:?}");
-    assert_eq!(w.real_log(), "grok\n");
+const TWO_AGENTS_UPDATE: &str = r#"#!/bin/sh
+set -e
+u="$HOME/.local/state/omarchy/agents/usage"
+mkdir -p "$u"
+"$OMARCHY_PATH/bin/omarchy-agent-usage-claude" > "$u/claude.json"
+"$OMARCHY_PATH/bin/omarchy-agent-usage-grok" > "$u/grok.json"
+"#;
+
+const FAKE_CLAUDE_COLLECTOR: &str = r#"#!/bin/sh
+sessions=$(ls -1 "$HOME/.claude/projects" 2>/dev/null | sort | tr '\n' ',' | sed 's/,$//')
+if touch "$HOME/.claude/projects/write-test" 2>/dev/null; then sess_w=rw; else sess_w=ro; fi
+if sh -c 'echo x >> "$HOME/.claude/.credentials.json"' 2>/dev/null; then login_w=rw; else login_w=ro; fi
+[ -e "$HOME/.ssh" ] && ssh=present || ssh=absent
+[ -e "$HOME/secret.txt" ] && secret=present || secret=absent
+[ -n "${DBUS_SESSION_BUS_ADDRESS:-}" ] && dbus_env=set || dbus_env=unset
+[ -e "$ bus_sock_path" ] && bus_sock=present || bus_sock=absent
+printf '{"id":"claude","sessions":"%s","login":%s,"sess_w":"%s","login_w":"%s","ssh":"%s","secret":"%s","dbus_env":"%s","bus_sock":"%s"}\n' \
+  "$sessions" "$(cat "$HOME/.claude/.credentials.json")" "$sess_w" "$login_w" "$ssh" "$secret" "$dbus_env" "$bus_sock"
+"#;
+
+const FAKE_GROK_COLLECTOR: &str = r#"#!/bin/sh
+sessions=$(ls -1 "$HOME/.grok/sessions" 2>/dev/null | sort | tr '\n' ',' | sed 's/,$//')
+if touch "$HOME/.grok/sessions/write-test" 2>/dev/null; then sess_w=rw; else sess_w=ro; fi
+if sh -c 'echo x >> "$HOME/.grok/auth.json"' 2>/dev/null; then login_w=rw; else login_w=ro; fi
+printf '{"id":"grok","sessions":"%s","login":%s,"sess_w":"%s","login_w":"%s"}\n' \
+  "$sessions" "$(cat "$HOME/.grok/auth.json")" "$sess_w" "$login_w"
+"#;
+
+#[test]
+fn two_agents_see_merged_sessions_freshest_logins_no_isolated_and_no_session_bus() {
+    let mut w = world();
+    let bus_sock = w.run.join("bus");
+    std::fs::write(&bus_sock, "fake-bus").unwrap();
+    w.vars.insert(
+        "DBUS_SESSION_BUS_ADDRESS".into(),
+        format!("unix:path={}", bus_sock.display()),
+    );
+    std::fs::create_dir_all(w.home.join(".ssh")).unwrap();
+    std::fs::write(w.home.join(".ssh/id_ed25519"), "private-key").unwrap();
+    std::fs::write(w.home.join("secret.txt"), "top-secret").unwrap();
+
+    // Agent 1 (claude): host + 2 shared sandbox homes + 1 isolated home.
+    let c_host = w.home.join(".claude");
+    let c_sb1 = w
+        .home
+        .join(".local/share/paddock/homes/claude/shared/p1/.claude");
+    let c_sb2 = w
+        .home
+        .join(".local/share/paddock/homes/claude/shared/p2/.claude");
+    let c_iso = w
+        .home
+        .join(".local/share/paddock/homes/claude/isolated/p3/.claude");
+    for (dir, sname) in [
+        (&c_host, "host.jsonl"),
+        (&c_sb1, "sb1.jsonl"),
+        (&c_sb2, "sb2.jsonl"),
+        (&c_iso, "isolated.jsonl"),
+    ] {
+        std::fs::create_dir_all(dir.join("projects")).unwrap();
+        std::fs::write(dir.join("projects").join(sname), "{}\n").unwrap();
+    }
+    // c_sb1 has the latest token expiry among non-isolated copies; c_iso has a
+    // higher expiry but is isolated so it must never be shown.
+    std::fs::write(
+        c_host.join(".credentials.json"),
+        r#"{"which":"host","claudeAiOauth":{"expiresAt":1000000000000}}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        c_sb1.join(".credentials.json"),
+        r#"{"which":"sb1","claudeAiOauth":{"expiresAt":3000000000000}}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        c_sb2.join(".credentials.json"),
+        r#"{"which":"sb2","claudeAiOauth":{"expiresAt":2000000000000}}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        c_iso.join(".credentials.json"),
+        r#"{"which":"isolated","claudeAiOauth":{"expiresAt":9000000000000}}"#,
+    )
+    .unwrap();
+    set_mtime(&c_host.join(".credentials.json"), 100);
+    set_mtime(&c_sb1.join(".credentials.json"), 200);
+    set_mtime(&c_sb2.join(".credentials.json"), 300);
+
+    // Agent 2 (grok): host + 2 shared sandbox homes + 1 isolated home.
+    let g_host = w.home.join(".grok");
+    let g_sb1 = w
+        .home
+        .join(".local/share/paddock/homes/grok/shared/p1/.grok");
+    let g_sb2 = w
+        .home
+        .join(".local/share/paddock/homes/grok/shared/p2/.grok");
+    let g_iso = w
+        .home
+        .join(".local/share/paddock/homes/grok/isolated-work/p3/.grok");
+    for (dir, sname) in [
+        (&g_host, "host.jsonl"),
+        (&g_sb1, "sb1.jsonl"),
+        (&g_sb2, "sb2.jsonl"),
+        (&g_iso, "isolated.jsonl"),
+    ] {
+        std::fs::create_dir_all(dir.join("sessions")).unwrap();
+        std::fs::write(dir.join("sessions").join(sname), "{}\n").unwrap();
+    }
+    // No expiry field in grok auth.json: g_sb2 has the latest mtime among
+    // non-isolated copies.
+    std::fs::write(g_host.join("auth.json"), r#"{"which":"host"}"#).unwrap();
+    std::fs::write(g_sb1.join("auth.json"), r#"{"which":"sb1"}"#).unwrap();
+    std::fs::write(g_sb2.join("auth.json"), r#"{"which":"sb2"}"#).unwrap();
+    std::fs::write(g_iso.join("auth.json"), r#"{"which":"isolated"}"#).unwrap();
+    set_mtime(&g_host.join("auth.json"), 100);
+    set_mtime(&g_sb1.join("auth.json"), 200);
+    set_mtime(&g_sb2.join("auth.json"), 400);
+    set_mtime(&g_iso.join("auth.json"), 900);
+
+    // Check the constructed view directly first.
+    let mut env = w.env();
+    env.runtime_dir = Some(w.run.clone());
+    let v = paddock::usage_box::view(&env);
+    assert_eq!(
+        v.logins.get(&c_host.join(".credentials.json")),
+        Some(&c_sb1.join(".credentials.json"))
+    );
+    assert_eq!(
+        v.logins.get(&g_host.join("auth.json")),
+        Some(&g_sb2.join("auth.json"))
+    );
+    assert!(v.mounts.contains(&Mount::Login {
+        src: c_sb1.join(".credentials.json"),
+        dest: c_host.join(".credentials.json"),
+    }));
+    assert!(v.mounts.contains(&Mount::Login {
+        src: g_sb2.join("auth.json"),
+        dest: g_host.join("auth.json"),
+    }));
+    let b_env = paddock::usage_box::box_env(&env);
+    assert!(!b_env.contains_key("DBUS_SESSION_BUS_ADDRESS"));
+    let args = paddock::usage_box::bwrap_args(&env, &v, Path::new("/x/u"), &[]);
+    // The host runtime folder (with the session bus socket) is hidden: by
+    // its own tmpfs, or by the tmpfs on /tmp when it lies under /tmp.
+    assert!(args.windows(2).any(|w_arg| w_arg[0] == "--tmpfs"
+        && (Path::new(&w_arg[1]) == w.run || w.run.starts_with(&w_arg[1]))));
+
+    if !box_works(&w) {
+        eprintln!("skipped: the usage box cannot start here (bwrap, user namespaces, overlayfs)");
+        return;
+    }
+
+    write_exec(
+        &w.home.join("omarchy/bin/omarchy-agent-usage-update"),
+        TWO_AGENTS_UPDATE,
+    );
+    write_exec(
+        &w.home.join("omarchy/bin/omarchy-agent-usage-claude"),
+        &FAKE_CLAUDE_COLLECTOR.replace("$ bus_sock_path", &bus_sock.display().to_string()),
+    );
+    write_exec(
+        &w.home.join("omarchy/bin/omarchy-agent-usage-grok"),
+        FAKE_GROK_COLLECTOR,
+    );
+
+    let out = w.update(&[]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let claude = w.record("claude");
+    assert_eq!(claude["sessions"], "host.jsonl,sb1.jsonl,sb2.jsonl");
+    assert_eq!(claude["login"]["which"], "sb1");
+    assert_eq!(claude["sess_w"], "ro");
+    assert_eq!(claude["login_w"], "ro");
+    assert_eq!(claude["ssh"], "absent");
+    assert_eq!(claude["secret"], "absent");
+    assert_eq!(claude["dbus_env"], "unset");
+    assert_eq!(claude["bus_sock"], "absent");
+
+    let grok = w.record("grok");
+    assert_eq!(grok["sessions"], "host.jsonl,sb1.jsonl,sb2.jsonl");
+    assert_eq!(grok["login"]["which"], "sb2");
+    assert_eq!(grok["sess_w"], "ro");
+    assert_eq!(grok["login_w"], "ro");
 }
 
 #[test]
-fn a_held_codex_login_is_not_checked_at_all() {
+fn a_collector_that_calls_an_unlisted_host_fails_and_stderr_names_the_host() {
     let w = world();
     if !box_works(&w) {
         eprintln!("skipped: the usage box cannot start here");
         return;
     }
-    let sb = w.home.join(".local/share/paddock/homes/codex/shared/p");
-    std::fs::create_dir_all(sb.join(".codex")).unwrap();
-    std::fs::write(sb.join(".codex/auth.json"), "{}").unwrap();
-    std::fs::create_dir_all(w.home.join(".codex")).unwrap();
-    let host_login = w.home.join(".codex/auth.json");
-    std::fs::write(&host_login, "{}").unwrap();
-    let usage = w.home.join(".local/state/omarchy/agents/usage");
-    std::fs::create_dir_all(&usage).unwrap();
-    std::fs::write(
-        usage.join("codex.json"),
-        r#"{"id":"codex","limits":[{"percent":0.98}],"limitsStale":false}"#,
-    )
-    .unwrap();
-    // Omarchy's collector is there, but must not run.
     write_exec(
-        &w.home.join("omarchy/bin/omarchy-agent-usage-codex"),
-        "#!/bin/sh\ntouch \"$HOME/codex-ran\"\nexit 1\n",
+        &w.home.join("omarchy/bin/omarchy-agent-usage-update"),
+        r#"#!/bin/sh
+python3 -c '
+import os, socket, sys
+proxy = os.environ["HTTPS_PROXY"].replace("http://", "")
+host, port = proxy.split(":")
+s = socket.create_connection((host, int(port)), timeout=5)
+s.sendall(b"CONNECT outside-allowlist.example:443 HTTP/1.1\r\nHost: outside-allowlist.example:443\r\n\r\n")
+resp = s.recv(1024).decode("utf-8", "replace")
+s.close()
+if "200" in resp.splitlines()[0]:
+    sys.exit(0)
+sys.exit(7)
+'
+"#,
     );
-    w.hold("codex-p", "codex", &sb, ".codex/auth.json", &host_login);
-
     let out = w.update(&[]);
-    assert!(out.status.success(), "{out:?}");
-    assert_eq!(w.real_log(), "--except codex\n");
-    assert!(!w.home.join("codex-ran").exists());
-    let r = w.record("codex");
-    assert_eq!(r["limits"][0]["percent"], 0.98);
-    assert_eq!(r["limitsStale"], true);
-    assert_eq!(r["usageStatusText"], "Limits paused");
-}
-
-/// Omarchy's real Claude Code collector, if this host has Omarchy, in the
-/// collector sandbox with a fake login and without any network: nothing
-/// leaves the machine. It must still print a record from a read-only home.
-/// Opt in: `cargo test --test omarchy_usage -- --ignored`.
-#[test]
-#[ignore]
-fn omarchy_s_collector_runs_in_the_sandbox_without_network() {
-    let collector = Path::new("/usr/share/omarchy/bin/omarchy-agent-usage-claude");
-    let env = HostEnv::detect().unwrap();
-    let store = env.home.join(".claude/.credentials.json");
-    if !collector.exists() || !store.is_file() || !tools_work() {
-        eprintln!("skipped: no Omarchy collector or Claude Code login file here");
-        return;
-    }
-    let t = common::tempdir();
-    let sb = t.path().join("sb");
-    std::fs::create_dir_all(sb.join(".claude")).unwrap();
-    std::fs::write(
-        sb.join(".claude/.credentials.json"),
-        r#"{"claudeAiOauth":{"accessToken":"fake","refreshToken":"fake","expiresAt":4102444800000}}"#,
-    )
-    .unwrap();
-    let run = t.path().join("run");
-    std::fs::create_dir_all(&run).unwrap();
-    let held = [HeldLogin {
-        home: sb,
-        rel: ".claude/.credentials.json".into(),
-        store,
-    }];
-    let binds = paddock::omarchy_usage::login_copies(&run, &held).unwrap();
-    assert_eq!(binds.len(), 1);
-    let out = paddock::omarchy_usage::collector_command(
-        &env,
-        &run,
-        &binds,
-        collector,
-        &["--limits-only".to_string()],
-        false,
-    )
-    .unwrap()
-    .output()
-    .unwrap();
-    let r: serde_json::Value = serde_json::from_slice(&out.stdout)
-        .unwrap_or_else(|e| panic!("{e}: {}", String::from_utf8_lossy(&out.stderr)));
-    assert_eq!(r["id"], "claude");
-    eprintln!(
-        "status: {} | help: {}",
-        r["usageStatusText"], r["authHelpText"]
-    );
-}
-
-/// Plays `codex app-server`: rate limits, and the refresh that Codex does
-/// by itself when the access token has less than 5 minutes left. It spends
-/// the refresh token as a service would: once.
-const FAKE_CODEX: &str = r#"#!/usr/bin/python3
-import base64, json, os, sys, time
-def b64(v): return base64.urlsafe_b64encode(json.dumps(v).encode()).decode().rstrip("=")
-def exp_of(at):
-    p = at.split(".")[1]
-    return json.loads(base64.urlsafe_b64decode(p + "=" * (-len(p) % 4)))["exp"]
-home = os.environ.get("CODEX_HOME") or os.path.expanduser("~/.codex")
-auth = os.path.join(home, "auth.json")
-for line in sys.stdin:
-    msg = json.loads(line); mid = msg.get("id"); m = msg.get("method")
-    if m == "initialize":
-        print(json.dumps({"id": mid, "result": {}}), flush=True)
-    elif m == "account/rateLimits/read":
-        a = json.load(open(auth)); t = a["tokens"]
-        if exp_of(t["access_token"]) <= time.time() + 300:
-            rt = t["refresh_token"]
-            with open(os.path.join(home, "used.log"), "a") as f: f.write(rt + "\n")
-            t["refresh_token"] = "rt-%d" % (int(rt.split("-")[1]) + 1)
-            t["access_token"] = "%s.%s.sig" % (b64({}), b64({"exp": int(time.time()) + 3600}))
-            json.dump(a, open(auth + ".tmp", "w")); os.replace(auth + ".tmp", auth)
-        print(json.dumps({"id": mid, "result": {"rateLimits": {"primary": {"usedPercent": 42}}}}), flush=True)
-"#;
-
-/// Omarchy's Codex collector, faked: it asks the app-server and prints a
-/// record with the percent and what it saw of the home.
-const FAKE_CODEX_COLLECTOR: &str = r#"#!/usr/bin/python3
-import json, os, subprocess
-if os.access(os.path.expanduser("~"), os.W_OK): home = "rw"
-else: home = "ro"
-p = subprocess.Popen(["codex", "app-server"], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
-def ask(i, m):
-    p.stdin.write(json.dumps({"id": i, "method": m, "params": {}}) + "\n"); p.stdin.flush()
-    return json.loads(p.stdout.readline())
-ask(1, "initialize")
-r = ask(2, "account/rateLimits/read")
-p.kill()
-print(json.dumps({"id": "codex", "limits": [{"percent": r["result"]["rateLimits"]["primary"]["usedPercent"]}], "limitsStale": False, "home": home, "host": open("/etc/hostname").read().strip() if os.path.exists("/etc/hostname") else os.uname().nodename}))
-"#;
-
-fn codex_login(exp: u64, rt: &str) -> String {
-    use base64::Engine as _;
-    let b64 = |v: serde_json::Value| {
-        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(v.to_string())
-    };
-    format!(
-        r#"{{"auth_mode":"chatgpt","tokens":{{"id_token":"e30.e30.sig","access_token":"{}.{}.sig","refresh_token":"{rt}","account_id":"a"}},"last_refresh":"2026-11-01T00:00:00Z"}}"#,
-        b64(serde_json::json!({})),
-        b64(serde_json::json!({"exp": exp}))
-    )
-}
-
-#[test]
-fn a_kept_codex_login_is_checked_in_the_keeper_sandbox() {
-    if !tools_work()
-        || !Command::new("python3")
-            .arg("-c")
-            .arg("pass")
-            .status()
-            .is_ok_and(|s| s.success())
-    {
-        eprintln!("skipped: needs bwrap, pasta and python3");
-        return;
-    }
-    let mut w = world();
-    if !box_works(&w) {
-        eprintln!("skipped: the usage box cannot start here");
-        return;
-    }
-    // A fake codex first on PATH, and a profile without the mise lookup,
-    // so that the real codex is never found.
-    let bin = w.home.parent().unwrap().join("tools/bin");
-    write_exec(&bin.join("codex"), FAKE_CODEX);
-    let path = format!("{}:{}", bin.display(), w.vars["PATH"]);
-    w.vars.insert("PATH".into(), path);
-    std::fs::create_dir_all(w.home.join(".config/paddock/harness.d")).unwrap();
-    std::fs::write(
-        w.home.join(".config/paddock/harness.d/codex.toml"),
-        "name = \"codex\"\n[locate]\ncommands = [\"codex\"]\n[state]\nauth = [\".codex/auth.json\"]\n",
-    )
-    .unwrap();
-    write_exec(
-        &w.home.join("omarchy/bin/omarchy-agent-usage-codex"),
-        FAKE_CODEX_COLLECTOR,
-    );
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
-    // Two minutes left: the app-server refreshes on its own.
-    std::fs::create_dir_all(w.home.join(".codex")).unwrap();
-    let store = w.home.join(".codex/auth.json");
-    std::fs::write(&store, codex_login(now + 120, "rt-1")).unwrap();
-    let sb = w.home.join(".local/share/paddock/homes/codex/shared/p");
-    std::fs::create_dir_all(sb.join(".codex")).unwrap();
-    std::fs::write(sb.join(".codex/auth.json"), codex_login(now + 120, "")).unwrap();
-    w.hold("codex-p", "codex", &sb, ".codex/auth.json", &store);
-    // The sandbox's login is kept: the record says so.
-    let env = w.env();
-    let mut r = Running::list(&env)
-        .into_iter()
-        .find(|r| r.id == "codex-p")
-        .unwrap();
-    r.kept_logins = r.logins.clone();
-    r.register(&env).unwrap();
-
-    w.vars.insert("PADDOCK_LOG".into(), "debug".into());
-    let out = w.update(&[]);
-    assert!(out.status.success(), "{out:?}");
-    assert_eq!(w.real_log(), "--except codex\n");
-    let f = w.home.join(".local/state/omarchy/agents/usage/codex.json");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(7), "{err}");
     assert!(
-        f.is_file(),
-        "no record: {}",
-        String::from_utf8_lossy(&out.stderr)
+        err.contains("outside-allowlist.example"),
+        "stderr did not name the refused host: {err}"
     );
-    let rec = w.record("codex");
-    assert_eq!(rec["limits"][0]["percent"], 42, "{rec}");
-    assert_eq!(rec["home"], "ro", "{rec}");
-    assert!(rec.get("usageStatusText").is_none(), "still paused: {rec}");
-    // The refresh went back to the host, once, and to the sandbox without
-    // its refresh token.
-    let host: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(&store).unwrap()).unwrap();
-    assert_eq!(host["tokens"]["refresh_token"], "rt-2");
-    let inside: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(sb.join(".codex/auth.json")).unwrap())
-            .unwrap();
-    assert_eq!(inside["tokens"]["refresh_token"], "");
-    assert_eq!(
-        inside["tokens"]["access_token"],
-        host["tokens"]["access_token"]
-    );
-    // The host's own folder was never written: the overlay took the writes.
-    assert!(!w.home.join(".codex/used.log").exists());
 }
 
 #[test]
@@ -606,6 +571,14 @@ fn the_usage_box_merges_sessions_and_hides_the_rest_of_the_home() {
                 "LANG",
                 "XDG_STATE_HOME",
                 "XDG_CACHE_HOME",
+                "HTTPS_PROXY",
+                "https_proxy",
+                "HTTP_PROXY",
+                "http_proxy",
+                "ALL_PROXY",
+                "all_proxy",
+                "NO_PROXY",
+                "no_proxy",
                 "PWD",
                 "SHLVL",
                 "_",
