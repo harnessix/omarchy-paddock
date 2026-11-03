@@ -17,6 +17,8 @@ login_callback = true
 yolo_args = ["--dangerously-bypass-approvals-and-sandbox"]
 
 [state]
+# The host data that `--profile default` copies into a private snapshot.
+data = [".codex"]
 # MCP OAuth tokens are shared only when codex stores them in a file
 # (mcp_oauth_credentials_store = "file"). Tokens in the system keyring stay outside.
 auth = [".codex/auth.json", ".codex/.credentials.json"]

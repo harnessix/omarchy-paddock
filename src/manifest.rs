@@ -19,7 +19,7 @@ pub const PROJECT_FILE: &str = "paddock.toml";
 /// themselves: `[devices]` (devices.rs), `[kv]` (kv.rs), `[pastures]`
 /// (pasture.rs), `[credentials]` (credentials.rs) and `[exec]`
 /// (gatewayd.rs), `[storage]` (storage/dedupe.rs), `[snapshot]`
-/// (snapshot.rs), `[detach]` (detach.rs). A project
+/// (snapshot.rs), `[profiles]` (shadow.rs), `[detach]` (detach.rs). A project
 /// `paddock.toml` with one of them is invalid.
 pub const USER_ONLY: &[&str] = &[
     "devices",
@@ -33,6 +33,7 @@ pub const USER_ONLY: &[&str] = &[
     "storage",
     "snapshot",
     "view",
+    "profiles",
     "detach",
 ];
 

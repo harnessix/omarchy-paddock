@@ -21,6 +21,8 @@ login_callback = true
 yolo_args = ["--always-approve"]
 
 [state]
+# The host data that `--profile default` copies into a private snapshot.
+data = [".grok"]
 # The login token. MCP OAuth tokens are kept in mcp_credentials.json; there
 # is no keyring.
 auth = [".grok/auth.json", ".grok/mcp_credentials.json"]

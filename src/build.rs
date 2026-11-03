@@ -51,6 +51,9 @@ pub struct Options {
     /// `paddock run --detach`: the sandbox id that the caller chose. The
     /// harness gets its interactive command with the `[detach]` args.
     pub detach: Option<String>,
+    /// `--profile default`: the harness runs on a private snapshot of its
+    /// host data (shadow.rs). Only the command line sets it.
+    pub profile_default: bool,
 }
 
 /// A worktree that paddock created for one run.
@@ -169,6 +172,17 @@ impl Drop for PendingWorktree<'_> {
     fn drop(&mut self) {
         if let Some(w) = self.wt.take() {
             discard_worktree(self.env, &w);
+        }
+    }
+}
+
+/// The run folder of a shadow run while the build can still fail.
+struct PendingShadow(Option<crate::shadow::Plan>);
+
+impl Drop for PendingShadow {
+    fn drop(&mut self) {
+        if let Some(p) = self.0.take() {
+            let _ = p.remove();
         }
     }
 }
@@ -445,13 +459,42 @@ pub fn build_with(env: &HostEnv, opts: &Options, harness: Harness) -> Result<Bui
         })?),
         None => None,
     };
-    let home_src = state::sandbox_home(env, &profile.name, &auth, &home_key)?;
-    // For `paddock du` and `paddock gc`. The sandbox can rewrite it, so they
-    // read it as a hint only.
-    crate::storage::write_origin(
-        &home_src,
-        &crate::storage::Origin::new(&home_key, &profile.name, &auth, profile.app.is_some()),
-    )?;
+    // `--profile default`: the home is an overlay on a private snapshot,
+    // and its upper folder is where paddock puts the credential files.
+    let shadow = if opts.profile_default {
+        if opts.transparent.is_some() || opts.child.is_some() || profile.app.is_some() {
+            bail!("--profile default is only for `paddock run` and `paddock shell`");
+        }
+        let roots = crate::shadow::roots(env, &profile)?;
+        Some(crate::shadow::Plan::create(
+            env,
+            &id,
+            roots,
+            profile.state.auth.clone(),
+        )?)
+    } else {
+        None
+    };
+    let home_src = match &shadow {
+        Some(p) => p.upper.clone(),
+        None => {
+            let h = state::sandbox_home(env, &profile.name, &auth, &home_key)?;
+            // For `paddock du` and `paddock gc`. The sandbox can rewrite it,
+            // so they read it as a hint only.
+            crate::storage::write_origin(
+                &h,
+                &crate::storage::Origin::new(
+                    &home_key,
+                    &profile.name,
+                    &auth,
+                    profile.app.is_some(),
+                ),
+            )?;
+            h
+        }
+    };
+    // A failed build leaves no run folder.
+    let mut pending_shadow = PendingShadow(shadow.clone());
     let mut spec = SandboxSpec::new(
         id.clone(),
         &profile.name,
@@ -468,6 +511,20 @@ pub fn build_with(env: &HostEnv, opts: &Options, harness: Harness) -> Result<Bui
     // identity.
     spec.identity = crate::identity::for_login(env, &profile.name, &auth)?;
 
+    if let Some(p) = &shadow {
+        spec.add_mount(Mount::overlay(
+            &p.lower,
+            &p.upper,
+            &p.work,
+            &env.home,
+            "profile default: a private snapshot of the data roots",
+        ));
+        spec.notices.push(format!(
+            "profile default: the home holds a private snapshot of {}. Nothing that the run changes goes back to the host",
+            p.roots.iter().map(|r| format!("~/{r}")).collect::<Vec<_>>().join(", ")
+        ));
+        spec.shadow = Some(p.clone());
+    }
     spec.add_mount(Mount::same(&project, true, "project"));
 
     // The harness.
@@ -608,6 +665,13 @@ pub fn build_with(env: &HostEnv, opts: &Options, harness: Harness) -> Result<Bui
         }
     }
     for rel in &profile.state.import_ro {
+        // The snapshot has the paths inside the data roots already.
+        if shadow
+            .as_ref()
+            .is_some_and(|p| p.root_of(Path::new(rel)).is_some())
+        {
+            continue;
+        }
         let host = state::host_file(env, &profile, &auth, rel);
         if host.exists() {
             spec.add_mount(Mount::same(&host, false, &format!("{porigin} import_ro")));
@@ -1013,7 +1077,10 @@ pub fn build_with(env: &HostEnv, opts: &Options, harness: Harness) -> Result<Bui
         shared_history,
         view: true,
         detach: opts.detach.is_some(),
-        worktree: pending.keep(),
+        worktree: {
+            pending_shadow.0 = None;
+            pending.keep()
+        },
         pasture: opts.pasture.clone(),
         bridge,
         auth,

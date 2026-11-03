@@ -1188,6 +1188,12 @@ struct RunArgs {
     /// Without it, the sandbox shares paddock kv with no other.
     #[arg(long, value_name = "NAME")]
     pasture: Option<String>,
+    /// default: start the harness with a private snapshot of its own host
+    /// data (conversations, settings, plugins) in the sandbox home. The
+    /// run changes only the snapshot, and paddock removes it at the end.
+    /// bwrap only.
+    #[arg(long, value_name = "PROFILE", value_parser = ["default"])]
+    profile: Option<String>,
     /// Start the harness without its auto-approval flags.
     #[arg(long)]
     no_yolo: bool,
@@ -1263,6 +1269,7 @@ impl RunArgs {
             pasture: self.pasture.clone(),
             workbench: false,
             detach: None,
+            profile_default: self.profile.as_deref() == Some(paddock::shadow::DEFAULT),
         })
     }
 }
@@ -1390,6 +1397,7 @@ fn start_built(env: &HostEnv, opts: &Options, built: build::Built, shell: bool) 
             if let Some(w) = &built.worktree {
                 build::discard_worktree(env, w);
             }
+            paddock::shadow::discard(&built.spec);
             return Err(e);
         }
     }
@@ -1399,6 +1407,7 @@ fn start_built(env: &HostEnv, opts: &Options, built: build::Built, shell: bool) 
             if let Some(w) = &built.worktree {
                 build::discard_worktree(env, w);
             }
+            paddock::shadow::discard(&built.spec);
             return Err(e);
         }
     };
@@ -1417,6 +1426,7 @@ fn explain(env: &HostEnv, a: &RunArgs, json: bool) -> Result<()> {
     let s = &built.spec;
     let cleanup = || {
         let _ = std::fs::remove_dir_all(env.paddock_run().join(&s.id));
+        paddock::shadow::discard(s);
         paddock::borrow::end(env, &s.id);
         if let Some(w) = &built.worktree {
             build::discard_worktree(env, w);
@@ -2297,6 +2307,11 @@ fn real_main() -> Result<i32> {
                                     None => serde_json::Value::Null,
                                 },
                             );
+                        }
+                        if let (Some(o), true) =
+                            (v.as_object_mut(), paddock::shadow::is_shadow(&env, &r.id))
+                        {
+                            o.insert("profile".into(), paddock::shadow::DEFAULT.into());
                         }
                         if let Some(o) = v.as_object_mut() {
                             o.insert(

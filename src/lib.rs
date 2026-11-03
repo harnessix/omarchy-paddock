@@ -51,6 +51,7 @@ pub mod report;
 pub mod run;
 pub mod safefs;
 pub mod setup;
+pub mod shadow;
 pub mod shims;
 pub mod snapshot;
 pub mod spawn;
