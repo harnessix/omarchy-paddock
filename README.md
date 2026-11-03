@@ -60,6 +60,8 @@ paddock moves the boundary from "which commands can run" to "which files exist".
 
    Without questions, for scripts and agents, name each step: `paddock setup --yes --shims --launchers --no-plugin --backend bwrap`. `--app vscode=~/src/api` saves a workspace folder for an app. With `--yes`, the setup only prints the command that installs missing packages and never runs `sudo`.
 
+4. Turn on the loft right after the install: answer yes to its step in `paddock setup`, or run `paddock setup --yes --loft`. Both set `[loft] auto = true` in `~/.config/paddock/config.toml`. Agents leave design notes and instruction files in repositories, and a push publishes them. The loft keeps them in a private store instead. See [The loft](#the-loft).
+
 ### From a clone or a release
 
 paddock is a Rust command and an Omarchy bar plugin in one repository. The commands below install the latest release, v0.1.7. The `main` branch can hold changes that are not released yet.
@@ -173,7 +175,7 @@ Then ask your agent, for example: "Install paddock and make the sandbox the defa
 
 6. Optional: if you used the docker or podman backend, run `paddock gc --yes` before you remove the command. It removes the old paddock images and paddock's build cache. To remove the current images too, run `docker image rm $(docker image ls -q paddock-base)`, and the same command with `podman`.
 
-paddock does not change any file outside these directories, except the files that you name in `paddock env hide` (in `~/.config/paddock/config.toml`), the git worktrees that `--worktree` creates, the files that `paddock shims install` and `paddock launchers install` change (also through `paddock setup`), and the paddock binary that `paddock update` replaces. Step 2 undoes the shell commands and launchers. To remove a worktree, use `paddock worktree remove`.
+paddock does not change any file outside these directories, except the files that you name in `paddock env hide` (in `~/.config/paddock/config.toml`), the git worktrees that `--worktree` creates, the files that `paddock shims install` and `paddock launchers install` change (also through `paddock setup`), the `.paddock` link, the empty mount points and the `.git/info/exclude` lines of [the loft](#the-loft), and the paddock binary that `paddock update` replaces. Step 2 undoes the shell commands and launchers. To remove a worktree, use `paddock worktree remove`.
 
 ## Use
 
@@ -1261,6 +1263,34 @@ enabled = true
 
 `paddock gc` removes the file of each run (its `self` scope and its own pasture), and the `tree` scope of spawn trees whose root ended, more than `keep_days` ago, and keys whose time to live passed. A named pasture keeps its data until you delete it. The audit log `~/.local/state/paddock/kv-audit.jsonl` records each write with its key name and size. It never records a value.
 
+## The loft
+
+Agents leave internal process files in repositories: instruction files (`CLAUDE.md`, `AGENTS.md`, `GEMINI.md`, `.cursor/rules/` and others), design and plan files (`DESIGN.md`, `PLAN.md`, `NOTES.md`, `TODO.md`), Spec Kit's `.specify/` and `specs/`, and new files under `docs/`. A push publishes them. The loft is a private layer above the project for these files. Each repository gets one loft in `~/.local/share/paddock/loft/<repository key>/`. The loft is a git repository of its own, so you can see the history of the agents' notes, specs and instruction files, and undo them, apart from the project's history.
+
+| Command | What it does |
+| :--- | :--- |
+| `paddock loft init` | makes the loft of the current repository and turns it on. `.paddock` in the project becomes a link to the loft's notes |
+| `paddock loft status` | the state, the private files that still sit in the project, and the changes since the last commit |
+| `paddock loft log`, `paddock loft diff` | the history of the loft, and the changes since its last commit |
+| `paddock loft commit` | commits the changes now |
+| `paddock loft adopt` | moves the private files of the repository into the loft, after a question. It says how to drop them from git history |
+| `paddock loft remove` | takes the `.paddock` link away and turns the loft off. The files and the history stay |
+
+With the loft on, every sandbox of the repository (also each `--worktree` sandbox and each spawned worker) sees the private files of the loft in place, for example `CLAUDE.md` at the project root. `.git/info/exclude` keeps them out of git. paddock commits the loft at the end of each run, one commit per run, with the sandbox id and the harness in the message. A private file that is still in the project stays there until you run `paddock loft adopt`.
+
+Every sandbox also gets the notes folder `.paddock/` for the agents' own design notes and plans, with or without `paddock loft init`. It is in the loft, the same for the whole spawn tree, and outside git. The host request inbox stays at `.paddock/inbox/`. Outside a sandbox, `.paddock` in the project is a link to the loft's notes after `paddock loft init`, so the agents and tools that you run on the host see the same notes.
+
+```toml
+[loft]
+store = "external"     # default. "repo": the private paths stay in the repository
+auto = true            # a loft for every project at its first paddock run. Default: false
+paths = ["notes/"]     # added to the built-in list. A folder ends with /
+public = ["AGENTS.md"] # kept in git on purpose, with no notice
+commit = "run"         # default. "manual": only `paddock loft commit` commits
+```
+
+A project `paddock.toml` cannot set `[loft]`. At the start of a run, paddock names the private files that git tracks or can add, unless you marked them public. The push approval has one line for each kind of private file in the push (instruction files, design files, Spec Kit files, your own paths), and one line with the new files under `docs/` that the push adds, at most five names and then a count. These lines never block a push. You decide in the approval. `paddock explain` lists each private path, where it lives, and whether git tracks it.
+
 ## Spec Kit projects
 
 A project with a `.specify/` folder ([GitHub Spec Kit](https://github.com/github/spec-kit)) is a Spec Kit project. paddock sees the folder and organizes spawn, kv, the hooks and the watch around the active feature (`feature_directory` in `.specify/feature.json`, or else the last folder in `specs/` with a `tasks.md`). You set nothing. To turn it off, set `enabled = false` in `[speckit]` of `~/.config/paddock/config.toml`. A project `paddock.toml` cannot turn it on or off.
@@ -1280,7 +1310,7 @@ A task is ready when all tasks of the earlier phases are done, all tasks before 
 
 ### The external spec store
 
-Spec Kit keeps `.specify/` and `specs/` in the repository. With the default store, paddock reminds you at the start of a run that a push publishes committed specs and plans, and adds a note to push approval requests that contain Spec Kit files. Set `store = "repo"` explicitly to keep the files there and silence these notices, or move them to the external store below.
+Spec Kit keeps `.specify/` and `specs/` in the repository. The external store is [the loft](#the-loft): with the loft on, the Spec Kit folders go there too, and `[speckit] store` is the short form for the Spec Kit folders alone. With the default store, paddock reminds you at the start of a run that a push publishes committed specs and plans, and adds a note to push approval requests that contain Spec Kit files. Set `store = "repo"` explicitly to keep the files there and silence these notices, or move them to the external store below.
 
 To keep them out of the repository, set:
 
@@ -1289,7 +1319,7 @@ To keep them out of the repository, set:
 store = "external"   # default: "repo", where Spec Kit puts them
 ```
 
-Then run `paddock spec adopt` once in the repository. It asks, then moves both folders to `~/.local/share/paddock/speckit/<repository key>/`. Every sandbox of the repository sees them at `.specify/` and `specs/`, also each `--worktree` sandbox and each worker, with the same content. paddock adds both paths to `.git/info/exclude`, which git does not track, so `git status` does not show them. If the files were committed, adopt tells you how to remove them from the index, and how to remove them from the history. It does not change the history itself.
+Then run `paddock spec adopt` once in the repository. It asks, then moves both folders to the loft, `~/.local/share/paddock/loft/<repository key>/tree/`. A store of an earlier paddock moves there by itself. Every sandbox of the repository sees them at `.specify/` and `specs/`, also each `--worktree` sandbox and each worker, with the same content. paddock adds both paths to `.git/info/exclude`, which git does not track, so `git status` does not show them. If the files were committed, adopt tells you how to remove them from the index, and how to remove them from the history. It does not change the history itself.
 
 ## Timers
 

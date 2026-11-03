@@ -263,7 +263,8 @@ pub struct PushPlan {
     /// The remote existed on the host before the sandbox started.
     pub known: bool,
     pub notes: Vec<String>,
-    pub spec_files: bool,
+    /// Files of private paths, and new files under docs/ (loft::push).
+    pub private: crate::loft::push::Found,
     pub refs: Vec<PlannedRef>,
     scratch: Scratch,
     /// The repository whose objects the scratch repository borrows.
@@ -517,10 +518,18 @@ fn capture(mut cmd: Command, secs: u64) -> Result<String> {
 
 /// Work out what the push does, for the card. Reads the remote with
 /// `git ls-remote` only for remotes that the host knows.
-pub fn plan(
+pub fn plan(repo: Option<&Repo>, run_dir: &Path, args: &Args) -> Result<PushPlan> {
+    plan_private(repo, run_dir, args, &[])
+}
+
+type Args = BTreeMap<String, serde_json::Value>;
+
+/// The same, with the pathspecs of the private files to look for.
+pub fn plan_private(
     repo: Option<&Repo>,
     run_dir: &Path,
-    args: &BTreeMap<String, serde_json::Value>,
+    args: &Args,
+    private: &[String],
 ) -> Result<PushPlan> {
     let repo = repo.context("the project is not a git repository on the host")?;
     let name = args
@@ -608,7 +617,7 @@ pub fn plan(
         .collect();
 
     let mut planned = Vec::new();
-    let mut spec_files = false;
+    let mut found = crate::loft::push::Found::default();
     for r in refs {
         let old = remote_refs.get(&r.dst).cloned();
         let mut commits = Vec::new();
@@ -628,12 +637,12 @@ pub fn plan(
             if !not.is_empty() {
                 c.arg("--not").args(&not);
             }
-            let mut check = scratch_git(&scratch.0);
-            check.arg("log").arg(&r.sha);
-            if !not.is_empty() {
-                check.arg("--not").args(&not);
-            }
-            spec_files |= crate::speckit::git::push_contains(check)?;
+            let check = || {
+                let mut c = scratch_git(&scratch.0);
+                c.arg("log").arg(&r.sha).arg("--not").args(&not);
+                c
+            };
+            found.scan(&check, private)?;
             c.arg("--");
             commits = capture(c, 20)?.lines().map(clean).collect();
             if commits.len() > MAX_COMMITS {
@@ -657,7 +666,7 @@ pub fn plan(
         known,
         notes,
         refs: planned,
-        spec_files,
+        private: found,
         scratch,
         common_dir: repo.common_dir.clone(),
         store,

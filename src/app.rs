@@ -333,7 +333,7 @@ pub fn run(env: &HostEnv, o: &AppOptions) -> Result<i32> {
         if o.backend.as_deref().is_some_and(|b| b != "bwrap") {
             bail!("{} is a flatpak app: flatpak runs its own bubblewrap sandbox, so it needs the bwrap backend", o.name);
         }
-        crate::speckit::git::notice(env, &roots[0]);
+        crate::loft::push::notice(env, &roots[0]);
         return run_flatpak(env, &profile, &id, &roots, gpu, worktree, o);
     }
     let opts = Options {

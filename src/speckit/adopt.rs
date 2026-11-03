@@ -2,7 +2,7 @@
 //! external store, once, after a question. It never rewrites git history:
 //! when the files were committed, it says how to drop them.
 
-use super::{store_dir, Cfg, Store, SPECIFY, SPECS};
+use super::{store_dir, Cfg, SPECIFY, SPECS};
 use crate::env::HostEnv;
 use anyhow::{bail, Context as _, Result};
 use std::path::Path;
@@ -27,7 +27,7 @@ fn copy_tree(from: &Path, to: &Path) -> Result<()> {
 }
 
 /// Move one folder: a rename, or a copy and a removal across file systems.
-fn move_dir(from: &Path, to: &Path) -> Result<()> {
+pub(crate) fn move_dir(from: &Path, to: &Path) -> Result<()> {
     if let Some(p) = to.parent() {
         crate::privfs::dir(p)?;
     }
@@ -42,8 +42,8 @@ fn move_dir(from: &Path, to: &Path) -> Result<()> {
 /// `ask` puts the question; false stops without a change. Returns what
 /// the user must know.
 pub fn adopt(env: &HostEnv, project: &Path, ask: &mut dyn FnMut(&str) -> bool) -> Result<String> {
-    if Cfg::load(env).store != Store::External {
-        bail!("[speckit] store is not \"external\" in the user configuration. Add this to {} first:\n\n[speckit]\nstore = \"external\"", env.paddock_config().join("config.toml").display());
+    if !crate::loft::speckit_external(env, &Cfg::load(env), project) {
+        bail!("the Spec Kit files stay in the repository. Run `paddock loft init`, or add this to {} first:\n\n[speckit]\nstore = \"external\"", env.paddock_config().join("config.toml").display());
     }
     let layout = crate::hostgit::Layout::discover(project)?;
     let repo = match &layout {

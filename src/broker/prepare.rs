@@ -4,7 +4,7 @@ use super::check_fetch;
 use super::describe::{
     arg_str, argv, describe, grant_key, safe_name, shell_quote, tool_args, tool_line,
 };
-use super::fetch::{fetch, inbox, plan_fetch, FetchPlan};
+use super::fetch::{fetch, inbox_for, plan_fetch, FetchPlan};
 use super::{
     forge, git, new_request_id, notify, Broker, Context, Mode, Request, Response, Status, INBOX,
 };
@@ -83,16 +83,14 @@ pub(in crate::broker) struct Prepared {
 pub(in crate::broker) fn prepare(env: &HostEnv, ctx: &Context, req: &Request) -> Result<Prepared> {
     match req.cap.as_str() {
         "git-push" => {
-            let mut plan = git::plan(
+            let mut plan = git::plan_private(
                 ctx.repo.as_ref(),
                 &env.paddock_run().join(&ctx.id),
                 &req.args,
+                &crate::loft::push::pathspecs(&crate::loft::Cfg::load(env)),
             )?;
-            if plan.spec_files
-                && crate::speckit::git::default_store(&crate::speckit::Cfg::load(env))
-            {
-                plan.notes.push(crate::speckit::git::PUSH_NOTICE.into());
-            }
+            let private = crate::loft::push::notes(env, &plan.private);
+            plan.notes.extend(private);
             let session_allowed = plan.session_allowed();
             Ok(Prepared {
                 summary: plan.summary(),
@@ -300,7 +298,7 @@ impl Broker {
                         // through the folder that paddock opened.
                         let png =
                             std::fs::read(dir.join("shot.png")).context("grim wrote no image")?;
-                        let inbox = inbox(&self.ctx.project)?;
+                        let inbox = inbox_for(&self.env, &self.ctx.project)?;
                         let (mut f, name) = inbox.new_file(&name, 0o644)?;
                         f.write_all(&png)?;
                         Ok(serde_json::json!({ "path": inbox.path().join(name) }))

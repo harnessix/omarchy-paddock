@@ -17,7 +17,7 @@ pub(crate) enum SpecCmd {
         #[arg(long)]
         json: bool,
     },
-    /// Move .specify/ and specs/ of a repository into paddock's external store, after a question. Needs [speckit] store = "external".
+    /// Move .specify/ and specs/ of a repository into the loft, after a question. Needs the loft (`paddock loft init`) or [speckit] store = "external".
     Adopt {
         #[arg(long)]
         dir: Option<PathBuf>,
