@@ -263,7 +263,7 @@ fn a_denied_card_and_a_missing_login_give_nothing() {
 fn the_sandbox_helper_refuses_store_erase_and_list() {
     for action in ["store", "erase", "list"] {
         assert_eq!(
-            crate::hostcli::credential_main(&["docker".into(), action.into()]),
+            crate::hostcli::credential::main(&["docker".into(), action.into()]),
             1
         );
     }

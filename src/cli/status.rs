@@ -54,6 +54,10 @@ pub(crate) fn ps(env: &HostEnv, json: bool) -> Result<i32> {
                         "boundary_count".into(),
                         paddock::boundary::count(env, &r.id).into(),
                     );
+                    o.insert(
+                        "compactions".into(),
+                        paddock::compaction::count(env, &r.id).into(),
+                    );
                 }
                 let spent = paddock::devices::ledger::spent_of(env, &r.id);
                 if let (Some(o), false) = (v.as_object_mut(), spent.is_empty()) {

@@ -242,19 +242,12 @@ pub fn refresh(
     crate::privfs::dir(&login_dir)?;
     let inside = home.join(kind.file);
     crate::privfs::write(&inside, &before)?;
-    let mut child = keeper_command(
-        env,
-        harness,
-        kind,
-        auth,
-        &dir,
-        Layout::Login { home: &home },
-    )?
-    .stdin(Stdio::piped())
-    .stdout(Stdio::piped())
-    .stderr(Stdio::null())
-    .spawn()
-    .context("cannot start the keeper sandbox")?;
+    let mut child = keeper_command(env, harness, kind, auth, &dir, &home)?
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .context("cannot start the keeper sandbox")?;
     let talked = talk(&mut child);
     let _ = child.kill();
     let _ = child.wait();
@@ -365,29 +358,13 @@ fn talk(child: &mut Child) -> Result<()> {
 /// The keeper sandbox: bwrap with the system read-only, an empty home but
 /// for the login folder, the harness's install read-only, the login's
 /// machine identity, the host name `paddock`, and network mode egress.
-/// How the home looks in a keeper sandbox, and what runs there.
-enum Layout<'a> {
-    /// Refresh: an empty home with the keeper's login folder in it, and
-    /// the harness's refresh server.
-    Login { home: &'a Path },
-    /// Omarchy's usage collector: the host home read-only (local stats),
-    /// the login folder as an overlay whose writes go to `upper`, Omarchy's
-    /// cache folder writable.
-    Collector {
-        upper: &'a Path,
-        work: &'a Path,
-        program: &'a Path,
-        args: &'a [String],
-    },
-}
-
 fn keeper_command(
     env: &HostEnv,
     harness: &Harness,
     kind: &Kind,
     auth: &AuthMode,
     dir: &Path,
-    layout: Layout,
+    home: &Path,
 ) -> Result<Command> {
     use crate::backend::bwrap::{resolv_target, DNS_FORWARD, ROOT_LINKS};
     let bwrap = env.which("bwrap").context("bwrap not found")?;
@@ -448,43 +425,16 @@ fn keeper_command(
         ]);
     }
     let login_dir = env.home.join(kind.home_dir);
-    match &layout {
-        Layout::Login { home } => {
-            // An empty home with the login folder in it, at the host
-            // home's path.
-            a.extend(["--tmpfs".into(), s(&env.home)]);
-            a.extend(["--bind".into(), s(&home.join(kind.home_dir)), s(&login_dir)]);
-        }
-        Layout::Collector { upper, work, .. } => {
-            a.extend(["--ro-bind".into(), s(&env.home), s(&env.home)]);
-            a.extend([
-                "--overlay-src".into(),
-                s(&login_dir),
-                "--overlay".into(),
-                s(upper),
-                s(work),
-                s(&login_dir),
-            ]);
-            let cache = env.cache_dir.join("omarchy").join("agent-usage");
-            std::fs::create_dir_all(&cache)?;
-            a.extend(["--bind".into(), s(&cache), s(&cache)]);
-        }
-    }
+    // An empty home with the login folder in it, at the host home's path.
+    a.extend(["--tmpfs".into(), s(&env.home)]);
+    a.extend(["--bind".into(), s(&home.join(kind.home_dir)), s(&login_dir)]);
     for m in &harness.install_mounts {
         a.extend(["--ro-bind".into(), s(m), s(m)]);
     }
     a.extend(["--ro-bind".into(), s(&harness.exe), s(&harness.exe)]);
     a.push("--".into());
-    match &layout {
-        Layout::Login { .. } => {
-            a.push(s(&harness.exe));
-            a.extend(kind.args.iter().map(|x| x.to_string()));
-        }
-        Layout::Collector { program, args, .. } => {
-            a.push(s(program));
-            a.extend(args.iter().cloned());
-        }
-    }
+    a.push(s(&harness.exe));
+    a.extend(kind.args.iter().map(|x| x.to_string()));
 
     let spec = crate::spec::SandboxSpec::new(
         format!("keeper-{}", std::process::id()),
@@ -681,7 +631,7 @@ pub fn refresh_now(env: &HostEnv, harness: &str, auth: &AuthMode) -> Result<Stri
 
 /// The lock that every run with the full login holds while it runs: at
 /// most one of them can spend the refresh token. Waits up to two minutes.
-fn refresh_lock(env: &HostEnv, store: &Path) -> Result<std::fs::File> {
+pub(crate) fn refresh_lock(env: &HostEnv, store: &Path) -> Result<std::fs::File> {
     let path = env
         .paddock_run()
         .join("keepers")
@@ -696,107 +646,6 @@ fn refresh_lock(env: &HostEnv, store: &Path) -> Result<std::fs::File> {
         }
         std::thread::sleep(Duration::from_millis(200));
     }
-}
-
-/// Omarchy's usage collector for a kept login, in a keeper sandbox, with the
-/// full login. The collector starts the harness's own server, which can
-/// refresh the login; then the result goes back where the login lives and
-/// into the running sandboxes, as after a refresh. Returns its output.
-pub fn collect_usage(
-    env: &HostEnv,
-    harness: &str,
-    store: &Path,
-    collector: &Path,
-    args: &[String],
-) -> Result<Vec<u8>> {
-    let kind = kind_for(harness).context("not a kept login")?;
-    let h = crate::profile::HarnessFactory::new(env)?.create(harness)?;
-    let _lock = refresh_lock(env, store)?;
-    let before = std::fs::read(store)?;
-    if !keepable(&before) {
-        bail!("{} holds no login with a refresh token", store.display());
-    }
-    let dir = keeper_dir(env, store);
-    let (upper, work) = (dir.join("usage-upper"), dir.join("usage-work"));
-    for d in [&upper, &work] {
-        let _ = std::fs::remove_dir_all(d);
-        crate::privfs::dir(d)?;
-    }
-    let login = upper.join(Path::new(kind.file).file_name().context("no file name")?);
-    crate::privfs::write(&login, &before)?;
-    // A shared login only: the overlay's lower layer is the host's folder.
-    let mut cmd = keeper_command(
-        env,
-        &h,
-        kind,
-        &AuthMode::Shared,
-        &dir,
-        Layout::Collector {
-            upper: &upper,
-            work: &work,
-            program: collector,
-            args,
-        },
-    )?;
-    cmd.env_remove(kind.home_var);
-    let out = run_capped(&mut cmd, Duration::from_secs(120))?;
-    let after = std::fs::read(&login).unwrap_or_default();
-    if after != before && keepable(&after) {
-        let now = std::fs::read(store).unwrap_or_default();
-        if hash(&now) == hash(&before) {
-            write_store(store, &after)?;
-        }
-        push(env, store)?;
-    }
-    let _ = std::fs::remove_dir_all(&work);
-    Ok(out)
-}
-
-/// Run a command, return its standard output (at most 4 MiB), and stop it
-/// after `wait`.
-fn run_capped(cmd: &mut Command, wait: Duration) -> Result<Vec<u8>> {
-    use std::io::Read as _;
-    let mut child = cmd
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .context("cannot start the keeper sandbox")?;
-    let mut out = child.stdout.take().context("no stdout")?;
-    let mut err = child.stderr.take().context("no stderr")?;
-    let err_reader = std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        let _ = (&mut err).take(64 << 10).read_to_end(&mut buf);
-        buf
-    });
-    let reader = std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        let _ = (&mut out).take(4 << 20).read_to_end(&mut buf);
-        buf
-    });
-    let start = Instant::now();
-    loop {
-        if child.try_wait()?.is_some() {
-            break;
-        }
-        if start.elapsed() > wait {
-            let _ = child.kill();
-            let _ = child.wait();
-            bail!("the collector did not finish in {} seconds", wait.as_secs());
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    let out = reader.join().unwrap_or_default();
-    let err = err_reader.join().unwrap_or_default();
-    if out.is_empty() && !err.is_empty() {
-        // The collector's own words, for `PADDOCK_LOG=debug`. Never a token:
-        // a collector does not print one.
-        log::debug!(
-            "the collector printed nothing; its errors: {}",
-            String::from_utf8_lossy(&err).trim()
-        );
-    }
-    Ok(out)
 }
 
 fn try_lock(path: &Path) -> Option<std::fs::File> {

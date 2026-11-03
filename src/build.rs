@@ -770,19 +770,8 @@ pub fn build_with(env: &HostEnv, opts: &Options, harness: Harness) -> Result<Bui
         }
     }
     crate::mcp::apply(env, &profile, &m, &project, &mut spec);
-    let state_settings: Vec<_> = profile
-        .state
-        .settings
-        .iter()
-        .filter(|s| !s.yolo_only || !opts.no_yolo)
-        .cloned()
-        .collect();
-    crate::privacy::push_settings(
-        &profile,
-        &state_settings,
-        &format!("{porigin} state.settings"),
-        &mut spec,
-    )?;
+    crate::privacy::push_state_settings(&profile, opts.no_yolo, &porigin, &mut spec)?;
+    crate::compaction::apply(env, &profile, &mut spec)?;
     if !matches!(spec.network, Network::None | Network::Api) {
         for p in &profile.network.publish {
             if !spec.publish.contains(p) {

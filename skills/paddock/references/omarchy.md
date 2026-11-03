@@ -9,9 +9,8 @@
 
 ## The agents panel
 
-- Sessions of claude, codex and grok that `omarchy-agent` starts reach the host history, so the panel counts them. claude gets only the host folder of its own project in `~/.claude/projects`. codex and grok copy new history back every five minutes and at exit. Do not bind more history folders by hand.
-- The panel never shows an isolated login (`--auth isolated:NAME`). `paddock doctor` lists them.
-- While a sandbox holds the login of Claude Code or Grok Build, paddock checks its limits from the sandbox, and the host does not. A held Codex login is not checked until the sandbox exits. `paddock doctor` shows the state.
+- The panel's `omarchy-agent-usage-update` runs in a box: each harness folder is one read-only tree of the host folder and the same folder of every sandbox home, so the panel counts sandbox sessions without a copy in the home. The box sees nothing else of the home, such as `~/.ssh`. claude still gets the host folder of its own project in `~/.claude/projects`. Do not bind more history folders by hand, and do not copy sessions to the home.
+- For every agent, the box shows the newest copy of each login file across the host and the non-isolated sandbox homes (and the keeper's copy for Codex), read-only, with no session bus or host keyring, and sends network traffic through paddock's proxy. `paddock doctor` shows the state.
 - Do not run `omarchy-agent-usage-update --force` or a collector to test this. Each run asks the vendor with the user's login.
 
 ## Agents without a sandbox

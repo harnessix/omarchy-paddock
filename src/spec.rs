@@ -155,6 +155,9 @@ pub struct HomeSetting {
     pub path: Vec<String>,
     pub value: serde_json::Value,
     pub origin: String,
+    /// Add the value to the array at `path` (profile.rs `Setting::append`).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub append: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]

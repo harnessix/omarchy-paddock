@@ -59,6 +59,29 @@ pub fn apply(profile: &Profile, mode: Telemetry, spec: &mut SandboxSpec) -> Resu
     push_settings(profile, &profile.privacy.settings, &origin, spec)
 }
 
+/// Add `[[state.settings]]` of a profile. The `yolo_only` entries only
+/// when the harness starts with its auto-approval flags.
+pub fn push_state_settings(
+    profile: &Profile,
+    no_yolo: bool,
+    porigin: &str,
+    spec: &mut SandboxSpec,
+) -> Result<()> {
+    let settings: Vec<_> = profile
+        .state
+        .settings
+        .iter()
+        .filter(|s| !s.yolo_only || !no_yolo)
+        .cloned()
+        .collect();
+    push_settings(
+        profile,
+        &settings,
+        &format!("{porigin} state.settings"),
+        spec,
+    )
+}
+
 /// Add settings entries of a profile to the values that paddock writes into
 /// the sandbox home.
 pub fn push_settings(
@@ -93,6 +116,7 @@ pub fn push_settings(
             path: crate::state::expand_path(&s.path, &spec.project),
             value,
             origin: origin.to_string(),
+            append: s.append,
         });
     }
     Ok(())
@@ -150,9 +174,38 @@ fn set_json(text: &str, entries: &[&HomeSetting]) -> Result<String> {
         bail!("the file is not a JSON object");
     }
     for e in entries {
-        crate::state::json_set(&mut doc, &e.path, e.value.clone());
+        if e.append {
+            json_append(&mut doc, &e.path, &e.value);
+        } else {
+            crate::state::json_set(&mut doc, &e.path, e.value.clone());
+        }
     }
     Ok(serde_json::to_string_pretty(&doc)? + "\n")
+}
+
+/// Add `value` to the array at `path`, once. A missing key or a value that
+/// is not an array becomes an array, so the user's other keys stay.
+fn json_append(doc: &mut serde_json::Value, path: &[String], value: &serde_json::Value) {
+    let cur = doc
+        .pointer(&format!(
+            "/{}",
+            path.iter()
+                .map(|k| k.replace('~', "~0").replace('/', "~1"))
+                .collect::<Vec<_>>()
+                .join("/")
+        ))
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    let next = match cur {
+        serde_json::Value::Array(a) if a.contains(value) => return,
+        serde_json::Value::Array(mut a) => {
+            a.push(value.clone());
+            serde_json::Value::Array(a)
+        }
+        serde_json::Value::Null => serde_json::json!([value]),
+        other => serde_json::json!([other, value]),
+    };
+    crate::state::json_set(doc, path, next);
 }
 
 fn toml_value(v: &serde_json::Value) -> Result<toml_edit::Value> {
@@ -276,6 +329,7 @@ mod tests {
             path: path.iter().map(|s| s.to_string()).collect(),
             value,
             origin: "test".into(),
+            append: false,
         }
     }
 
