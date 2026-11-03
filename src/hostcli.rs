@@ -832,7 +832,7 @@ fn print_human(req: &Request, resp: &Response) {
                     "paddock-host: started {} on branch {}. Wait for it: paddock-host wait {}",
                     r["harness"].as_str().unwrap_or(""),
                     r["branch"].as_str().unwrap_or(""),
-                    r["id"].as_str().unwrap_or("")
+                    crate::ids::short(r["id"].as_str().unwrap_or(""))
                 );
             }
             Some("list") => {

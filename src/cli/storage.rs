@@ -218,7 +218,7 @@ pub(crate) fn files_cmd(env: &HostEnv, id: Option<&str>, json: bool) -> Result<i
             .iter()
             .map(|(s, running, items, changes)| {
                 serde_json::json!({
-                    "id": s.id, "harness": s.harness, "project": s.project, "home": s.home,
+                    "id": s.id, "short": paddock::ids::short(&s.id), "harness": s.harness, "project": s.project, "home": s.home,
                     "started": s.started, "ended": s.ended, "running": running,
                     "files": items, "project_changes": changes,
                 })

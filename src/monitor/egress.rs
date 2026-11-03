@@ -305,7 +305,8 @@ fn report(env: &HostEnv, sandbox: &str, harness: &str, project: &Path, a: &Alert
             &crate::broker::notify::Note {
                 summary: "a sandbox reached a new host".into(),
                 body: format!(
-                    "{detail}. paddock log shows it. paddock stop {sandbox} ends the sandbox."
+                    "{detail}. paddock log shows it. paddock stop {} ends the sandbox.",
+                    crate::ids::short(sandbox)
                 ),
                 actions: Vec::new(),
                 critical: false,

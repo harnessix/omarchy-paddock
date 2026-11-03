@@ -27,6 +27,7 @@ pub(crate) fn ps(env: &HostEnv, json: bool) -> Result<i32> {
                     );
                 }
                 if let Some(o) = v.as_object_mut() {
+                    o.insert("short".into(), paddock::ids::short(&r.id).into());
                     let (view, tmux) = paddock::view::available(env, &sessions, &r.id);
                     o.insert("view".into(), view.into());
                     o.insert("view_tmux".into(), tmux.into());
@@ -163,7 +164,8 @@ pub(crate) fn ps(env: &HostEnv, json: bool) -> Result<i32> {
 
 pub(crate) fn freeze(env: &HostEnv, id: String, tree: bool, reason: String) -> Result<i32> {
     for f in paddock::freeze::freeze(env, &id, tree, &reason)? {
-        println!("Froze {f}. Thaw it with: paddock thaw {f}");
+        let short = paddock::ids::short(&f);
+        println!("Froze {short}. Thaw it with: paddock thaw {short}");
     }
     Ok(0)
 }

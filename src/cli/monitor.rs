@@ -28,7 +28,7 @@ A project's own paddock.toml cannot mute it.
 
 Examples:
   paddock monitor list
-  paddock monitor ack claude-app-1a2b
+  paddock monitor ack 1a2b3c
   paddock monitor mute ~/src/tunnel-demo";
 
 pub(crate) fn monitor_cmd(env: &HostEnv, cmd: MonitorCmd) -> Result<i32> {
@@ -52,6 +52,7 @@ pub(crate) fn monitor_cmd(env: &HostEnv, cmd: MonitorCmd) -> Result<i32> {
                     .map(|r| {
                         serde_json::json!({
                             "id": r.id,
+                            "short": paddock::ids::short(&r.id),
                             "harness": r.harness,
                             "project": r.project,
                             "muted": monitor::is_muted(&mute, &r.project),
@@ -89,6 +90,7 @@ pub(crate) fn monitor_cmd(env: &HostEnv, cmd: MonitorCmd) -> Result<i32> {
             Ok(0)
         }
         MonitorCmd::Ack { id } => {
+            let id = paddock::ids::resolve(env, &id)?;
             if !Running::list(env).iter().any(|r| r.id == id) {
                 bail!("no running sandbox {id}. paddock ps lists them.");
             }

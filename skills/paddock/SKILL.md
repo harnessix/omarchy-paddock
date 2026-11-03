@@ -73,9 +73,11 @@ paddock claude --worktree       # a new branch in a new worktree; review the dif
 paddock app run vscode ~/src/api   # a desktop app in a sandbox
 paddock pick claude             # choose a recent project in the terminal
 paddock ps                      # running sandboxes
-paddock stop ID                 # stop one
-paddock freeze ID               # no CPU, memory kept; paddock thaw ID continues it
+paddock stop 1a2b3c             # stop one, by the short id from paddock ps
+paddock freeze 1a2b3c           # no CPU, memory kept; paddock thaw 1a2b3c continues it
 ```
+
+A sandbox id such as `claude-app-1a2b3c` also works as `1a2b3c`, or as its first 4 or more characters (`1a2b`).
 
 A harness command in the home folder stops with an error: the home folder is never a project.
 

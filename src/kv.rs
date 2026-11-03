@@ -1780,7 +1780,7 @@ fn timer_tick(env: &HostEnv, id: &Identity, root: &Path, cfg: &KvCfg) -> Result<
                 if let Err(e) = crate::freeze::freeze(env, &id.sandbox, false, &reason) {
                     log::warn!("cannot freeze {}: {e:#}", id.sandbox);
                 }
-                timer_notice(env, id, "paddock froze a sandbox: its time is up", &format!("{reason}. paddock thaw {} lets it continue; paddock timer extend gives it more.", id.sandbox));
+                timer_notice(env, id, "paddock froze a sandbox: its time is up", &format!("{reason}. paddock thaw {} lets it continue; paddock timer extend gives it more.", crate::ids::short(&id.sandbox)));
             }
         }
     }

@@ -1335,7 +1335,7 @@ fn alert(
                 summary: "a sandbox sends much data".into(),
                 body: format!(
                     "{detail}. paddock does not know what it sends. paddock stop {} ends the sandbox.",
-                    id.sandbox
+                    crate::ids::short(&id.sandbox)
                 ),
                 actions: Vec::new(),
                 critical: false,
@@ -1435,7 +1435,7 @@ fn report(env: &HostEnv, id: &Identity, t: &Tunnel, notify: bool) {
                 summary: "a sandbox opened a tunnel".into(),
                 body: format!(
                     "{detail}. It can reach or expose this machine from outside. paddock stop {} ends the sandbox.",
-                    id.sandbox
+                    crate::ids::short(&id.sandbox)
                 ),
                 actions: Vec::new(),
                 critical: false,

@@ -116,22 +116,22 @@ impl KvScope {
             bail!("--as needs --pasture NAME");
         };
         let project = paddock::kv::host::project_of(self.project.as_deref())?;
-        paddock::kv::principal::cli(env, who, &project, pasture, req)
+        paddock::kv::principal::cli(env, who, &project, &pasture_name(env, pasture)?, req)
     }
 
-    fn target(&self) -> Result<paddock::kv::host::Target> {
+    fn target(&self, env: &HostEnv) -> Result<paddock::kv::host::Target> {
         use paddock::kv::host::{project_of, Target};
         use paddock::kv::shard::Ns;
         Ok(if self.user {
             Target::One(Ns::User)
         } else if let Some(id) = &self.sandbox {
-            Target::One(Ns::Own(id.clone()))
+            Target::One(Ns::Own(paddock::ids::resolve(env, id)?))
         } else if let Some(root) = &self.tree {
-            Target::One(Ns::Tree(root.clone()))
+            Target::One(Ns::Tree(paddock::ids::resolve(env, root)?))
         } else {
             let project = project_of(self.project.as_deref())?;
             if let Some(name) = &self.pasture {
-                Target::One(Ns::pasture(&project, name)?)
+                Target::One(Ns::pasture(&project, &pasture_name(env, name)?)?)
             } else if self.legacy {
                 Target::One(Ns::Legacy(project))
             } else {
@@ -139,6 +139,19 @@ impl KvScope {
             }
         })
     }
+}
+
+/// `solo-ID` with the full sandbox id, so `solo-1a2b` works too.
+fn pasture_name(env: &HostEnv, name: &str) -> Result<String> {
+    let solo = paddock::pasture::SOLO_PREFIX;
+    let Some(id) = name.strip_prefix(solo) else {
+        return Ok(name.to_owned());
+    };
+    let known = paddock::ids::known(env);
+    Ok(match paddock::ids::find(id, &known, |s| s.as_str())? {
+        Some(full) => format!("{solo}{full}"),
+        None => name.to_owned(),
+    })
 }
 
 pub(crate) fn run(env: &HostEnv, cmd: KvCmd) -> Result<i32> {
@@ -176,8 +189,13 @@ pub(crate) fn run(env: &HostEnv, cmd: KvCmd) -> Result<i32> {
             prefix,
             scope,
             json,
-        } => host::list(env, &scope.target()?, prefix.as_deref().unwrap_or(""), json),
-        KvCmd::Get { key, scope, json } => host::get(env, &scope.target()?, &key, json),
+        } => host::list(
+            env,
+            &scope.target(env)?,
+            prefix.as_deref().unwrap_or(""),
+            json,
+        ),
+        KvCmd::Get { key, scope, json } => host::get(env, &scope.target(env)?, &key, json),
         KvCmd::Delete {
             key,
             scope,
@@ -188,13 +206,13 @@ pub(crate) fn run(env: &HostEnv, cmd: KvCmd) -> Result<i32> {
             &who,
             kv_request("delete", Some(key), |r| r.version = version),
         ),
-        KvCmd::Delete { key, scope, .. } => host::delete(env, &scope.target()?, &key),
+        KvCmd::Delete { key, scope, .. } => host::delete(env, &scope.target(env)?, &key),
         KvCmd::Release {
             name,
             scope,
             principal: KvAs { as_: Some(who) },
         } => scope.principal(env, &who, kv_request("release", Some(name), |_| {})),
-        KvCmd::Release { name, scope, .. } => host::release(env, &scope.target()?, &name),
+        KvCmd::Release { name, scope, .. } => host::release(env, &scope.target(env)?, &name),
         KvCmd::Put {
             key,
             value,

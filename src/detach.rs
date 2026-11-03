@@ -329,6 +329,7 @@ pub fn recent_ended(env: &HostEnv, now: u64) -> Vec<serde_json::Value> {
             .unwrap_or_default();
         rows.push(serde_json::json!({
             "id": rec.id,
+            "short": crate::ids::short(&rec.id),
             "harness": rec.harness,
             "project": rec.project,
             "ended": ended,

@@ -97,11 +97,22 @@ fn real_main() -> Result<i32> {
         Cmd::Shims { cmd } => cli::shims::run(&env, cmd),
         Cmd::Launchers { cmd } => cli::shims::launchers(&env, cmd),
         Cmd::Windows { json, mark, focus } => cli::windows::windows(&env, json, mark, focus),
-        Cmd::Focus { id, display } => cli::windows::focus(&env, id, display),
-        Cmd::Freeze { id, tree, reason } => cli::status::freeze(&env, id, tree, reason),
-        Cmd::Thaw { id, tree } => cli::status::thaw(&env, id, tree),
+        Cmd::Focus { id, display } => {
+            cli::windows::focus(&env, paddock::ids::resolve(&env, &id)?, display)
+        }
+        Cmd::Freeze { id, tree, reason } => {
+            cli::status::freeze(&env, paddock::ids::resolve(&env, &id)?, tree, reason)
+        }
+        Cmd::Thaw { id, tree } => cli::status::thaw(&env, paddock::ids::resolve(&env, &id)?, tree),
         Cmd::Ps { json } => cli::status::ps(&env, json),
-        Cmd::Files { id, json } => cli::storage::files_cmd(&env, id.as_deref(), json),
+        Cmd::Files { id, json } => cli::storage::files_cmd(
+            &env,
+            id.as_deref()
+                .map(|s| paddock::ids::resolve(&env, s))
+                .transpose()?
+                .as_deref(),
+            json,
+        ),
         Cmd::Undo {
             session,
             list,
@@ -146,8 +157,17 @@ fn real_main() -> Result<i32> {
             all,
             to,
             keep,
-        } => cli::storage::recover_cmd(&env, &id, paths, all, to.as_deref(), keep),
-        Cmd::Discard { id, paths, all } => cli::storage::discard_cmd(&env, &id, paths, all),
+        } => cli::storage::recover_cmd(
+            &env,
+            &paddock::ids::resolve(&env, &id)?,
+            paths,
+            all,
+            to.as_deref(),
+            keep,
+        ),
+        Cmd::Discard { id, paths, all } => {
+            cli::storage::discard_cmd(&env, &paddock::ids::resolve(&env, &id)?, paths, all)
+        }
         Cmd::Pasture { cmd } => cli::pasture::run(&env, cmd),
         Cmd::Forage {
             agents,
@@ -159,10 +179,16 @@ fn real_main() -> Result<i32> {
         Cmd::Timer { cmd } => cli::timer::run(&env, cmd),
         Cmd::Logins { cmd } => cli::logins::run(&env, cmd),
         Cmd::Credentials { cmd } => cli::credentials::run(&env, cmd),
-        Cmd::Boundary { id, json, follow } => cli::status::boundary(&env, id, json, follow),
-        Cmd::Stop { id } => cli::storage::stop(&env, &id),
-        Cmd::Wait { id, timeout } => cli::status::wait(&env, id, timeout),
-        Cmd::View { id, write } => cli::status::view(&env, id, write),
+        Cmd::Boundary { id, json, follow } => {
+            cli::status::boundary(&env, paddock::ids::resolve(&env, &id)?, json, follow)
+        }
+        Cmd::Stop { id } => cli::storage::stop(&env, &paddock::ids::resolve(&env, &id)?),
+        Cmd::Wait { id, timeout } => {
+            cli::status::wait(&env, paddock::ids::resolve(&env, &id)?, timeout)
+        }
+        Cmd::View { id, write } => {
+            cli::status::view(&env, paddock::ids::resolve(&env, &id)?, write)
+        }
         Cmd::Doctor {
             escape,
             backend,

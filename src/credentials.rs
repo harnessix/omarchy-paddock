@@ -975,7 +975,7 @@ pub fn revoke(env: &HostEnv, sandbox: &str, name: Option<&str>) -> Result<Vec<St
     let names: Vec<String> = match name {
         Some(n) if held.iter().any(|g| g == n) => vec![n.to_string()],
         Some(n) if r.credentials.iter().any(|c| c == n) => bail!(
-            "{n} was delivered: its value is in the sandbox and cannot be taken back. Stop the sandbox to end it: paddock stop {sandbox}"
+            "{n} was delivered: its value is in the sandbox and cannot be taken back. Stop the sandbox to end it: paddock stop {}", crate::ids::short(sandbox)
         ),
         Some(n) => bail!("sandbox {sandbox} does not use the credential {n}"),
         None if held.is_empty() => {

@@ -116,7 +116,10 @@ impl World {
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(lines.len(), 2, "{text}");
         let id = lines[0].to_string();
-        assert_eq!(lines[1], format!("paddock view {id} --write"));
+        assert_eq!(
+            lines[1],
+            format!("paddock view {} --write", paddock::ids::short(&id))
+        );
         assert!(self.has_session(&id), "no tmux session {id}");
         id
     }
@@ -333,6 +336,82 @@ fn ps_marks_the_run_and_wait_times_out() {
     assert!(w.paddock().args(["stop", &id]).status().unwrap().success());
     let (code, _) = w.wait(&id, "60s");
     assert_eq!(code, Some(1));
+}
+
+#[test]
+fn wait_and_stop_take_the_short_id() {
+    if !common::bwrap_works() || !has_tmux() {
+        eprintln!("skipped: needs bwrap with a user namespace and tmux");
+        return;
+    }
+    let w = World::new(true);
+    let id = w.detach("hang");
+    // The sandbox shows in ps once it runs.
+    w.result();
+    let short = paddock::ids::short(&id);
+    assert_eq!(w.sandbox(&id)["short"], short);
+    let (code, _) = w.wait(&short[..4], "2s");
+    assert_eq!(code, Some(124));
+    assert!(w
+        .paddock()
+        .args(["stop", short])
+        .status()
+        .unwrap()
+        .success());
+    // The ended run still resolves.
+    let (code, _) = w.wait(short, "60s");
+    assert_eq!(code, Some(1));
+}
+
+/// Without bwrap and tmux: a fake running sandbox (a `sleep` with a run
+/// record) and a fake ended run, named by short ids.
+#[test]
+fn stop_and_wait_take_a_short_id_of_records() {
+    let w = World::new(true);
+    let mut sleep = Command::new("sleep").arg("60").spawn().unwrap();
+    let id = "fake-project-9c8b7a";
+    let dir = w.root.join("run/paddock").join(id);
+    std::fs::create_dir_all(&dir).unwrap();
+    let info = serde_json::json!({
+        "id": id, "harness": "fake", "project": w.root.join("project"),
+        "backend": "bwrap", "network": "none", "gui": "none",
+        "pid": sleep.id(), "started": 1,
+    });
+    std::fs::write(dir.join("info.json"), info.to_string()).unwrap();
+    let out = w.paddock().args(["stop", "9c8b"]).output().unwrap();
+    assert!(out.status.success(), "{out:?}");
+    assert!(String::from_utf8_lossy(&out.stdout).contains(id), "{out:?}");
+    assert!(
+        !sleep.wait().unwrap().success(),
+        "the sandbox got no SIGTERM"
+    );
+
+    let ended = "fake-project-5e4d3c";
+    let records = w.root.join("state/paddock/detach");
+    std::fs::create_dir_all(&records).unwrap();
+    let rec = serde_json::json!({
+        "id": ended, "harness": "fake", "project": w.root.join("project"),
+        "started": 1, "ended": 2,
+        "done": {"status": "ok", "text": "all good", "at": 2},
+    });
+    std::fs::write(records.join(format!("{ended}.json")), rec.to_string()).unwrap();
+    let (code, out) = w.wait("5e4d3c", "5s");
+    assert_eq!(code, Some(0), "{out}");
+    assert_eq!(out.trim(), "ok: all good");
+}
+
+#[test]
+fn a_short_id_that_fits_no_sandbox_fails() {
+    let w = World::new(true);
+    for (cmd, input, says) in [
+        ("wait", "1a2", "too short"),
+        ("stop", "ffff", "no sandbox with id ffff"),
+    ] {
+        let out = w.paddock().args([cmd, input]).output().unwrap();
+        assert!(!out.status.success(), "{out:?}");
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(err.contains(says), "{err}");
+    }
 }
 
 #[test]

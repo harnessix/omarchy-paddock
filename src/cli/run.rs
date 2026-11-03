@@ -112,7 +112,7 @@ pub(crate) fn start_detached(env: &HostEnv, a: &RunArgs) -> Result<i32> {
     };
     paddock::detach::launch(env, &tmux, &job, &opts.harness, &project, &prompt)?;
     println!("{id}");
-    println!("paddock view {id} --write");
+    println!("paddock view {} --write", paddock::ids::short(&id));
     Ok(0)
 }
 

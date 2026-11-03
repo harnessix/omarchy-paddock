@@ -840,7 +840,7 @@ pub fn render_list(all: &[(PathBuf, Meta)]) -> String {
             m.harness,
             crate::storage::human(m.bytes),
             if m.reflink { " shared" } else { "       " },
-            m.id
+            crate::ids::short(&m.id)
         ));
     }
     t
@@ -908,7 +908,7 @@ pub fn undo_cmd(
         return Ok(0);
     }
     let Some((dir, meta)) = (match session {
-        Some(s) => all.iter().find(|(_, m)| m.id == s),
+        Some(s) => crate::ids::find(s, &all, |(_, m)| &m.id)?,
         None => all.first(),
     }) else {
         match session {

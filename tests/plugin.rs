@@ -154,7 +154,10 @@ fn the_view_commands_of_the_panel_parse() {
     let t = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(t.path().join("home")).unwrap();
     std::fs::create_dir_all(t.path().join("run")).unwrap();
-    for args in [&["view", "abc123"][..], &["view", "abc123", "--write"][..]] {
+    for args in [
+        &["view", "fake-app-abc123"][..],
+        &["view", "fake-app-abc123", "--write"][..],
+    ] {
         // An empty PATH: no tmux, no terminal, so no window opens.
         let out = Command::new(env!("CARGO_BIN_EXE_paddock"))
             .args(args)

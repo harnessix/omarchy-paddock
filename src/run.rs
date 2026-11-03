@@ -346,7 +346,8 @@ fn setup_credentials(
                     &crate::broker::notify::Note {
                         summary: "paddock froze a sandbox".into(),
                         body: format!(
-                            "{id}: {reason}. Read paddock log, then run paddock thaw {id} or paddock stop {id}."
+                            "{id}: {reason}. Read paddock log, then run paddock thaw {s} or paddock stop {s}.",
+                            s = crate::ids::short(&id)
                         ),
                         actions: Vec::new(),
                         critical: true,
@@ -1304,8 +1305,7 @@ pub fn run(
     Ok(Outcome { code, stdout: out })
 }
 
-/// The run folder of a shadow run: removed when the run ends, also on an
-/// error.
+/// The run folder of a shadow run: removed when the run ends or fails.
 struct ShadowRun(crate::shadow::Plan);
 
 impl Drop for ShadowRun {
@@ -1316,9 +1316,9 @@ impl Drop for ShadowRun {
     }
 }
 
-/// Quick Recovery at exit: name the files that the sandbox left in its
-/// recovery folders, and the command that brings them to the host.
+/// Quick Recovery at exit: the files left in the recovery folders, and how to copy them.
 fn recovery_notice(env: &HostEnv, id: &str, home: &Path, started: u64) {
+    let id = crate::ids::short(id);
     let cfg = match crate::recover::RecoveryCfg::load(env) {
         Ok(c) => c,
         Err(e) => {

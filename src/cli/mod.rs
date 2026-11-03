@@ -110,6 +110,7 @@ pub(crate) enum Cmd {
     },
     /// Focus the terminal window, or the display window with --display, of a running sandbox (Hyprland).
     Focus {
+        /// A sandbox id from `paddock ps`, or its short form such as 1a2b3c.
         id: String,
         /// Focus the nested display window of a sandbox in window mode instead.
         #[arg(long)]
@@ -127,6 +128,7 @@ pub(crate) enum Cmd {
     },
     /// Show what the sandbox boundary denied, grouped by kind and target.
     Boundary {
+        /// A sandbox id from `paddock ps`, or its short form such as 1a2b3c.
         id: String,
         #[arg(long)]
         json: bool,
@@ -135,10 +137,14 @@ pub(crate) enum Cmd {
         follow: bool,
     },
     /// Stop a running sandbox.
-    Stop { id: String },
+    Stop {
+        /// A sandbox id from `paddock ps`, or its short form such as 1a2b3c.
+        id: String,
+    },
     /// Wait until a sandbox ends. Prints what `paddock-host done` said.
     /// Exit code 0 for ok, 1 for failed or no `done`, 124 for a timeout.
     Wait {
+        /// A sandbox id from `paddock ps`, or its short form such as 1a2b3c.
         id: String,
         /// The longest wait, for example 90s, 30m or 2h.
         #[arg(long, value_name = "DURATION")]
@@ -147,6 +153,7 @@ pub(crate) enum Cmd {
     /// Open a live view of a sandbox that runs without a terminal, in a new
     /// terminal window. Read-only unless --write.
     View {
+        /// A sandbox id from `paddock ps`, or its short form such as 1a2b3c.
         id: String,
         /// Attach with the keyboard. In a detached run (`run --detach`) the
         /// keys go to the agent: you take over. In a logged one-shot run,
@@ -157,6 +164,7 @@ pub(crate) enum Cmd {
     /// Freeze a running sandbox: it uses no CPU and keeps its memory until
     /// you thaw it.
     Freeze {
+        /// A sandbox id from `paddock ps`, or its short form such as 1a2b3c.
         id: String,
         /// Also the sandboxes that it started.
         #[arg(long)]
@@ -167,6 +175,7 @@ pub(crate) enum Cmd {
     },
     /// Thaw a frozen sandbox: it continues where it stopped.
     Thaw {
+        /// A sandbox id from `paddock ps`, or its short form such as 1a2b3c.
         id: String,
         /// Also the sandboxes that it started.
         #[arg(long)]
@@ -217,14 +226,16 @@ pub(crate) enum Cmd {
     /// List the files a sandbox saved outside the project, and its project changes.
     #[command(after_help = storage::FILES_HELP)]
     Files {
-        /// A sandbox id from `paddock ps` or an earlier run. Without it, every sandbox home with files.
+        /// A sandbox id from `paddock ps` or an earlier run, or its short form such as
+        /// 1a2b3c. Without it, every sandbox home with files.
         id: Option<String>,
         #[arg(long)]
         json: bool,
     },
     /// Bring the project back to its snapshot from before a sandbox started.
     Undo {
-        /// A session id from `paddock undo --list`. Without it, the last session of this project.
+        /// A session id from `paddock undo --list`, such as 1a2b3c. Without it, the last
+        /// session of this project.
         session: Option<String>,
         /// List the snapshots of this project.
         #[arg(long)]
@@ -238,6 +249,7 @@ pub(crate) enum Cmd {
     },
     /// Copy files from a sandbox home to the host, then remove the sandbox copy.
     Recover {
+        /// A sandbox id from `paddock files`, or its short form such as 1a2b3c.
         id: String,
         /// Paths as `paddock files` shows them, such as Desktop/report.pdf.
         #[arg(required_unless_present = "all")]
@@ -254,6 +266,7 @@ pub(crate) enum Cmd {
     },
     /// Delete files from the recovery folders of a sandbox home.
     Discard {
+        /// A sandbox id from `paddock files`, or its short form such as 1a2b3c.
         id: String,
         #[arg(required_unless_present = "all")]
         paths: Vec<String>,
@@ -562,10 +575,10 @@ pub(crate) struct KvScope {
     /// The scope that all projects share.
     #[arg(long, conflicts_with_all = ["sandbox", "tree"])]
     user: bool,
-    /// The self scope of one sandbox, by id.
+    /// The self scope of one sandbox, by its id or short id.
     #[arg(long, conflicts_with = "tree")]
     sandbox: Option<String>,
-    /// The tree scope of a spawn tree, by the id of its root sandbox.
+    /// The tree scope of a spawn tree, by the id or short id of its root sandbox.
     #[arg(long)]
     tree: Option<String>,
 }
@@ -636,8 +649,8 @@ pub(crate) struct RunArgs {
     yes: bool,
     /// Start the run in the background, in a session of paddock's own tmux
     /// server: the harness runs its interactive interface with the task as
-    /// its first prompt. `paddock view ID --write` takes over, `paddock
-    /// wait ID` waits for the end. Needs --prompt-file or --prompt.
+    /// its first prompt. `paddock view 1a2b3c --write` takes over, `paddock
+    /// wait 1a2b3c` waits for the end. Needs --prompt-file or --prompt.
     #[arg(long)]
     #[serde(skip)]
     detach: bool,

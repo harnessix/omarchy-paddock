@@ -211,8 +211,22 @@ impl Broker {
         let Some(sp) = &self.spawner else {
             return Response::new(Status::Disabled, self.spawn_off_reason());
         };
-        let to_json = |s: &crate::spawn::Status| serde_json::to_value(s).unwrap_or_default();
-        let id = arg_str(req, "id").unwrap_or("");
+        let to_json = |s: &crate::spawn::Status| {
+            let mut v = serde_json::to_value(s).unwrap_or_default();
+            v["short"] = crate::ids::short(&s.sandbox).into();
+            v
+        };
+        // A child by its spawn id, its sandbox id, or a unique prefix.
+        let input = arg_str(req, "id").unwrap_or("");
+        let children = sp.list();
+        let resolved = match children.iter().find(|c| c.sandbox == input) {
+            Some(c) => c.id.clone(),
+            None => match crate::ids::find(input, &children, |c| c.id.as_str()) {
+                Ok(c) => c.map_or(input.to_owned(), |c| c.id.clone()),
+                Err(e) => return Response::new(Status::Invalid, e.to_string()),
+            },
+        };
+        let id = resolved.as_str();
         let missing = || Response::new(Status::Invalid, format!("no child {id} of this sandbox"));
         match (work, arg_str(req, "action").unwrap_or("start")) {
             (
@@ -231,7 +245,7 @@ impl Broker {
                 },
             },
             (_, "list") => Response::done(serde_json::json!({
-                "children": sp.list(),
+                "children": sp.list().iter().map(to_json).collect::<Vec<_>>(),
                 "max_running": sp.cfg.max_running,
             })),
             (_, "status") => match sp.status(id) {

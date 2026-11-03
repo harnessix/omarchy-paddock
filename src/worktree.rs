@@ -21,15 +21,19 @@ pub fn list(env: &HostEnv) -> Vec<Worktree> {
 /// The worktree that `target` names: its path, its folder name or its
 /// branch (with or without `paddock/`).
 pub fn find(all: &[Worktree], target: &str) -> Result<Worktree> {
+    let ids: Vec<&str> = all.iter().filter_map(|w| w.branch.as_deref()).collect();
+    let resolved = crate::ids::resolve_from(target, ids.iter().copied()).ok();
     let path = std::fs::canonicalize(target).ok();
     let hits: Vec<&Worktree> = all
         .iter()
         .filter(|w| {
             path.is_some() && std::fs::canonicalize(&w.path).ok() == path
                 || w.path.file_name().is_some_and(|n| n == target)
-                || w.branch
-                    .as_deref()
-                    .is_some_and(|b| b == target || b.strip_prefix("paddock/") == Some(target))
+                || w.branch.as_deref().is_some_and(|b| {
+                    b == target
+                        || b.strip_prefix("paddock/") == Some(target)
+                        || resolved.as_deref() == Some(b)
+                })
         })
         .collect();
     match hits.as_slice() {
