@@ -333,6 +333,7 @@ pub fn run(env: &HostEnv, o: &AppOptions) -> Result<i32> {
         if o.backend.as_deref().is_some_and(|b| b != "bwrap") {
             bail!("{} is a flatpak app: flatpak runs its own bubblewrap sandbox, so it needs the bwrap backend", o.name);
         }
+        crate::speckit::git::notice(env, &roots[0]);
         return run_flatpak(env, &profile, &id, &roots, gpu, worktree, o);
     }
     let opts = Options {
@@ -351,7 +352,6 @@ pub fn run(env: &HostEnv, o: &AppOptions) -> Result<i32> {
         ..Default::default()
     };
     let mut built = build::build(env, &opts)?;
-    // An app has a window: nothing to show in a terminal view.
     built.view = false;
     add_roots(env, &mut built.spec, &built.manifest, &roots[1..])?;
     crate::policy::enforce(env, &built.spec)?;

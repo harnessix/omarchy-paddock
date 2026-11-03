@@ -58,3 +58,34 @@ fn a_push_url_with_credentials_stays_out_of_the_audit_line() {
     assert!(!d.contains("ghp_secret"), "{d}");
     assert!(d.contains("example.com"), "{d}");
 }
+
+#[test]
+fn push_approval_warns_for_spec_commits_only_with_the_default_store() {
+    let (_tmp, b, _, sha) = setup_repo(None, HostPolicy::default());
+    let prepare = |sha: &str| {
+        super::super::prepare::prepare(
+            &b.env,
+            &b.ctx,
+            &push_req("origin", sha, "refs/heads/feature", false),
+        )
+        .unwrap()
+        .detail
+    };
+    let notice = crate::speckit::git::PUSH_NOTICE;
+    assert!(!prepare(&sha).contains(notice));
+    std::fs::create_dir(b.ctx.project.join("specs")).unwrap();
+    std::fs::write(b.ctx.project.join("specs/plan.md"), "plan").unwrap();
+    git_in(&b.ctx.project, &["add", "."]);
+    git_in(&b.ctx.project, &["commit", "-qm", "plan"]);
+    let sha = git_in(&b.ctx.project, &["rev-parse", "HEAD"]);
+    assert!(prepare(&sha).contains(notice));
+    std::fs::create_dir_all(b.env.paddock_config()).unwrap();
+    for store in ["repo", "external"] {
+        std::fs::write(
+            b.env.paddock_config().join("config.toml"),
+            format!("[speckit]\nstore = \"{store}\"\n"),
+        )
+        .unwrap();
+        assert!(!prepare(&sha).contains(notice));
+    }
+}

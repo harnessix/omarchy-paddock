@@ -232,8 +232,12 @@ pub(in crate::broker) fn validate(req: &Request) -> Result<()> {
                     if !arg_str(req, "harness").is_some_and(name_ok) {
                         bail!("spawn needs a harness name, for example codex");
                     }
-                    if arg_str(req, "prompt_file").is_none_or(str::is_empty) {
-                        bail!("spawn needs --prompt-file FILE");
+                    let task = arg_str(req, "task");
+                    if task.is_some_and(|t| t != "next" && !crate::speckit::tasks::is_id(t)) {
+                        bail!("--task takes a task id such as T012, or next");
+                    }
+                    if task.is_none() && arg_str(req, "prompt_file").is_none_or(str::is_empty) {
+                        bail!("spawn needs --prompt-file FILE, or --task ID|next");
                     }
                 }
                 "status" | "wait" | "kill" => {

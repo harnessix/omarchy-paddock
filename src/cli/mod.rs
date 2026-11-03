@@ -19,6 +19,7 @@ pub(crate) mod run;
 pub(crate) mod setup;
 pub(crate) mod shims;
 pub(crate) mod skill;
+pub(crate) mod spec;
 pub(crate) mod status;
 pub(crate) mod storage;
 pub(crate) mod timer;
@@ -424,6 +425,11 @@ pub(crate) enum Cmd {
         /// How many recent entries to show.
         #[arg(short = 'n', long, default_value_t = 20)]
         lines: usize,
+    },
+    /// Spec Kit projects: the tasks of the active feature, and the external spec store.
+    Spec {
+        #[command(subcommand)]
+        cmd: spec::SpecCmd,
     },
     /// The git worktrees that paddock made for --worktree runs and apps: list, merge or remove them.
     Worktree {

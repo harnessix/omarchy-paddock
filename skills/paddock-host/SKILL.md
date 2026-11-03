@@ -66,6 +66,18 @@ Never wait with `sleep`. Use a blocking read: it returns the moment the event ha
 
 A request that waits for the user stays one request. If you send the identical request again, it joins the one that waits, and the user sees one card.
 
+## Spec Kit projects
+
+A project with a `.specify/` folder is a Spec Kit project, and paddock keeps its tasks.
+
+- Do not edit `tasks.md` to mark a task. paddock writes its checkboxes.
+- `paddock-host spec status` shows the feature, the state of each task, what is ready, and what waits for review.
+- To hand out work, run `paddock-host spawn HARNESS --task next` (or `--task T012`) once for each ready task. Ready `[P]` tasks run side by side.
+- When a worker ended, read and merge its branch, then run `paddock-host spec review ID pass` (or `changes "WHAT TO FIX"`).
+- When you are a worker, do only your task and end with `paddock-host done "SUMMARY"`, or `paddock-host done --status failed "WHY"`.
+
+Run `paddock-host help spec` for the details.
+
 ## Long tasks
 
 A timer lives on the host, so it outlasts your context.

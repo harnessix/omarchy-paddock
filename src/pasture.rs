@@ -21,6 +21,7 @@
 //! `ration` that the user owns, set when the member starts (timer.rs).
 
 pub mod bridge;
+pub mod mounts;
 pub mod ports;
 pub mod workbench;
 

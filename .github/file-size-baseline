@@ -2,7 +2,7 @@
 1745 src/app.rs
 894 src/backend/docker.rs
 1137 src/borrow.rs
-1682 src/build.rs
+1625 src/build.rs
 1397 src/credentials.rs
 993 src/credentials/gateway.rs
 850 src/detect.rs
@@ -11,7 +11,7 @@
 1195 src/devices/user.rs
 1317 src/doctor.rs
 1208 src/gatewayd.rs
-947 src/hostcli.rs
+856 src/hostcli.rs
 2219 src/kv.rs
 1007 src/kv/store.rs
 2241 src/kv/tests.rs
@@ -24,7 +24,7 @@
 1189 src/safefs.rs
 811 src/shadow.rs
 960 src/snapshot.rs
-1957 src/spawn.rs
+1897 src/spawn.rs
 1713 src/spawn/tests.rs
 2003 src/state.rs
 1202 src/timer.rs

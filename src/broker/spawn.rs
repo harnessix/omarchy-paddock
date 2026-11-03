@@ -107,8 +107,18 @@ impl Broker {
             .get("from_head")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
-        let prompt = read_prompt(&self.ctx.project, arg_str(req, "prompt_file").unwrap_or(""))
-            .map_err(|e| invalid(format!("{e:#}")))?;
+        // `--task`: paddock writes the prompt from the Spec Kit files.
+        let (prompt, task) = match arg_str(req, "task") {
+            Some(want) => {
+                let (spot, line) = self.task_preview(req, want)?;
+                (line.into_bytes(), Some((spot, want.to_string())))
+            }
+            None => (
+                read_prompt(&self.ctx.project, arg_str(req, "prompt_file").unwrap_or(""))
+                    .map_err(|e| invalid(format!("{e:#}")))?,
+                None,
+            ),
+        };
         let text = String::from_utf8_lossy(&prompt);
         let chars = text.chars().count();
         let shown: String = text.chars().take(crate::spawn::PROMPT_SHOWN).collect();
@@ -167,6 +177,7 @@ impl Broker {
                     limits,
                     from_head,
                 },
+                task,
             },
         })
     }
@@ -209,11 +220,15 @@ impl Broker {
                     harness,
                     prompt,
                     opts,
+                    task,
                 },
                 _,
-            ) => match sp.start(harness, prompt, *opts) {
-                Ok(s) => Response::done(to_json(&s)),
-                Err(e) => Response::new(Status::Failed, format!("{e:#}")),
+            ) => match task {
+                Some((spot, want)) => self.start_task(sp, harness, *opts, spot, want),
+                None => match sp.start(harness, prompt, *opts) {
+                    Ok(s) => Response::done(to_json(&s)),
+                    Err(e) => Response::new(Status::Failed, format!("{e:#}")),
+                },
             },
             (_, "list") => Response::done(serde_json::json!({
                 "children": sp.list(),

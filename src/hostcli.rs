@@ -14,6 +14,8 @@ pub mod forage;
 mod git;
 pub mod kv;
 pub mod pasture;
+mod spawn;
+pub mod spec;
 pub mod status;
 pub mod timer;
 
@@ -43,7 +45,8 @@ USAGE
   paddock-host git push [REMOTE] [REFSPEC...]   (plain `git push` works too)
   paddock-host gh COMMAND [ARG...]              (plain `gh` works too)
   paddock-host tea|glab COMMAND [ARG...]        (plain `tea` and `glab` too, when the host has them)
-  paddock-host spawn HARNESS --prompt-file FILE [--role ROLE] [--from-head] [--reason TEXT]
+  paddock-host spawn HARNESS --prompt-file FILE|--task ID [--role ROLE] [--from-head] [--reason TEXT]
+  paddock-host spec status|review|note          (Spec Kit tasks, see `paddock-host help spec`)
   paddock-host status [ID]
   paddock-host wait ID [--timeout SECONDS]
   paddock-host kill ID
@@ -323,67 +326,8 @@ access: then the user gets a notice and the run stays open until they close
 the view. In a run that is not detached, done fails with exit code 4."#
         }
         "compacted" | "compaction" => compacted::HELP,
-        "spawn" | "status" | "wait" | "kill" => {
-            r#"paddock-host spawn: start another harness in its own sandbox with one task.
-
-  paddock-host spawn HARNESS --prompt-file FILE [--role implementer|reviewer]
-                     [--from-head] [--timeout TIME] [--mem SIZE] [--cpus N]
-                     [--worktree] [--reason TEXT]
-  paddock-host status [ID]                 one child, or all of them
-  paddock-host wait ID [--timeout SECONDS]
-  paddock-host kill ID
-
-spawn prints the id of the child. The child is a sibling sandbox on the host,
-not a sandbox inside this one. It runs the harness once, without a terminal,
-and stops when the task is done.
-
-  - FILE is a file in the project with the task. Write the whole task there:
-    the child does not see this conversation. The prompt never goes into a
-    command line.
-  - The child works in a new git worktree on the branch
-    paddock/spawn-HARNESS-ID, from the commit that this sandbox has checked
-    out. With --from-head, paddock first makes a commit of your files as they
-    are now, uncommitted and new files included (not the ignored ones), and
-    the child starts from it. Your files, index and branches stay as they
-    are. --worktree is the default and the only mode.
-  - Tell the child to commit its work. Uncommitted changes stay in its
-    worktree, and you cannot see them.
-  - --role sets fixed limits. implementer (the default): its own writable
-    worktree. reviewer: the files are read-only, and it cannot push or change
-    anything with gh; use it to review or compare. Under a parent with
-    network egress, a reviewer gets network mode api: only its model API.
-    Both roles get a clean environment: only the allowlist and the
-    harness's own variables.
-  - --timeout (600, 30m, 2h), --mem (512M, 4G) and --cpus (2, 0.5) can only
-    lower the limits in the user's configuration. A systemd scope enforces
-    them when the host has `systemd-run --user`; without it, paddock enforces
-    the timeout and refuses --mem and --cpus.
-  - The child uses its own login of that harness. You never see it.
-  - The child never gets more than this sandbox: the same network, backend
-    and mounts, no display, and host capabilities that are at most as open
-    as yours. Its requests show the user that you started it.
-  - The user's configuration decides which harnesses are allowed, how many
-    children run at the same time, how long one may run, and whether a child
-    may start children of its own (by default it may not).
-
-When the child ends, its results are in .paddock/inbox/spawn-ID/:
-  result.json  state, exit code, branch, commit count, diff summary
-  output.txt   the end of the child's final output
-
-Read the branch with git, for example `git log --stat paddock/spawn-codex-ID`,
-and merge what you want to keep.
-
-paddock also writes result:ID into the tree scope of paddock kv (status,
-summary, ref). With several children, wait for all of them at once:
-  paddock-host kv watch --prefix result: --scope tree --timeout 600
-Children read your own kv scope with --scope parent, and share tasks with you
-in --scope tree. Run `paddock-host kv --help` for the key names.
-
-wait exits with 0 when the child ended with exit code 0, 1 when it failed or
-was stopped, and 75 (still waiting) when it still runs after --timeout: run
-the same wait again. A child stops when this
-sandbox ends. Use `paddock-host capabilities --json` to see the limits."#
-        }
+        "spawn" | "status" | "wait" | "kill" => spawn::HELP,
+        "spec" => spec::HELP,
         _ => return None,
     })
 }
@@ -504,6 +448,7 @@ pub fn main(args: &[String]) -> i32 {
         "forage" => return forage::main(rest),
         "status" => return status::main(rest),
         "compacted" => return compacted::main(rest),
+        "spec" => return spec::main(rest),
         "device" => return device::main(rest),
         "credential" => return credential::main(rest),
         "tea" | "glab" => return git::forge_main(cmd, rest),
@@ -700,44 +645,8 @@ pub fn main(args: &[String]) -> i32 {
                 (req("notify", p.reason, a), p.json)
             }
             "spawn" => {
-                // A child always gets a worktree; the flag only says so.
-                let from_head = rest.iter().any(|a| a == "--from-head");
-                let args: Vec<String> = rest
-                    .iter()
-                    .filter(|a| *a != "--worktree" && *a != "--from-head")
-                    .cloned()
-                    .collect();
-                let p = parse(&args, &["prompt-file", "role", "timeout", "mem", "cpus"])?;
-                let [harness] = p.rest.as_slice() else {
-                    return Err("spawn needs one harness name, for example: spawn codex --prompt-file task.md".into());
-                };
-                let file = p
-                    .opts
-                    .get("prompt-file")
-                    .ok_or("spawn needs --prompt-file FILE with the task")?;
-                let mut a = BTreeMap::new();
-                a.insert("action".into(), serde_json::json!("start"));
-                a.insert("harness".into(), serde_json::json!(harness));
-                a.insert("prompt_file".into(), serde_json::json!(file));
-                a.insert("from_head".into(), serde_json::json!(from_head));
-                if let Some(r) = p.opts.get("role") {
-                    let role: crate::spawn::Role = r.parse().map_err(|e| format!("{e:#}"))?;
-                    a.insert("role".into(), serde_json::json!(role.name()));
-                }
-                let bad = |e: anyhow::Error| format!("{e:#}");
-                if let Some(t) = p.opts.get("timeout") {
-                    let t = crate::spawn::parse_duration(t).map_err(bad)?;
-                    a.insert("timeout".into(), serde_json::json!(t));
-                }
-                if let Some(m) = p.opts.get("mem") {
-                    let m = crate::spawn::parse_bytes(m).map_err(bad)?;
-                    a.insert("mem".into(), serde_json::json!(m));
-                }
-                if let Some(c) = p.opts.get("cpus") {
-                    let c = crate::spawn::parse_cpus(c).map_err(bad)?;
-                    a.insert("cpu_percent".into(), serde_json::json!(c));
-                }
-                (req("spawn", p.reason, a), p.json)
+                let (a, reason, json) = spawn::args(rest)?;
+                (req("spawn", reason, a), json)
             }
             "status" | "wait" | "kill" => {
                 let p = parse(rest, if cmd == "wait" { &["timeout"] } else { &[] })?;
