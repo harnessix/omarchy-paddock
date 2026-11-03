@@ -626,3 +626,18 @@ fn activity_reads_only_the_tail_of_a_large_log() {
     assert_eq!(got.chars().count(), 120);
     assert!(got.chars().all(|c| c == '你'), "{got}");
 }
+
+#[test]
+fn last_output_falls_back_to_window_activity_on_older_tmux() {
+    // tmux 3.5 and later: the pane's own time wins.
+    assert_eq!(
+        parse_last_output("1700000100,1700000050"),
+        PaneOutput::At(1700000100)
+    );
+    // tmux before 3.5 does not know pane_last_output_time.
+    assert_eq!(parse_last_output(",1700000050"), PaneOutput::At(1700000050));
+    assert_eq!(parse_last_output(","), PaneOutput::Quiet);
+    assert_eq!(parse_last_output("0,0"), PaneOutput::Quiet);
+    assert_eq!(parse_last_output(""), PaneOutput::Quiet);
+    assert_eq!(parse_last_output("x,1"), PaneOutput::Unknown);
+}

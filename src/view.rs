@@ -115,6 +115,7 @@ impl Config {
 }
 
 /// What tmux reports for the last output of a pane.
+#[derive(Debug, PartialEq, Eq)]
 pub enum PaneOutput {
     /// The session is gone.
     Missing,
@@ -124,6 +125,21 @@ pub enum PaneOutput {
     Quiet,
     /// Unix time of the last output.
     At(u64),
+}
+
+/// One line of `#{pane_last_output_time},#{window_activity}`.
+pub fn parse_last_output(line: &str) -> PaneOutput {
+    let (pane, window) = line.trim().split_once(',').unwrap_or((line.trim(), ""));
+    let pick = if pane.trim().is_empty() { window } else { pane };
+    let pick = pick.trim();
+    if pick.is_empty() {
+        return PaneOutput::Quiet;
+    }
+    match pick.parse::<u64>() {
+        Ok(0) => PaneOutput::Quiet,
+        Ok(t) => PaneOutput::At(t),
+        Err(_) => PaneOutput::Unknown,
+    }
 }
 
 /// paddock's own tmux server.
@@ -230,7 +246,9 @@ impl Tmux {
     }
 
     /// When the pane last wrote output. `pane_last_output_time` is empty
-    /// until the pane writes something.
+    /// until the pane writes something, and tmux before 3.5 does not know it.
+    /// Then `window_activity` counts: each run has one window, and tmux sets
+    /// that time when the window starts and on each output.
     pub fn last_output(&self, id: &str) -> PaneOutput {
         if !valid_id(id) || !self.sock.exists() {
             return PaneOutput::Missing;
@@ -243,7 +261,7 @@ impl Tmux {
                 "-t",
                 &target,
                 "-F",
-                "#{pane_last_output_time}",
+                "#{pane_last_output_time},#{window_activity}",
             ])
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -255,15 +273,7 @@ impl Tmux {
             return PaneOutput::Missing;
         }
         let text = String::from_utf8_lossy(&out.stdout);
-        let line = text.lines().next().unwrap_or("").trim();
-        if line.is_empty() {
-            return PaneOutput::Quiet;
-        }
-        match line.parse::<u64>() {
-            Ok(0) => PaneOutput::Quiet,
-            Ok(t) => PaneOutput::At(t),
-            Err(_) => PaneOutput::Unknown,
-        }
+        parse_last_output(text.lines().next().unwrap_or(""))
     }
 
     /// Start the session of a sandbox: a pane that prints `header` and then
