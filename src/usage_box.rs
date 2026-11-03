@@ -30,7 +30,7 @@
 //! The rest of the home (`~/.ssh`, documents, other projects) is absent.
 //! When the box cannot start, the command does not run on the host either.
 
-mod collectors;
+pub mod collectors;
 mod expiry;
 pub mod refresh;
 pub mod stage;

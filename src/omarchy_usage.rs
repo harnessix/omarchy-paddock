@@ -16,12 +16,13 @@
 //!   session `PATH`, ahead of `$OMARCHY_PATH/bin`. That folder holds
 //!   `omarchy-agent-usage-update`, which calls
 //!   `paddock shims exec omarchy-agent-usage-update`.
-//! - The Codex keeper lock. Omarchy's Codex collector starts
-//!   `codex app-server`, which can try to refresh a near-expiry login token
-//!   with the vendor when it reads rate limits. Holding `keeper::refresh_lock`
-//!   for each kept login while the usage box runs keeps the collector and the
-//!   credential keeper (`keeper.rs`) from refreshing the same login at the
-//!   same time.
+//! - Kept logins. Omarchy's Codex collector starts `codex app-server`,
+//!   which writes its state next to the login and can refresh the login.
+//!   A login that the credential keeper (`keeper.rs`) keeps is therefore
+//!   left out of the box (`--except AGENT`) and checked by
+//!   `keeper::collect_usage` instead: in the keeper's sandbox, with the
+//!   keeper's login and under its refresh lock, with writes in the keeper's
+//!   own folder. This is the path that worked before the usage box.
 //!
 //! paddock checks only when the panel asks. It never adds a timer.
 
@@ -295,27 +296,131 @@ pub fn remove(env: &HostEnv) -> Result<Vec<PathBuf>> {
 }
 
 /// `paddock omarchy-usage-update -- ARGS`.
-pub fn update(env: &HostEnv, raw: &[String]) -> Result<i32> {
-    let real = real_command(env);
-    // Hold the refresh lock for any kept login while the usage box runs, so
-    // a collector that starts `codex app-server` never refreshes beside the
-    // credential keeper.
-    let mut locks = Vec::new();
-    for kind in crate::keeper::KINDS {
-        let store = env.home.join(kind.file);
-        if store.is_file() {
-            if let Ok(lock) = crate::keeper::refresh_lock(env, &store) {
-                locks.push(lock);
+/// The arguments of Omarchy's command.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Args {
+    pub flags: Vec<String>,
+    pub except: Vec<String>,
+    pub only: Vec<String>,
+}
+
+impl Args {
+    pub fn parse(args: &[String]) -> Self {
+        let mut a = Args::default();
+        let mut it = args.iter();
+        while let Some(x) = it.next() {
+            match x.as_str() {
+                "--force" | "--limits-only" => a.flags.push(x.clone()),
+                "--except" => {
+                    if let Some(v) = it.next() {
+                        a.except.push(v.clone());
+                    }
+                }
+                _ => a.only.push(x.clone()),
             }
         }
+        a
     }
+
+    pub fn wanted(&self, agent: &str) -> bool {
+        !self.except.iter().any(|e| e == agent)
+            && (self.only.is_empty() || self.only.iter().any(|o| o == agent))
+    }
+}
+
+/// A panel agent whose login the credential keeper keeps: its collector
+/// runs through `keeper::collect_usage`, not in the usage box.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Kept {
+    pub agent: &'static str,
+    pub profile: &'static str,
+    pub store: PathBuf,
+}
+
+/// The kept agents that this update checks. The store is the host login
+/// when it holds a refresh token (the keeper pushes refreshes there), else
+/// the newest copy of the sandbox homes.
+pub fn kept(env: &HostEnv, args: &Args) -> Vec<Kept> {
+    let mut out = Vec::new();
+    for c in crate::usage_box::collectors::COLLECTORS {
+        let Some(profile) = c.profile else { continue };
+        let Some(kind) = crate::keeper::kind_for(profile) else {
+            continue;
+        };
+        if !args.wanted(c.id) {
+            continue;
+        }
+        let keepable = |p: &Path| std::fs::read(p).is_ok_and(|b| crate::keeper::keepable(&b));
+        let host = env.home.join(kind.file);
+        let store = if keepable(&host) {
+            Some(host)
+        } else {
+            let set = std::iter::once(profile.to_string()).collect();
+            crate::usage_box::newest_login(env, kind.file, &set, None)
+                .filter(|p| !p.starts_with(env.paddock_state().join("keepers")) && keepable(p))
+        };
+        if let Some(store) = store {
+            out.push(Kept {
+                agent: c.id,
+                profile,
+                store,
+            });
+        }
+    }
+    out
+}
+
+/// The arguments for the box: the panel's own, and `--except` for each
+/// kept agent.
+pub fn box_args(raw: &[String], kept: &[Kept]) -> Vec<String> {
+    let mut a = raw.to_vec();
+    for k in kept {
+        a.extend(["--except".to_string(), k.agent.to_string()]);
+    }
+    a
+}
+
+pub fn update(env: &HostEnv, raw: &[String]) -> Result<i32> {
+    let real = real_command(env);
+    let args = Args::parse(raw);
+    let kept = kept(env, &args);
     // Omarchy's command runs in the usage box (usage_box.rs), never on the
     // host. When the box cannot start, the panel keeps its last records.
-    let Some(status) = crate::usage_box::run(env, &real, raw)? else {
+    let Some(mut status) = crate::usage_box::run(env, &real, &box_args(raw, &kept))? else {
         return Ok(1);
     };
-    drop(locks);
+    for k in &kept {
+        if let Err(e) = collect_kept(env, k, &args.flags) {
+            log::warn!("{}: the limits stay as they were: {e:#}", k.agent);
+            status = status.max(1);
+        }
+    }
     Ok(status)
+}
+
+fn collect_kept(env: &HostEnv, k: &Kept, flags: &[String]) -> Result<()> {
+    let collector = omarchy_path(env)
+        .join("bin")
+        .join(format!("omarchy-agent-usage-{}", k.agent));
+    if !crate::env::is_executable(&collector) {
+        bail!("{} is missing", collector.display());
+    }
+    let record = crate::keeper::collect_usage(env, k.profile, &k.store, &collector, flags)?;
+    let v: serde_json::Value =
+        serde_json::from_slice(&record).context("the collector did not print JSON")?;
+    if v.get("id").and_then(|i| i.as_str()) != Some(k.agent) {
+        bail!("the collector printed a record for another agent");
+    }
+    write_record(env, k.agent, &v)
+}
+
+fn write_record(env: &HostEnv, agent: &str, record: &serde_json::Value) -> Result<()> {
+    let dir = env.state_dir.join("omarchy").join("agents").join("usage");
+    std::fs::create_dir_all(&dir)?;
+    let tmp = dir.join(format!(".{agent}.paddock-{}", std::process::id()));
+    std::fs::write(&tmp, format!("{record}\n"))?;
+    std::fs::rename(&tmp, dir.join(format!("{agent}.json")))?;
+    Ok(())
 }
 
 pub fn doctor_lines(env: &HostEnv) -> Vec<String> {
@@ -360,6 +465,52 @@ pub fn doctor_lines(env: &HostEnv) -> Vec<String> {
 mod tests {
     use super::*;
     use std::collections::BTreeMap;
+
+    fn sv(a: &[&str]) -> Vec<String> {
+        a.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn the_panel_arguments_keep_flags_and_name_agents() {
+        let a = Args::parse(&sv(&["--force", "--except", "grok", "claude"]));
+        assert_eq!(a.flags, sv(&["--force"]));
+        assert!(a.wanted("claude") && !a.wanted("grok") && !a.wanted("codex"));
+        assert!(Args::parse(&[]).wanted("codex"));
+    }
+
+    /// A Codex login with a refresh token goes to the keeper path and out
+    /// of the box. An API-key login, or none, stays in the box.
+    #[test]
+    fn a_kept_codex_login_leaves_the_box_for_the_keeper() {
+        let t = tempfile::tempdir().unwrap();
+        let home = t.path().join("home");
+        let env = HostEnv::from_parts(home.clone(), "demo".into(), 1, 1, Default::default());
+        assert!(kept(&env, &Args::default()).is_empty());
+        let auth = home.join(".codex/auth.json");
+        std::fs::create_dir_all(auth.parent().unwrap()).unwrap();
+        std::fs::write(&auth, r#"{"OPENAI_API_KEY":"sk-test"}"#).unwrap();
+        assert!(kept(&env, &Args::default()).is_empty());
+        std::fs::write(
+            &auth,
+            r#"{"tokens":{"access_token":"a","refresh_token":"r"}}"#,
+        )
+        .unwrap();
+        let k = kept(&env, &Args::default());
+        assert_eq!(
+            k,
+            vec![Kept {
+                agent: "codex",
+                profile: "codex",
+                store: auth.clone()
+            }]
+        );
+        assert_eq!(
+            box_args(&sv(&["--force"]), &k),
+            sv(&["--force", "--except", "codex"])
+        );
+        // The panel asked for another agent only: Codex is not checked.
+        assert!(kept(&env, &Args::parse(&sv(&["claude"]))).is_empty());
+    }
 
     fn env(t: &Path) -> HostEnv {
         HostEnv::from_parts(t.join("home"), "demo".into(), 1, 1, BTreeMap::new())

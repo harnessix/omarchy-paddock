@@ -242,12 +242,19 @@ pub fn refresh(
     crate::privfs::dir(&login_dir)?;
     let inside = home.join(kind.file);
     crate::privfs::write(&inside, &before)?;
-    let mut child = keeper_command(env, harness, kind, auth, &dir, &home)?
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .context("cannot start the keeper sandbox")?;
+    let mut child = keeper_command(
+        env,
+        harness,
+        kind,
+        auth,
+        &dir,
+        Layout::Login { home: &home },
+    )?
+    .stdin(Stdio::piped())
+    .stdout(Stdio::piped())
+    .stderr(Stdio::null())
+    .spawn()
+    .context("cannot start the keeper sandbox")?;
     let talked = talk(&mut child);
     let _ = child.kill();
     let _ = child.wait();
@@ -358,13 +365,29 @@ fn talk(child: &mut Child) -> Result<()> {
 /// The keeper sandbox: bwrap with the system read-only, an empty home but
 /// for the login folder, the harness's install read-only, the login's
 /// machine identity, the host name `paddock`, and network mode egress.
+/// How the home looks in a keeper sandbox, and what runs there.
+enum Layout<'a> {
+    /// Refresh: an empty home with the keeper's login folder in it, and
+    /// the harness's refresh server.
+    Login { home: &'a Path },
+    /// Omarchy's usage collector: the host home read-only (local stats),
+    /// the login folder as an overlay whose writes go to `upper`, Omarchy's
+    /// cache folder writable.
+    Collector {
+        upper: &'a Path,
+        work: &'a Path,
+        program: &'a Path,
+        args: &'a [String],
+    },
+}
+
 fn keeper_command(
     env: &HostEnv,
     harness: &Harness,
     kind: &Kind,
     auth: &AuthMode,
     dir: &Path,
-    home: &Path,
+    layout: Layout,
 ) -> Result<Command> {
     use crate::backend::bwrap::{resolv_target, DNS_FORWARD, ROOT_LINKS};
     let bwrap = env.which("bwrap").context("bwrap not found")?;
@@ -425,16 +448,43 @@ fn keeper_command(
         ]);
     }
     let login_dir = env.home.join(kind.home_dir);
-    // An empty home with the login folder in it, at the host home's path.
-    a.extend(["--tmpfs".into(), s(&env.home)]);
-    a.extend(["--bind".into(), s(&home.join(kind.home_dir)), s(&login_dir)]);
+    match &layout {
+        Layout::Login { home } => {
+            // An empty home with the login folder in it, at the host
+            // home's path.
+            a.extend(["--tmpfs".into(), s(&env.home)]);
+            a.extend(["--bind".into(), s(&home.join(kind.home_dir)), s(&login_dir)]);
+        }
+        Layout::Collector { upper, work, .. } => {
+            a.extend(["--ro-bind".into(), s(&env.home), s(&env.home)]);
+            a.extend([
+                "--overlay-src".into(),
+                s(&login_dir),
+                "--overlay".into(),
+                s(upper),
+                s(work),
+                s(&login_dir),
+            ]);
+            let cache = env.cache_dir.join("omarchy").join("agent-usage");
+            std::fs::create_dir_all(&cache)?;
+            a.extend(["--bind".into(), s(&cache), s(&cache)]);
+        }
+    }
     for m in &harness.install_mounts {
         a.extend(["--ro-bind".into(), s(m), s(m)]);
     }
     a.extend(["--ro-bind".into(), s(&harness.exe), s(&harness.exe)]);
     a.push("--".into());
-    a.push(s(&harness.exe));
-    a.extend(kind.args.iter().map(|x| x.to_string()));
+    match &layout {
+        Layout::Login { .. } => {
+            a.push(s(&harness.exe));
+            a.extend(kind.args.iter().map(|x| x.to_string()));
+        }
+        Layout::Collector { program, args, .. } => {
+            a.push(s(program));
+            a.extend(args.iter().cloned());
+        }
+    }
 
     let spec = crate::spec::SandboxSpec::new(
         format!("keeper-{}", std::process::id()),
@@ -631,7 +681,7 @@ pub fn refresh_now(env: &HostEnv, harness: &str, auth: &AuthMode) -> Result<Stri
 
 /// The lock that every run with the full login holds while it runs: at
 /// most one of them can spend the refresh token. Waits up to two minutes.
-pub(crate) fn refresh_lock(env: &HostEnv, store: &Path) -> Result<std::fs::File> {
+fn refresh_lock(env: &HostEnv, store: &Path) -> Result<std::fs::File> {
     let path = env
         .paddock_run()
         .join("keepers")
@@ -679,74 +729,8 @@ fn notify_failure(env: &HostEnv, store: &Path, e: &anyhow::Error) {
     );
 }
 
+mod usage;
+pub use usage::collect_usage;
+
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// A ChatGPT login as Codex writes it, with an access token that
-    /// expires at `exp`.
-    pub fn login(exp: u64, refresh: &str) -> Vec<u8> {
-        use base64::Engine as _;
-        let b64 = |v: serde_json::Value| {
-            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(v.to_string())
-        };
-        let at = format!(
-            "{}.{}.sig",
-            b64(serde_json::json!({"alg": "none"})),
-            b64(serde_json::json!({"exp": exp}))
-        );
-        serde_json::to_vec(&serde_json::json!({
-            "auth_mode": "chatgpt",
-            "OPENAI_API_KEY": null,
-            "tokens": {"id_token": "e30.e30.sig", "access_token": at, "refresh_token": refresh, "account_id": "acct-1"},
-            "last_refresh": "2026-11-01T00:00:00Z"
-        }))
-        .unwrap()
-    }
-
-    #[test]
-    fn a_login_loses_only_its_refresh_token() {
-        let l = login(2_000_000_000, "rt-1");
-        assert!(keepable(&l));
-        let s = strip(&l).unwrap();
-        let v: serde_json::Value = serde_json::from_slice(&s).unwrap();
-        // Codex needs the field; it is there, empty.
-        assert_eq!(v["tokens"]["refresh_token"], "");
-        assert_eq!(v["tokens"]["account_id"], "acct-1");
-        assert_eq!(v["last_refresh"], "2026-11-01T00:00:00Z");
-        assert!(!keepable(&s));
-        assert!(strip(&s).is_none(), "nothing to take out twice");
-        // An API-key login and other files are left alone.
-        assert!(strip(br#"{"auth_mode":"apikey","OPENAI_API_KEY":"sk-x"}"#).is_none());
-        assert!(strip(b"not json").is_none());
-    }
-
-    #[test]
-    fn a_refresh_is_due_before_codex_would_refresh_itself() {
-        let cfg = Cfg::default();
-        let now = 1_900_000_000;
-        assert_eq!(access_expiry(&login(now + 3600, "rt")), Some(now + 3600));
-        assert!(!due(&login(now + 3600, "rt"), now, &cfg));
-        assert!(due(&login(now + cfg.margin, "rt"), now, &cfg));
-        assert!(due(&login(now - 10, "rt"), now, &cfg));
-        // No expiry: the age of the last refresh decides.
-        let no_exp = br#"{"tokens":{"access_token":"opaque","refresh_token":"rt"},"last_refresh":"2026-11-01T00:00:00Z"}"#;
-        let t = parse_rfc3339("2026-11-01T00:00:00Z").unwrap();
-        assert!(!due(no_exp, t + 6 * 86400, &cfg));
-        assert!(due(no_exp, t + 7 * 86400, &cfg));
-    }
-
-    #[test]
-    fn dates_and_settings() {
-        assert_eq!(parse_rfc3339("1970-01-01T00:00:00Z"), Some(0));
-        assert_eq!(parse_rfc3339("2000-03-01T12:30:15.123Z"), Some(951_913_815));
-        assert!(parse_rfc3339("yesterday").is_none());
-        assert_eq!(Cfg::parse("").unwrap(), Cfg::default());
-        let c = Cfg::parse("[logins]\nrefresh_margin = 3600\ncheck_interval = 5\n").unwrap();
-        assert_eq!((c.margin, c.interval, c.enabled), (3600, 5, true));
-        assert!(!Cfg::parse("[logins]\nkeep = false\n").unwrap().enabled);
-        // Not later than Codex's own window of 5 minutes.
-        assert!(Cfg::parse("[logins]\nrefresh_margin = 300\n").is_err());
-        assert!(Cfg::parse("[logins]\nother = 1\n").is_err());
-    }
-}
+mod tests;

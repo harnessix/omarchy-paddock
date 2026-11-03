@@ -643,3 +643,109 @@ fn codex_and_grok_copy_no_sessions_back() {
     assert!(folders[".codex"].contains("codex"));
     assert!(folders[".grok"].contains("grok"));
 }
+
+const FAKE_CODEX: &str = r#"#!/usr/bin/python3
+import base64, json, os, sys, time
+def b64(v): return base64.urlsafe_b64encode(json.dumps(v).encode()).decode().rstrip("=")
+def exp_of(at):
+    p = at.split(".")[1]
+    return json.loads(base64.urlsafe_b64decode(p + "=" * (-len(p) % 4)))["exp"]
+home = os.environ.get("CODEX_HOME") or os.path.expanduser("~/.codex")
+auth = os.path.join(home, "auth.json")
+for line in sys.stdin:
+    msg = json.loads(line); mid = msg.get("id"); m = msg.get("method")
+    if m == "initialize":
+        print(json.dumps({"id": mid, "result": {}}), flush=True)
+    elif m == "account/rateLimits/read":
+        a = json.load(open(auth)); t = a["tokens"]
+        if exp_of(t["access_token"]) <= time.time() + 300:
+            rt = t["refresh_token"]
+            with open(os.path.join(home, "used.log"), "a") as f: f.write(rt + "\n")
+            t["refresh_token"] = "rt-%d" % (int(rt.split("-")[1]) + 1)
+            t["access_token"] = "%s.%s.sig" % (b64({}), b64({"exp": int(time.time()) + 3600}))
+            json.dump(a, open(auth + ".tmp", "w")); os.replace(auth + ".tmp", auth)
+        print(json.dumps({"id": mid, "result": {"rateLimits": {"primary": {"usedPercent": 42}}}}), flush=True)
+"#;
+
+/// Omarchy's Codex collector, faked: it asks the app-server and prints a
+/// record with the percent and what it saw of the home.
+const FAKE_CODEX_COLLECTOR: &str = r#"#!/usr/bin/python3
+import json, os, subprocess
+if os.access(os.path.expanduser("~"), os.W_OK): home = "rw"
+else: home = "ro"
+p = subprocess.Popen(["codex", "app-server"], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+def ask(i, m):
+    p.stdin.write(json.dumps({"id": i, "method": m, "params": {}}) + "\n"); p.stdin.flush()
+    return json.loads(p.stdout.readline())
+ask(1, "initialize")
+r = ask(2, "account/rateLimits/read")
+p.kill()
+print(json.dumps({"id": "codex", "limits": [{"percent": r["result"]["rateLimits"]["primary"]["usedPercent"]}], "limitsStale": False, "home": home, "host": open("/etc/hostname").read().strip() if os.path.exists("/etc/hostname") else os.uname().nodename}))
+"#;
+
+fn codex_login(exp: u64, rt: &str) -> String {
+    use base64::Engine as _;
+    let b64 = |v: serde_json::Value| {
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(v.to_string())
+    };
+    format!(
+        r#"{{"auth_mode":"chatgpt","tokens":{{"id_token":"e30.e30.sig","access_token":"{}.{}.sig","refresh_token":"{rt}","account_id":"a"}},"last_refresh":"2026-11-01T00:00:00Z"}}"#,
+        b64(serde_json::json!({})),
+        b64(serde_json::json!({"exp": exp}))
+    )
+}
+
+/// A Codex login that the keeper keeps is checked as before the usage box:
+/// out of the box (`--except codex`), in the keeper's sandbox, with the
+/// writes in the keeper's own folder.
+#[test]
+fn a_kept_codex_login_is_checked_in_the_keeper_sandbox() {
+    let mut w = world();
+    if !box_works(&w)
+        || !Command::new("python3")
+            .arg("-c")
+            .arg("pass")
+            .status()
+            .is_ok_and(|s| s.success())
+    {
+        eprintln!("skipped: needs bwrap, pasta and python3");
+        return;
+    }
+    // A fake codex first on PATH, and a profile without the mise lookup,
+    // so that the real codex is never found.
+    let bin = w.home.parent().unwrap().join("tools/bin");
+    write_exec(&bin.join("codex"), FAKE_CODEX);
+    let path = format!("{}:{}", bin.display(), w.vars["PATH"]);
+    w.vars.insert("PATH".into(), path);
+    std::fs::create_dir_all(w.home.join(".config/paddock/harness.d")).unwrap();
+    std::fs::write(
+        w.home.join(".config/paddock/harness.d/codex.toml"),
+        "name = \"codex\"\n[locate]\ncommands = [\"codex\"]\n[state]\nauth = [\".codex/auth.json\"]\n",
+    )
+    .unwrap();
+    write_exec(
+        &w.home.join("omarchy/bin/omarchy-agent-usage-codex"),
+        FAKE_CODEX_COLLECTOR,
+    );
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    // Two minutes left: the app-server refreshes on its own.
+    std::fs::create_dir_all(w.home.join(".codex")).unwrap();
+    let store = w.home.join(".codex/auth.json");
+    std::fs::write(&store, codex_login(now + 120, "rt-1")).unwrap();
+
+    let out = w.update(&[]);
+    assert!(out.status.success(), "{out:?}");
+    assert!(w.real_log().contains("--except codex"), "{}", w.real_log());
+    let rec = w.record("codex");
+    assert_eq!(rec["limits"][0]["percent"], 42, "{rec}");
+    assert_eq!(rec["home"], "ro", "{rec}");
+    // The refresh went back to the host login, once.
+    let host: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&store).unwrap()).unwrap();
+    assert_eq!(host["tokens"]["refresh_token"], "rt-2");
+    // The host's own folder was never written: the overlay took the writes.
+    assert!(!w.home.join(".codex/used.log").exists());
+}
