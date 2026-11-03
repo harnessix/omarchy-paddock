@@ -9,6 +9,9 @@
 #      Use /home/demo/ in examples.
 #   4. A commit in the range (first argument, for example origin/main..HEAD)
 #      has an author or committer email that is not a noreply address.
+#   5. A tracked file is a document that is not on the public list below.
+#      Design notes, plans and other internal documents stay out of this
+#      repository. Only code, the user documentation and images are public.
 #
 # To fix a failure, remove the file or text, or rewrite the commit with a
 # GitHub noreply email (Settings > Emails > Keep my email address private).
@@ -20,6 +23,14 @@ status=0
 bad_files=$(git ls-files | grep -E '^(docs/DESIGN\.md|(.*/)?CLAUDE(\.local)?\.md|(.*/)?AGENTS\.md|(.*/)?\.claude/)' || true)
 if [ -n "$bad_files" ]; then
   echo "leak guard: these private files must not be tracked:"; echo "$bad_files"; status=1
+fi
+
+# The only documents this repository publishes. Anything else under docs/
+# (except images in docs/assets/), and any other text document, fails.
+public_docs='^(README\.md|CHANGELOG\.md|CONTRIBUTING\.md|SECURITY\.md|\.github/pull_request_template\.md|changes/[^/]+\.md|skills/[^/]+/SKILL\.md|skills/[^/]+/references/[^/]+\.md|docs/assets/[^/]+\.(png|gif|svg|jpg|jpeg|webp))$'
+docs=$(git ls-files | grep -iE '\.(md|markdown|txt|rst|adoc|org)$|^docs/' | grep -vE "$public_docs" || true)
+if [ -n "$docs" ]; then
+  echo "leak guard: these documents must not be published (only code and the user docs):"; echo "$docs"; status=1
 fi
 
 # Internal names, built from parts so this file does not contain them.
