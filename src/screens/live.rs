@@ -198,6 +198,12 @@ impl Tap for Watcher {
         if let Some(t) = self.thread.lock().unwrap().take() {
             let _ = t.join();
         }
+        // A harness that goes on at once can end the run before the thread
+        // saw the screen change: look once more, so the answer is told.
+        let mut sh = self.inner.shared.lock().unwrap();
+        if sh.pending.is_some() {
+            let _ = self.inner.step(&mut sh, Instant::now());
+        }
     }
 }
 
