@@ -23,7 +23,7 @@ fn the_note_names_role_parent_task_file_and_done() {
         parent: Some("claude-x-1".into()),
         spawn_id: Some("abc".into()),
         pasture: None,
-        task_file: Some("/home/u/.paddock-spawn/codex-spawn-abc/prompt.md".into()),
+        task_file: Some("/home/demo/.paddock-spawn/codex-spawn-abc/prompt.md".into()),
         detached: true,
         note: "Keep the ticket rules.".into(),
         count: 2,
@@ -33,9 +33,9 @@ fn the_note_names_role_parent_task_file_and_done() {
     assert!(n.contains("role: reviewer"), "{n}");
     assert!(n.contains("parent: claude-x-1 (it knows this run as spawn id abc)"));
     assert!(n.contains("pasture: none"));
-    assert!(
-        n.contains("task file: /home/u/.paddock-spawn/codex-spawn-abc/prompt.md. Read it again.")
-    );
+    assert!(n.contains(
+        "task file: /home/demo/.paddock-spawn/codex-spawn-abc/prompt.md. Read it again."
+    ));
     assert!(n.contains("paddock-host done"));
     assert!(n.ends_with("Keep the ticket rules."));
     let top = note(&Facts {
@@ -220,7 +220,7 @@ fn claude_reads_the_note_from_its_session_start_hook() {
     // https://code.claude.com/docs/en/hooks: SessionStart input.
     let input = serde_json::json!({
         "session_id": "abc123",
-        "transcript_path": "/home/u/.claude/projects/p/abc123.jsonl",
+        "transcript_path": "/home/demo/.claude/projects/p/abc123.jsonl",
         "cwd": "/work/app",
         "hook_event_name": "SessionStart",
         "source": "compact",
@@ -305,7 +305,7 @@ fn spawn_tree(config: &str, harness: &str) -> Tree {
     broker.run = crate::broker::RunFacts {
         spawn_id: Some("abc".into()),
         pasture: None,
-        task_file: Some("/home/u/.paddock-spawn/codex-spawn-abc/prompt.md".into()),
+        task_file: Some("/home/demo/.paddock-spawn/codex-spawn-abc/prompt.md".into()),
     };
     let _ = broker.kv.set(Arc::new(child));
     Tree { w, parent, broker }
@@ -353,7 +353,7 @@ fn a_child_compaction_reaches_the_tree_scope_and_counts_up() {
     assert_eq!(f.note, "Keep the ticket rules.");
     let n = note(&f);
     assert!(
-        n.contains("/home/u/.paddock-spawn/codex-spawn-abc/prompt.md. Read it again."),
+        n.contains("/home/demo/.paddock-spawn/codex-spawn-abc/prompt.md. Read it again."),
         "{n}"
     );
     assert!(n.contains("role: implementer"), "{n}");
@@ -391,7 +391,7 @@ fn qwen_reads_the_note_from_its_session_start_hook() {
     // https://github.com/QwenLM/qwen-code docs/users/features/hooks.md
     let input = serde_json::json!({
         "session_id": "s-1",
-        "transcript_path": "/home/u/.qwen/tmp/s-1.jsonl",
+        "transcript_path": "/home/demo/.qwen/tmp/s-1.jsonl",
         "cwd": "/work/app",
         "hook_event_name": "SessionStart",
         "timestamp": "2026-11-03T12:00:00.000Z",
