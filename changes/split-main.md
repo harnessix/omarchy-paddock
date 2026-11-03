@@ -1,0 +1,1 @@
+- Changed: split the binary command line into `src/cli/` modules, and cap the size of Rust and QML files in CI.

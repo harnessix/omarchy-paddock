@@ -32,7 +32,7 @@ paddock is a security tool. Some changes let a sandbox reach more of the host: a
 
 ## Continuous integration
 
-GitHub Actions runs checks on every pull request and on each push to `main`. It runs `cargo fmt`, `cargo clippy` and the tests. It runs the escape probe on the bwrap backend without a display. It checks the plugin manifest. A changelog check requires a file in `changes/` when a pull request changes `src/`, `plugin/`, `profiles/` or `skills/`. The label `no-changelog` skips that requirement. The check rejects an edit of the `Unreleased` section unless the head branch starts with `release/` or the pull request has the label `release`. A leak guard fails the build if a file contains private notes, internal names, or home paths other than `/home/demo`, or if a commit email is not a noreply address. The scripts are in `.github/scripts/`. Every check must pass before review.
+GitHub Actions runs checks on every pull request and on each push to `main`. It runs `cargo fmt`, `cargo clippy` and the tests. It runs the escape probe on the bwrap backend without a display. It checks the plugin manifest. It checks that Rust and QML files stay within the size limits. A changelog check requires a file in `changes/` when a pull request changes `src/`, `plugin/`, `profiles/` or `skills/`. The label `no-changelog` skips that requirement. The check rejects an edit of the `Unreleased` section unless the head branch starts with `release/` or the pull request has the label `release`. A leak guard fails the build if a file contains private notes, internal names, or home paths other than `/home/demo`, or if a commit email is not a noreply address. The scripts are in `.github/scripts/`. Every check must pass before review.
 
 ## The pull request
 
@@ -48,6 +48,18 @@ Keep one change per pull request. Do not commit build output, local configuratio
 ## Reports
 
 To report a bug, use the issue form. It asks for the output of `paddock doctor --report`. The report removes your user name, paths and tokens, but read it before you paste it. To report a security problem, do not open a public issue. Follow [SECURITY.md](SECURITY.md).
+
+## Code map
+
+- `src/lib.rs` and `src/*.rs` are the library: sandbox, backends, storage, kv.
+- `src/main.rs` is the binary entry. It parses the command line and calls `src/cli/`.
+- `src/cli/` holds one module per command area. `cli/mod.rs` has `Cli`, `Cmd` and shared argument types.
+- `plugin/` is the Omarchy bar widget (QML).
+- `profiles/` is the harness and app profiles.
+- `skills/` is the paddock-host skill for agents.
+- `tests/` is the integration tests.
+
+A tracked `.rs` or `.qml` file must stay at or under 800 lines, unless it is listed in `.github/file-size-baseline.txt`. A listed file must not grow past the size in that list. Split a file that is too long. Change the baseline only in a separate pull request, with a reason.
 
 ## Tests
 

@@ -59,6 +59,13 @@ jobs:
           echo "::notice::Skipped --gui and --app probes: the runner has no Wayland compositor."
           echo "::notice::Skipped docker, podman and srt probes: run bin/test on a workstation for these."
 
+  file-size:
+    name: file size
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: .github/scripts/file-size.sh
+
   plugin-manifest:
     name: plugin manifest
     runs-on: ubuntu-24.04
