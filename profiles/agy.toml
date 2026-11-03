@@ -224,3 +224,11 @@ prompt = "file"
 # prompt interactively and continues the session.
 [detach]
 args = ["-i", "Read the file {prompt_file} and do the task that it describes."]
+
+# The user's own hooks (src/hooks.rs). Each user entry keeps its name with
+# the prefix "user-", so paddock's entry comes first.
+[hooks]
+files = [".gemini/config/hooks.json"]
+into = ".gemini/config/hooks.json"
+path = []
+style = "named"

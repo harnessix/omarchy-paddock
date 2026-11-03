@@ -828,7 +828,7 @@ pub fn run(
         if let Err(e) = state::toml_set(&built.profile, &spec.home_src, &spec.project) {
             log::warn!("{e:#}");
         }
-        match crate::privacy::write_settings(&spec.home_src, &spec.home_settings) {
+        match crate::privacy::write_home(spec) {
             Ok(w) => w.iter().for_each(|w| log::warn!("{w}")),
             Err(e) => log::warn!("{e:#}"),
         }
@@ -842,7 +842,7 @@ pub fn run(
             &spec.home_src,
             &spec.project,
         )?;
-        for w in crate::privacy::write_settings(&spec.home_src, &spec.home_settings)? {
+        for w in crate::privacy::write_home(spec)? {
             log::warn!("{w}");
         }
     }

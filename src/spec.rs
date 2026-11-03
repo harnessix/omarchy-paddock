@@ -347,6 +347,10 @@ pub struct SandboxSpec {
     pub generated: Vec<(PathBuf, PathBuf)>,
     /// Values written into settings files in the sandbox home before the start.
     pub home_settings: Vec<HomeSetting>,
+    /// The hook files of the sandbox home: paddock's entries and the user's
+    /// (hooks.rs).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub hooks: Vec<crate::hooks::Target>,
     /// `--profile default`: the home is an overlay on a private snapshot of
     /// the harness's host data (shadow.rs). Only bwrap runs it.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -412,6 +416,7 @@ impl SandboxSpec {
             inherit_path: Vec::new(),
             generated: Vec::new(),
             home_settings: Vec::new(),
+            hooks: Vec::new(),
             shadow: None,
         }
     }

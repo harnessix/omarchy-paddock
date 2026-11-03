@@ -1371,7 +1371,7 @@ These harnesses get the note:
 | Grok Build | `~/.grok/hooks/paddock-compaction.json` | `PostCompact` records the compaction, and the next `PostToolUse` adds the note |
 | agy | `~/.gemini/config/hooks.json` | `PreInvocation` finds a new `CHECKPOINT` step in the transcript |
 
-Codex runs a hook only when `config.toml` has a trusted hash for it, and a user approves a hook with `/hooks`. No user is in a sandbox to approve, so paddock writes the hash of its own hook into the sandbox copy of `config.toml`. It trusts no other hook.
+Codex runs a hook only when `config.toml` has a trusted hash for it, and a user approves a hook with `/hooks`. No user is in a sandbox to approve, so paddock writes the hash of its own hook into the sandbox copy of `config.toml`. It trusts a hook of your own only when its program is in `[hooks] programs` (see below). A trust in the host copy of `config.toml` does not count in the sandbox.
 
 paddock also records the compaction. A spawn child writes `compacted:SPAWN-ID` into the `tree` scope of paddock kv, with the time and the count so far, so a parent can watch with `paddock-host kv watch --prefix compacted: --scope tree`. A pasture member writes `compacted:RUN-ID` into `pasture`. The audit log gets one line, and `paddock ps --json` shows `compactions` for each run.
 
@@ -1383,6 +1383,26 @@ enabled = true        # false: no hook
 note = "Run the tests before you commit."   # text added to the note
 notify = false        # true: a desktop notification for each compaction
 ```
+
+### Your own hooks
+
+Your own hook entries come into the sandbox copy of each hook file, after paddock's entry. This works for Claude Code, Codex, Grok Build, agy, Qwen Code and Gemini CLI. paddock checks the program of each entry. A program must be in the sandbox: on the sandbox PATH, or at a path that the sandbox can see. Shell builtins and `sh -c` lines always count. An entry whose program is not in the sandbox is left out of the sandbox copy, and `paddock run` prints one line that names the program. The host files never change.
+
+To give a hook program to the sandbox, list it in the user configuration:
+
+```toml
+[hooks]
+programs = ["~/.local/bin/my-hook"]   # bound read-only at /run/paddock/bin/my-hook and at its own path
+ignore = ["other-hook"]               # left out without a notice
+```
+
+- A listed program must be a regular file, not a symlink. It must belong to you or to root, it must not be writable by group or others, and it must not be inside the project. paddock binds the file only, never its folder.
+- The program runs with the sandbox home as `HOME`, so it keeps its state there (for example `~/.local/state/my-hook`), never on the host.
+- Codex trusts the entries that run a listed program, and no other entry of yours.
+- An `ignore` entry is a program name or a path (`~/` is your home). A hook entry that runs it is left out for every harness, with no notice line. Use it for a hook that does a job paddock does already, such as a note after a compaction. `ignore` wins over `programs`.
+- Only the user configuration can set `[hooks]`. A project `paddock.toml` with `[hooks]` is an error.
+
+`paddock explain HARNESS` lists each hook entry of the sandbox copy with its origin: paddock, your file, or left out and why.
 
 ## Devices: /dev/paddock
 
