@@ -27,6 +27,7 @@ pub mod hostcli;
 pub mod hostgit;
 pub mod hosttools;
 pub mod identity;
+pub mod ids;
 pub mod keeper;
 pub mod keyring;
 pub mod kv;

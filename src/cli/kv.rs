@@ -119,15 +119,15 @@ impl KvScope {
         paddock::kv::principal::cli(env, who, &project, pasture, req)
     }
 
-    fn target(&self) -> Result<paddock::kv::host::Target> {
+    fn target(&self, env: &HostEnv) -> Result<paddock::kv::host::Target> {
         use paddock::kv::host::{project_of, Target};
         use paddock::kv::shard::Ns;
         Ok(if self.user {
             Target::One(Ns::User)
         } else if let Some(id) = &self.sandbox {
-            Target::One(Ns::Own(id.clone()))
+            Target::One(Ns::Own(paddock::ids::resolve(env, id)?))
         } else if let Some(root) = &self.tree {
-            Target::One(Ns::Tree(root.clone()))
+            Target::One(Ns::Tree(paddock::ids::resolve(env, root)?))
         } else {
             let project = project_of(self.project.as_deref())?;
             if let Some(name) = &self.pasture {
@@ -176,8 +176,13 @@ pub(crate) fn run(env: &HostEnv, cmd: KvCmd) -> Result<i32> {
             prefix,
             scope,
             json,
-        } => host::list(env, &scope.target()?, prefix.as_deref().unwrap_or(""), json),
-        KvCmd::Get { key, scope, json } => host::get(env, &scope.target()?, &key, json),
+        } => host::list(
+            env,
+            &scope.target(env)?,
+            prefix.as_deref().unwrap_or(""),
+            json,
+        ),
+        KvCmd::Get { key, scope, json } => host::get(env, &scope.target(env)?, &key, json),
         KvCmd::Delete {
             key,
             scope,
@@ -188,13 +193,13 @@ pub(crate) fn run(env: &HostEnv, cmd: KvCmd) -> Result<i32> {
             &who,
             kv_request("delete", Some(key), |r| r.version = version),
         ),
-        KvCmd::Delete { key, scope, .. } => host::delete(env, &scope.target()?, &key),
+        KvCmd::Delete { key, scope, .. } => host::delete(env, &scope.target(env)?, &key),
         KvCmd::Release {
             name,
             scope,
             principal: KvAs { as_: Some(who) },
         } => scope.principal(env, &who, kv_request("release", Some(name), |_| {})),
-        KvCmd::Release { name, scope, .. } => host::release(env, &scope.target()?, &name),
+        KvCmd::Release { name, scope, .. } => host::release(env, &scope.target(env)?, &name),
         KvCmd::Put {
             key,
             value,

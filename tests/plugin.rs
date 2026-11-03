@@ -169,7 +169,7 @@ fn the_view_commands_of_the_panel_parse() {
         // The arguments parse, and paddock says why it cannot open a view.
         assert!(!out.status.success(), "{out:?}");
         let err = String::from_utf8_lossy(&out.stderr);
-        assert!(err.contains("has no run log"), "{err}");
+        assert!(err.contains("no sandbox with id"), "{err}");
     }
 }
 

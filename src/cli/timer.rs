@@ -91,6 +91,7 @@ pub(crate) fn run(env: &HostEnv, cmd: TimerCmd) -> Result<i32> {
             quota,
             hard,
         } => {
+            let id = paddock::ids::resolve(env, &id)?;
             let budget = match budget {
                 Some(b) => timer::parse_duration(&b)?,
                 None => 0,
@@ -100,10 +101,12 @@ pub(crate) fn run(env: &HostEnv, cmd: TimerCmd) -> Result<i32> {
             println!("{id}  {}", show(&s));
         }
         TimerCmd::Extend { id, name, by } => {
+            let id = paddock::ids::resolve(env, &id)?;
             let s = timer::host_change(env, &id, &name, Some(timer::parse_more(&by)?))?;
             println!("{id}  {}", show(&s));
         }
         TimerCmd::Stop { id, name } => {
+            let id = paddock::ids::resolve(env, &id)?;
             let s = timer::host_change(env, &id, &name, None)?;
             println!("{id}  {} (stopped)", show(&s));
         }

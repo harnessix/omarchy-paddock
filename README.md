@@ -243,7 +243,7 @@ The project is writable in the sandbox, and host tools run some project files la
 ```sh
 paddock undo                  # the last session of this project
 paddock undo --list           # the snapshots: time, harness, size
-paddock undo claude-app-1a2b3c --yes
+paddock undo 1a2b3c --yes
 ```
 
 `paddock undo` lists the files that the run added, changed and deleted, and asks before it restores. Changed and deleted files come back from the snapshot. Added files go to `~/.local/share/paddock/undo-trash/TIME/`, so you can undo an undo by hand. The command refuses while a sandbox of the project runs. A file that changed after the session ended (you or another agent edited it) gets a warning and stays as it is. When paddock did not record the end of the session (it was stopped, or the end walk took longer than 20 s), every changed file counts as such. `--force` restores it too. At exit, paddock names `paddock undo` when the run changed files.
@@ -271,10 +271,10 @@ The project is shared with the host, so the agent's changes there are already yo
 
 ```sh
 paddock files                                 # every sandbox that has files
-paddock files claude-app-1a2b3c               # one sandbox
-paddock recover claude-app-1a2b3c Desktop/report.pdf          # to ~/Desktop/report.pdf
-paddock recover claude-app-1a2b3c --all --to ~/Inbox
-paddock discard claude-app-1a2b3c Downloads/setup.zip
+paddock files 1a2b3c               # one sandbox
+paddock recover 1a2b3c Desktop/report.pdf          # to ~/Desktop/report.pdf
+paddock recover 1a2b3c --all --to ~/Inbox
+paddock discard 1a2b3c Downloads/setup.zip
 ```
 
 `paddock recover` copies the file to the host, then deletes the sandbox copy. Add `--keep` to keep it. The rules:

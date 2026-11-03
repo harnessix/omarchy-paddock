@@ -104,7 +104,10 @@ impl World {
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(lines.len(), 2, "{text}");
         let id = lines[0].to_string();
-        assert_eq!(lines[1], format!("paddock view {id} --write"));
+        assert_eq!(
+            lines[1],
+            format!("paddock view {} --write", paddock::ids::short(&id))
+        );
         assert!(self.has_session(&id), "no tmux session {id}");
         id
     }
@@ -315,10 +318,15 @@ fn ps_marks_the_run_and_wait_times_out() {
     assert_eq!(sb["detached"], true, "{sb}");
     assert_eq!(sb["view_tmux"], true, "{sb}");
     let start = Instant::now();
-    let (code, _) = w.wait(&id, "2s");
+    let (code, _) = w.wait(paddock::ids::short(&id), "2s");
     assert_eq!(code, Some(124));
     assert!(start.elapsed() < Duration::from_secs(10));
-    assert!(w.paddock().args(["stop", &id]).status().unwrap().success());
+    assert!(w
+        .paddock()
+        .args(["stop", paddock::ids::short(&id)])
+        .status()
+        .unwrap()
+        .success());
     let (code, _) = w.wait(&id, "60s");
     assert_eq!(code, Some(1));
 }
