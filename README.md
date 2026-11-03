@@ -195,6 +195,8 @@ paddock mcp claude             # MCP servers, and whether each runs in the sandb
 paddock env show               # which host variables pass, by name
 ```
 
+A sandbox id looks like `claude-app-1a2b3c`. A command that takes a sandbox id also takes its last part, `1a2b3c`, or the start of that part with at least 4 characters, such as `1a2b`. paddock looks for the id among the running sandboxes, the recent ended runs, the sandbox homes of `paddock files` and the snapshots of `paddock undo`. When the start fits more than one sandbox, paddock lists their full ids. The hints that paddock prints show the short id. `--json` output keeps the full id in `id` and adds the short id in `short`.
+
 A sandbox uses your existing login of the harness. See [Logins and MCP](#logins-and-mcp) for a separate login.
 
 ## What the sandbox contains
@@ -271,8 +273,8 @@ The project is shared with the host, so the agent's changes there are already yo
 
 ```sh
 paddock files                                 # every sandbox that has files
-paddock files 1a2b3c               # one sandbox
-paddock recover 1a2b3c Desktop/report.pdf          # to ~/Desktop/report.pdf
+paddock files 1a2b3c                          # one sandbox
+paddock recover 1a2b3c Desktop/report.pdf     # to ~/Desktop/report.pdf
 paddock recover 1a2b3c --all --to ~/Inbox
 paddock discard 1a2b3c Downloads/setup.zip
 ```
@@ -539,8 +541,8 @@ A program in a sandbox rarely says "permission denied". A path is missing, a soc
 Each line has the time, the kind, the target, the rule and a count. The same denial within a minute raises the count of its line. The log never holds content. It goes away with the run folder when the sandbox ends.
 
 ```sh
-paddock boundary ID            # the denials, by kind and target, with counts
-paddock boundary ID --follow   # and each new denial as it happens
+paddock boundary 1a2b3c        # the denials, by kind and target, with counts
+paddock boundary 1a2b3c --follow   # and each new denial as it happens
 paddock-host boundary          # inside the sandbox: its own log, read-only
 ```
 
@@ -1034,8 +1036,8 @@ These rules always hold:
 A sandbox that starts without a terminal, such as `paddock run claude -- -p < ticket` in a script or a spawned child, has nothing on your screen. When `tmux` is on your PATH, paddock shows its output in a tmux session. Click the row in the bar panel, or run:
 
 ```sh
-paddock view <id>           # a new terminal with a read-only live view
-paddock view <id> --write   # the same with keys
+paddock view 1a2b3c           # a new terminal with a read-only live view
+paddock view 1a2b3c --write   # the same with keys
 ```
 
 A terminal that no window shows, such as the pty of a background process, gets this view too, and the panel says a background process started the run.
@@ -1045,7 +1047,7 @@ A terminal that no window shows, such as the pty of a background process, gets t
 - In a run like this, the keys of `--write` only scroll the view (tmux copy mode) or close it. They do not reach the harness, which reads its input from the caller.
 - The session stays after the sandbox ends, with the exit code on the last line. `paddock stop <id>` ends it. `paddock gc --yes` removes sessions and logs of sandboxes that ended longer ago than `[view] keep_ended` (default `2h`). The start of a new view session removes those too.
 - `paddock ps --json` adds `activity` on each sandbox. It is the last line of the view log with terminal control sequences removed, at most 120 characters, or null when that log has no such line. For a detached run it is the last line of the pane.
-- The same JSON adds `ended`. That list holds up to 8 runs that ended in the last 10 minutes, newest first. Each entry has `id`, `harness`, `project`, `ended`, `status` (`ok`, `failed`, `idle`, `stopped` or `unknown`) and `text` (the `done` text, at most 200 characters). A run with no `done` has status `unknown`. A run that `paddock stop` ended has status `stopped`. A run that ended because its pane stayed quiet has status `idle`.
+- The same JSON adds `ended`. That list holds up to 8 runs that ended in the last 10 minutes, newest first. Each entry has `id`, `short`, `harness`, `project`, `ended`, `status` (`ok`, `failed`, `idle`, `stopped` or `unknown`) and `text` (the `done` text, at most 200 characters). A run with no `done` has status `unknown`. A run that `paddock stop` ended has status `stopped`. A run that ended because its pane stayed quiet has status `idle`.
 - Without tmux, `paddock view` opens `tail -f` of the run log. It uses `xdg-terminal-exec`, or `$TERMINAL -e` without it.
 - One-shot modes such as `claude -p` print nothing until the end, so the view shows little until then.
 - `[view] tmux = false` in `~/.config/paddock/config.toml` turns the tmux session off.
@@ -1308,11 +1310,11 @@ paddock-host timer extend review --by 1% --reason "two more files to check"
 On the host:
 
 ```sh
-paddock timer set ID review --budget 1h30m --hard       # you own it; --hard freezes the sandbox at the end
-paddock timer set ID tests --quota weekly=1% --hard     # a quota budget on the sandbox's account
+paddock timer set 1a2b3c review --budget 1h30m --hard   # you own it; --hard freezes the sandbox at the end
+paddock timer set 1a2b3c tests --quota weekly=1% --hard # a quota budget on the sandbox's account
 paddock timer list                                      # the timers of every running sandbox
-paddock timer extend ID review --by 30m
-paddock timer stop ID review
+paddock timer extend 1a2b3c review --by 30m
+paddock timer stop 1a2b3c review
 ```
 
 - Whoever sets a deadline owns it. Only the owner extends or stops it. When an agent asks for more time on a timer that it does not own, you answer on the approval card, which shows its reason.

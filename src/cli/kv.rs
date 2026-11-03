@@ -116,7 +116,7 @@ impl KvScope {
             bail!("--as needs --pasture NAME");
         };
         let project = paddock::kv::host::project_of(self.project.as_deref())?;
-        paddock::kv::principal::cli(env, who, &project, pasture, req)
+        paddock::kv::principal::cli(env, who, &project, &pasture_name(env, pasture)?, req)
     }
 
     fn target(&self, env: &HostEnv) -> Result<paddock::kv::host::Target> {
@@ -131,7 +131,7 @@ impl KvScope {
         } else {
             let project = project_of(self.project.as_deref())?;
             if let Some(name) = &self.pasture {
-                Target::One(Ns::pasture(&project, name)?)
+                Target::One(Ns::pasture(&project, &pasture_name(env, name)?)?)
             } else if self.legacy {
                 Target::One(Ns::Legacy(project))
             } else {
@@ -139,6 +139,19 @@ impl KvScope {
             }
         })
     }
+}
+
+/// `solo-ID` with the full sandbox id, so `solo-1a2b` works too.
+fn pasture_name(env: &HostEnv, name: &str) -> Result<String> {
+    let solo = paddock::pasture::SOLO_PREFIX;
+    let Some(id) = name.strip_prefix(solo) else {
+        return Ok(name.to_owned());
+    };
+    let known = paddock::ids::known(env);
+    Ok(match paddock::ids::find(id, &known, |s| s.as_str())? {
+        Some(full) => format!("{solo}{full}"),
+        None => name.to_owned(),
+    })
 }
 
 pub(crate) fn run(env: &HostEnv, cmd: KvCmd) -> Result<i32> {

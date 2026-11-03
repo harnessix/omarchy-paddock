@@ -1,1 +1,2 @@
-- New: Use a sandbox ID or a unique prefix of at least four hex digits in sandbox commands. Lists and hints show short IDs, and JSON keeps full IDs with a short field.
+- New: A command that takes a sandbox id also takes its short form, such as `paddock stop 1a2b3c`, or a unique start of it with at least 4 characters. paddock finds the id among running sandboxes, recent ended runs, sandbox homes and `paddock undo` snapshots, lists the full ids when the start is ambiguous, and resolves the children of `paddock-host wait`, `status` and `kill` among the caller's own children.
+- New: Hints and examples show the short id. `--json` output of `paddock ps`, `files`, `monitor list`, `timer list` and `paddock-host status` keeps the full `id` and adds `short`.

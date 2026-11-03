@@ -19,6 +19,7 @@ use std::io::IsTerminal;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
+
 /// Snapshots kept per project.
 pub const KEEP: usize = 10;
 /// A snapshot that takes longer is dropped, and the sandbox starts anyway.
@@ -39,10 +40,12 @@ pub fn root(env: &HostEnv) -> PathBuf {
 pub fn trash_root(env: &HostEnv) -> PathBuf {
     env.paddock_data().join("undo-trash")
 }
+
 /// The snapshots of one project.
 pub fn project_dir(root: &Path, project: &Path) -> PathBuf {
     root.join(crate::state::slug(project))
 }
+
 /// `[snapshot]` of the user configuration.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
@@ -89,6 +92,7 @@ impl Config {
         Ok(c)
     }
 }
+
 /// "500M", "2G", "800K", "1000": decimal units, as `paddock du` shows them.
 pub fn parse_size(s: &str) -> Option<u64> {
     let s = s.trim();
@@ -904,10 +908,7 @@ pub fn undo_cmd(
         return Ok(0);
     }
     let Some((dir, meta)) = (match session {
-        Some(s) => {
-            let id = crate::ids::resolve_from(s, all.iter().map(|(_, m)| m.id.as_str()))?;
-            all.iter().find(|(_, m)| m.id == id)
-        }
+        Some(s) => crate::ids::find(s, &all, |(_, m)| &m.id)?,
         None => all.first(),
     }) else {
         match session {

@@ -213,18 +213,18 @@ impl Broker {
         };
         let to_json = |s: &crate::spawn::Status| {
             let mut v = serde_json::to_value(s).unwrap_or_default();
-            v["short"] = crate::ids::short(&s.id).into();
+            v["short"] = crate::ids::short(&s.sandbox).into();
             v
         };
+        // A child by its spawn id, its sandbox id, or a unique prefix.
         let input = arg_str(req, "id").unwrap_or("");
         let children = sp.list();
-        let resolved = if input.is_empty() {
-            String::new()
-        } else {
-            match crate::ids::resolve_from(input, children.iter().map(|s| s.id.as_str())) {
-                Ok(id) => id,
+        let resolved = match children.iter().find(|c| c.sandbox == input) {
+            Some(c) => c.id.clone(),
+            None => match crate::ids::find(input, &children, |c| c.id.as_str()) {
+                Ok(c) => c.map_or(input.to_owned(), |c| c.id.clone()),
                 Err(e) => return Response::new(Status::Invalid, e.to_string()),
-            }
+            },
         };
         let id = resolved.as_str();
         let missing = || Response::new(Status::Invalid, format!("no child {id} of this sandbox"));

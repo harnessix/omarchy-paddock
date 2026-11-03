@@ -23,7 +23,7 @@
 1793 src/run.rs
 1189 src/safefs.rs
 811 src/shadow.rs
-959 src/snapshot.rs
+960 src/snapshot.rs
 1897 src/spawn.rs
 1713 src/spawn/tests.rs
 2003 src/state.rs

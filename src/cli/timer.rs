@@ -66,7 +66,9 @@ pub(crate) fn run(env: &HostEnv, cmd: TimerCmd) -> Result<i32> {
             if json {
                 let v: Vec<serde_json::Value> = all
                     .iter()
-                    .map(|(id, t)| serde_json::json!({"sandbox": id, "timers": t}))
+                    .map(|(id, t)| {
+                        serde_json::json!({"sandbox": id, "short": paddock::ids::short(id), "timers": t})
+                    })
                     .collect();
                 println!(
                     "{}",
