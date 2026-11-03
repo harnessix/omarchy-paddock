@@ -198,10 +198,19 @@ fn two_parallel_tasks_start_at_once_each_claimed_once_with_results_and_checkboxe
         assert_eq!(s.exit_code, Some(0), "{}", s.message);
     }
     // Now no task is ready: T003 waits for both, which wait for review.
-    let third = b.handle(&req(
-        "spawn",
-        serde_json::json!({"action": "start", "harness": "codex", "task": "next"}),
-    ));
+    // The broker records the end of a child a moment after the child
+    // exits, so ask again until it did (a slow CI machine needs it).
+    let end = std::time::Instant::now() + Duration::from_secs(20);
+    let third = loop {
+        let r = b.handle(&req(
+            "spawn",
+            serde_json::json!({"action": "start", "harness": "codex", "task": "next"}),
+        ));
+        if r.message.contains("no task of 001-albums is ready") || std::time::Instant::now() > end {
+            break r;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    };
     assert!(
         third.message.contains("no task of 001-albums is ready"),
         "{}",
