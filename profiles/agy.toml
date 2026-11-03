@@ -45,6 +45,162 @@ setting = "type /settings in agy and turn off Enable Telemetry"
 url = "https://antigravity.google/docs/settings"
 onboarding = "Its data-use box there is checked by default."
 
+# The training gate (training.rs). agy 1.4 shows "Terms of Service & Data
+# Use" after the theme choice of its onboarding, with the opt-in checked
+# and the focus on it. agy wraps the text to the terminal width, so the
+# rows hold at the recorded width of 49 columns, and paddock gives agy that
+# width while the gate runs. The checked screen and the screens before and
+# after it come from a real login (2026-11-02). The three other states are
+# not recorded yet: they follow agy's own focus mark "> ". When a state
+# differs, paddock stops and leaves the screen to the user.
+# https://antigravity.google/terms
+[[privacy.training.rule]]
+id = "agy-1.4-data-use"
+url = "https://antigravity.google/docs/settings"
+title = "Terms of Service & Data Use"
+cols = 49
+until_done = true
+# The login and theme screens before the dialog. A user key there keeps the gate.
+before = ["Select login method:", "Select Google Cloud sign-in method:", "Choose your color scheme:"]
+
+# The recorded screen: the box is checked and has the focus. Enter toggles it.
+[[privacy.training.rule.state]]
+id = "checked"
+send = "enter"
+next = ["unchecked"]
+rows = [
+  "Terms of Service & Data Use",
+  "",
+  "AI coding agents are known to have certain",
+  "security risks, including autonomous code",
+  "execution, data exfiltration, prompt injection",
+  "and supply chain risks. Ensure that you monitor",
+  "and verify all actions taken by the agent.",
+  "",
+  "-------------------------------------------------",
+  "",
+  "> [x] Yes, I agree to help improve Antigravity",
+  "CLI by allowing Google to collect and use",
+  "my Interactions data, subject to the",
+  "Google Antigravity CLI Terms of Service",
+  "and Google Privacy Policy. I understand I",
+  "can choose to opt out later whenever I",
+  "want via my settings.",
+  "",
+  "Links:",
+  "- Terms of Service:",
+  "https://antigravity.google/terms",
+  "- Privacy Policy:",
+  "https://policies.google.com/privacy",
+  "",
+  "[Previous]      [Done]",
+  "",
+  "",
+  "↑/↓ Navigate · enter Toggle",
+]
+
+# The box is unchecked and keeps the focus. Down moves the focus to the buttons.
+[[privacy.training.rule.state]]
+id = "unchecked"
+send = "down"
+next = ["on-previous", "on-done"]
+rows = [
+  "Terms of Service & Data Use",
+  "",
+  "AI coding agents are known to have certain",
+  "security risks, including autonomous code",
+  "execution, data exfiltration, prompt injection",
+  "and supply chain risks. Ensure that you monitor",
+  "and verify all actions taken by the agent.",
+  "",
+  "-------------------------------------------------",
+  "",
+  "> [ ] Yes, I agree to help improve Antigravity",
+  "CLI by allowing Google to collect and use",
+  "my Interactions data, subject to the",
+  "Google Antigravity CLI Terms of Service",
+  "and Google Privacy Policy. I understand I",
+  "can choose to opt out later whenever I",
+  "want via my settings.",
+  "",
+  "Links:",
+  "- Terms of Service:",
+  "https://antigravity.google/terms",
+  "- Privacy Policy:",
+  "https://policies.google.com/privacy",
+  "",
+  "[Previous]      [Done]",
+  "",
+  "",
+  "↑/↓ Navigate · enter Toggle",
+]
+
+# The box is unchecked, and [Previous] has the focus. Right moves to [Done].
+[[privacy.training.rule.state]]
+id = "on-previous"
+send = "right"
+next = ["on-done"]
+rows = [
+  "Terms of Service & Data Use",
+  "",
+  "AI coding agents are known to have certain",
+  "security risks, including autonomous code",
+  "execution, data exfiltration, prompt injection",
+  "and supply chain risks. Ensure that you monitor",
+  "and verify all actions taken by the agent.",
+  "",
+  "-------------------------------------------------",
+  "",
+  "[ ] Yes, I agree to help improve Antigravity",
+  "CLI by allowing Google to collect and use",
+  "my Interactions data, subject to the",
+  "Google Antigravity CLI Terms of Service",
+  "and Google Privacy Policy. I understand I",
+  "can choose to opt out later whenever I",
+  "want via my settings.",
+  "",
+  "Links:",
+  "- Terms of Service:",
+  "https://antigravity.google/terms",
+  "- Privacy Policy:",
+  "https://policies.google.com/privacy",
+  "",
+  "> [Previous]      [Done]",
+]
+
+# The box is unchecked, and [Done] has the focus. Enter submits the refusal.
+[[privacy.training.rule.state]]
+id = "on-done"
+send = "enter"
+next = ["gone"]
+rows = [
+  "Terms of Service & Data Use",
+  "",
+  "AI coding agents are known to have certain",
+  "security risks, including autonomous code",
+  "execution, data exfiltration, prompt injection",
+  "and supply chain risks. Ensure that you monitor",
+  "and verify all actions taken by the agent.",
+  "",
+  "-------------------------------------------------",
+  "",
+  "[ ] Yes, I agree to help improve Antigravity",
+  "CLI by allowing Google to collect and use",
+  "my Interactions data, subject to the",
+  "Google Antigravity CLI Terms of Service",
+  "and Google Privacy Policy. I understand I",
+  "can choose to opt out later whenever I",
+  "want via my settings.",
+  "",
+  "Links:",
+  "- Terms of Service:",
+  "https://antigravity.google/terms",
+  "- Privacy Policy:",
+  "https://policies.google.com/privacy",
+  "",
+  "[Previous]    > [Done]",
+]
+
 # agy has no compaction hook. A compaction adds a CHECKPOINT step to the
 # transcript (transcriptPath in the hook input). The PreInvocation hook runs
 # before each model call, counts these steps, and puts the note in with

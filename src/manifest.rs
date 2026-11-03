@@ -73,8 +73,8 @@ pub struct Manifest {
     /// configuration only; a project file cannot set them.
     #[serde(default, skip_serializing)]
     pub recovery: Option<toml::Value>,
-    /// Vendor telemetry inside the sandbox. Read from the user configuration
-    /// only; a project file cannot change it.
+    /// Vendor telemetry inside the sandbox, and the training gate. Read
+    /// from the user configuration only; a project file cannot change it.
     #[serde(default)]
     pub privacy: PrivacyCfg,
     /// Limits for `paddock-host spawn`. Read by spawn.rs from the user
@@ -89,6 +89,10 @@ pub struct PrivacyCfg {
     /// off (default): paddock turns vendor telemetry off in every sandbox.
     /// vendor: the harness's own default applies.
     pub telemetry: Option<crate::privacy::Telemetry>,
+    /// deny (default): paddock refuses the optional training opt-in in a
+    /// harness's setup screens (training.rs). manual: paddock types
+    /// nothing. vendor: paddock does not touch it.
+    pub training: Option<crate::training::Policy>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -301,6 +305,7 @@ impl Manifest {
             || !self.apps.is_empty()
             || self.recovery.is_some()
             || self.privacy.telemetry.is_some()
+            || self.privacy.training.is_some()
             || self.spawn.is_some()
         {
             w.push(
@@ -560,6 +565,35 @@ mod tests {
         let host = l.merged.host.unwrap();
         assert!(host["tools"].get("mine").is_some());
         assert!(host["tools"].get("evil").is_none());
+    }
+
+    #[test]
+    fn a_project_file_cannot_change_the_training_policy() {
+        use crate::training::{policy, Policy};
+        let t = tempfile::tempdir().unwrap();
+        let env = HostEnv::from_parts(t.path().join("home"), "u".into(), 1, 1, Default::default());
+        let project = t.path().join("p");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(
+            project.join(PROJECT_FILE),
+            "[privacy]\ntraining = \"vendor\"\n",
+        )
+        .unwrap();
+        let l = Manifest::load(&env, &project).unwrap();
+        assert_eq!(policy(&l.merged), Policy::Deny);
+        let w = l.project.as_ref().unwrap().1.project_warnings();
+        assert!(w.iter().any(|w| w.contains("[privacy]")), "{w:?}");
+        let cfg = env.paddock_config();
+        std::fs::create_dir_all(&cfg).unwrap();
+        std::fs::write(
+            cfg.join("config.toml"),
+            "[privacy]\ntraining = \"manual\"\n",
+        )
+        .unwrap();
+        let l = Manifest::load(&env, &project).unwrap();
+        assert_eq!(policy(&l.merged), Policy::Manual);
+        // Only the three words.
+        assert!(toml::from_str::<Manifest>("[privacy]\ntraining = \"yes\"\n").is_err());
     }
 
     #[test]
