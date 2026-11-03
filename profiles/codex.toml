@@ -71,12 +71,9 @@ url = "https://chatgpt.com/#settings/DataControls"
 # from ~/.codex/hooks.json only with a trusted hash in [hooks.state] of
 # config.toml, which /hooks writes when the user approves it. No user is in
 # the sandbox to approve, so paddock writes the hash of this hook, and of no
-# other hook, into the sandbox copy of config.toml (codex_trust). The rules
-# for the hash and the key come from the Codex source, see
+# other hook, into the sandbox copy of config.toml ([hooks] codex_trust
+# below). The rules for the hash and the key come from the Codex source, see
 # src/compaction/codex.rs. https://developers.openai.com/codex/hooks
-[compaction]
-codex_trust = ".codex/config.toml"
-
 [[compaction.settings]]
 file = ".codex/hooks.json"
 path = ["hooks", "SessionStart"]
@@ -96,3 +93,11 @@ probe_args = ["exec", "--help"]
 # https://developers.openai.com/codex/cli/reference
 [detach]
 args = ["Read the file {prompt_file} and do the task that it describes."]
+
+# The user's own hooks (src/hooks.rs). paddock's entry comes first. A user
+# entry is trusted only when its program is in [hooks] programs of the user
+# configuration. The trust in the host copy of config.toml does not count.
+[hooks]
+files = [".codex/hooks.json"]
+into = ".codex/hooks.json"
+codex_trust = ".codex/config.toml"

@@ -60,7 +60,12 @@ pub fn apply(
         &format!("profile {} compaction hook", profile.name),
         spec,
     )?;
-    if let Some(config) = &h.codex_trust {
+    // A profile with `[hooks] codex_trust` trusts its hooks there (hooks.rs).
+    let hooks_trust = profile
+        .hooks
+        .as_ref()
+        .is_some_and(|f| f.codex_trust.is_some());
+    if let Some(config) = h.codex_trust.as_ref().filter(|_| !hooks_trust) {
         let rel = PathBuf::from(config);
         if !rel
             .components()

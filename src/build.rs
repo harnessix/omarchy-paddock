@@ -771,7 +771,7 @@ pub fn build_with(env: &HostEnv, opts: &Options, harness: Harness) -> Result<Bui
     }
     crate::mcp::apply(env, &profile, &m, &project, &mut spec);
     crate::privacy::push_state_settings(&profile, opts.no_yolo, &porigin, &mut spec)?;
-    crate::compaction::apply(env, &profile, &mut spec)?;
+    crate::hooks::apply_all(env, &profile, &auth, &mut spec)?;
     if !matches!(spec.network, Network::None | Network::Api) {
         for p in &profile.network.publish {
             if !spec.publish.contains(p) {

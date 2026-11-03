@@ -110,6 +110,7 @@ fn setup(harness: &str) -> Setup {
     };
     let b = paddock::build::build_with(&env, &opts, h).unwrap();
     paddock::privacy::write_settings(&b.spec.home_src, &b.spec.home_settings).unwrap();
+    paddock::hooks::write(&b.spec).unwrap();
     let home = b.spec.home_src.clone();
 
     let parent = kv_service(&env, &project, "claude", "claude-parent-1", vec![]);

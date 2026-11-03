@@ -117,3 +117,8 @@ file = ".claude/settings.json"
 path = ["hooks", "SessionStart"]
 append = true
 value = { matcher = "compact", hooks = [{ type = "command", command = "paddock-host compacted --harness claude", timeout = 20 }] }
+
+# The user's own hooks (src/hooks.rs): checked, then beside paddock's entry.
+[hooks]
+files = [".claude/settings.json"]
+into = ".claude/settings.json"
