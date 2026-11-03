@@ -13,6 +13,8 @@ struct World {
     root: PathBuf,
     window: Child,
     host_window: Child,
+    /// The app process really has a mount namespace of its own.
+    isolated: bool,
 }
 
 impl Drop for World {
@@ -39,18 +41,24 @@ impl World {
         std::fs::create_dir_all(&run).unwrap();
         std::fs::set_permissions(&run, std::os::unix::fs::PermissionsExt::from_mode(0o700))
             .unwrap();
-        let window = Command::new("unshare")
-            .args(["--user", "--map-root-user", "--mount", "sleep", "60"])
+        // bwrap, as paddock uses it: some hosts (Ubuntu with AppArmor)
+        // allow user namespaces for bwrap only, not for `unshare`.
+        let window = Command::new("bwrap")
+            .args(["--dev-bind", "/", "/", "sleep", "60"])
+            .stderr(Stdio::null())
             .spawn()
+            .or_else(|_| Command::new("sleep").arg("60").spawn())
             .unwrap();
         let host_window = Command::new("sleep").arg("60").spawn().unwrap();
         // Wait until unshare has made its namespace and run sleep.
         let own = format!("/proc/{}/ns/mnt", window.id());
+        let mut isolated = false;
         for _ in 0..100 {
             if std::fs::read_link(&own).ok() != std::fs::read_link("/proc/self/ns/mnt").ok()
                 && std::fs::read_to_string(format!("/proc/{}/comm", window.id()))
                     .is_ok_and(|c| c.trim() == "sleep")
             {
+                isolated = true;
                 break;
             }
             std::thread::sleep(std::time::Duration::from_millis(20));
@@ -60,6 +68,7 @@ impl World {
             root,
             window,
             host_window,
+            isolated,
         };
         w.set_clients(serde_json::json!([
             {"address": "0xa1", "pid": w.window.id(), "at": [10, 50], "size": [800, 600],
@@ -162,6 +171,10 @@ fn set_light_theme(home: &Path) {
 #[test]
 fn lists_and_marks_protected_windows_by_network_level() {
     let w = World::new();
+    if !w.isolated {
+        eprintln!("skipped: bwrap cannot create a namespace here");
+        return;
+    }
     w.add_app("app-1", "egress");
 
     let v = w.json(&["windows", "--json", "--mark"]);
@@ -221,6 +234,10 @@ fn lists_and_marks_protected_windows_by_network_level() {
 #[test]
 fn focus_takes_only_protected_windows() {
     let w = World::new();
+    if !w.isolated {
+        eprintln!("skipped: bwrap cannot create a namespace here");
+        return;
+    }
     w.add_app("app-2", "api");
     let out = w.paddock(&["windows", "--focus", "0xb2"]);
     assert!(!out.status.success(), "an unprotected window: {out:?}");
