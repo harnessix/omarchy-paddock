@@ -50,3 +50,9 @@ value = false
 [privacy.training]
 setting = "the privacy notice of your sign-in method"
 url = "https://developers.google.com/gemini-code-assist/resources/privacy-notices"
+
+# Gemini CLI reads hooks from settings.json, in the same form as Claude
+# Code. paddock checks the user's entries (src/hooks.rs).
+[hooks]
+files = [".gemini/settings.json"]
+into = ".gemini/settings.json"

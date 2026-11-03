@@ -101,3 +101,10 @@ prompt = "file"
 # https://github.com/xai-org/grok-build/blob/main/crates/codegen/xai-grok-pager/docs/user-guide/01-getting-started.md
 [detach]
 args = ["Read the file {prompt_file} and do the task that it describes."]
+
+# The user's own hooks (src/hooks.rs). Grok Build loads every file in
+# ~/.grok/hooks. The sandbox copy has one file: paddock's entries first, then
+# the user's entries of every host file, in file name order.
+[hooks]
+files = [".grok/hooks/*.json"]
+into = ".grok/hooks/paddock-compaction.json"

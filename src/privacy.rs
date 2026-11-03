@@ -131,6 +131,14 @@ pub fn args(profile: &Profile, mode: Telemetry) -> Vec<String> {
     }
 }
 
+/// Write the settings and then the hooks (hooks.rs) into the sandbox home.
+/// Returns warnings.
+pub fn write_home(spec: &SandboxSpec) -> Result<Vec<String>> {
+    let mut w = write_settings(&spec.home_src, &spec.home_settings)?;
+    w.extend(crate::hooks::write(spec)?);
+    Ok(w)
+}
+
 /// Write the spec's settings into the sandbox home, keeping the rest of each
 /// file. The home is sandbox-controlled: every access goes through `safefs`,
 /// so a symlink planted there is never followed. A file that does not parse

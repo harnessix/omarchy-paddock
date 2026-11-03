@@ -71,3 +71,8 @@ file = ".qwen/settings.json"
 path = ["hooks", "SessionStart"]
 append = true
 value = { matcher = "compact", hooks = [{ type = "command", name = "paddock-compacted", command = "paddock-host compacted --harness qwen" }] }
+
+# The user's own hooks (src/hooks.rs): checked, then beside paddock's entry.
+[hooks]
+files = [".qwen/settings.json"]
+into = ".qwen/settings.json"

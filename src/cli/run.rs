@@ -323,6 +323,13 @@ pub(crate) fn explain(env: &HostEnv, a: &RunArgs, json: bool) -> Result<()> {
             );
         }
     }
+    let hooks = paddock::hooks::explain(s);
+    if !hooks.is_empty() {
+        println!("\nhooks in the sandbox copies (the host files stay as they are):");
+        for l in hooks {
+            println!("{l}");
+        }
+    }
     if !s.setup.is_empty() {
         println!("\nsetup inside the sandbox:");
         for l in &s.setup {

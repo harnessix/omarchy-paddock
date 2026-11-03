@@ -43,6 +43,9 @@ pub struct Profile {
     pub detach: Option<Detach>,
     /// The hook that runs after a context compaction (compaction.rs).
     pub compaction: Option<crate::compaction::Hook>,
+    /// Where the harness reads hooks: paddock carries the user's hook
+    /// entries there and checks their programs (hooks.rs).
+    pub hooks: Option<crate::hooks::Files>,
 }
 
 /// `[detach]`: the arguments that give the interactive interface its first

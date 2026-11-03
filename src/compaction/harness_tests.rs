@@ -52,16 +52,22 @@ fn json(p: &Path) -> serde_json::Value {
 #[test]
 fn codex_gets_its_hook_and_only_its_trust_in_the_sandbox_home() {
     let w = world("");
-    // The user's own hook and trust stay as they are, and stay untrusted
-    // when they were not trusted.
+    // The user's own hooks stay untrusted, also with a trust in the host
+    // copy of config.toml. A hook whose program is not in the sandbox is
+    // left out.
     let codex = w.env.home.join(".codex");
     std::fs::create_dir_all(&codex).unwrap();
     std::fs::write(
         codex.join("hooks.json"),
-        r#"{"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"my-hook"}]}]}}"#,
+        r#"{"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"my-hook"}]},{"hooks":[{"type":"command","command":"true"}]}]}}"#,
     )
     .unwrap();
-    std::fs::write(codex.join("config.toml"), "model = \"m\"\n").unwrap();
+    let src = format!("{}/.codex/hooks.json", w.env.home.display());
+    std::fs::write(
+        codex.join("config.toml"),
+        format!("model = \"m\"\n[hooks.state.\"{src}:session_start:1:0\"]\ntrusted_hash = \"sha256:00\"\n"),
+    )
+    .unwrap();
     let before = tree(&w.env.home);
     // The snapshot of the host data has the user's hooks.json.
     let spec = sandbox_spec(&w, "codex", &[".codex/hooks.json"]);
@@ -69,23 +75,23 @@ fn codex_gets_its_hook_and_only_its_trust_in_the_sandbox_home() {
     assert!(!home.starts_with(&w.env.home));
     // The next start of the same home finds the hook where it is.
     crate::privacy::write_settings(&home, &spec.home_settings).unwrap();
+    crate::hooks::write(&spec).unwrap();
     let hooks = json(&home.join(".codex/hooks.json"));
     let groups = hooks["hooks"]["SessionStart"].as_array().unwrap();
-    assert_eq!(groups.len(), 2);
-    assert_eq!(groups[0]["hooks"][0]["command"], "my-hook");
+    assert_eq!(groups.len(), 2, "{groups:?}");
     assert_eq!(
-        groups[1]["hooks"][0]["command"],
+        groups[0]["hooks"][0]["command"],
         "paddock-host compacted --harness codex"
     );
+    assert_eq!(groups[1]["hooks"][0]["command"], "true");
     let cfg: toml::Value =
         toml::from_str(&std::fs::read_to_string(home.join(".codex/config.toml")).unwrap()).unwrap();
     assert_eq!(cfg["model"].as_str(), Some("m"));
     // The sandbox home has the host home's path.
-    let src = format!("{}/.codex/hooks.json", w.env.home.display());
     let state = cfg["hooks"]["state"].as_table().unwrap();
     assert_eq!(state.len(), 1, "{state:?}");
     assert_eq!(
-        state[&format!("{src}:session_start:1:0")]["trusted_hash"].as_str(),
+        state[&format!("{src}:session_start:0:0")]["trusted_hash"].as_str(),
         Some(PADDOCK_CODEX_HASH)
     );
     // The host home did not change.

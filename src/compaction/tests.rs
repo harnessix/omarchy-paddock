@@ -160,6 +160,7 @@ pub(super) fn sandbox_spec(w: &World, name: &str, extra: &[&str]) -> crate::spec
         }
     }
     crate::privacy::write_settings(&b.spec.home_src, &b.spec.home_settings).unwrap();
+    crate::hooks::write(&b.spec).unwrap();
     b.spec
 }
 
@@ -199,12 +200,12 @@ fn settings_file(name: &str) -> &'static str {
 fn each_supported_harness_gets_its_hook_in_the_sandbox_home_only() {
     for name in SUPPORTED {
         let w = world("");
-        // A hook of the user's own stays next to paddock's.
+        // A hook of the user's own stays next to paddock's, after it.
         let own = w.env.home.join(settings_file(name));
         std::fs::create_dir_all(own.parent().unwrap()).unwrap();
         std::fs::write(
             &own,
-            r#"{"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"my-hook"}]}]}}"#,
+            r#"{"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"true"}]}]}}"#,
         )
         .unwrap();
         let before = tree(&w.env.home);
@@ -220,10 +221,7 @@ fn each_supported_harness_gets_its_hook_in_the_sandbox_home_only() {
         let v: serde_json::Value =
             serde_json::from_slice(&std::fs::read(home.join(settings_file(name))).unwrap())
                 .unwrap();
-        assert_eq!(
-            v["hooks"]["SessionStart"][0]["hooks"][0]["command"],
-            "my-hook"
-        );
+        assert_eq!(v["hooks"]["SessionStart"][1]["hooks"][0]["command"], "true");
         assert_eq!(v["hooks"]["SessionStart"].as_array().unwrap().len(), 2);
         // `[compaction] enabled = false`: no hook.
         let w = world("[compaction]\nenabled = false\n");

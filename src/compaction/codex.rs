@@ -137,6 +137,13 @@ pub fn hook_hash(event: &str, matcher: Option<&str>, handler: &Value) -> Result<
     Ok(format!("sha256:{hex}"))
 }
 
+/// The `[hooks.state]` key of handler `handler` of group `group` of an
+/// event in the hooks file `source`.
+pub fn hook_key(source: &str, event: &str, group: usize, handler: usize) -> Result<String> {
+    let label = event_key(event).with_context(|| format!("Codex has no hook event {event}"))?;
+    Ok(format!("{source}:{label}:{group}:{handler}"))
+}
+
 /// The `[hooks.state]` key and the trusted hash of each handler of a group
 /// at `group_index` in the array of `event`, in the hooks file `source` (an
 /// absolute path inside the sandbox).
