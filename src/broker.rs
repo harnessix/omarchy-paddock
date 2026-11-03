@@ -9,17 +9,42 @@
 //! change it, because the agent can edit that file.
 
 use crate::env::HostEnv;
-use crate::policy;
 use crate::state;
 use anyhow::{bail, Context as _, Result};
-use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+
+mod approval;
+mod audit;
+mod capture;
+mod describe;
+mod fetch;
+pub mod forge;
+pub mod git;
+pub mod notify;
+mod policy;
+mod prepare;
+mod protocol;
+mod spawn;
+
+pub use approval::{
+    answer, answer_reply, answer_with_note, approval_note, approval_ui_active, approval_ui_file,
+    approvals_dir, ask_choice, clean_note, clean_text, denied_message, pending, write_pending,
+    Answer, Approver, DenyAll, HostApprover, Pending, Verdict, ASK_CAPABILITY, BUDGET_CAPABILITY,
+    MAX_NOTE, MAX_REPLY, TIMEOUT_CAPABILITY,
+};
+pub use audit::{audit_detail, audit_file, audit_line};
+pub use capture::{run_capture, run_capture_input};
+pub use policy::{HostPolicy, Mode};
+pub use protocol::{Request, Response, Status};
+
+pub(crate) use capture::{Pipe, PIPE_GRACE};
+pub(crate) use describe::{safe_name, tool_args};
+pub(crate) use fetch::{check_fetch, inbox};
+pub(crate) use protocol::new_request_id;
 
 pub const PROTOCOL: u32 = 1;
 /// Where the socket appears inside the sandbox.
@@ -28,14 +53,7 @@ pub const SOCKET_IN_SANDBOX: &str = "/run/paddock/host.sock";
 pub const INBOX: &str = ".paddock/inbox";
 
 const MAX_REQUEST: usize = 64 * 1024;
-const MAX_FETCH: u64 = 64 * 1024 * 1024;
-const MAX_OUTPUT: usize = 1024 * 1024;
 
-pub mod forge;
-pub mod git;
-pub mod notify;
-
-/// The capabilities, in the order `paddock-host capabilities` lists them.
 pub const CAPABILITIES: &[(&str, &str)] = &[
     (
         "screenshot",
@@ -79,630 +97,6 @@ pub const CAPABILITIES: &[(&str, &str)] = &[
     ),
 ];
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Mode {
-    Deny,
-    Ask,
-    Allow,
-}
-
-/// Per-capability modes. `exec` can never be `allow`: that would remove the
-/// sandbox, so it is read as `ask`.
-#[derive(Debug, Clone, Serialize)]
-pub struct HostPolicy {
-    pub modes: BTreeMap<String, Mode>,
-    /// Seconds to wait for an answer before a request times out.
-    pub wait: u64,
-    /// The named host tools of `[host.tools]`.
-    pub tools: BTreeMap<String, crate::hosttools::Tool>,
-}
-
-impl Default for HostPolicy {
-    fn default() -> Self {
-        let mut modes = BTreeMap::new();
-        for (cap, _) in CAPABILITIES {
-            modes.insert(cap.to_string(), Mode::Ask);
-        }
-        modes.insert("notify".into(), Mode::Allow);
-        Self {
-            modes,
-            wait: 120,
-            tools: BTreeMap::new(),
-        }
-    }
-}
-
-impl HostPolicy {
-    pub fn load(env: &HostEnv) -> Result<Self> {
-        let mut p = Self::default();
-        let file = env.paddock_config().join("config.toml");
-        let Ok(text) = std::fs::read_to_string(&file) else {
-            return Ok(p);
-        };
-        let doc: toml::Value =
-            toml::from_str(&text).with_context(|| format!("{} is invalid", file.display()))?;
-        let Some(host) = doc.get("host").and_then(|h| h.as_table()) else {
-            return Ok(p);
-        };
-        p.tools = crate::hosttools::parse_host(host)
-            .with_context(|| format!("{} is invalid", file.display()))?;
-        for (k, v) in host {
-            if k == "tools" {
-                continue;
-            }
-            if k == "wait" {
-                p.wait = v
-                    .as_integer()
-                    .filter(|n| (5..=3600).contains(n))
-                    .context("[host] wait must be 5 to 3600 seconds")?
-                    as u64;
-                continue;
-            }
-            if !CAPABILITIES.iter().any(|(c, _)| c == k) {
-                bail!(
-                    "[host] {k}: unknown capability. Known: {}",
-                    CAPABILITIES
-                        .iter()
-                        .map(|c| c.0)
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                );
-            }
-            let mode: Mode = v
-                .clone()
-                .try_into()
-                .with_context(|| format!("[host] {k} must be deny, ask or allow"))?;
-            p.modes.insert(k.clone(), mode);
-        }
-        if p.modes.get("exec") == Some(&Mode::Allow) {
-            p.modes.insert("exec".into(), Mode::Ask);
-        }
-        Ok(p)
-    }
-
-    pub fn mode(&self, cap: &str) -> Mode {
-        self.modes.get(cap).copied().unwrap_or(Mode::Deny)
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Request {
-    pub v: u32,
-    pub cap: String,
-    #[serde(default)]
-    pub args: BTreeMap<String, serde_json::Value>,
-    /// Why the agent asks. Shown to the user next to the request.
-    #[serde(default)]
-    pub reason: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
-pub enum Status {
-    Done,
-    Denied,
-    Disabled,
-    Timeout,
-    Failed,
-    Invalid,
-    /// A blocking read reached its time limit before the event, for example
-    /// `paddock-host wait` on a child that still runs. Run it again.
-    Waiting,
-}
-
-impl Status {
-    /// The exit code of `paddock-host` for this status.
-    pub fn exit_code(&self) -> i32 {
-        match self {
-            Status::Done => 0,
-            Status::Denied => 3,
-            Status::Disabled => 4,
-            Status::Timeout => 5,
-            Status::Waiting => crate::waiting::EXIT_STILL_WAITING,
-            Status::Failed => 7,
-            Status::Invalid => 8,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Response {
-    pub status: Status,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub message: String,
-    #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
-    pub result: serde_json::Value,
-}
-
-impl Response {
-    pub(crate) fn new(status: Status, message: impl Into<String>) -> Self {
-        Self {
-            status,
-            message: message.into(),
-            result: serde_json::Value::Null,
-        }
-    }
-    pub(crate) fn done(result: serde_json::Value) -> Self {
-        Self {
-            status: Status::Done,
-            message: String::new(),
-            result,
-        }
-    }
-}
-
-/// A request that waits for the user, as `paddock approvals --json` shows it.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Pending {
-    pub id: String,
-    pub sandbox: String,
-    pub harness: String,
-    pub project: PathBuf,
-    pub capability: String,
-    /// One line for a list.
-    pub summary: String,
-    /// The exact thing that will happen, for example the full command line.
-    pub detail: String,
-    pub reason: String,
-    pub created: u64,
-    /// Unix time when the request stops waiting and times out.
-    #[serde(default)]
-    pub expires: u64,
-    /// Whether "allow for this session" is offered.
-    pub session_allowed: bool,
-    /// For a request from a sandbox that another sandbox started: the
-    /// sandboxes above it, the first one started by the user, the parent last.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub started_by: Vec<String>,
-    /// For a question (`/dev/paddock/ask`): short answers that the card
-    /// offers as buttons. The user can always type another answer. For a
-    /// card of paddock itself (`spawn-timeout`): the only answers, besides
-    /// deny.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub choices: Vec<String>,
-}
-
-/// The capability name of a question from `/dev/paddock/ask` on the
-/// approval card. It is not a host capability: the answer is text for the
-/// agent, and nothing runs on the host.
-pub const ASK_CAPABILITY: &str = "ask";
-/// The capability name of the card for a spawned child at its time limit
-/// (`[spawn] on_timeout = "ask"`). The answer is one of its choices (more
-/// time), or deny (stop).
-pub const TIMEOUT_CAPABILITY: &str = "spawn-timeout";
-/// The capability name of the first-use card of a paid device. The answer
-/// is one of its choices (the budget of the run), or deny.
-pub const BUDGET_CAPABILITY: &str = "device-budget";
-/// The longest typed answer to a question, in characters.
-pub const MAX_REPLY: usize = 4000;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Answer {
-    Once,
-    Session,
-    Deny,
-    /// Deny this request and every same request of this sandbox for the
-    /// rest of its session, without a new card.
-    #[serde(rename = "deny-session")]
-    DenySession,
-}
-
-impl Answer {
-    pub fn denies(self) -> bool {
-        matches!(self, Self::Deny | Self::DenySession)
-    }
-}
-
-/// The longest note for the agent on a denial, in characters.
-pub const MAX_NOTE: usize = 300;
-
-/// The note of a denial, made safe: one line, no control or invisible
-/// characters, at most `MAX_NOTE` characters. None when nothing is left.
-pub fn clean_note(s: &str) -> Option<String> {
-    let line: String = s
-        .chars()
-        .map(|c| if c.is_whitespace() { ' ' } else { c })
-        .collect();
-    let t: String = clean_text(&line).trim().chars().take(MAX_NOTE).collect();
-    let t = t.trim_end().to_string();
-    (!t.is_empty()).then_some(t)
-}
-
-/// The message of a denial for the agent: the user's note when there is
-/// one, else `plain`.
-pub fn denied_message(plain: &str, note: Option<&str>) -> String {
-    match note {
-        Some(n) => format!("the user denied this request: \"{n}\""),
-        None => plain.to_string(),
-    }
-}
-
-/// An answer with the user's note on a denial, and who gave it ("user" or
-/// "agent").
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Verdict {
-    pub answer: Answer,
-    pub note: Option<String>,
-    pub who: &'static str,
-}
-
-/// The answer file: a plain answer (`"deny"`), or an answer with a note.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(untagged)]
-enum AnswerFile {
-    Plain(Answer),
-    Noted {
-        answer: Answer,
-        #[serde(default)]
-        note: String,
-    },
-}
-
-impl AnswerFile {
-    fn parse(text: &str) -> Option<(Answer, Option<String>)> {
-        match serde_json::from_str::<AnswerFile>(text).ok()? {
-            AnswerFile::Plain(a) => Some((a, None)),
-            AnswerFile::Noted { answer, note } => {
-                Some((answer, clean_note(&note).filter(|_| answer.denies())))
-            }
-        }
-    }
-}
-
-impl std::str::FromStr for Answer {
-    type Err = anyhow::Error;
-    fn from_str(s: &str) -> Result<Self> {
-        match s {
-            "once" => Ok(Self::Once),
-            "session" => Ok(Self::Session),
-            "deny" => Ok(Self::Deny),
-            "deny-session" => Ok(Self::DenySession),
-            _ => bail!("answer must be once, session, deny or deny-session"),
-        }
-    }
-}
-
-pub fn approvals_dir(env: &HostEnv) -> PathBuf {
-    env.paddock_run().join("approvals")
-}
-
-/// Every request that waits for an answer, from every running sandbox.
-pub fn pending(env: &HostEnv) -> Vec<Pending> {
-    let mut out = Vec::new();
-    let Ok(entries) = std::fs::read_dir(approvals_dir(env)) else {
-        return out;
-    };
-    for e in entries.flatten() {
-        let p = e.path();
-        if p.extension().is_some_and(|x| x == "json") {
-            if let Some(req) = std::fs::read_to_string(&p)
-                .ok()
-                .and_then(|t| serde_json::from_str::<Pending>(&t).ok())
-            {
-                out.push(req);
-            }
-        }
-    }
-    // A question of a sandbox that no longer runs: its paddock process was
-    // killed before it could withdraw the question. Older than a minute, so
-    // a question that is being put on the card is never removed.
-    let now = state::now();
-    if out
-        .iter()
-        .any(|p| p.capability == ASK_CAPABILITY && now.saturating_sub(p.created) > 60)
-    {
-        let running: Vec<String> = state::Running::list(env)
-            .into_iter()
-            .map(|r| r.id)
-            .collect();
-        out.retain(|p| {
-            let gone = p.capability == ASK_CAPABILITY
-                && now.saturating_sub(p.created) > 60
-                && !running.contains(&p.sandbox);
-            if gone {
-                let dir = approvals_dir(env);
-                let _ = std::fs::remove_file(dir.join(format!("{}.json", p.id)));
-                let _ = std::fs::remove_file(dir.join(format!("{}.answer", p.id)));
-            }
-            !gone
-        });
-    }
-    // Host requests first: questions of agents never push them off the card.
-    out.sort_by_key(|p| (p.capability == ASK_CAPABILITY, p.created));
-    out
-}
-
-/// Record the user's answer. Only the host can call this: the approvals
-/// directory is not mounted in any sandbox.
-pub fn answer(env: &HostEnv, id: &str, a: Answer) -> Result<()> {
-    answer_with_note(env, id, a, None)
-}
-
-/// Record the user's answer with a note for the agent. Only a denial
-/// carries a note.
-pub fn answer_with_note(env: &HostEnv, id: &str, a: Answer, note: Option<&str>) -> Result<()> {
-    if id.is_empty() || !id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
-        bail!("invalid request id");
-    }
-    let dir = approvals_dir(env);
-    let pending = dir.join(format!("{id}.json"));
-    if !pending.is_file() {
-        bail!("no pending request {id}");
-    }
-    let p: Pending = serde_json::from_str(&std::fs::read_to_string(&pending)?)?;
-    if p.capability == ASK_CAPABILITY && a != Answer::Deny {
-        bail!("{id} is a question: answer it with --text TEXT, or dismiss it with deny");
-    }
-    if p.capability == ASK_CAPABILITY && a == Answer::DenySession {
-        bail!("{id} is a question: dismiss it with deny");
-    }
-    if p.capability != ASK_CAPABILITY && !p.choices.is_empty() && a != Answer::Deny {
-        bail!(
-            "{id} offers choices: answer it with --text {}, or deny",
-            p.choices.join("|")
-        );
-    }
-    if a == Answer::Session && !p.session_allowed {
-        bail!("this request can only be allowed once");
-    }
-    if a == Answer::DenySession && !p.session_allowed {
-        bail!("this request has no session answer: deny it with deny");
-    }
-    if note.is_some() && !a.denies() {
-        bail!("only a denial carries a note");
-    }
-    let file = match note.and_then(clean_note) {
-        Some(note) => AnswerFile::Noted { answer: a, note },
-        None => AnswerFile::Plain(a),
-    };
-    write_answer(&dir, id, serde_json::to_string(&file)?)?;
-    Ok(())
-}
-
-/// Write the answer file of `id` whole, at once, and only the first time:
-/// a poller never reads half an answer, and a second answer does not
-/// replace the first.
-fn write_answer(dir: &Path, id: &str, text: String) -> Result<()> {
-    match crate::privfs::write_new(&dir.join(format!("{id}.answer")), text) {
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-            bail!("{id} was already answered")
-        }
-        r => Ok(r?),
-    }
-}
-
-/// Answer a question from `/dev/paddock/ask` with text. The text goes to
-/// the agent that asked; nothing runs on the host. Only the host can call
-/// this, like `answer`.
-pub fn answer_reply(env: &HostEnv, id: &str, text: &str) -> Result<()> {
-    if id.is_empty() || !id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
-        bail!("invalid request id");
-    }
-    let dir = approvals_dir(env);
-    let pending = dir.join(format!("{id}.json"));
-    if !pending.is_file() {
-        bail!("no pending request {id}");
-    }
-    let p: Pending = serde_json::from_str(&std::fs::read_to_string(&pending)?)?;
-    // A card of paddock itself with fixed choices: only those.
-    if p.capability != ASK_CAPABILITY && !p.choices.is_empty() {
-        if !p.choices.iter().any(|c| c == text.trim()) {
-            bail!(
-                "{id} takes one of these answers: {}, or deny",
-                p.choices.join(", ")
-            );
-        }
-        write_answer(
-            &dir,
-            id,
-            serde_json::json!({ "reply": text.trim() }).to_string(),
-        )?;
-        return Ok(());
-    }
-    if p.capability != ASK_CAPABILITY {
-        bail!("{id} is a host request, not a question: answer it with once, session or deny");
-    }
-    if text.trim().is_empty() {
-        bail!("the answer is empty");
-    }
-    if text.chars().count() > MAX_REPLY {
-        bail!("the answer is longer than {MAX_REPLY} characters");
-    }
-    write_answer(&dir, id, serde_json::json!({ "reply": text }).to_string())?;
-    Ok(())
-}
-
-pub fn audit_file(env: &HostEnv) -> PathBuf {
-    env.paddock_state().join("host-audit.jsonl")
-}
-
-/// What the audit log keeps about a request. The log lives on disk for a
-/// long time, so it never holds request text that can be private:
-///
-/// - clipboard-write: the length of the text, never the text.
-/// - exec: the program and the number of arguments. Arguments can hold
-///   tokens or passwords (`curl -H "Authorization: ..."`), so they stay out.
-///   An allowed command line of plain words (`hosttools::loggable_argv`)
-///   goes into `argv`, for `paddock tools suggest`.
-/// - tool: the tool name and the arguments, which match a shape that the
-///   user wrote.
-/// - forge: the command line without the body text, and the body length.
-/// - notify: the lengths of the title and the body.
-/// - open-url: the scheme and host. Paths and queries can hold login codes.
-/// - fetch, git-push, screenshot: the paths, remote and refs, as the user saw
-///   them. These name host locations, not private content.
-/// - borrow, return: the host folder, the size and the counts of changes.
-///
-/// `prepared` is the detail that `prepare` worked out, for the capabilities
-/// where it is safe to keep (fetch and git-push).
-pub fn audit_detail(req: &Request, project: &Path, prepared: Option<&str>) -> String {
-    let chars = |key: &str| arg_str(req, key).map_or(0, |t| t.chars().count());
-    match req.cap.as_str() {
-        "clipboard-write" => format!("set the host clipboard: {} characters", chars("text")),
-        "exec" => {
-            let a = argv(req);
-            let total: usize =
-                a.iter().map(|x| x.chars().count()).sum::<usize>() + a.len().saturating_sub(1);
-            format!(
-                "run on the host: {} with {} arguments ({total} characters; arguments are not logged)",
-                a.first().map(|p| shell_quote(p)).unwrap_or_default(),
-                a.len().saturating_sub(1),
-            )
-        }
-        // The arguments match a shape that the user wrote: they stay.
-        "tool" => format!("run the host tool {}", tool_line(req)),
-        "forge" => {
-            let tool = arg_str(req, "tool").unwrap_or("gh");
-            let t = forge::tool(tool).unwrap_or(&forge::GH);
-            let (rest, body) = forge::split_body(t, &argv(req));
-            let mut line = std::iter::once(tool.to_string())
-                .chain(rest)
-                .map(|a| shell_quote(&a))
-                .collect::<Vec<_>>()
-                .join(" ");
-            if let Some(b) = body {
-                line.push_str(&format!(" (body: {} characters)", b.chars().count()));
-            }
-            line
-        }
-        "notify" => format!(
-            "show a notification: title {} characters, body {} characters",
-            chars("title"),
-            chars("body")
-        ),
-        "open-url" => {
-            let u = arg_str(req, "url").unwrap_or("");
-            match url::Url::parse(u) {
-                Ok(p) => format!(
-                    "open {}://{} ({} characters)",
-                    p.scheme(),
-                    p.host_str().unwrap_or(""),
-                    u.chars().count()
-                ),
-                Err(_) => format!("open a URL ({} characters)", u.chars().count()),
-            }
-        }
-        "fetch" | "git-push" | "spawn" | "borrow" | "return" if prepared.is_some() => {
-            prepared.unwrap_or_default().to_string()
-        }
-        "spawn" => format!(
-            "spawn {} {}",
-            arg_str(req, "action").unwrap_or("start"),
-            arg_str(req, "harness").or(arg_str(req, "id")).unwrap_or("")
-        ),
-        "fetch" => format!(
-            "copy {} into the sandbox",
-            arg_str(req, "path").unwrap_or("")
-        ),
-        "borrow" => format!("borrow {}", arg_str(req, "path").unwrap_or("")),
-        "return" => format!("return {}", arg_str(req, "name").unwrap_or("")),
-        "git-push" => format!(
-            "git push {}",
-            git::redact(arg_str(req, "remote").unwrap_or(""))
-        ),
-        "screenshot" | "clipboard-read" => describe(req, project).1,
-        other => other.to_string(),
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn audit(
-    env: &HostEnv,
-    ctx: &Context,
-    req: &Request,
-    detail: &str,
-    request: Option<&str>,
-    decision: &str,
-    resp: &Response,
-    note: Option<&str>,
-) {
-    // The note of a denial goes to the agent only: the log keeps its length.
-    let message = match note {
-        Some(_) => "the user denied the request with a note",
-        None => resp.message.as_str(),
-    };
-    let line = serde_json::json!({
-        "time": state::now(),
-        "sandbox": ctx.id,
-        "harness": ctx.harness,
-        "project": ctx.project,
-        "capability": req.cap,
-        "request": request,
-        "detail": detail,
-        "reason": req.reason.chars().take(500).collect::<String>(),
-        "decision": decision,
-        "status": resp.status,
-        "message": message,
-    });
-    let mut line = line;
-    if let Some(n) = note {
-        line["note_chars"] = n.chars().count().into();
-    }
-    if let Some(code) = resp.result.get("exit_code") {
-        line["exit_code"] = code.clone();
-    }
-    if req.cap == "tool" {
-        line["tool"] = arg_str(req, "name").unwrap_or("").into();
-        line["args"] = serde_json::json!(tool_args(req).unwrap_or_default());
-    }
-    // A plain exec line that the user allowed, for `paddock tools suggest`,
-    // only when the user asked for it (`[exec] remember_allowed = true`).
-    if req.cap == "exec"
-        && decision.starts_with("allowed")
-        && crate::execbox::ExecCfg::load(env).is_ok_and(|c| c.remember_allowed)
-    {
-        if let Some(a) = crate::hosttools::loggable_argv(&argv(req)) {
-            line["argv"] = serde_json::json!(a);
-        }
-    }
-    if let Some(parent) = ctx.chain.last() {
-        line["parent"] = parent.clone().into();
-        line["chain"] = serde_json::json!(ctx.chain);
-    }
-    audit_line(env, &line);
-    if let Some(rule) = boundary_rule(decision, resp) {
-        crate::boundary::record(
-            env,
-            &ctx.id,
-            crate::boundary::HOST,
-            &format!("{}: {detail}", req.cap),
-            &rule,
-        );
-    }
-}
-
-/// The rule for the boundary log when the broker refused or denied a
-/// request. None for allowed requests, failures and timeouts. A denial note
-/// of the user stays out: the log keeps paddock's own words only.
-fn boundary_rule(decision: &str, resp: &Response) -> Option<String> {
-    let refused = ["invalid", "disabled", "refused", "denied"]
-        .iter()
-        .any(|d| decision.starts_with(d));
-    if !refused {
-        return None;
-    }
-    if decision.starts_with("denied") {
-        return Some(decision.to_string());
-    }
-    let msg: String = resp.message.chars().take(300).collect();
-    Some(format!("{decision}: {msg}"))
-}
-
-/// Append one line to the audit log.
-pub fn audit_line(env: &HostEnv, line: &serde_json::Value) {
-    let f = audit_file(env);
-    match crate::privfs::append(&f) {
-        Ok(mut file) => {
-            if let Err(e) = writeln!(file, "{line}") {
-                log::warn!("cannot write the audit log {}: {e}", f.display());
-            }
-        }
-        Err(e) => log::warn!("cannot open the audit log {}: {e}", f.display()),
-    }
-}
-
 /// The sandbox this broker serves.
 #[derive(Debug, Clone)]
 pub struct Context {
@@ -719,941 +113,6 @@ pub struct Context {
     /// The role of a child. A reviewer cannot push or change anything on
     /// the forge. None when the user started the sandbox.
     pub role: Option<crate::spawn::Role>,
-}
-
-/// The answer source. The real one waits for `paddock approvals answer` or a
-/// notification action. Tests use a fixed answer.
-pub trait Approver: Send + Sync {
-    fn ask(&self, env: &HostEnv, p: &Pending, wait: Duration) -> Option<Answer>;
-
-    /// The answer and who gave it ("user" or "agent"), for the audit log.
-    fn ask_with_source(
-        &self,
-        env: &HostEnv,
-        p: &Pending,
-        wait: Duration,
-    ) -> Option<(Answer, &'static str)> {
-        self.ask(env, p, wait).map(|a| (a, "user"))
-    }
-
-    /// The answer with the user's note on a denial. Callers that tell the
-    /// agent about a denial use this one.
-    /// A card with fixed choices (`p.choices`): the chosen one, or None
-    /// for deny or no answer.
-    fn choose(&self, env: &HostEnv, p: &Pending, wait: Duration) -> Option<String> {
-        match ask_choice(env, p, wait, &|| false) {
-            crate::spawn::Choice::More(c) => Some(c),
-            _ => None,
-        }
-    }
-
-    fn ask_verdict(&self, env: &HostEnv, p: &Pending, wait: Duration) -> Option<Verdict> {
-        self.ask_with_source(env, p, wait)
-            .map(|(answer, who)| Verdict {
-                answer,
-                note: None,
-                who,
-            })
-    }
-}
-
-/// Answers every request with deny. `paddock doctor --escape` uses it.
-pub struct DenyAll;
-
-impl Approver for DenyAll {
-    fn ask(&self, _: &HostEnv, _: &Pending, _: Duration) -> Option<Answer> {
-        Some(Answer::Deny)
-    }
-}
-
-pub struct HostApprover;
-
-/// Write a pending request for the panel and the CLI: 0600 in a 0700 folder.
-/// Text from a sandbox, made safe to show: no control characters except
-/// newline and tab, and no invisible format characters. A terminal would run
-/// escape sequences (clear the screen, rewrite a line), and bidi overrides
-/// can reverse text on a card or in a notification.
-pub fn clean_text(s: &str) -> String {
-    s.chars()
-        .filter(|&c| {
-            if c == '\n' || c == '\t' {
-                return true;
-            }
-            !c.is_control()
-                && !matches!(c,
-                    '\u{061C}' | '\u{180E}' | '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}'
-                    | '\u{2060}'..='\u{206F}' | '\u{FEFF}' | '\u{FFF9}'..='\u{FFFB}')
-        })
-        .collect()
-}
-
-impl Pending {
-    /// The same request with every text that a sandbox can choose cleaned.
-    pub fn cleaned(&self) -> Self {
-        let mut p = self.clone();
-        p.summary = clean_text(&p.summary);
-        p.detail = clean_text(&p.detail);
-        p.reason = clean_text(&p.reason);
-        p.harness = clean_text(&p.harness);
-        p.choices = p.choices.iter().map(|c| clean_text(c)).collect();
-        p.started_by = p.started_by.iter().map(|c| clean_text(c)).collect();
-        p
-    }
-}
-
-pub fn write_pending(env: &HostEnv, p: &Pending) -> std::io::Result<PathBuf> {
-    let p = &p.cleaned();
-    let pending = approvals_dir(env).join(format!("{}.json", p.id));
-    crate::privfs::write(&pending, serde_json::to_string(p).unwrap_or_default())?;
-    Ok(pending)
-}
-
-impl Approver for HostApprover {
-    fn ask(&self, env: &HostEnv, p: &Pending, wait: Duration) -> Option<Answer> {
-        self.ask_verdict(env, p, wait).map(|v| v.answer)
-    }
-
-    fn ask_with_source(
-        &self,
-        env: &HostEnv,
-        p: &Pending,
-        wait: Duration,
-    ) -> Option<(Answer, &'static str)> {
-        self.ask_verdict(env, p, wait).map(|v| (v.answer, v.who))
-    }
-
-    fn ask_verdict(&self, env: &HostEnv, p: &Pending, wait: Duration) -> Option<Verdict> {
-        let p = &p.cleaned();
-        let answer_file = approvals_dir(env).join(format!("{}.answer", p.id));
-        let Ok(pending) = write_pending(env, p) else {
-            return None;
-        };
-        let shown = notify_with_actions(env, p);
-        let start = Instant::now();
-        let mut got = None;
-        while start.elapsed() < wait {
-            if let Ok(t) = std::fs::read_to_string(&answer_file) {
-                got = AnswerFile::parse(&t).map(|(answer, note)| Verdict {
-                    answer,
-                    note,
-                    who: "user",
-                });
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(200));
-        }
-        // Answered elsewhere or timed out: the buttons mean nothing now.
-        if let Some(h) = shown {
-            h.close();
-        }
-        let _ = std::fs::remove_file(&pending);
-        let _ = std::fs::remove_file(&answer_file);
-        got
-    }
-}
-
-/// Put a card with fixed choices up (`TIMEOUT_CAPABILITY`) and wait for
-/// the answer: one of `p.choices`, or deny. Stop waiting after `wait` or
-/// when `cancelled` turns true.
-pub fn ask_choice(
-    env: &HostEnv,
-    p: &Pending,
-    wait: Duration,
-    cancelled: &dyn Fn() -> bool,
-) -> crate::spawn::Choice {
-    use crate::spawn::Choice;
-    let p = &p.cleaned();
-    let answer_file = approvals_dir(env).join(format!("{}.answer", p.id));
-    let Ok(pending) = write_pending(env, p) else {
-        return Choice::NoAnswer;
-    };
-    let shown = notify_choices(env, p);
-    let start = Instant::now();
-    let mut got = Choice::NoAnswer;
-    while start.elapsed() < wait && !cancelled() {
-        if let Ok(t) = std::fs::read_to_string(&answer_file) {
-            let reply = serde_json::from_str::<serde_json::Value>(&t)
-                .ok()
-                .and_then(|v| v["reply"].as_str().map(str::to_string));
-            got = match reply {
-                Some(r) if p.choices.contains(&r) => Choice::More(r),
-                _ => Choice::Stop,
-            };
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(200));
-    }
-    if let Some(h) = shown {
-        h.close();
-    }
-    let _ = std::fs::remove_file(&pending);
-    let _ = std::fs::remove_file(&answer_file);
-    got
-}
-
-/// The notification for a card with fixed choices, when the bar does not
-/// run: one button per choice, and Stop.
-fn notify_choices(env: &HostEnv, p: &Pending) -> Option<notify::Handle> {
-    if approval_ui_active(env) {
-        return None;
-    }
-    let mut actions: Vec<(String, String)> = p
-        .choices
-        .iter()
-        .enumerate()
-        .map(|(i, c)| (format!("choice:{i}"), format!("+{c}")))
-        .collect();
-    actions.push(("deny".into(), "Stop".into()));
-    let note = notify::Note {
-        summary: format!("paddock: {}", p.summary),
-        body: p.detail.clone(),
-        actions,
-        critical: true,
-    };
-    let (env2, id, choices) = (env.clone(), p.id.clone(), p.choices.clone());
-    let on_action = move |key: &str| {
-        if let Some(c) = key
-            .strip_prefix("choice:")
-            .and_then(|i| i.parse::<usize>().ok())
-            .and_then(|i| choices.get(i))
-        {
-            let _ = answer_reply(&env2, &id, c);
-        } else if key == "deny" {
-            let _ = answer(&env2, &id, Answer::Deny);
-        }
-    };
-    match notify::ask(env, &note, on_action) {
-        Ok(h) => Some(h),
-        Err(e) => {
-            log::debug!("cannot show the card as a notification: {e:#}");
-            None
-        }
-    }
-}
-
-/// A desktop notification with buttons. Its answer goes through the same
-/// answer file, so the panel, the CLI and the notification never disagree.
-/// The bar plugin's approval service writes the Unix time to this file every
-/// few seconds while it runs. Then it shows the request itself, and a second
-/// popup would only repeat it.
-pub fn approval_ui_file(env: &HostEnv) -> PathBuf {
-    env.paddock_run().join("approval-ui")
-}
-
-pub fn approval_ui_active(env: &HostEnv) -> bool {
-    std::fs::read_to_string(approval_ui_file(env))
-        .ok()
-        .and_then(|t| t.trim().parse::<u64>().ok())
-        .is_some_and(|t| state::now().saturating_sub(t) < 15)
-}
-
-/// The fallback prompt when the bar does not run. The request detail can
-/// hold clipboard text, so it goes over the user's session bus, never into
-/// the arguments of a process, which every local user can read.
-pub fn approval_note(p: &Pending) -> notify::Note {
-    let mut actions = vec![("once".to_string(), "Allow once".to_string())];
-    if p.session_allowed {
-        actions.push(("session".into(), "Allow for this session".into()));
-    }
-    actions.push(("deny".into(), "Deny".into()));
-    if p.session_allowed {
-        actions.push(("deny-session".into(), "Deny for this session".into()));
-    }
-    notify::Note {
-        summary: format!("paddock: {} asks for {}", p.harness, p.capability),
-        body: {
-            let mut b = match crate::spawn::chain_text(&p.started_by) {
-                Some(c) => format!("{c}\n\n{}", p.detail),
-                None => p.detail.clone(),
-            };
-            if !p.reason.is_empty() {
-                b.push_str(&format!("\n\nReason: {}", p.reason));
-            }
-            b
-        },
-        actions,
-        critical: true,
-    }
-}
-
-fn notify_with_actions(env: &HostEnv, p: &Pending) -> Option<notify::Handle> {
-    if approval_ui_active(env) {
-        return None;
-    }
-    let (env2, id) = (env.clone(), p.id.clone());
-    let on_action = move |key: &str| {
-        if let Ok(a) = key.parse::<Answer>() {
-            let _ = answer(&env2, &id, a);
-        }
-    };
-    match notify::ask(env, &approval_note(p), on_action) {
-        Ok(h) => Some(h),
-        Err(e) => {
-            log::debug!("cannot show the approval notification: {e:#}");
-            None
-        }
-    }
-}
-
-fn arg_str<'a>(req: &'a Request, key: &str) -> Option<&'a str> {
-    req.args.get(key).and_then(|v| v.as_str())
-}
-
-/// The arguments of a `tool` request: a list of strings, or none.
-pub(crate) fn tool_args(req: &Request) -> Result<Vec<String>> {
-    match req.args.get("args") {
-        None | Some(serde_json::Value::Null) => Ok(Vec::new()),
-        Some(v) => serde_json::from_value(v.clone()).context("tool arguments must be strings"),
-    }
-}
-
-fn tool_line(req: &Request) -> String {
-    std::iter::once(arg_str(req, "name").unwrap_or("").to_string())
-        .chain(tool_args(req).unwrap_or_default())
-        .map(|a| shell_quote(&a))
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
-fn argv(req: &Request) -> Vec<String> {
-    req.args
-        .get("argv")
-        .and_then(|v| v.as_array())
-        .map(|a| {
-            a.iter()
-                .filter_map(|x| x.as_str().map(str::to_string))
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
-/// Quote one argument for display, the way a shell would read it.
-fn shell_quote(s: &str) -> String {
-    if !s.is_empty()
-        && s.chars()
-            .all(|c| c.is_ascii_alphanumeric() || "-_./=:,@%+".contains(c))
-    {
-        s.to_string()
-    } else {
-        format!("'{}'", s.replace('\'', r"'\''"))
-    }
-}
-
-/// (summary, detail) for the approval prompt and the audit log.
-pub fn describe(req: &Request, project: &Path) -> (String, String) {
-    match req.cap.as_str() {
-        "screenshot" => {
-            let t = arg_str(req, "target").unwrap_or("screen");
-            (
-                format!("screenshot of the {t}"),
-                format!("Capture the host {t} into {}/{INBOX}", project.display()),
-            )
-        }
-        "exec" => {
-            let line = argv(req)
-                .iter()
-                .map(|a| shell_quote(a))
-                .collect::<Vec<_>>()
-                .join(" ");
-            (
-                format!(
-                    "run on the host: {}",
-                    line.chars().take(80).collect::<String>()
-                ),
-                format!(
-                    "Run on the host in {}.\nThe sandbox writes that folder, so a command that reads files there, a git command for example, can take instructions from them.\n{line}",
-                    project.display()
-                ),
-            )
-        }
-        "fetch" => {
-            let p = arg_str(req, "path").unwrap_or("");
-            (
-                format!("copy {p} into the sandbox"),
-                format!("Copy the host path {p} into {}/{INBOX}", project.display()),
-            )
-        }
-        "clipboard-read" => (
-            "read the host clipboard".into(),
-            "Give the current host clipboard text to the sandbox".into(),
-        ),
-        "clipboard-write" => {
-            let t = arg_str(req, "text").unwrap_or("");
-            (
-                "set the host clipboard".into(),
-                format!(
-                    "Set the host clipboard to:\n{}",
-                    t.chars().take(500).collect::<String>()
-                ),
-            )
-        }
-        "open-url" => {
-            let u = arg_str(req, "url").unwrap_or("");
-            (
-                format!("open {u}"),
-                format!("Open in the host browser:\n{u}"),
-            )
-        }
-        "notify" => (
-            "show a notification".into(),
-            arg_str(req, "title").unwrap_or("").to_string(),
-        ),
-        "git-push" => (
-            format!("git push {}", arg_str(req, "remote").unwrap_or("")),
-            format!(
-                "git push {} {}",
-                arg_str(req, "remote").unwrap_or(""),
-                req.args
-                    .get("refs")
-                    .map(|r| r.to_string())
-                    .unwrap_or_default()
-            ),
-        ),
-        "forge" => {
-            let line = std::iter::once(arg_str(req, "tool").unwrap_or("gh").to_string())
-                .chain(argv(req))
-                .map(|a| shell_quote(&a))
-                .collect::<Vec<_>>()
-                .join(" ");
-            (line.chars().take(80).collect(), line)
-        }
-        other => (other.to_string(), other.to_string()),
-    }
-}
-
-/// A key that "allow for this session" remembers. For `exec` it is the exact
-/// command line, so a grant never covers a different command.
-fn grant_key(req: &Request) -> String {
-    match req.cap.as_str() {
-        "exec" => format!("exec\0{}", argv(req).join("\0")),
-        "open-url" => "open-url".into(),
-        other => other.to_string(),
-    }
-}
-
-fn validate(req: &Request) -> Result<()> {
-    if req.v != PROTOCOL {
-        bail!(
-            "protocol version {} is not supported; this paddock speaks {PROTOCOL}",
-            req.v
-        );
-    }
-    match req.cap.as_str() {
-        "screenshot" => {
-            let t = arg_str(req, "target").unwrap_or("screen");
-            if !(t == "screen"
-                || t == "window"
-                || t.strip_prefix("output:")
-                    .is_some_and(|n| !n.is_empty() && n.len() < 64))
-            {
-                bail!("target must be screen, window or output:NAME");
-            }
-        }
-        "exec" => {
-            if argv(req).is_empty() {
-                bail!("exec needs a command");
-            }
-        }
-        "tool" => {
-            let n = arg_str(req, "name").context("tool needs a tool name")?;
-            if !crate::hosttools::valid_name(n) {
-                bail!("not a valid tool name: {n}");
-            }
-            tool_args(req)?;
-        }
-        "fetch" => {
-            let p = PathBuf::from(arg_str(req, "path").context("fetch needs a path")?);
-            if !p.is_absolute() {
-                bail!("fetch needs an absolute host path");
-            }
-            // `prepare` opens the path and checks where it really leads.
-        }
-        "borrow" => {
-            let p = PathBuf::from(arg_str(req, "path").context("borrow needs a path")?);
-            if !p.is_absolute() {
-                bail!("borrow needs an absolute host path");
-            }
-        }
-        "return" => {
-            let n = arg_str(req, "name").context("return needs the name of a borrowed copy")?;
-            if !crate::borrow::valid_name(n) {
-                bail!("{n} is not the name of a borrowed copy");
-            }
-        }
-        "clipboard-write" => {
-            arg_str(req, "text").context("clipboard-write needs text")?;
-        }
-        "open-url" => {
-            let u = arg_str(req, "url").context("open-url needs a url")?;
-            let parsed = url::Url::parse(u).context("not a valid URL")?;
-            if !matches!(parsed.scheme(), "http" | "https") {
-                bail!("only http and https URLs can be opened");
-            }
-        }
-        "notify" => {
-            arg_str(req, "title").context("notify needs a title")?;
-        }
-        "clipboard-read" => {}
-        "git-push" => git::validate(&req.args)?,
-        "forge" => {
-            let t = arg_str(req, "tool").unwrap_or("gh");
-            if forge::tool(t).is_none() {
-                bail!(
-                    "forge supports {}",
-                    forge::TOOLS
-                        .iter()
-                        .map(|t| t.name)
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                );
-            }
-            if argv(req).is_empty() {
-                bail!("forge needs a command, for example pr view");
-            }
-        }
-        "spawn" => {
-            let name_ok = |s: &str| {
-                !s.is_empty()
-                    && s.len() <= 64
-                    && s.chars()
-                        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-            };
-            match arg_str(req, "action").unwrap_or("start") {
-                "start" => {
-                    if !arg_str(req, "harness").is_some_and(name_ok) {
-                        bail!("spawn needs a harness name, for example codex");
-                    }
-                    if arg_str(req, "prompt_file").is_none_or(str::is_empty) {
-                        bail!("spawn needs --prompt-file FILE");
-                    }
-                }
-                "status" | "wait" | "kill" => {
-                    if !arg_str(req, "id").is_some_and(name_ok) {
-                        bail!("give the spawn id that `paddock-host spawn` printed");
-                    }
-                }
-                "list" => {}
-                other => bail!("unknown spawn action {other}"),
-            }
-        }
-        other => bail!("unknown capability {other}"),
-    }
-    Ok(())
-}
-
-pub(crate) fn safe_name(raw: &str, fallback: &str) -> String {
-    let name: String = Path::new(raw)
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_default()
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || "-_.".contains(c) {
-                c
-            } else {
-                '_'
-            }
-        })
-        .take(100)
-        .collect();
-    if name.is_empty() || name.starts_with('.') {
-        fallback.to_string()
-    } else {
-        name
-    }
-}
-
-/// The inbox in the project. The project is sandbox-writable, so the folder
-/// is opened one step at a time without following symlinks, and every result
-/// is written through it (see safefs).
-pub(crate) fn inbox(project: &Path) -> Result<crate::safefs::Dir> {
-    let root = crate::safefs::Root::open(project)?;
-    let dot = root.dir(Path::new(".paddock"), true)?;
-    // Keep results out of commits. An existing entry, whatever it is, stays.
-    if let Ok(mut f) = dot.create_new(std::ffi::OsStr::new(".gitignore"), 0o644) {
-        f.write_all(b"*\n")?;
-    }
-    dot.subdir(std::ffi::OsStr::new("inbox"), true)
-}
-
-/// The output of a command, read in a thread. A process that the command
-/// left behind can keep the pipe open after the command ended, so the end
-/// of the pipe is waited for only until a deadline.
-pub(crate) struct Pipe {
-    buf: Arc<Mutex<Vec<u8>>>,
-    done: std::sync::mpsc::Receiver<()>,
-}
-
-/// How long the output may stay open after the command ended: enough to
-/// read what it wrote.
-pub(crate) const PIPE_GRACE: Duration = Duration::from_secs(2);
-
-impl Pipe {
-    /// Read `r` to its end, at most `cap` bytes.
-    pub(crate) fn read(mut r: impl Read + Send + 'static, cap: usize) -> Self {
-        let buf = Arc::new(Mutex::new(Vec::new()));
-        let (tx, done) = std::sync::mpsc::channel();
-        let b = buf.clone();
-        std::thread::spawn(move || {
-            let mut chunk = [0u8; 8192];
-            loop {
-                let room = cap.saturating_sub(b.lock().unwrap().len()).min(chunk.len());
-                match r.read(&mut chunk[..room]) {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => b.lock().unwrap().extend_from_slice(&chunk[..n]),
-                }
-            }
-            // It can hold a credential value.
-            chunk.iter_mut().for_each(|c| *c = 0);
-            let _ = tx.send(());
-        });
-        Self { buf, done }
-    }
-
-    /// What was read, once the pipe ended or `deadline` passed. False:
-    /// the pipe is still open, and the output can be cut short.
-    pub(crate) fn finish(self, deadline: Instant) -> (Vec<u8>, bool) {
-        let wait = deadline.saturating_duration_since(Instant::now());
-        let ended = self.done.recv_timeout(wait).is_ok();
-        let out = std::mem::take(&mut *self.buf.lock().unwrap());
-        (out, ended)
-    }
-}
-
-pub fn run_capture(cmd: &mut Command, timeout: Duration) -> Result<(i32, String, String)> {
-    run_capture_input(cmd, timeout, None)
-}
-
-/// Like `run_capture`, with `input` written to the command's stdin.
-pub fn run_capture_input(
-    cmd: &mut Command,
-    timeout: Duration,
-    input: Option<&[u8]>,
-) -> Result<(i32, String, String)> {
-    let mut child = cmd
-        .stdin(if input.is_some() {
-            Stdio::piped()
-        } else {
-            Stdio::null()
-        })
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
-    if let (Some(data), Some(mut stdin)) = (input, child.stdin.take()) {
-        let data = data.to_vec();
-        // A thread, so a command that does not read cannot block paddock.
-        std::thread::spawn(move || {
-            let _ = stdin.write_all(&data);
-        });
-    }
-    let so = Pipe::read(child.stdout.take().unwrap(), MAX_OUTPUT);
-    let se = Pipe::read(child.stderr.take().unwrap(), MAX_OUTPUT);
-    let start = Instant::now();
-    let code = loop {
-        if let Some(s) = child.try_wait()? {
-            break s.code().unwrap_or(-1);
-        }
-        if start.elapsed() > timeout {
-            let _ = child.kill();
-            let _ = child.wait();
-            bail!(
-                "the command did not finish in {} seconds and was stopped",
-                timeout.as_secs()
-            );
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    };
-    // A process left behind (an ssh ControlPersist master) can keep the
-    // output open: take what came, within the time limit.
-    let deadline = (start + timeout).min(Instant::now() + PIPE_GRACE);
-    let out = String::from_utf8_lossy(&so.finish(deadline).0).into_owned();
-    let err = String::from_utf8_lossy(&se.finish(deadline).0).into_owned();
-    Ok((code, out, err))
-}
-
-/// Do the approved work on the host.
-fn perform(env: &HostEnv, ctx: &Context, req: &Request, work: &Work) -> Result<serde_json::Value> {
-    match work {
-        Work::Spawn { .. } | Work::SpawnControl => bail!("spawn was not prepared"),
-        // The executor pushes (Broker::execute), never this process.
-        Work::Push(_) => bail!("the push runs in the executor"),
-        Work::Forge(_) => bail!("gh runs in the executor"),
-        Work::Fetch(f) => return fetch(env, ctx, req, f),
-        Work::Borrow(b) => {
-            // Check again after the wait, like fetch.
-            let asked = PathBuf::from(arg_str(req, "path").unwrap_or(""));
-            check_fetch(env, &asked, &b.src.real_path()?, true)?;
-            let max = crate::borrow::Cfg::load(env)?.max;
-            return crate::borrow::borrow(env, &ctx.id, b, max);
-        }
-        Work::Return(r) => return r.apply(env, &ctx.id),
-        Work::Plain => {}
-    }
-    // Every other capability runs in the executor (Broker::run_elsewhere).
-    let _ = (env, ctx);
-    bail!("{} runs in the executor", req.cap)
-}
-
-/// A fetch source, opened before the user is asked. The copy reads from the
-/// open fd, so changing the path during the wait changes nothing.
-struct FetchPlan {
-    src: crate::safefs::Source,
-    /// Where the path led when it was opened; the prompt shows this.
-    real: PathBuf,
-    size: u64,
-}
-
-/// Refuse a fetch of a protected path: the path asked for, where it really
-/// leads, or a folder that holds a protected path.
-pub(crate) fn check_fetch(env: &HostEnv, asked: &Path, real: &Path, dir: bool) -> Result<()> {
-    let mut denied = policy::denied_paths(env);
-    // Harness logins too: paddock copies them in itself, never by request.
-    if let Ok(f) = crate::profile::HarnessFactory::new(env) {
-        for n in f.names() {
-            if let Some(p) = f.profile(&n) {
-                denied.extend(p.state.auth.iter().map(|a| env.home.join(a)));
-            }
-        }
-    }
-    // paddock's own folders: sandbox homes of other projects, approvals,
-    // the audit log, paddock kv, the gateway key, the configuration.
-    denied.extend([
-        env.paddock_data(),
-        env.paddock_state(),
-        env.paddock_config(),
-        env.paddock_cache(),
-    ]);
-    for d in denied {
-        let canon = std::fs::canonicalize(&d).ok();
-        let hit =
-            |d: &Path| real.starts_with(d) || asked.starts_with(d) || (dir && d.starts_with(real));
-        if hit(&d) || canon.as_deref().is_some_and(hit) {
-            bail!(
-                "{} is or holds a protected path; paddock never copies it into a sandbox",
-                asked.display()
-            );
-        }
-    }
-    Ok(())
-}
-
-fn plan_fetch(env: &HostEnv, req: &Request) -> Result<FetchPlan> {
-    let asked = PathBuf::from(arg_str(req, "path").context("fetch needs a path")?);
-    let src = crate::safefs::Source::open(&asked)?;
-    let real = src.real_path()?;
-    check_fetch(env, &asked, &real, src.is_dir())?;
-    let size = src.size(MAX_FETCH)?;
-    if size > MAX_FETCH {
-        bail!(
-            "{} is {} MiB; the limit is {} MiB",
-            real.display(),
-            size >> 20,
-            MAX_FETCH >> 20
-        );
-    }
-    Ok(FetchPlan { src, real, size })
-}
-
-fn fetch(env: &HostEnv, ctx: &Context, req: &Request, f: &FetchPlan) -> Result<serde_json::Value> {
-    // Check again after the wait: the open file or folder may have moved
-    // into a protected place. A replaced path does not matter: the copy
-    // reads what was opened, which is what the user saw.
-    let asked = PathBuf::from(arg_str(req, "path").unwrap_or(""));
-    check_fetch(env, &asked, &f.src.real_path()?, f.src.is_dir())?;
-    let dir = inbox(&ctx.project)?;
-    let want = safe_name(&f.real.to_string_lossy(), "fetched");
-    // Never remove what is there: a free name instead.
-    let name = dir.copy_source(&f.src, &want, MAX_FETCH)?;
-    Ok(serde_json::json!({ "path": dir.path().join(name), "bytes": f.size }))
-}
-
-/// The work behind a request, worked out before the user is asked.
-enum Work {
-    Plain,
-    /// Start a child with this prompt.
-    Spawn {
-        harness: String,
-        prompt: Vec<u8>,
-        opts: crate::spawn::StartOpts,
-    },
-    /// status, wait, kill or list of this sandbox's own children.
-    SpawnControl,
-    Push(git::PushPlan),
-    Forge(forge::Call),
-    Fetch(FetchPlan),
-    Borrow(crate::borrow::BorrowPlan),
-    Return(crate::borrow::ReturnPlan),
-}
-
-/// What the user sees and what a session grant covers.
-struct Prepared {
-    summary: String,
-    detail: String,
-    /// "Allow for this session" stores these keys. A request is covered when
-    /// every key is granted.
-    keys: Vec<String>,
-    /// A session grant can cover this request.
-    session_allowed: bool,
-    /// Ask even when the configuration says allow.
-    always_ask: bool,
-    /// Allowed without asking unless the capability is denied (forge reads).
-    read_only: bool,
-    /// What the audit log may keep, when it differs from `audit_detail`.
-    audit: Option<String>,
-    work: Work,
-}
-
-fn prepare(env: &HostEnv, ctx: &Context, req: &Request) -> Result<Prepared> {
-    match req.cap.as_str() {
-        "git-push" => {
-            let plan = git::plan(
-                ctx.repo.as_ref(),
-                &env.paddock_run().join(&ctx.id),
-                &req.args,
-            )?;
-            let session_allowed = plan.session_allowed();
-            Ok(Prepared {
-                summary: plan.summary(),
-                detail: plan.detail(),
-                keys: plan.grant_keys(),
-                session_allowed,
-                always_ask: !session_allowed,
-                read_only: false,
-                audit: None,
-                work: Work::Push(plan),
-            })
-        }
-        "forge" => {
-            let t =
-                forge::tool(arg_str(req, "tool").unwrap_or("gh")).context("unknown forge tool")?;
-            let remotes = ctx
-                .repo
-                .as_ref()
-                .map(|r| r.remotes.as_slice())
-                .unwrap_or_default();
-            // tea picks the host by its login: the host's own login for the
-            // repository's host, never one that the sandbox names.
-            let call = forge::check_with(t, &argv(req), arg_str(req, "branch"), remotes, &|r| {
-                forge::tea_login(env, &r.host)
-            })?;
-            let line = std::iter::once(call.tool.to_string())
-                .chain(call.argv.iter().cloned())
-                .map(|a| shell_quote(&a))
-                .collect::<Vec<_>>()
-                .join(" ");
-            let write = call.access == forge::Access::Write;
-            let mut detail = format!(
-                "{} on the host with your {} login:\n{line}",
-                if write { "Change" } else { "Read" },
-                call.tool
-            );
-            if let Some(b) = &call.stdin {
-                detail.push_str(&format!("\n\nBody (read from stdin):\n{b}"));
-            }
-            Ok(Prepared {
-                summary: format!("{} {} on {}", call.tool, call.command, call.repo),
-                detail,
-                keys: vec![call.grant_key()],
-                session_allowed: true,
-                always_ask: false,
-                read_only: !write,
-                audit: None,
-                work: Work::Forge(call),
-            })
-        }
-        "fetch" => {
-            let plan = plan_fetch(env, req)?;
-            let (real, asked) = (plan.real.display(), arg_str(req, "path").unwrap_or(""));
-            let mut detail = format!(
-                "Copy the host path {real} into {}/{INBOX}",
-                ctx.project.display()
-            );
-            if Path::new(asked) != plan.real {
-                detail.push_str(&format!(" (asked for as {asked})"));
-            }
-            Ok(Prepared {
-                summary: format!("copy {real} into the sandbox"),
-                detail,
-                // A grant covers the real path the user saw.
-                keys: vec![format!("fetch\0{real}")],
-                session_allowed: true,
-                always_ask: false,
-                read_only: false,
-                audit: None,
-                work: Work::Fetch(plan),
-            })
-        }
-        "borrow" => {
-            let asked = PathBuf::from(arg_str(req, "path").unwrap_or(""));
-            let plan =
-                crate::borrow::plan_borrow(env, &asked, |a, r| check_fetch(env, a, r, true))?;
-            let real = plan.real.display().to_string();
-            let mut detail = format!(
-                "Copy the host folder {real} ({}) into {} in the sandbox. The agent changes the copy, and the original stays as it is. A return asks again and shows every change.",
-                crate::storage::human(plan.bytes),
-                crate::borrow::MOUNT
-            );
-            if asked != plan.real {
-                detail.push_str(&format!(" (asked for as {})", asked.display()));
-            }
-            Ok(Prepared {
-                summary: format!("borrow {real}"),
-                audit: Some(format!("borrow {real} ({} bytes)", plan.bytes)),
-                detail,
-                keys: vec![format!("borrow\0{real}")],
-                session_allowed: true,
-                always_ask: false,
-                read_only: false,
-                work: Work::Borrow(plan),
-            })
-        }
-        "return" => {
-            let name = arg_str(req, "name").unwrap_or("");
-            let max = crate::borrow::Cfg::load(env)?.max;
-            let plan = crate::borrow::plan_return(env, &ctx.id, name, max)?;
-            if plan.changes.is_empty() {
-                bail!(
-                    "the copy {name} has no changes to return{}",
-                    if plan.changes.kept.is_empty() {
-                        String::new()
-                    } else {
-                        " (changes of git files are never returned)".into()
-                    }
-                );
-            }
-            let orig = plan.manifest.original.display().to_string();
-            Ok(Prepared {
-                summary: format!("return {name} to {orig} ({})", plan.changes.counts()),
-                detail: plan.detail(),
-                audit: Some(format!(
-                    "return {name} to {orig}: {}, {} kept, {} skipped, {} changed bytes",
-                    plan.changes.counts(),
-                    plan.changes.kept.len(),
-                    plan.changes.skipped.len(),
-                    plan.changed_bytes
-                )),
-                // Each return shows its own changes: never a session grant.
-                keys: vec![format!("return\0{orig}")],
-                session_allowed: false,
-                always_ask: false,
-                read_only: false,
-                work: Work::Return(plan),
-            })
-        }
-        _ => {
-            let (summary, detail) = describe(req, &ctx.project);
-            Ok(Prepared {
-                summary,
-                detail,
-                keys: vec![grant_key(req)],
-                session_allowed: true,
-                always_ask: false,
-                read_only: false,
-                audit: None,
-                work: Work::Plain,
-            })
-        }
-    }
 }
 
 pub struct Broker {
@@ -1697,117 +156,6 @@ impl Broker {
         }
     }
 
-    /// The capabilities that the executor runs from a plan of this process:
-    /// gh, the desktop tools, links and notifications.
-    fn run_elsewhere(&self, req: &Request, work: &Work) -> Result<serde_json::Value> {
-        let workdir = || -> Result<PathBuf> {
-            let d = self
-                .env
-                .paddock_run()
-                .join(&self.ctx.id)
-                .join(format!("req-{}", new_request_id()));
-            crate::privfs::dir(&d)?;
-            Ok(d)
-        };
-        match req.cap.as_str() {
-            _ if matches!(work, Work::Forge(_)) => {
-                let Work::Forge(call) = work else {
-                    unreachable!()
-                };
-                // Found with this process's PATH, as before: the executor
-                // runs exactly this program.
-                let exe = self
-                    .env
-                    .which(call.tool)
-                    .with_context(|| format!("{} is not installed on the host", call.tool))?;
-                let long = call.argv.iter().any(|a| a == "watch" || a == "--watch");
-                let dir = workdir()?;
-                let plan = forge::ForgeExec {
-                    tool: exe.display().to_string(),
-                    argv: call.argv.clone(),
-                    stdin: call.stdin.clone(),
-                    timeout: req
-                        .args
-                        .get("timeout")
-                        .and_then(|t| t.as_u64())
-                        .unwrap_or(if long { 1800 } else { 120 })
-                        .clamp(1, 3600),
-                    workdir: dir.clone(),
-                };
-                let r = self.execute(req, serde_json::to_value(&plan)?);
-                let _ = std::fs::remove_dir_all(&dir);
-                r
-            }
-            "screenshot" => {
-                let name = safe_name(
-                    arg_str(req, "out").unwrap_or(""),
-                    &format!("screenshot-{}.png", state::now()),
-                );
-                let dir = workdir()?;
-                let plan = crate::gatewayd::DesktopExec {
-                    workdir: dir.clone(),
-                };
-                let r = self
-                    .execute(req, serde_json::to_value(&plan)?)
-                    .and_then(|_| {
-                        // The folder is paddock's own; the inbox is written
-                        // through the folder that paddock opened.
-                        let png =
-                            std::fs::read(dir.join("shot.png")).context("grim wrote no image")?;
-                        let inbox = inbox(&self.ctx.project)?;
-                        let (mut f, name) = inbox.new_file(&name, 0o644)?;
-                        f.write_all(&png)?;
-                        Ok(serde_json::json!({ "path": inbox.path().join(name) }))
-                    });
-                let _ = std::fs::remove_dir_all(&dir);
-                r
-            }
-            "clipboard-read" | "clipboard-write" => {
-                let dir = workdir()?;
-                let plan = crate::gatewayd::DesktopExec {
-                    workdir: dir.clone(),
-                };
-                let r = self.execute(req, serde_json::to_value(&plan)?);
-                let _ = std::fs::remove_dir_all(&dir);
-                r
-            }
-            "open-url" => {
-                let r = self.execute(req, serde_json::Value::Null)?;
-                // A login page: let its localhost callback through for a while.
-                crate::login::note_opened(arg_str(req, "url").unwrap_or(""));
-                Ok(r)
-            }
-            "notify" => {
-                let n = notify::Note {
-                    summary: format!(
-                        "{}: {}",
-                        self.ctx.harness,
-                        arg_str(req, "title").unwrap_or("")
-                    ),
-                    body: arg_str(req, "body").unwrap_or("").to_string(),
-                    ..Default::default()
-                };
-                self.execute(req, serde_json::to_value(&n)?)
-            }
-            other => bail!("{other} does not run in the executor"),
-        }
-    }
-
-    /// exec does not run in this process: it is signed for exactly this
-    /// request and run by the executor, which checks the signature first.
-    fn execute(&self, req: &Request, plan: serde_json::Value) -> Result<serde_json::Value> {
-        let remote;
-        let dispatch: &dyn crate::gatewayd::Dispatch = match &self.dispatch {
-            Some(d) => d.as_ref(),
-            None => {
-                remote = crate::gatewayd::Remote::new(&self.env)?;
-                &remote
-            }
-        };
-        let key = dispatch.signing_key(&self.env)?;
-        crate::gatewayd::execute(dispatch, &key, &self.ctx.id, &self.ctx.project, req, plan)
-    }
-
     /// The mode of a capability for this sandbox. Spawn is off when this
     /// sandbox has no spawner, when it is as deep as `[spawn] max_depth`
     /// allows, or when `[spawn] harnesses` names no harness. The depth comes
@@ -1820,305 +168,6 @@ impl Broker {
         match &self.spawner {
             Some(s) if s.cfg.depth_allows(self.ctx.depth) && !s.cfg.harnesses.is_empty() => m,
             _ => Mode::Deny,
-        }
-    }
-
-    fn spawn_off_reason(&self) -> String {
-        match &self.spawner {
-            None => "spawn is not available in this sandbox".into(),
-            Some(s) if !s.cfg.depth_allows(self.ctx.depth) => format!(
-                "this sandbox was started by {}; [spawn] max_depth = {} does not let it start more",
-                self.ctx.chain.last().map_or("the user", |p| p.as_str()),
-                s.cfg.max_depth
-            ),
-            Some(s) if s.cfg.harnesses.is_empty() => {
-                "no harness is allowed: the user lists them in [spawn] harnesses".into()
-            }
-            _ => "spawn is set to deny in [host] of the user configuration".into(),
-        }
-    }
-
-    /// Check a tool request before the user is asked: the tool exists, its
-    /// mode is not deny, and the arguments match one of its shapes. Err is
-    /// the response to send instead.
-    fn prepare_tool(&self, req: &Request) -> std::result::Result<Prepared, Response> {
-        let name = arg_str(req, "name").unwrap_or("");
-        let Some(tool) = self.policy.tools.get(name) else {
-            let known: Vec<&str> = self.policy.tools.keys().map(String::as_str).collect();
-            return Err(Response::new(
-                Status::Invalid,
-                if known.is_empty() {
-                    format!("no tool {name}: the user defines none in [host.tools]")
-                } else {
-                    format!("no tool {name}. Tools: {}", known.join(", "))
-                },
-            ));
-        };
-        if tool.mode == Mode::Deny {
-            return Err(Response::new(
-                Status::Disabled,
-                format!("tool {name} is set to deny in the user configuration"),
-            ));
-        }
-        let args = tool_args(req).map_err(|e| Response::new(Status::Invalid, format!("{e:#}")))?;
-        tool.check(&args)
-            .map_err(|e| Response::new(Status::Invalid, format!("{e:#}")))?;
-        let line = tool
-            .command
-            .iter()
-            .chain(args.iter())
-            .map(|a| shell_quote(a))
-            .collect::<Vec<_>>()
-            .join(" ");
-        let place = match tool.cwd {
-            crate::hosttools::Cwd::Project => self.ctx.project.display().to_string(),
-            crate::hosttools::Cwd::Home => "your home folder".into(),
-        };
-        let mut key = format!("tool\0{name}");
-        for a in &args {
-            key.push('\0');
-            key.push_str(a);
-        }
-        Ok(Prepared {
-            summary: format!(
-                "host tool {}",
-                tool_line(req).chars().take(80).collect::<String>()
-            ),
-            detail: format!("Run the host tool {name} in {place}:\n{line}"),
-            keys: vec![key],
-            session_allowed: true,
-            always_ask: false,
-            read_only: false,
-            audit: None,
-            work: Work::Plain,
-        })
-    }
-
-    /// Work out a spawn request before the user is asked. Err is the
-    /// response to send instead.
-    fn prepare_spawn(&self, req: &Request) -> std::result::Result<Prepared, Response> {
-        let Some(sp) = &self.spawner else {
-            return Err(Response::new(Status::Disabled, self.spawn_off_reason()));
-        };
-        let action = arg_str(req, "action").unwrap_or("start");
-        if action != "start" {
-            return Ok(Prepared {
-                summary: format!("spawn {action}"),
-                detail: format!("spawn {action}"),
-                keys: vec![],
-                session_allowed: false,
-                always_ask: false,
-                read_only: true,
-                audit: None,
-                work: Work::SpawnControl,
-            });
-        }
-        let harness = arg_str(req, "harness").unwrap_or_default().to_string();
-        if !sp.cfg.allows(&harness) {
-            return Err(Response::new(
-                Status::Disabled,
-                format!(
-                    "{harness} is not in [spawn] harnesses of the user configuration (allowed: {})",
-                    if sp.cfg.harnesses.is_empty() {
-                        "none".to_string()
-                    } else {
-                        sp.cfg.harnesses.join(", ")
-                    }
-                ),
-            ));
-        }
-        let invalid = |m: String| Response::new(Status::Invalid, m);
-        let has_oneshot = crate::profile::HarnessFactory::new(&self.env)
-            .ok()
-            .and_then(|f| f.profile(&harness).map(|p| p.oneshot.is_some()));
-        match has_oneshot {
-            None => return Err(invalid(format!("unknown harness {harness}"))),
-            Some(false) => {
-                return Err(invalid(format!(
-                    "{harness} has no one-shot mode in its profile, so it cannot run a task without a terminal"
-                )))
-            }
-            Some(true) => {}
-        }
-        if sp.running() as u32 >= sp.cfg.max_running {
-            return Err(Response::new(
-                Status::Failed,
-                format!(
-                    "{} children run already; [spawn] max_running is {}. Wait for one with `paddock-host wait`",
-                    sp.running(),
-                    sp.cfg.max_running
-                ),
-            ));
-        }
-        // A role is a fixed set of limits; the agent only names it.
-        let role: crate::spawn::Role = arg_str(req, "role")
-            .unwrap_or("implementer")
-            .parse()
-            .map_err(|e: anyhow::Error| invalid(format!("{e:#}")))?;
-        let num = |k: &str| req.args.get(k).and_then(|v| v.as_u64());
-        let limits = sp
-            .cfg
-            .limits(
-                num("timeout"),
-                num("mem"),
-                num("cpu_percent").map(|c| c.min(u32::MAX as u64) as u32),
-            )
-            .map_err(|e| invalid(format!("{e:#}")))?;
-        let scope = sp.scope_tool();
-        if scope.is_none() && (limits.mem.is_some() || limits.cpu_percent.is_some()) {
-            return Err(Response::new(
-                Status::Failed,
-                "paddock needs `systemd-run --user` to limit memory and CPUs, and it does not work on this host",
-            ));
-        }
-        let from_head = req
-            .args
-            .get("from_head")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
-        let prompt = read_prompt(&self.ctx.project, arg_str(req, "prompt_file").unwrap_or(""))
-            .map_err(|e| invalid(format!("{e:#}")))?;
-        let text = String::from_utf8_lossy(&prompt);
-        let chars = text.chars().count();
-        let shown: String = text.chars().take(crate::spawn::PROMPT_SHOWN).collect();
-        let c = &sp.ceiling;
-        let detail = format!(
-            "Start {harness} in a new sandbox with this task. It runs once and stops.\n\
-             Role: {}\n\
-             Login: {} (the {harness} login of this computer; this sandbox never sees it)\n\
-             Branch: a new worktree of {} from {}\n\
-             Limits: network {}, backend {}, no display, {} (enforced by {}), at most {} at a time\n\
-             Results go to {}/{INBOX}.\n\n\
-             Task ({chars} characters{}):\n{shown}",
-            role.describe(),
-            c.auth,
-            c.repo.display(),
-            if from_head {
-                "the files of this sandbox as they are now, uncommitted changes included"
-            } else {
-                "the current commit of this sandbox"
-            },
-            format!("{:?}", c.network).to_lowercase(),
-            c.backend,
-            limits.describe(),
-            if scope.is_some() {
-                "systemd-run"
-            } else {
-                "paddock"
-            },
-            sp.cfg.max_running,
-            self.ctx.project.display(),
-            if chars > crate::spawn::PROMPT_SHOWN {
-                format!(", the first {} shown", crate::spawn::PROMPT_SHOWN)
-            } else {
-                String::new()
-            },
-        );
-        Ok(Prepared {
-            summary: format!("start {harness} as {} with a task", role.name()),
-            detail,
-            // A session grant covers this harness in this role only.
-            keys: vec![format!("spawn\0{harness}\0{}", role.name())],
-            session_allowed: true,
-            always_ask: false,
-            read_only: false,
-            audit: Some(format!(
-                "start {harness} as {} in a new sandbox (login {}; {}; task {chars} characters, not logged)",
-                role.name(),
-                c.auth,
-                limits.describe()
-            )),
-            work: Work::Spawn {
-                harness,
-                prompt,
-                opts: crate::spawn::StartOpts {
-                    role,
-                    limits,
-                    from_head,
-                },
-            },
-        })
-    }
-
-    fn refuse_reviewer(&self, req: &Request) -> Response {
-        let r = Response::new(
-            Status::Disabled,
-            format!(
-                "this sandbox runs as a reviewer, which cannot use {}",
-                if req.cap == "git-push" {
-                    "git push"
-                } else {
-                    "forge commands that change something"
-                }
-            ),
-        );
-        audit(
-            &self.env,
-            &self.ctx,
-            req,
-            &audit_detail(req, &self.ctx.project, None),
-            None,
-            "refused: reviewer",
-            &r,
-            None,
-        );
-        r
-    }
-
-    fn perform_spawn(&self, req: &Request, work: &Work) -> Response {
-        let Some(sp) = &self.spawner else {
-            return Response::new(Status::Disabled, self.spawn_off_reason());
-        };
-        let to_json = |s: &crate::spawn::Status| serde_json::to_value(s).unwrap_or_default();
-        let id = arg_str(req, "id").unwrap_or("");
-        let missing = || Response::new(Status::Invalid, format!("no child {id} of this sandbox"));
-        match (work, arg_str(req, "action").unwrap_or("start")) {
-            (
-                Work::Spawn {
-                    harness,
-                    prompt,
-                    opts,
-                },
-                _,
-            ) => match sp.start(harness, prompt, *opts) {
-                Ok(s) => Response::done(to_json(&s)),
-                Err(e) => Response::new(Status::Failed, format!("{e:#}")),
-            },
-            (_, "list") => Response::done(serde_json::json!({
-                "children": sp.list(),
-                "max_running": sp.cfg.max_running,
-            })),
-            (_, "status") => match sp.status(id) {
-                Some(s) => Response::done(to_json(&s)),
-                None => missing(),
-            },
-            (_, "kill") => match sp.status(id) {
-                Some(_) => {
-                    sp.stop_one(id, crate::spawn::State::Stopped);
-                    let s = sp.wait(id, Duration::from_secs(20)).or(sp.status(id));
-                    Response::done(s.as_ref().map(to_json).unwrap_or_default())
-                }
-                None => missing(),
-            },
-            (_, "wait") => {
-                let max = sp.cfg.timeout + 120;
-                let t = req
-                    .args
-                    .get("timeout")
-                    .and_then(|t| t.as_u64())
-                    .unwrap_or(max)
-                    .min(max);
-                match sp.wait(id, Duration::from_secs(t)) {
-                    Some(s) if s.state.active() => Response {
-                        status: Status::Waiting,
-                        message: format!("still waiting: {id} still runs after {t} seconds; run the same wait again"),
-                        result: to_json(&s),
-                    },
-                    Some(s) => Response::done(to_json(&s)),
-                    None => missing(),
-                }
-            }
-            (_, other) => Response::new(Status::Invalid, format!("unknown spawn action {other}")),
         }
     }
 
@@ -2173,11 +222,11 @@ impl Broker {
                 "this sandbox is not a detached run (paddock run --detach), so there is nothing to end: finish your answer, and the user ends the run",
             );
         };
-        let status = match arg_str(req, "status").unwrap_or("ok").parse() {
+        let status = match describe::arg_str(req, "status").unwrap_or("ok").parse() {
             Ok(s) => s,
             Err(e) => return Response::new(Status::Invalid, format!("{e:#}")),
         };
-        let text = arg_str(req, "text").unwrap_or("");
+        let text = describe::arg_str(req, "text").unwrap_or("");
         log::info!("sandbox {}: the agent says the task is done", self.ctx.id);
         match ctl.done(status, text) {
             Ok(msg) => Response::done(serde_json::json!({ "message": msg })),
@@ -2187,23 +236,11 @@ impl Broker {
 
     pub fn handle(&self, req: &Request) -> Response {
         if req.cap == "capabilities" {
-            return Response::done(self.capabilities());
+            return self.handle_capabilities();
         }
         // A docker or aws credential: the channel checks, asks and audits.
         if req.cap == crate::credentials::channels::CAPABILITY {
-            if req.v != PROTOCOL {
-                return Response::new(Status::Invalid, "unsupported protocol version");
-            }
-            return match self.channels.get() {
-                Some(c) => match c.handle(&req.args) {
-                    Ok(v) => Response::done(v),
-                    Err((s, m)) => Response::new(s, m),
-                },
-                None => Response::new(
-                    Status::Disabled,
-                    "this sandbox has no docker or aws credential: the user registers them in [credentials] and allows them when the sandbox starts",
-                ),
-            };
+            return self.handle_channels(req);
         }
         // The end of the task in a detached run: never asked, it only ends
         // this sandbox.
@@ -2212,9 +249,41 @@ impl Broker {
         }
         // The sandbox reads its own boundary log: a read, never asked.
         if req.cap == "boundary" {
-            let lines = crate::boundary::read(&self.env, &self.ctx.id);
-            return Response::done(crate::boundary::to_json(&lines));
+            return self.handle_boundary();
         }
+        self.handle_gated(req)
+    }
+
+    fn handle_capabilities(&self) -> Response {
+        Response::done(self.capabilities())
+    }
+
+    /// A docker or aws credential: the channel checks, asks and audits.
+    fn handle_channels(&self, req: &Request) -> Response {
+        if req.v != PROTOCOL {
+            return Response::new(Status::Invalid, "unsupported protocol version");
+        }
+        match self.channels.get() {
+            Some(c) => match c.handle(&req.args) {
+                Ok(v) => Response::done(v),
+                Err((s, m)) => Response::new(s, m),
+            },
+            None => Response::new(
+                Status::Disabled,
+                "this sandbox has no docker or aws credential: the user registers them in [credentials] and allows them when the sandbox starts",
+            ),
+        }
+    }
+
+    /// The sandbox reads its own boundary log: a read, never asked.
+    fn handle_boundary(&self) -> Response {
+        let lines = crate::boundary::read(&self.env, &self.ctx.id);
+        Response::done(crate::boundary::to_json(&lines))
+    }
+
+    /// Every other capability: the same checks, in the same order, then the
+    /// work for that capability.
+    fn handle_gated(&self, req: &Request) -> Response {
         let invalid = |e: anyhow::Error| {
             let r = Response::new(Status::Invalid, format!("{e:#}"));
             log::info!(
@@ -2222,7 +291,7 @@ impl Broker {
                 self.ctx.id,
                 req.cap
             );
-            audit(
+            audit::audit(
                 &self.env,
                 &self.ctx,
                 req,
@@ -2234,7 +303,7 @@ impl Broker {
             );
             r
         };
-        if let Err(e) = validate(req) {
+        if let Err(e) = describe::validate(req) {
             return invalid(e);
         }
         // A reviewer reads and reports. It never pushes and never changes
@@ -2256,7 +325,7 @@ impl Broker {
                     )
                 },
             );
-            audit(
+            audit::audit(
                 &self.env,
                 &self.ctx,
                 req,
@@ -2272,7 +341,7 @@ impl Broker {
             match self.prepare_spawn(req) {
                 Ok(p) => p,
                 Err(r) => {
-                    audit(
+                    audit::audit(
                         &self.env,
                         &self.ctx,
                         req,
@@ -2294,7 +363,7 @@ impl Broker {
                     } else {
                         "invalid"
                     };
-                    audit(
+                    audit::audit(
                         &self.env,
                         &self.ctx,
                         req,
@@ -2308,14 +377,14 @@ impl Broker {
                 }
             }
         } else {
-            match prepare(&self.env, &self.ctx, req) {
+            match prepare::prepare(&self.env, &self.ctx, req) {
                 Ok(p) => p,
                 Err(e) => return invalid(e),
             }
         };
         // A tool has its own mode; `[host] tool` only turns every tool off.
         let mode = match req.cap.as_str() {
-            "tool" => arg_str(req, "name")
+            "tool" => describe::arg_str(req, "name")
                 .and_then(|n| self.policy.tools.get(n))
                 .map_or(Mode::Deny, |t| t.mode),
             _ => mode,
@@ -2422,46 +491,28 @@ impl Broker {
                 Status::Denied,
                 denied_message("the user denied the request", note.as_deref()),
             ),
-            _ if matches!(prep.work, Work::Spawn { .. } | Work::SpawnControl) => {
+            _ if matches!(
+                prep.work,
+                prepare::Work::Spawn { .. } | prepare::Work::SpawnControl
+            ) =>
+            {
                 self.perform_spawn(req, &prep.work)
             }
             _ if matches!(
                 req.cap.as_str(),
                 "screenshot" | "clipboard-read" | "clipboard-write" | "open-url" | "notify"
-            ) || matches!(prep.work, Work::Forge(_)) =>
+            ) || matches!(prep.work, prepare::Work::Forge(_)) =>
             {
-                match self.run_elsewhere(req, &prep.work) {
-                    Ok(result) => Response::done(result),
-                    Err(e) => Response::new(Status::Failed, format!("{e:#}")),
-                }
+                self.respond_remote(req, &prep.work)
             }
-            _ if req.cap == "exec" || req.cap == "tool" => {
-                match self.execute(req, serde_json::Value::Null) {
-                    Ok(result) => Response::done(result),
-                    Err(e) => Response::new(Status::Failed, format!("{e:#}")),
-                }
-            }
+            _ if req.cap == "exec" || req.cap == "tool" => self.respond_exec(req),
             // The push runs in the executor too, from the plan of the card.
-            _ if matches!(prep.work, Work::Push(_)) => {
-                let Work::Push(plan) = &prep.work else {
-                    unreachable!()
-                };
-                match serde_json::to_value(plan.exec())
-                    .map_err(anyhow::Error::from)
-                    .and_then(|p| self.execute(req, p))
-                {
-                    Ok(result) => Response::done(result),
-                    Err(e) => Response::new(Status::Failed, format!("{e:#}")),
-                }
-            }
-            _ => match perform(&self.env, &self.ctx, req, &prep.work) {
-                Ok(result) => Response::done(result),
-                Err(e) => Response::new(Status::Failed, format!("{e:#}")),
-            },
+            _ if matches!(prep.work, prepare::Work::Push(_)) => self.respond_push(req, &prep.work),
+            _ => self.respond_local(req, &prep.work),
         };
         // Status and wait calls are reads of this sandbox's own children.
-        if matches!(prep.work, Work::SpawnControl)
-            && arg_str(req, "action").is_some_and(|a| a != "kill")
+        if matches!(prep.work, prepare::Work::SpawnControl)
+            && describe::arg_str(req, "action").is_some_and(|a| a != "kill")
         {
             return resp;
         }
@@ -2471,7 +522,7 @@ impl Broker {
                 matches!(req.cap.as_str(), "fetch" | "git-push").then_some(prep.detail.as_str())
             }
         };
-        audit(
+        audit::audit(
             &self.env,
             &self.ctx,
             req,
@@ -2497,6 +548,44 @@ impl Broker {
             );
         }
         resp
+    }
+
+    /// Screenshot, clipboard, open-url, notify and forge run in the executor.
+    fn respond_remote(&self, req: &Request, work: &prepare::Work) -> Response {
+        match self.run_elsewhere(req, work) {
+            Ok(result) => Response::done(result),
+            Err(e) => Response::new(Status::Failed, format!("{e:#}")),
+        }
+    }
+
+    /// `exec` and `tool` run in the executor, with no plan of their own.
+    fn respond_exec(&self, req: &Request) -> Response {
+        match self.execute(req, serde_json::Value::Null) {
+            Ok(result) => Response::done(result),
+            Err(e) => Response::new(Status::Failed, format!("{e:#}")),
+        }
+    }
+
+    /// The push runs in the executor, from the plan of the card.
+    fn respond_push(&self, req: &Request, work: &prepare::Work) -> Response {
+        let prepare::Work::Push(plan) = work else {
+            unreachable!()
+        };
+        match serde_json::to_value(plan.exec())
+            .map_err(anyhow::Error::from)
+            .and_then(|p| self.execute(req, p))
+        {
+            Ok(result) => Response::done(result),
+            Err(e) => Response::new(Status::Failed, format!("{e:#}")),
+        }
+    }
+
+    /// Fetch, borrow, return and the other work this process runs itself.
+    fn respond_local(&self, req: &Request, work: &prepare::Work) -> Response {
+        match prepare::perform(&self.env, &self.ctx, req, work) {
+            Ok(result) => Response::done(result),
+            Err(e) => Response::new(Status::Failed, format!("{e:#}")),
+        }
     }
 
     fn serve_conn(&self, conn: UnixStream) -> Result<()> {
@@ -2539,13 +628,6 @@ pub fn read_prompt(project: &Path, raw: &str) -> Result<Vec<u8>> {
         bail!("the prompt file {raw} is empty");
     }
     Ok(bytes)
-}
-
-pub(crate) fn new_request_id() -> String {
-    use sha2::{Digest, Sha256};
-    let seed = format!("{:?}-{}", Instant::now(), std::process::id());
-    let h = crate::manifest::hex(&Sha256::digest(seed.as_bytes()));
-    format!("r-{}-{}", state::now(), &h[..8])
 }
 
 /// Serve requests on `socket` until the process exits.
