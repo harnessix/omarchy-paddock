@@ -41,3 +41,9 @@ onboarding = "Its data-use box there is checked by default."
 [oneshot]
 args = ["--dangerously-skip-permissions", "--print", "Read the file {prompt_file} and do the task that it describes."]
 prompt = "file"
+
+# A detached run (paddock run --detach): agy's terminal UI with the task as
+# its first prompt. `agy --help`: -i (--prompt-interactive) runs an initial
+# prompt interactively and continues the session.
+[detach]
+args = ["-i", "Read the file {prompt_file} and do the task that it describes."]

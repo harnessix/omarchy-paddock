@@ -69,7 +69,7 @@ fn detach_args_name_the_prompt_file_once() {
         let n: usize = d.args.iter().map(|a| a.matches(PROMPT_FILE).count()).sum();
         assert_eq!(n, 1, "{name} must name the prompt file once");
     }
-    for h in ["claude", "codex", "grok"] {
+    for h in ["claude", "codex", "grok", "agy"] {
         assert!(with.iter().any(|w| w == h), "{h} has no [detach]");
     }
 }
