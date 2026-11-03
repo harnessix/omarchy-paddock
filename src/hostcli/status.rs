@@ -186,6 +186,9 @@ pub fn main(args: &[String]) -> i32 {
             if hook.is_some() && !spec.is_empty() {
                 println!("paddock:\n{}", spec.join("\n"));
             }
+            if hook.is_some() {
+                println!("{}", crate::loft::NOTES_LINE);
+            }
         }
         Some("prompt") => {
             if !urgent.is_empty() {

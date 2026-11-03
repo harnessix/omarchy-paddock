@@ -324,6 +324,10 @@ pub(crate) fn explain(env: &HostEnv, a: &RunArgs, json: bool) -> Result<()> {
             );
         }
     }
+    println!("\nprivate paths (the loft keeps them out of git):");
+    for l in paddock::loft::host::explain(env, &s.project) {
+        println!("{l}");
+    }
     let hooks = paddock::hooks::explain(s);
     if !hooks.is_empty() {
         println!("\nhooks in the sandbox copies (the host files stay as they are):");

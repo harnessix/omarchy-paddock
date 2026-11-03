@@ -76,6 +76,7 @@ pub(crate) fn setup(
     no_launchers: bool,
     plugin: bool,
     no_plugin: bool,
+    (loft, no_loft): (bool, bool),
     backend: Option<String>,
     apps: Vec<String>,
 ) -> Result<i32> {
@@ -105,6 +106,7 @@ pub(crate) fn setup(
         shims: flag(shims, no_shims),
         launchers: flag(launchers, no_launchers),
         plugin: flag(plugin, no_plugin),
+        loft: flag(loft, no_loft),
         backend,
         app_roots,
     };

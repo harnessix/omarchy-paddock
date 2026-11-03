@@ -31,6 +31,7 @@ pub mod keeper;
 pub mod keyring;
 pub mod kv;
 pub mod launchers;
+pub mod loft;
 pub mod logging;
 pub mod login;
 pub mod manifest;

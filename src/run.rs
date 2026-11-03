@@ -599,6 +599,7 @@ impl Drop for EndOfRun<'_> {
         if self.snapshot {
             crate::snapshot::after_end(self.env, &self.project, &self.id, self.quiet);
         }
+        crate::loft::end_of_run(self.env, &self.project, &self.id, &self.harness);
     }
 }
 
@@ -615,9 +616,7 @@ pub fn run(
     // Before launch, paddock notes the signal and stops. After launch it
     // forwards the signal and waits. A frozen sandbox is thawed first.
     // The old handlers come back when `run` returns.
-    if built.parent.is_none() && built.spawn.is_none() {
-        crate::speckit::git::notice(env, &built.home_key);
-    }
+    crate::loft::push::start_notice(env, &built);
     let forwarding = Forward::install();
     // Without Hyprland, any terminal counts as watched.
     let caller_terminal =

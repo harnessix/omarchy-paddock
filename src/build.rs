@@ -970,7 +970,7 @@ pub fn build_with(env: &HostEnv, opts: &Options, harness: Harness) -> Result<Bui
         "borrow folder",
     ));
 
-    // The shared folder of the pasture, and the Spec Kit store.
+    // The shared folder of the pasture, and the loft with the Spec Kit store.
     let kv_project = pending
         .wt
         .as_ref()
@@ -979,7 +979,7 @@ pub fn build_with(env: &HostEnv, opts: &Options, harness: Harness) -> Result<Bui
     if let Some(name) = &opts.pasture {
         crate::pasture::mounts::apply(env, &mut spec, &kv_project, name, opts.workbench)?;
     }
-    crate::speckit::mount(env, &mut spec, &kv_project)?;
+    crate::loft::mount(env, &mut spec, &kv_project)?;
     let bridge = match (&opts.pasture, &profile.oneshot, &opts.child) {
         (Some(_), Some(o), None) => Some(crate::pasture::bridge::Command::of(
             &harness.exe,

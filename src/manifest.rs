@@ -21,7 +21,7 @@ pub const PROJECT_FILE: &str = "paddock.toml";
 /// (gatewayd.rs), `[storage]` (storage/dedupe.rs), `[snapshot]`
 /// (snapshot.rs), `[profiles]` (shadow.rs), `[detach]` (detach.rs),
 /// `[compaction]` (compaction.rs), `[hooks]` (hooks.rs), `[speckit]`
-/// (speckit.rs). A project
+/// (speckit.rs), `[loft]` (loft.rs). A project
 /// `paddock.toml` with one of them is invalid.
 pub const USER_ONLY: &[&str] = &[
     "devices",
@@ -40,6 +40,7 @@ pub const USER_ONLY: &[&str] = &[
     "compaction",
     "hooks",
     "speckit",
+    "loft",
 ];
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]

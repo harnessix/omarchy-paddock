@@ -464,8 +464,8 @@ fn the_layout_follows_the_folder_the_config_and_the_store() {
     // The external store: per repository, in paddock's data folder.
     write_cfg(&env, "[speckit]\nstore = \"external\"\n");
     let store = store_dir(&env, &project);
-    assert!(store.starts_with(env.paddock_data().join("speckit")));
-    assert_eq!(store.file_name().unwrap().len(), 16);
+    assert!(store.starts_with(env.paddock_data().join("loft")));
+    assert_eq!(store.parent().unwrap().file_name().unwrap().len(), 16);
     // Not adopted yet: the files in the project still count.
     assert!(!Layout::resolve(&env, &project).unwrap().external);
     std::fs::create_dir_all(store.join(".specify")).unwrap();

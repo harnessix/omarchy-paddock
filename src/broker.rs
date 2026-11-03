@@ -46,7 +46,7 @@ pub use protocol::{Request, Response, Status};
 
 pub(crate) use capture::{Pipe, PIPE_GRACE};
 pub(crate) use describe::{safe_name, tool_args};
-pub(crate) use fetch::{check_fetch, inbox};
+pub(crate) use fetch::{check_fetch, inbox, inbox_for};
 pub(crate) use protocol::new_request_id;
 
 pub const PROTOCOL: u32 = 1;

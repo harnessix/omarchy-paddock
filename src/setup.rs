@@ -61,6 +61,8 @@ pub struct Opts {
     pub shims: Option<bool>,
     pub launchers: Option<bool>,
     pub plugin: Option<bool>,
+    /// `[loft] auto` (loft/host.rs).
+    pub loft: Option<bool>,
     pub backend: Option<String>,
     /// `[apps.NAME] roots` to write, from `--app NAME=DIR`.
     pub app_roots: Vec<(String, Vec<PathBuf>)>,
@@ -470,6 +472,7 @@ pub fn run(env: &HostEnv, o: &Opts, mut ask: Option<&mut dyn Ask>) -> Result<Out
     backend_step(env, o, &mut ask, &mut out)?;
     apps_step(env, o, &mut ask, &mut out)?;
     privacy_step(env)?;
+    crate::loft::host::setup_step(env, o.loft, &mut ask, &mut out)?;
     println!();
     if out.changes.is_empty() {
         println!("Nothing changed.");
@@ -546,6 +549,7 @@ mod tests {
             shims: Some(true),
             launchers: Some(true),
             plugin: Some(true),
+            loft: None,
             backend: Some("podman".into()),
             app_roots: vec![],
         };
@@ -562,9 +566,9 @@ mod tests {
         let none = run(&env, &Opts::default(), None).unwrap();
         assert!(none.changes.is_empty(), "{:?}", none.changes);
         // An interactive run asks only about the packages (missing: PATH is
-        // empty) and the backend, and changes nothing
+        // empty), the backend and the loft, and changes nothing
         // when the user presses Enter.
-        let mut s = Script(vec!["n".into(), String::new()]);
+        let mut s = Script(vec!["n".into(), String::new(), "n".into()]);
         let asked = run(&env, &Opts::default(), Some(&mut s)).unwrap();
         assert!(asked.changes.is_empty(), "{:?}", asked.changes);
         assert_eq!(snapshot(t.path()), before, "a second run changed files");
@@ -574,6 +578,7 @@ mod tests {
             shims: Some(false),
             launchers: Some(false),
             plugin: Some(false),
+            loft: None,
             backend: Some("auto".into()),
             app_roots: vec![],
         };
@@ -591,9 +596,15 @@ mod tests {
     fn interactive_answers_turn_steps_on() {
         let t = tempfile::tempdir().unwrap();
         let env = env_in(t.path());
-        // No sudo, shims yes, launchers no, backend docker. Omarchy is not on PATH,
+        // No sudo, shims yes, launchers no, backend docker, no loft. Omarchy is not on PATH,
         // so there is no plugin question.
-        let mut s = Script(vec!["n".into(), "y".into(), "n".into(), "docker".into()]);
+        let mut s = Script(vec![
+            "n".into(),
+            "y".into(),
+            "n".into(),
+            "docker".into(),
+            "n".into(),
+        ]);
         let r = run(&env, &Opts::default(), Some(&mut s)).unwrap();
         assert_eq!(r.changes.len(), 2, "{:?}", r.changes);
         assert!(shims::installed(&env));

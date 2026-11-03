@@ -10,10 +10,11 @@
 //! - `enabled` (default true): false turns all of this off.
 //! - `store` (default `"repo"`): where the Spec Kit files live. `repo` is
 //!   the Spec Kit default: `.specify/` and `specs/` in the project.
-//!   `external` keeps them in paddock's data folder, one folder per
-//!   repository (the same key as pastures), and mounts them into every
+//!   `external` keeps them in the loft (loft.rs), one per repository
+//!   (the same key as pastures), and mounts them into every
 //!   sandbox of the repository at `.specify/` and `specs/`, worktrees
-//!   included. They never become git files: paddock adds both paths to
+//!   included. Without the key, an active loft with its external store
+//!   holds them too. They never become git files: paddock adds both paths to
 //!   `info/exclude` of the repository, which git does not track.
 //!
 //! `paddock spec adopt` moves an in-repo `.specify/` and `specs/` into the
@@ -110,9 +111,7 @@ pub fn repo_of(dir: &Path) -> PathBuf {
 
 /// The external store of a repository.
 pub fn store_dir(env: &HostEnv, repo: &Path) -> PathBuf {
-    env.paddock_data()
-        .join("speckit")
-        .join(crate::kv::shard::project_hash(repo))
+    crate::loft::speckit_tree(env, repo)
 }
 
 /// A real folder, not a symlink.
@@ -142,7 +141,7 @@ impl Layout {
         if !cfg.enabled {
             return None;
         }
-        if cfg.store == Store::External {
+        if crate::loft::speckit_external(env, cfg, project) {
             let store = store_dir(env, &repo_of(project));
             if is_dir(&store.join(SPECIFY)) {
                 return Some(Self {
@@ -283,7 +282,7 @@ pub fn exclude(project: &Path) -> Result<bool> {
 /// the repository key (the main work tree of a worktree).
 pub fn mount(env: &HostEnv, spec: &mut SandboxSpec, repo: &Path) -> Result<()> {
     let cfg = Cfg::load(env);
-    if !cfg.enabled || cfg.store != Store::External {
+    if !cfg.enabled || !crate::loft::speckit_external(env, &cfg, repo) {
         return Ok(());
     }
     let store = store_dir(env, &repo_of(repo));

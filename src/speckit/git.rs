@@ -45,11 +45,8 @@ pub fn needs_notice(env: &HostEnv, cfg: &Cfg, project: &Path) -> bool {
         && (tracked(project) == Some(true) || files(project, true) == Some(true))
 }
 
-pub fn notice(env: &HostEnv, project: &Path) {
-    if needs_notice(env, &Cfg::load(env), project) {
-        eprintln!("paddock: Spec Kit keeps your constitution, specs, plans and tasks in .specify/ and specs/ in this repository. A push publishes committed files there.\nSet [speckit] store = \"external\" and run `paddock spec adopt` to move them out.\nSet [speckit] store = \"repo\" to keep them here and silence this notice.");
-    }
-}
+/// The start notice of a Spec Kit project with the repo store (loft::push).
+pub const START_NOTICE: &str = "paddock: Spec Kit keeps your constitution, specs, plans and tasks in .specify/ and specs/ in this repository. A push publishes committed files there.\nSet [speckit] store = \"external\" (or turn on the loft, see `paddock loft init`) and run `paddock spec adopt` to move them out.\nSet [speckit] store = \"repo\" to keep them here and silence this notice.";
 
 /// The caller supplies `git log` and its revision range. Read every commit,
 /// including merge parents and root commits, without a display list limit.

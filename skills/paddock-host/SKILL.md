@@ -7,6 +7,10 @@ description: Use inside a paddock sandbox (PADDOCK=1) when a task needs the host
 
 You are in a paddock sandbox when the environment variable `PADDOCK` is `1`. The sandbox holds the project, your own home folder and package caches. The rest of the host is not there. Do not search for host files, and do not try to reach host services. For paddock on the host, use the `paddock` skill.
 
+## Your notes
+
+Keep your own design notes, plans and reviews in `.paddock/` of the project. It is private, not in git, and the same for every sandbox of the repository. Do not put them in `docs/` or the project root.
+
 ## Ask the host
 
 1. Run `paddock-host capabilities --json` once. It lists each capability and its mode: `allow`, `ask` or `deny`. Do not use a capability in `deny` mode.
