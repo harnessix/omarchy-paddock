@@ -192,18 +192,30 @@ Item {
     triggeredOnStart: true
     onTriggered: root.heartbeat()
   }
-  // Windows of app sandboxes get paddock's border, so you can tell a
-  // protected app at a glance. paddock sets it per window at run time.
+  // Protected windows get paddock's border, sage or amber by network
+  // level, so you can tell a protected window at a glance. paddock sets it
+  // per window at run time. The same answer feeds the corner badge.
   Timer {
     interval: 3000
     running: true
     repeat: true
     triggeredOnStart: true
-    onTriggered: if (!markProc.running) markProc.running = true
+    onTriggered: root.refreshWindows()
   }
-  Process {
-    id: markProc
-    command: ["sh", "-c", root.launcher, "paddock", "windows", "--mark"]
+  function refreshWindows() {
+    if (!windowsProc.running) { windowsProc.buffer = ""; windowsProc.running = true }
+  }
+  // A new window gets its border at once, not at the next tick.
+  Connections {
+    target: (Quickshell.env("HYPRLAND_INSTANCE_SIGNATURE") || "") !== "" ? Hyprland : null
+    function onRawEvent(event) {
+      if (event.name === "openwindow" || event.name === "closewindow") windowsSoon.restart()
+    }
+  }
+  Timer { id: windowsSoon; interval: 400; onTriggered: root.refreshWindows() }
+
+  Badge {
+    id: badge
   }
 
   Timer {
@@ -272,6 +284,39 @@ Item {
         root.lastWarning = ""
       } catch (e) {
         root.warnOnce("cannot read paddock approvals --json, keeping the old list: " + e)
+      }
+    }
+  }
+
+  JsonProc {
+    id: windowsProc
+    command: ["sh", "-c", root.launcher, "paddock", "windows", "--mark", "--json"]
+    onExited: function(exitCode) {
+      if (exitCode !== 0) { badge.windows = []; return }
+      try {
+        var p = JSON.parse(buffer)
+        if (!p || p.api_version !== "paddock.windows/v1" || !Array.isArray(p.windows)) throw "version"
+        badge.lightTheme = p.theme === "light"
+        var clean = []
+        for (var i = 0; i < p.windows.length && clean.length < 64; i++) {
+          var w = p.windows[i] || {}
+          var address = String(w.address || "")
+          if (!/^0x[0-9a-fA-F]{1,16}$/.test(address)) continue
+          var pair = function(v) { return Array.isArray(v) && v.length === 2 ? [Number(v[0]) || 0, Number(v[1]) || 0] : [0, 0] }
+          clean.push({
+            sandbox: root.plain(w.sandbox, 96),
+            address: address,
+            level: w.level === "proxy" ? "proxy" : "wide",
+            badge: root.plain(w.badge || "", 120),
+            focused: w.focused === true,
+            at: pair(w.at),
+            size: pair(w.size)
+          })
+        }
+        badge.windows = clean
+      } catch (e) {
+        root.debugLog("cannot read paddock windows --json: " + e)
+        badge.windows = []
       }
     }
   }

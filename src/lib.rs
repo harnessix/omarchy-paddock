@@ -63,6 +63,7 @@ pub mod timer;
 pub mod update;
 pub mod view;
 pub mod waiting;
+pub mod windows;
 pub mod wlsec;
 pub mod worktree;
 pub mod wrap;

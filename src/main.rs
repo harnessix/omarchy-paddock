@@ -78,12 +78,17 @@ enum Cmd {
         #[command(subcommand)]
         cmd: LaunchersCmd,
     },
-    /// List the host windows of app sandboxes; --mark gives them paddock's border (Hyprland).
+    /// List the protected windows: app sandbox windows, window mode displays
+    /// and the terminal windows of runs (Hyprland). --mark gives them
+    /// paddock's border, sage or amber by network level.
     Windows {
         #[arg(long)]
         json: bool,
         #[arg(long)]
         mark: bool,
+        /// Focus this protected window (an address from --json).
+        #[arg(long, value_name = "ADDRESS")]
+        focus: Option<String>,
     },
     /// Focus the terminal window, or the display window with --display, of a running sandbox (Hyprland).
     Focus {
@@ -2136,25 +2141,35 @@ fn real_main() -> Result<i32> {
             }
             Ok(0)
         }
-        Cmd::Windows { json, mark } => {
-            let found = app_windows(&env);
+        Cmd::Windows { json, mark, focus } => {
+            use paddock::windows;
+            let light = windows::current_theme_is_light(&env.home);
+            let (found, clients) = protected_windows(&env);
+            if let Some(address) = focus {
+                if !windows::valid_address(&address)
+                    || !found.iter().any(|p| p.client.address == address)
+                {
+                    bail!("{address} is not a protected window");
+                }
+                return Ok(if focus_address(&address) { 0 } else { 1 });
+            }
             if mark {
-                for (_, _, address) in &found {
-                    mark_window(address);
+                if let Some(clients) = &clients {
+                    mark_windows(&env, &found, clients, light);
                 }
             }
             if json {
-                let items: Vec<serde_json::Value> = found
-                    .iter()
-                    .map(|(id, harness, address)| serde_json::json!({ "sandbox": id, "app": harness, "address": address }))
-                    .collect();
-                println!(
-                    "{}",
-                    serde_json::json!({ "api_version": "paddock.windows/v1", "windows": items })
-                );
+                println!("{}", windows::to_json(&found, state::now(), light));
             } else if !mark {
-                for (id, harness, address) in &found {
-                    println!("{id:<28} {harness:<16} {address}");
+                for p in &found {
+                    println!(
+                        "{:<28} {:<9} {:<16} {:<10} {}",
+                        p.sandbox,
+                        p.kind.as_str(),
+                        p.harness,
+                        p.network,
+                        p.client.address
+                    );
                 }
             }
             Ok(0)
@@ -2212,39 +2227,7 @@ fn real_main() -> Result<i32> {
             let Some(address) = target else {
                 bail!("no window found for {id}; it may run without a terminal window")
             };
-            // Hyprland with a Lua configuration takes the hl.dsp form; older
-            // versions take the classic dispatcher. Try both, as Omarchy does.
-            let dispatch = |arg: &str| {
-                std::process::Command::new("hyprctl")
-                    .args(["dispatch", arg])
-                    .output()
-                    .map(|o| {
-                        o.status.success() && {
-                            let t = String::from_utf8_lossy(&o.stdout).to_lowercase();
-                            !t.contains("error") && !t.contains("not found")
-                        }
-                    })
-                    .unwrap_or(false)
-            };
-            let ok = dispatch(&format!(
-                "hl.dsp.focus({{ window = \"address:{address}\" }})"
-            )) || std::process::Command::new("hyprctl")
-                .args(["dispatch", "focuswindow", &format!("address:{address}")])
-                .output()
-                .map(|o| {
-                    o.status.success() && {
-                        let t = String::from_utf8_lossy(&o.stdout).to_lowercase();
-                        !t.contains("error") && !t.contains("not found")
-                    }
-                })
-                .unwrap_or(false);
-            if ok {
-                // Focus alone can leave a floating window under others: raise it.
-                let _ = dispatch(&format!(
-                    "hl.dsp.window.bring_to_top({{ window = \"address:{address}\" }})"
-                ));
-            }
-            Ok(if ok { 0 } else { 1 })
+            Ok(if focus_address(&address) { 0 } else { 1 })
         }
         Cmd::List { json: false } => {
             let f = HarnessFactory::new(&env)?;
@@ -4156,85 +4139,120 @@ fn app_cmd(env: &HostEnv, cmd: AppCmd) -> Result<i32> {
     }
 }
 
-/// Host windows that belong to app sandboxes: (sandbox id, app name, address).
-/// A window belongs to a sandbox when its process descends from the paddock
-/// process that runs the sandbox.
-fn app_windows(env: &HostEnv) -> Vec<(String, String, String)> {
-    let apps: Vec<Running> = Running::list(env)
-        .into_iter()
-        .filter(|r| r.gui == "app")
+/// The protected windows (windows.rs), and the Hyprland window list. The
+/// list is None without Hyprland.
+fn protected_windows(
+    env: &HostEnv,
+) -> (
+    Vec<paddock::windows::Protected>,
+    Option<Vec<paddock::windows::Client>>,
+) {
+    use paddock::windows;
+    let runs: Vec<windows::Run> = Running::list(env)
+        .iter()
+        .map(windows::Run::from_running)
         .collect();
-    if apps.is_empty() {
-        return vec![];
+    if runs.is_empty() {
+        // No run: read the windows only when --mark has borders to take off.
+        let marked = env.paddock_run().join("window-marks.json").exists();
+        return (vec![], marked.then(windows::hypr_clients).flatten());
     }
-    let Some(clients) = paddock::relay::hypr_clients() else {
-        return vec![];
+    let Some(clients) = windows::hypr_clients() else {
+        return (vec![], None);
     };
-    let mut found = Vec::new();
-    for c in &clients {
-        let mut p = c.pid;
-        let address = c.address.as_str();
-        'walk: for _ in 0..64 {
-            for r in &apps {
-                let host = if r.host_pid > 0 { r.host_pid } else { r.pid };
-                if p == host {
-                    found.push((r.id.clone(), r.harness.clone(), address.to_string()));
-                    break 'walk;
-                }
-            }
-            match state::parent_pid(p) {
-                Some(q) if q > 1 => p = q,
-                _ => break,
-            }
-        }
-    }
-    found
+    let ttys = runs.iter().filter_map(|r| r.tty).collect();
+    let holders = windows::pty_holders(&ttys);
+    let procs = windows::Procs {
+        parent: &state::parent_pid,
+        mnt_ns: &windows::mnt_ns,
+        holders: &holders,
+    };
+    let found = windows::find(&runs, &clients, &procs);
+    (found, Some(clients))
 }
 
-/// paddock's mark on a protected window: a sage border, set on that window
-/// only, at run time. Nothing in the Hyprland configuration changes, and the
-/// border goes away with the window.
-fn mark_window(address: &str) {
-    let lua = |prop: &str, value: &str| {
-        format!("hl.dsp.window.set_prop({{ window = \"address:{address}\", prop = \"{prop}\", value = \"{value}\" }})")
-    };
-    let run = |args: &[&str]| {
-        std::process::Command::new("hyprctl")
-            .args(args)
-            .output()
-            .map(|o| {
-                let t = String::from_utf8_lossy(&o.stdout).to_lowercase();
-                o.status.success() && !t.contains("error") && !t.contains("not found")
-            })
-            .unwrap_or(false)
-    };
-    let active = "rgb(9fb8a0) rgb(7fd29a) 45deg";
-    let inactive = "rgba(9fb8a088)";
-    let ok = run(&["dispatch", &lua("active_border_color", active)]);
-    if ok {
-        run(&["dispatch", &lua("inactive_border_color", inactive)]);
-    } else {
+/// `hyprctl ARGS`: true when Hyprland took the command.
+fn hyprctl(args: &[String]) -> bool {
+    std::process::Command::new("hyprctl")
+        .args(args)
+        .output()
+        .map(|o| {
+            let t = String::from_utf8_lossy(&o.stdout).to_lowercase();
+            o.status.success() && !t.contains("error") && !t.contains("not found")
+        })
+        .unwrap_or(false)
+}
+
+/// paddock's mark on protected windows: a border, sage or amber by network
+/// level, set on each window only, at run time. Nothing in the Hyprland
+/// configuration changes. A window that lost its run (a terminal after the
+/// run ends) gets its own border back.
+fn mark_windows(
+    env: &HostEnv,
+    found: &[paddock::windows::Protected],
+    clients: &[paddock::windows::Client],
+    light: bool,
+) {
+    use paddock::windows::{self, Level};
+    use std::collections::{BTreeMap, HashSet};
+    let file = env.paddock_run().join("window-marks.json");
+    let before: BTreeMap<String, Level> = std::fs::read_to_string(&file)
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or_default();
+    let existing: HashSet<String> = clients.iter().map(|c| c.address.clone()).collect();
+    let (marks, unmark) = windows::plan_marks(&before, found, &existing);
+    let apply = |address: &str, level: Option<Level>| {
+        let [lua, classic] = windows::border_commands(address, level, light);
+        if hyprctl(&lua[0]) {
+            hyprctl(&lua[1]);
+            return;
+        }
         // Hyprland before the Lua configuration. Debug only: the plugin runs
         // this every few seconds, so anything louder would fill the journal.
         log::debug!("window {address}: Lua set_prop failed, using setprop");
-        let ok = run(&[
-            "dispatch",
-            "setprop",
-            &format!("address:{address}"),
-            "activebordercolor",
-            active,
-        ]);
-        if !ok {
+        if !hyprctl(&classic[0]) {
             log::debug!("window {address}: setprop failed too, no border");
         }
-        run(&[
-            "dispatch",
-            "setprop",
-            &format!("address:{address}"),
-            "inactivebordercolor",
-            inactive,
+        hyprctl(&classic[1]);
+    };
+    for (address, level) in &marks {
+        apply(address, Some(*level));
+    }
+    for address in &unmark {
+        apply(address, None);
+    }
+    if marks != before {
+        if marks.is_empty() {
+            let _ = std::fs::remove_file(&file);
+        } else if let Ok(t) = serde_json::to_string(&marks) {
+            if let Err(e) = paddock::privfs::write(&file, t) {
+                log::debug!("cannot save the window marks: {e:#}");
+            }
+        }
+    }
+}
+
+/// Focus a window and raise it (Hyprland). Hyprland with a Lua
+/// configuration takes the hl.dsp form; older versions take the classic
+/// dispatcher. Try both, as Omarchy does.
+fn focus_address(address: &str) -> bool {
+    let ok = hyprctl(&[
+        "dispatch".into(),
+        format!("hl.dsp.focus({{ window = \"address:{address}\" }})"),
+    ]) || hyprctl(&[
+        "dispatch".into(),
+        "focuswindow".into(),
+        format!("address:{address}"),
+    ]);
+    if ok {
+        // Focus alone can leave a floating window under others: raise it.
+        let _ = hyprctl(&[
+            "dispatch".into(),
+            format!("hl.dsp.window.bring_to_top({{ window = \"address:{address}\" }})"),
         ]);
     }
+    ok
 }
 
 /// `paddock pick`: a project chooser for launcher entries, which start in a
