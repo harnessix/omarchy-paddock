@@ -8,6 +8,7 @@ pub mod borrow;
 pub mod boundary;
 pub mod broker;
 pub mod build;
+pub mod compaction;
 pub mod credentials;
 pub mod detach;
 pub mod detect;

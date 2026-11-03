@@ -20,6 +20,7 @@ use std::time::Duration;
 mod approval;
 mod audit;
 mod capture;
+mod compacted;
 mod describe;
 mod fetch;
 pub mod forge;
@@ -38,6 +39,7 @@ pub use approval::{
 };
 pub use audit::{audit_detail, audit_file, audit_line};
 pub use capture::{run_capture, run_capture_input};
+pub use compacted::RunFacts;
 pub use policy::{HostPolicy, Mode};
 pub use protocol::{Request, Response, Status};
 
@@ -130,6 +132,11 @@ pub struct Broker {
     pub channels: std::sync::OnceLock<Arc<crate::credentials::channels::Channels>>,
     /// A detached run (`paddock run --detach`): `paddock-host done` ends it.
     pub detach: Option<Arc<crate::detach::Ctl>>,
+    /// What the note after a context compaction says (compaction.rs).
+    pub run: compacted::RunFacts,
+    /// The kv service of this sandbox, for the compaction record. Set once
+    /// the store runs; it starts after the broker.
+    pub kv: std::sync::OnceLock<Arc<crate::kv::Service>>,
     grants: Mutex<Vec<String>>,
     /// "Deny for this session": the keys of the request and the user's note.
     denials: Mutex<Vec<(String, Option<String>)>>,
@@ -151,6 +158,8 @@ impl Broker {
             dispatch: None,
             channels: std::sync::OnceLock::new(),
             detach: None,
+            run: Default::default(),
+            kv: std::sync::OnceLock::new(),
             grants: Mutex::new(Vec::new()),
             denials: Mutex::new(Vec::new()),
         }
@@ -246,6 +255,11 @@ impl Broker {
         // this sandbox.
         if req.cap == "done" {
             return self.done(req);
+        }
+        // A harness hook after a context compaction: never asked, it only
+        // records the event and returns facts about this run.
+        if req.cap == "compacted" {
+            return self.compacted(req);
         }
         // The sandbox reads its own boundary log: a read, never asked.
         if req.cap == "boundary" {

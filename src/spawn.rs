@@ -1824,16 +1824,14 @@ fn run_child(env: &HostEnv, job: &Job, prompt: Vec<u8>, result: &mut ChildResult
         built.device_ceiling = Some(c.devices.clone());
         let home = built.spec.home_src.clone();
         let prompt_id = built.spec.id.clone();
-        match oneshot.prompt {
-            crate::profile::PromptVia::Stdin => built.stdin = Some(prompt.clone()),
-            crate::profile::PromptVia::File => {
-                write_prompt(&home, &prompt_id, &prompt, 0o600)?;
-            }
+        // The file also when the prompt comes on stdin: the note after a
+        // context compaction (compaction.rs) points the agent at it.
+        if oneshot.prompt == crate::profile::PromptVia::Stdin {
+            built.stdin = Some(prompt.clone());
         }
+        write_prompt(&home, &prompt_id, &prompt, 0o600)?;
         let out = crate::run::run(env, built, backend.as_ref(), true, true);
-        if oneshot.prompt == crate::profile::PromptVia::File {
-            remove_prompt(&home, &prompt_id);
-        }
+        remove_prompt(&home, &prompt_id);
         out
     })();
     if let Some(w) = &wt {

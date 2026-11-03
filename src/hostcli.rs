@@ -7,6 +7,8 @@ use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 
+pub mod compacted;
+pub(crate) mod credential;
 pub mod device;
 pub mod forage;
 mod git;
@@ -46,6 +48,7 @@ USAGE
   paddock-host wait ID [--timeout SECONDS]
   paddock-host kill ID
   paddock-host done [--status ok|failed] [TEXT]   (a detached run: the task ended)
+  paddock-host compacted --harness NAME         (the hook after a context compaction; paddock runs it)
   paddock-host kv COMMAND [ARG...]              (key-value store, see `paddock-host kv --help`)
   paddock-host timer COMMAND [ARG...]           (task timers, see `paddock-host timer --help`)
   paddock-host pasture share|unshare PORT       (ports for your pasture, see `paddock-host pasture --help`)
@@ -88,6 +91,13 @@ OTHER AGENTS
   `paddock-host spawn` starts another harness, for example codex, in its own
   sandbox with one task. It works on its own branch and returns its results
   to .paddock/inbox/. Run `paddock-host help spawn` for the rules and limits.
+
+AFTER A CONTEXT COMPACTION
+  paddock puts a hook into your harness. After a compaction, it adds a short
+  note with the facts of this run: sandbox, role, parent, pasture and task
+  file. A child's compaction appears as `compacted:<SPAWN-ID>` in the tree
+  scope: `paddock-host kv watch --prefix compacted: --scope tree`. Run
+  `paddock-host help compacted`.
 
 STATE AND DEVICES
   `paddock-host kv` keeps state on the host: for this sandbox, for every
@@ -312,6 +322,7 @@ paddock then ends the run, unless the user is attached to it with write
 access: then the user gets a notice and the run stays open until they close
 the view. In a run that is not detached, done fails with exit code 4."#
         }
+        "compacted" | "compaction" => compacted::HELP,
         "spawn" | "status" | "wait" | "kill" => {
             r#"paddock-host spawn: start another harness in its own sandbox with one task.
 
@@ -492,8 +503,9 @@ pub fn main(args: &[String]) -> i32 {
         "pasture" => return pasture::main(rest),
         "forage" => return forage::main(rest),
         "status" => return status::main(rest),
+        "compacted" => return compacted::main(rest),
         "device" => return device::main(rest),
-        "credential" => return credential_main(rest),
+        "credential" => return credential::main(rest),
         "tea" | "glab" => return git::forge_main(cmd, rest),
         "forge"
             if rest
@@ -796,80 +808,6 @@ pub fn main(args: &[String]) -> i32 {
         return wait_exit_code(&resp.result);
     }
     resp.status.exit_code()
-}
-
-const CREDENTIAL_HELP: &str = "paddock-host credential: the docker and aws credential channels.
-
-USAGE
-  paddock-host credential docker get      (docker credential helper protocol)
-  paddock-host credential aws NAME        (AWS credential_process output)
-
-paddock sets these up itself when the user registered a docker or aws
-credential: DOCKER_CONFIG names the helper docker-credential-paddock, and
-AWS_CONFIG_FILE has a profile with this credential_process. You do not
-need to call them by hand. The first use in a run asks the user.";
-
-/// `credential docker ACTION` and `credential aws NAME`: the client side
-/// of credentials/channels.rs. It prints only what docker or aws reads.
-pub(crate) fn credential_main(args: &[String]) -> i32 {
-    use std::io::Read as _;
-    let words: Vec<&str> = args.iter().map(String::as_str).collect();
-    let (kind, extra) = match words.as_slice() {
-        ["docker", "get"] => {
-            let mut server = String::new();
-            if std::io::stdin()
-                .take(4096)
-                .read_to_string(&mut server)
-                .is_err()
-            {
-                println!("paddock: cannot read the server address");
-                return 1;
-            }
-            ("docker", ("server", server.trim().to_string()))
-        }
-        ["docker", "store" | "erase" | "list"] => {
-            // docker reads the error from stdout.
-            println!("paddock keeps the docker logins on the host: docker login, logout and a list of logins do not work in the sandbox");
-            return 1;
-        }
-        ["aws", name] => ("aws", ("name", name.to_string())),
-        ["-h" | "--help"] | [] => {
-            println!("{CREDENTIAL_HELP}");
-            return if args.is_empty() { EXIT_USAGE } else { 0 };
-        }
-        _ => return usage("credential needs docker get|store|erase|list or aws NAME"),
-    };
-    let mut a = BTreeMap::new();
-    a.insert("kind".to_string(), serde_json::json!(kind));
-    a.insert(extra.0.to_string(), serde_json::json!(extra.1));
-    let req = Request {
-        v: PROTOCOL,
-        cap: crate::credentials::channels::CAPABILITY.into(),
-        args: a,
-        reason: String::new(),
-    };
-    match send(&req) {
-        Ok(r) if r.status == Status::Done => {
-            println!("{}", r.result);
-            0
-        }
-        Ok(r) if kind == "docker" => {
-            println!("{}", r.message);
-            1
-        }
-        Ok(r) => {
-            eprintln!("paddock-host: credential {kind}: {}", r.message);
-            1
-        }
-        Err(e) if kind == "docker" => {
-            println!("{e}");
-            1
-        }
-        Err(e) => {
-            eprintln!("paddock-host: {e}");
-            EXIT_NO_HOST
-        }
-    }
 }
 
 /// 0 when the child ended with exit code 0, else 1.
