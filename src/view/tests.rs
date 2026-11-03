@@ -26,7 +26,7 @@ fn env_in(t: &Path, extra: &[(&str, &str)]) -> HostEnv {
 
 /// The tmux server of a test: a private socket in its folder, killed at
 /// the end.
-struct Server(Option<Tmux>);
+pub(crate) struct Server(pub(crate) Option<Tmux>);
 impl Drop for Server {
     fn drop(&mut self) {
         if let Some(t) = &self.0 {
