@@ -5,7 +5,7 @@ use std::process::{Command, Stdio};
 use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
 
-fn env_in(t: &Path) -> HostEnv {
+pub(super) fn env_in(t: &Path) -> HostEnv {
     let run = t.join("run");
     crate::privfs::dir(&run).unwrap();
     let mut vars = BTreeMap::new();
@@ -24,7 +24,7 @@ fn env_in(t: &Path) -> HostEnv {
 }
 
 /// The private tmux server of a test, killed at the end.
-struct Server(Tmux);
+pub(super) struct Server(pub(super) Tmux);
 impl Drop for Server {
     fn drop(&mut self) {
         let _ = Command::new(&self.0.exe)
@@ -48,7 +48,7 @@ fn wait_for(what: &str, mut f: impl FnMut() -> bool) {
     }
 }
 
-fn record(env: &HostEnv, id: &str) {
+pub(super) fn record(env: &HostEnv, id: &str) {
     Record {
         id: id.into(),
         harness: "fake".into(),
@@ -60,7 +60,7 @@ fn record(env: &HostEnv, id: &str) {
     .unwrap();
 }
 
-fn ctl(env: &HostEnv, id: &str) -> (Arc<Ctl>, Arc<AtomicUsize>) {
+pub(super) fn ctl(env: &HostEnv, id: &str) -> (Arc<Ctl>, Arc<AtomicUsize>) {
     let stops = Arc::new(AtomicUsize::new(0));
     let s = stops.clone();
     let c = Ctl::with_stop(
@@ -499,7 +499,7 @@ fn idle_durations_parse_and_the_end_text_names_the_quiet_time() {
     assert!("ok".parse::<Status>().is_ok());
 }
 
-fn write_idle_cfg(env: &HostEnv, after: &str, timeout: &str) {
+pub(super) fn write_idle_cfg(env: &HostEnv, after: &str, timeout: &str) {
     let dir = env.paddock_config();
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(
@@ -509,7 +509,7 @@ fn write_idle_cfg(env: &HostEnv, after: &str, timeout: &str) {
     .unwrap();
 }
 
-fn until(what: &str, limit: Duration, mut f: impl FnMut() -> bool) {
+pub(super) fn until(what: &str, limit: Duration, mut f: impl FnMut() -> bool) {
     let start = Instant::now();
     while !f() {
         assert!(start.elapsed() < limit, "timed out: {what}");
@@ -517,7 +517,7 @@ fn until(what: &str, limit: Duration, mut f: impl FnMut() -> bool) {
     }
 }
 
-fn quiet_session(tmux: &Tmux, id: &str, script: &str) {
+pub(super) fn quiet_session(tmux: &Tmux, id: &str, script: &str) {
     tmux.new_session(id, &["sh".into(), "-c".into(), script.into()])
         .unwrap();
 }
@@ -538,7 +538,7 @@ fn a_quiet_pane_goes_idle_then_the_timeout_stops_it() {
     quiet_session(&tmux, id, "echo once; exec sleep 60");
     record(&env, id);
     let (c, stops) = ctl(&env, id);
-    c.watch();
+    c.watch(Vec::new());
     until("idle_since", Duration::from_secs(15), || {
         idle_since(&env, id).is_some()
     });
@@ -548,7 +548,10 @@ fn a_quiet_pane_goes_idle_then_the_timeout_stops_it() {
     });
     let done = Record::load(&env, id).unwrap().done.unwrap();
     assert_eq!(done.status, Status::Idle);
-    assert_eq!(done.text, "ended after 5 seconds without output");
+    assert_eq!(
+        done.text,
+        "ended after 5 seconds without output\nlast screen:\nonce"
+    );
 }
 
 #[test]
@@ -573,7 +576,7 @@ fn output_clears_idle_before_the_timeout() {
     );
     record(&env, id);
     let (c, stops) = ctl(&env, id);
-    c.watch();
+    c.watch(Vec::new());
     until("idle_since", Duration::from_secs(15), || {
         idle_since(&env, id).is_some()
     });
@@ -608,7 +611,7 @@ fn a_write_client_is_told_and_the_run_stops_when_it_leaves() {
         .unwrap();
     wait_for("the write client", || tmux.write_clients(id) == 1);
     let (c, stops) = ctl(&env, id);
-    c.watch();
+    c.watch(Vec::new());
     until("the idle notice", Duration::from_secs(20), || {
         let out = Command::new(&server.0.exe)
             .arg("-S")
@@ -632,7 +635,9 @@ fn a_write_client_is_told_and_the_run_stops_when_it_leaves() {
     );
     let done = Record::load(&env, id).unwrap().done.unwrap();
     assert_eq!(done.status, Status::Idle);
-    assert_eq!(done.text, "ended after 5 seconds without output");
+    assert!(done
+        .text
+        .starts_with("ended after 5 seconds without output"));
 }
 
 #[test]
@@ -649,7 +654,7 @@ fn a_zero_idle_timeout_never_stops_the_run() {
     quiet_session(&tmux, id, "echo once; exec sleep 60");
     record(&env, id);
     let (c, stops) = ctl(&env, id);
-    c.watch();
+    c.watch(Vec::new());
     until("idle_since", Duration::from_secs(15), || {
         idle_since(&env, id).is_some()
     });

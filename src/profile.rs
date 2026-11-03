@@ -46,6 +46,9 @@ pub struct Profile {
     /// Where the harness reads hooks: paddock carries the user's hook
     /// entries there and checks their programs (hooks.rs).
     pub hooks: Option<crate::hooks::Files>,
+    /// Start screens that paddock answers when nobody watches (screens.rs).
+    #[serde(default)]
+    pub screens: crate::screens::Screens,
 }
 
 /// `[detach]`: the arguments that give the interactive interface its first
