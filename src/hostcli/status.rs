@@ -181,6 +181,11 @@ pub fn main(args: &[String]) -> i32 {
             if !all.is_empty() {
                 println!("{}", text(&all, hook.is_some()));
             }
+            // A run in a Spec Kit project hears its feature and its task.
+            let spec = super::spec::note_lines();
+            if hook.is_some() && !spec.is_empty() {
+                println!("paddock:\n{}", spec.join("\n"));
+            }
         }
         Some("prompt") => {
             if !urgent.is_empty() {

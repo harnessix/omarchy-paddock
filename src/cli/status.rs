@@ -45,6 +45,11 @@ pub(crate) fn ps(env: &HostEnv, json: bool) -> Result<i32> {
                         },
                     );
                 }
+                if let (Some(o), Some(t)) = (v.as_object_mut(), spec_task(env, &r.id)) {
+                    o.insert("spec_task".into(), t.id.into());
+                    o.insert("spec_feature".into(), t.feature.into());
+                    o.insert("spec_state".into(), t.state.name().into());
+                }
                 if let (Some(o), true) = (v.as_object_mut(), paddock::shadow::is_shadow(env, &r.id))
                 {
                     o.insert("profile".into(), paddock::shadow::DEFAULT.into());
@@ -123,8 +128,11 @@ pub(crate) fn ps(env: &HostEnv, json: bool) -> Result<i32> {
                 .as_deref()
                 .map(|p| format!("  pasture {p}"))
                 .unwrap_or_default();
+            let task = spec_task(env, &r.id)
+                .map(|t| format!("  task {}", t.id))
+                .unwrap_or_default();
             println!(
-                "{:<28} {:<8} {:<7} {:<7} {:>5}m  {}{pasture}{frozen}",
+                "{:<28} {:<8} {:<7} {:<7} {:>5}m  {}{pasture}{task}{frozen}",
                 id,
                 r.harness,
                 r.backend,
@@ -158,7 +166,28 @@ pub(crate) fn wait(env: &HostEnv, id: String, timeout: Option<String>) -> Result
         )),
         None => None,
     };
-    paddock::detach::wait(env, &id, t)
+    // The tree is known only while the sandbox runs.
+    let root = paddock::speckit::tree_root_of(env, &id);
+    if let Some(t) = root
+        .as_deref()
+        .and_then(|r| paddock::speckit::record_of(env, r, &id))
+    {
+        eprintln!("paddock: {id} works on task {} of {}", t.id, t.feature);
+    }
+    let code = paddock::detach::wait(env, &id, t)?;
+    if let Some(t) = root
+        .as_deref()
+        .and_then(|r| paddock::speckit::record_of(env, r, &id))
+    {
+        println!("task {} of {}: {}", t.id, t.feature, t.state.name());
+    }
+    Ok(code)
+}
+
+/// The Spec Kit task that a running sandbox holds.
+fn spec_task(env: &HostEnv, id: &str) -> Option<paddock::speckit::board::Record> {
+    let root = paddock::speckit::tree_root_of(env, id)?;
+    paddock::speckit::record_of(env, &root, id).filter(|t| t.state.held())
 }
 
 pub(crate) fn view(env: &HostEnv, id: String, write: bool) -> Result<i32> {

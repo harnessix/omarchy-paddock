@@ -48,6 +48,12 @@ impl Broker {
             detached: self.detach.is_some(),
             note: cfg.note.clone(),
             count,
+            spec: crate::speckit::flow::facts(
+                &self.env,
+                &self.ctx.project,
+                &self.tree_root(),
+                &self.ctx.id,
+            ),
         };
         let recorded = self.record_in_kv(&facts);
         log::info!(

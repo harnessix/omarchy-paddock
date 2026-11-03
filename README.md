@@ -1261,6 +1261,34 @@ enabled = true
 
 `paddock gc` removes the file of each run (its `self` scope and its own pasture), and the `tree` scope of spawn trees whose root ended, more than `keep_days` ago, and keys whose time to live passed. A named pasture keeps its data until you delete it. The audit log `~/.local/state/paddock/kv-audit.jsonl` records each write with its key name and size. It never records a value.
 
+## Spec Kit projects
+
+A project with a `.specify/` folder ([GitHub Spec Kit](https://github.com/github/spec-kit)) is a Spec Kit project. paddock sees the folder and organizes spawn, kv, the hooks and the watch around the active feature (`feature_directory` in `.specify/feature.json`, or else the last folder in `specs/` with a `tasks.md`). You set nothing. To turn it off, set `enabled = false` in `[speckit]` of `~/.config/paddock/config.toml`. A project `paddock.toml` cannot turn it on or off.
+
+paddock is the only writer of `tasks.md`. Workers do not edit it. paddock keeps one record per task in the `tree` scope of paddock kv (`spec/<feature>/task/<id>`): the state (todo, claimed, running, review, done, failed), the sandbox that holds it, its branch, its time limit, the result and the review. It writes the checkboxes of `tasks.md` from these records, and a short note such as the branch at the end of a task line. Nothing else in the file changes. When you edit `tasks.md` yourself, your edit wins: paddock reads the file again before each write, adds new tasks, and keeps the records of removed tasks.
+
+| Command | What it does |
+| :--- | :--- |
+| `paddock-host spawn codex --task T012` | starts a worker for one task. paddock claims the task with a lease, so two workers never take one task, and the task of a dead worker is free again |
+| `paddock-host spawn codex --task next` | the same for the next ready task. Run it once for each task of a ready `[P]` group. They run side by side, up to `[spawn] max_running` |
+| `paddock-host spec status` | the feature, each task with state, owner and branch, what is ready, and what waits for review |
+| `paddock-host spec review T012 pass` | marks a task done after you merged its branch. `changes "TEXT"` sends it back, and TEXT goes to the next worker |
+| `paddock spec status` | the same status on the host, for the current folder |
+| `paddock spec adopt` | moves `.specify/` and `specs/` of a repository into the external store (see below) |
+
+A task is ready when all tasks of the earlier phases are done, all tasks before it in its phase are done (a run of `[P]` tasks can run together), and all tasks that its text names after "depends on" are done. The prompt of a worker has the task line, its acceptance text (the goal lines of the phase and the acceptance scenarios of its user story), and the paths of the constitution, `spec.md`, `plan.md` and the contracts. The worker ends with `paddock-host done "SUMMARY"`, and the task waits for your review. Watch the tasks with `paddock-host kv watch --scope tree --prefix spec/<feature>/task/`. `paddock ps` and `paddock wait` show the task of a worker. The session note (Claude Code) and the note after a context compaction name the feature, the task of the run, its acceptance text and the spec paths.
+
+### The external spec store
+
+Spec Kit keeps `.specify/` and `specs/` in the repository. To keep them out of the repository, set:
+
+```toml
+[speckit]
+store = "external"   # default: "repo", where Spec Kit puts them
+```
+
+Then run `paddock spec adopt` once in the repository. It asks, then moves both folders to `~/.local/share/paddock/speckit/<repository key>/`. Every sandbox of the repository sees them at `.specify/` and `specs/`, also each `--worktree` sandbox and each worker, with the same content. paddock adds both paths to `.git/info/exclude`, which git does not track, so `git status` does not show them. If the files were committed, adopt tells you how to remove them from the index, and how to remove them from the history. It does not change the history itself.
+
 ## Timers
 
 An agent loses its sense of time with its context. After a compaction, or when another agent takes over, it no longer knows how long it has worked on a bug or when the task must end. A paddock timer lives on the host, in paddock kv, so it outlasts every context, and the agent that it times cannot change it.

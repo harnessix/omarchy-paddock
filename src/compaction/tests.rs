@@ -35,6 +35,7 @@ fn the_note_names_role_parent_task_file_and_done() {
         detached: true,
         note: "Keep the ticket rules.".into(),
         count: 2,
+        spec: None,
     };
     let n = note(&f);
     assert!(n.contains("compaction 2"), "{n}");
@@ -512,4 +513,41 @@ fn a_pasture_member_records_its_compaction_in_the_pasture() {
     assert_eq!(r.result["kv"]["scope"], "pasture", "{:?}", r);
     assert_eq!(r.result["role"], serde_json::Value::Null);
     assert_eq!(pasture_sees(&svc).unwrap()["count"], 1);
+}
+
+#[test]
+fn the_note_names_the_spec_kit_task_of_a_worker() {
+    let f = Facts {
+        sandbox: "codex-spawn-abc".into(),
+        harness: "codex".into(),
+        role: Some("implementer".into()),
+        count: 1,
+        spec: Some(crate::speckit::prompt::Facts {
+            feature: "001-albums".into(),
+            task: Some("T012 Create Album model in src/models/album.py".into()),
+            acceptance:
+                "Independent Test: drag a photo\n1. Given an album, When I drop, Then it moves"
+                    .into(),
+            paths: vec![
+                "specs/001-albums/spec.md".into(),
+                "specs/001-albums/plan.md".into(),
+            ],
+            summary: None,
+        }),
+        ..Default::default()
+    };
+    let n = note(&f);
+    assert!(n.contains("Spec Kit feature: 001-albums"), "{n}");
+    assert!(n.contains("your task: T012 Create Album model"), "{n}");
+    assert!(
+        n.contains("acceptance: Independent Test: drag a photo / 1. Given"),
+        "{n}"
+    );
+    assert!(
+        n.contains("spec files: specs/001-albums/spec.md, specs/001-albums/plan.md"),
+        "{n}"
+    );
+    // The facts travel as JSON from the broker to the hook.
+    let back: Facts = serde_json::from_value(serde_json::to_value(&f).unwrap()).unwrap();
+    assert_eq!(back, f);
 }

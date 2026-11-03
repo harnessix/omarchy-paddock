@@ -30,6 +30,7 @@ mod policy;
 mod prepare;
 mod protocol;
 mod spawn;
+mod spec;
 
 pub use approval::{
     answer, answer_reply, answer_with_note, approval_note, approval_ui_active, approval_ui_file,
@@ -226,6 +227,10 @@ impl Broker {
             return Response::new(Status::Invalid, "unsupported protocol version");
         }
         let Some(ctl) = &self.detach else {
+            // A worker of a Spec Kit task reports into its task record.
+            if let Some(r) = self.report_task(req) {
+                return r;
+            }
             return Response::new(
                 Status::Disabled,
                 "this sandbox is not a detached run (paddock run --detach), so there is nothing to end: finish your answer, and the user ends the run",
@@ -260,6 +265,10 @@ impl Broker {
         // records the event and returns facts about this run.
         if req.cap == "compacted" {
             return self.compacted(req);
+        }
+        // Spec Kit tasks: a read, or a review of this sandbox's own workers.
+        if req.cap == "spec" {
+            return self.spec(req);
         }
         // The sandbox reads its own boundary log: a read, never asked.
         if req.cap == "boundary" {

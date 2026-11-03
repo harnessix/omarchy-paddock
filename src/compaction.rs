@@ -155,6 +155,10 @@ pub struct Facts {
     /// Compactions of this run so far, this one included.
     #[serde(default)]
     pub count: u64,
+    /// In a Spec Kit project: the feature, the task of this run, its
+    /// acceptance text and the spec paths (speckit.rs).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spec: Option<crate::speckit::prompt::Facts>,
 }
 
 /// The note: plain facts, one per line.
@@ -182,6 +186,9 @@ pub fn note(f: &Facts) -> String {
     match &f.task_file {
         Some(t) => l.push(format!("- task file: {t}. Read it again.")),
         None => l.push("- task file: none".into()),
+    }
+    if let Some(s) = &f.spec {
+        l.extend(crate::speckit::prompt::lines(s));
     }
     if f.detached {
         l.push("- this is a detached run: it ends with `paddock-host done` when the task is finished or cannot be finished".into());

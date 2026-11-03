@@ -50,6 +50,8 @@ pub(in crate::broker) enum Work {
         harness: String,
         prompt: Vec<u8>,
         opts: crate::spawn::StartOpts,
+        /// `--task`: the feature and the task that the worker claims.
+        task: Option<(crate::speckit::flow::Spot, String)>,
     },
     /// status, wait, kill or list of this sandbox's own children.
     SpawnControl,

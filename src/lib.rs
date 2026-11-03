@@ -57,6 +57,7 @@ pub mod shims;
 pub mod snapshot;
 pub mod spawn;
 pub mod spec;
+pub mod speckit;
 pub mod state;
 pub mod storage;
 #[cfg(test)]

@@ -73,6 +73,7 @@ fn real_main() -> Result<i32> {
         Cmd::SpawnChild { job } => cli::run::spawn_child(&env, job),
         Cmd::Approvals { json, cmd } => cli::approver::approvals(&env, json, cmd),
         Cmd::Worktree { cmd } => cli::worktree::run(&env, cmd),
+        Cmd::Spec { cmd } => cli::spec::run(&env, cmd),
         Cmd::Log { json, lines } => cli::approver::log(&env, json, lines),
         Cmd::Approver { cmd } => cli::approver::run(&env, cmd),
         Cmd::App { cmd } => cli::app::run(&env, cmd),

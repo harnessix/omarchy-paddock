@@ -20,7 +20,7 @@ pub const PROJECT_FILE: &str = "paddock.toml";
 /// (pasture.rs), `[credentials]` (credentials.rs) and `[exec]`
 /// (gatewayd.rs), `[storage]` (storage/dedupe.rs), `[snapshot]`
 /// (snapshot.rs), `[profiles]` (shadow.rs), `[detach]` (detach.rs),
-/// `[compaction]` (compaction.rs). A project
+/// `[compaction]` (compaction.rs), `[speckit]` (speckit.rs). A project
 /// `paddock.toml` with one of them is invalid.
 pub const USER_ONLY: &[&str] = &[
     "devices",
@@ -37,6 +37,7 @@ pub const USER_ONLY: &[&str] = &[
     "profiles",
     "detach",
     "compaction",
+    "speckit",
 ];
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
