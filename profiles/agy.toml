@@ -4,6 +4,11 @@ description = "Google Antigravity CLI"
 # Tested inside paddock: a login, full one-shot runs, the seeded settings and
 # MCP tool cache, and the onboarding flags.
 
+# Entries that come from documentation, not from a test. paddock doctor lists them.
+unverified = [
+  "compaction: a CHECKPOINT step in transcript.jsonl marks a compaction, and only a compaction",
+]
+
 [locate]
 mise = "agy"
 commands = ["agy", "antigravity"]
@@ -39,6 +44,17 @@ endpoints = ["generativelanguage.googleapis.com", "oauth2.googleapis.com", "clou
 setting = "type /settings in agy and turn off Enable Telemetry"
 url = "https://antigravity.google/docs/settings"
 onboarding = "Its data-use box there is checked by default."
+
+# agy has no compaction hook. A compaction adds a CHECKPOINT step to the
+# transcript (transcriptPath in the hook input). The PreInvocation hook runs
+# before each model call, counts these steps, and puts the note in with
+# injectSteps[].ephemeralMessage. agy loads ~/.gemini/config/hooks.json
+# without a trust step, and paddock owns the "paddock-compaction" entry in
+# it. https://antigravity.google/docs/hooks
+[[compaction.settings]]
+file = ".gemini/config/hooks.json"
+path = ["paddock-compaction"]
+value = { PreInvocation = [{ type = "command", command = "paddock-host compacted --harness agy", timeout = 20 }] }
 
 # One task without a terminal, for `paddock-host spawn`. `agy --help`:
 # --print runs one prompt and prints the response; the prompt is the value

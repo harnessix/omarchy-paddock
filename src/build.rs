@@ -1138,6 +1138,7 @@ mod tests {
         let proj = tmp.path().join("proj");
         std::fs::create_dir_all(home.join(".config/paddock")).unwrap();
         std::fs::create_dir_all(&proj).unwrap();
+        let user = format!("{user}\n[compaction]\nenabled = false\n");
         std::fs::write(home.join(".config/paddock/config.toml"), user).unwrap();
         std::fs::write(proj.join("paddock.toml"), project).unwrap();
         let mut vars = std::collections::BTreeMap::new();
@@ -1288,7 +1289,6 @@ mod tests {
         assert!(!b.spec.mounts.iter().any(|m| m.dst == Path::new("/pasture")));
         assert!(!b.spec.env.contains_key("PADDOCK_PASTURE"));
         drop(t);
-
         let tmp = tempfile::tempdir().unwrap();
         let home = tmp.path().join("home");
         let proj = tmp.path().join("proj");
