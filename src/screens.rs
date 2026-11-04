@@ -260,6 +260,15 @@ pub enum Found {
 }
 
 pub fn find(rules: &[Rule], rows: &[String]) -> Found {
+    // A real screen has empty rows between the parts of a dialog (Codex
+    // puts one after the text and one before the key help). Rules name the
+    // rows with text only.
+    let rows: Vec<String> = rows
+        .iter()
+        .filter(|r| !r.trim().is_empty())
+        .cloned()
+        .collect();
+    let rows = rows.as_slice();
     let mut hit = None;
     for (i, r) in rules.iter().enumerate() {
         match find_pattern(rows, &r.rows) {

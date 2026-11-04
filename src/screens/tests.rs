@@ -113,6 +113,21 @@ fn the_codex_hooks_screen_matches_with_its_count() {
     );
 }
 
+/// The Codex 0.166.0 screen as a real terminal shows it: empty rows between
+/// the parts.
+const CODEX_HOOKS_REAL: &str = "  Hooks need review\n  1 hook is new or changed.\n  Hooks can run outside the sandbox after you trust them.\n\n\u{203a} 1. Review hooks\n  2. Trust all and continue\n  3. Continue without trusting (hooks won't run)\n\n  enter confirm \u{b7} esc skip\n";
+
+#[test]
+fn the_codex_hooks_screen_matches_with_empty_rows_between_its_parts() {
+    let rules = valid("codex", &codex().screens.rule);
+    let found = find(&rules, &rows(CODEX_HOOKS_REAL));
+    let Found::Rule(i, n) = found else {
+        panic!("{found:?}")
+    };
+    assert_eq!(rules[i].id, "codex-hooks-review");
+    assert_eq!(n, Some(1));
+}
+
 #[test]
 fn a_changed_screen_does_not_match() {
     let rules = valid("codex", &codex().screens.rule);
