@@ -1,0 +1,163 @@
+name = "codex"
+description = "OpenAI Codex CLI"
+
+# Entries that come from documentation, not from a test. paddock doctor lists them.
+unverified = [
+  "state.auth .codex/.credentials.json: the file store for MCP OAuth tokens",
+  "compaction: the trusted hash of paddock's hook, from the source of codex 0.166.0",
+  "state.settings features.unified_exec_tty: shell commands without a pty on macOS, from the source of codex 0.166.0",
+]
+
+[locate]
+mise = "codex"
+commands = ["codex"]
+
+[launch]
+# Logs in through a browser and a localhost callback.
+login_callback = true
+# The help text says this flag is intended for externally sandboxed environments.
+yolo_args = ["--dangerously-bypass-approvals-and-sandbox"]
+
+[state]
+# The host data that `--profile default` copies into a private snapshot.
+data = [".codex"]
+# MCP OAuth tokens are shared only when codex stores them in a file
+# (mcp_oauth_credentials_store = "file"). Tokens in the system keyring stay outside.
+auth = [".codex/auth.json", ".codex/.credentials.json"]
+import_ro = [".codex/AGENTS.md", ".codex/prompts", ".agents/skills"]
+# A writable copy: codex records project trust in config.toml. Edits made in
+# the sandbox are not copied back, and the host copy replaces them each start.
+seed = [".codex/config.toml"]
+env_pass = ["OPENAI_API_KEY", "OPENAI_BASE_URL", "CODEX_API_KEY"]
+# Pure caches: a tmpfs in the sandbox, and paddock gc clears old ones.
+scratch = [".codex/cache"]
+
+# Omarchy's account switch: CODEX_HOME replaces ~/.codex.
+[state.account]
+env = "CODEX_HOME"
+dir = ".codex"
+
+# The project is already sandboxed: mark it trusted, so codex does not ask.
+[[state.toml_set]]
+file = ".codex/config.toml"
+path = ["projects", "{project}", "trust_level"]
+value = "trusted"
+
+# macOS: released Codex builds have the hardened runtime, so dyld ignores
+# paddock's pty library, and a Seatbelt run cannot open a pty. Codex's shell
+# tool (exec_command) uses pipes unless the model asks for a terminal
+# (tty = true). With unified_exec_tty = false the tool has no tty argument,
+# so every command runs with pipes. "unified_exec = false" does not help:
+# since codex 0.150.0 Codex turns it on again unless a managed requirement
+# pins it (core/src/config/managed_features.rs). paddock sets this value
+# only when the harness gets no ptys from paddock (when = "no_pty").
+# https://github.com/openai/codex/blob/main/codex-rs/features/src/lib.rs
+[[state.settings]]
+file = ".codex/config.toml"
+format = "toml"
+path = ["features", "unified_exec_tty"]
+value = false
+when = "no_pty"
+
+[[mcp]]
+file = ".codex/config.toml"
+format = "toml"
+path = ["mcp_servers"]
+
+[network]
+endpoints = ["api.openai.com", "chatgpt.com", "auth.openai.com"]
+
+# "analytics.enabled = false" also turns off the metrics exporter (statsig by
+# default). The value goes into the sandbox copy of config.toml only.
+# https://developers.openai.com/codex/config-reference
+[[privacy.settings]]
+file = ".codex/config.toml"
+format = "toml"
+path = ["analytics", "enabled"]
+value = false
+
+# ChatGPT accounts: Data controls, "Improve the model for everyone".
+# https://help.openai.com/en/articles/7730893-data-controls-faq
+[privacy.training]
+setting = "ChatGPT Settings, Data controls, Improve the model for everyone"
+url = "https://chatgpt.com/#settings/DataControls"
+
+# After a context compaction, Codex runs the SessionStart hooks with the
+# source "compact" (the matcher selects it), and the hook's
+# hookSpecificOutput.additionalContext reaches the context. Codex runs a hook
+# from ~/.codex/hooks.json only with a trusted hash in [hooks.state] of
+# config.toml, which /hooks writes when the user approves it. No user is in
+# the sandbox to approve, so paddock writes the hash of this hook, and of no
+# other hook, into the sandbox copy of config.toml ([hooks] codex_trust
+# below). The rules for the hash and the key come from the Codex source, see
+# src/compaction/codex.rs. https://developers.openai.com/codex/hooks
+[[compaction.settings]]
+file = ".codex/hooks.json"
+path = ["hooks", "SessionStart"]
+append = true
+value = { matcher = "compact", hooks = [{ type = "command", command = "paddock-host compacted --harness codex", timeout = 20 }] }
+
+# One task without a terminal, for `paddock-host spawn`. `codex exec --help`:
+# with `-` as the prompt, codex reads the instructions from stdin.
+[oneshot]
+args = ["exec", "--dangerously-bypass-approvals-and-sandbox", "-"]
+prompt = "stdin"
+probe_args = ["exec", "--help"]
+# `codex exec --help`: -c sets a config value, read as TOML; paddock
+# allows no quote in a model name (spawn/model.rs).
+model_args = ["-c", "model=\"{model}\""]
+effort_args = ["-c", "model_reasoning_effort=\"{effort}\""]
+
+# `paddock run --detach`: the interactive interface with a first prompt.
+# `codex --help` and the CLI reference: PROMPT is an "Optional text
+# instruction to start the session".
+# https://developers.openai.com/codex/cli/reference
+[detach]
+args = ["Read the file {prompt_file} and do the task that it describes."]
+
+# The user's own hooks (src/hooks.rs). paddock's entry comes first. A user
+# entry is trusted only when its program is in [hooks] programs of the user
+# configuration. The trust in the host copy of config.toml does not count.
+[hooks]
+files = [".codex/hooks.json"]
+into = ".codex/hooks.json"
+codex_trust = ".codex/config.toml"
+
+# Start screens (src/screens.rs). Codex 0.166.0 stops at "Hooks need review"
+# when a hook of the user changed since the last trust. In a run that nobody
+# watches, paddock chooses "Continue without trusting": the changed hooks do
+# not run, and paddock's own trusted hook still does. paddock never chooses
+# "Trust all". The screen was recorded on 2026-11-03 in a detached run.
+[[screens.rule]]
+id = "codex-hooks-review"
+name = "Codex hooks review"
+send = ["3"]
+answer = "3. Continue without trusting (hooks won't run)"
+note = "continued without trusting {n} hook"
+rows = [
+  "Hooks need review",
+  "{n} hook is new or changed.",
+  "Hooks can run outside the sandbox after you trust them.",
+  "› 1. Review hooks",
+  "2. Trust all and continue",
+  "3. Continue without trusting (hooks won't run)",
+  "enter confirm · esc skip",
+]
+
+# The same screen for more than one hook. Only the count row differs from
+# the recording.
+[[screens.rule]]
+id = "codex-hooks-review-many"
+name = "Codex hooks review"
+send = ["3"]
+answer = "3. Continue without trusting (hooks won't run)"
+note = "continued without trusting {n} hooks"
+rows = [
+  "Hooks need review",
+  "{n} hooks are new or changed.",
+  "Hooks can run outside the sandbox after you trust them.",
+  "› 1. Review hooks",
+  "2. Trust all and continue",
+  "3. Continue without trusting (hooks won't run)",
+  "enter confirm · esc skip",
+]

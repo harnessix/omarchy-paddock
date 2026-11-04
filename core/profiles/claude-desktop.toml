@@ -1,0 +1,29 @@
+name = "claude-desktop"
+description = "Claude desktop app"
+unverified = [
+  "a login inside the sandbox",
+  "the permission setting of Claude Code in the app: set it inside the app",
+]
+
+[locate]
+paths = ["/usr/lib/claude-desktop/claude-desktop"]
+
+[launch]
+args = ["--ozone-platform=wayland", "--no-sandbox", "--password-store=gnome-libsecret"]
+
+[app]
+display_name = "Claude"
+icon = "claude-desktop"
+schemes = ["claude"]
+
+# On macOS paddock runs the app bundle with Seatbelt. It is an Electron app
+# without App Sandbox.
+[app.macos]
+bundles = ["/Applications/Claude.app", "~/Applications/Claude.app"]
+user_data = "Library/Application Support/Claude"
+
+# Anthropic documents no telemetry setting for the desktop app.
+# https://code.claude.com/docs/en/data-usage
+[privacy.training]
+setting = "claude.ai Settings, Privacy, Help improve Claude"
+url = "https://claude.ai/settings/data-privacy-controls"

@@ -1,5 +1,8 @@
-blank_issues_enabled: false
+blank_issues_enabled: true
 contact_links:
+  - name: A problem with the paddock command
+    url: https://github.com/harnessix/paddock/issues
+    about: Report problems of paddock itself, on Linux or macOS, in its own repository.
   - name: Report a security problem
-    url: https://github.com/harnessix/omarchy-paddock/security/advisories/new
+    url: https://github.com/harnessix/paddock/security/advisories/new
     about: Report sandbox escapes privately, not in a public issue.

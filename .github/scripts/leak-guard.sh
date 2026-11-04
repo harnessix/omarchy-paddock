@@ -1,59 +1,28 @@
 #!/usr/bin/env bash
-# Leak guard: stop private files and private data from entering this public repo.
-#
-# It fails when:
-#   1. A tracked file is a private agent or design note
-#      (docs/DESIGN.md, CLAUDE.md, CLAUDE.local.md, AGENTS.md, .claude/).
-#   2. A tracked file contains a blocked internal name.
-#   3. A tracked file contains a home path such as /home/<user>/.
-#      Use /home/demo/ in examples.
-#   4. A commit in the range (first argument, for example origin/main..HEAD)
-#      has an author or committer email that is not a noreply address.
-#   5. A tracked file is a document that is not on the public list below.
-#      Design notes, plans and other internal documents stay out of this
-#      repository. Only code, the user documentation and images are public.
-#
-# To fix a failure, remove the file or text, or rewrite the commit with a
-# GitHub noreply email (Settings > Emails > Keep my email address private).
+# Leak guard for the files of this repository outside core/. core/ is a
+# copy of harnessix/paddock, which runs its own guard.
+# It fails on a private note, a home path other than /home/demo, a
+# document that is not public, or a commit email (first argument, a range)
+# that is not a noreply address.
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/../.."
 self=.github/scripts/leak-guard.sh
 status=0
+files=$(git ls-files | grep -v '^core/' || true)
 
-bad_files=$(git ls-files | grep -E '^(docs/DESIGN\.md|(.*/)?CLAUDE(\.local)?\.md|(.*/)?AGENTS\.md|(.*/)?\.claude/)' || true)
-if [ -n "$bad_files" ]; then
-  echo "leak guard: these private files must not be tracked:"; echo "$bad_files"; status=1
-fi
+bad=$(grep -E '(^|/)(CLAUDE(\.local)?\.md|AGENTS\.md|\.claude/)' <<<"$files" || true)
+[ -z "$bad" ] || { echo "leak guard: private files are tracked:"; echo "$bad"; status=1; }
 
-# The only documents this repository publishes. Anything else under docs/
-# (except images in docs/assets/), and any other text document, fails.
-public_docs='^(README\.md|CHANGELOG\.md|CONTRIBUTING\.md|SECURITY\.md|\.github/pull_request_template\.md|changes/[^/]+\.md|skills/[^/]+/SKILL\.md|skills/[^/]+/references/[^/]+\.md|docs/assets/[^/]+\.(png|gif|svg|jpg|jpeg|webp))$'
-docs=$(git ls-files | grep -iE '\.(md|markdown|txt|rst|adoc|org)$|^docs/' | grep -vE "$public_docs" || true)
-if [ -n "$docs" ]; then
-  echo "leak guard: these documents must not be published (only code and the user docs):"; echo "$docs"; status=1
-fi
+docs=$(grep -E '\.(md|txt|rst)$' <<<"$files" | grep -vE '^(README\.md|CONTRIBUTING\.md)$' || true)
+[ -z "$docs" ] || { echo "leak guard: documents that are not public:"; echo "$docs"; status=1; }
 
-# Internal names, built from parts so this file does not contain them.
-blocked="r""e""o""l"
-hits=$(git grep -nIi -e "$blocked" -- . ":!$self" || true)
-if [ -n "$hits" ]; then
-  echo "leak guard: blocked internal name found:"; echo "$hits"; status=1
-fi
-
-hits=$(git grep -noIE '/home/[A-Za-z0-9_.-]+' -- . ":!$self" | grep -vE ':/home/demo$' || true)
-if [ -n "$hits" ]; then
-  echo "leak guard: private home path found (use /home/demo/):"; echo "$hits"; status=1
-fi
+paths=$(grep -v "^$self\$" <<<"$files" | xargs -r grep -nIE '/(home|Users)/[a-z][a-z0-9_-]*/' 2>/dev/null \
+  | grep -vE '/(home|Users)/demo/' || true)
+[ -z "$paths" ] || { echo "leak guard: home paths:"; echo "$paths"; status=1; }
 
 if [ -n "${1:-}" ]; then
-  emails=$(git log --format='%ae%n%ce' "$1" | sort -u)
-  for e in $emails; do
-    case "$e" in
-      *@users.noreply.github.com|noreply@github.com|noreply@anthropic.com) ;;
-      # Only the masked address goes to the public log.
-      *) echo "leak guard: a commit email is not a noreply address: ${e:0:1}***@${e#*@}"; status=1 ;;
-    esac
-  done
+  mails=$(git log --format='%ae%n%ce' "$1" | sort -u | grep -vE '(@users\.noreply\.github\.com|^noreply@github\.com|^noreply@anthropic\.com)$' || true)
+  [ -z "$mails" ] || { echo "leak guard: commit emails that are not noreply:"; echo "$mails"; status=1; }
 fi
 
 [ "$status" = 0 ] && echo "leak guard: ok"

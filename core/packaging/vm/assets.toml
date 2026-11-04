@@ -1,0 +1,17 @@
+# The guest files of the VM backend. packaging/vm/build.sh writes this list.
+version = "0.2.1"
+
+[[file]]
+name = "kernel"
+url = "https://github.com/harnessix/paddock/releases/download/v0.2.1/kernel"
+sha256 = "67bac9f416af4cdc9b151e4ba4962d6515e0ad7acc53816761cf964aa6af6ea0"
+size = 14750208
+version = "6.12.28-153"
+
+[[file]]
+name = "rootfs.img"
+url = "https://github.com/harnessix/paddock/releases/download/v0.2.1/rootfs.img"
+sha256 = "1e903e02eaa3ff6c6e13c2534b3c81c10039c10e9e4d843d2ffd5ff33cc82301"
+size = 67108864
+version = "alpine-3.21.9-paddock-0.2.1"
+

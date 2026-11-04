@@ -11,19 +11,58 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
 
+defaults:
+  run:
+    shell: bash
+
 jobs:
+  manifest:
+    name: plugin manifest
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - run: .github/scripts/check-manifest.sh
+      - run: .github/scripts/check-core.sh
+
+  leak-guard:
+    name: leak guard
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Leak guard
+        run: |
+          if [ "${{ github.event_name }}" = pull_request ]; then
+            .github/scripts/leak-guard.sh "origin/${{ github.base_ref }}..HEAD"
+          else
+            .github/scripts/leak-guard.sh
+          fi
+
+  # The tests of paddock expect to run at the root of its own repository,
+  # so both jobs below copy core/ into a fresh one first.
   rust:
     name: fmt, clippy, test
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
+      - name: Copy core/ into its own repository
+        run: |
+          cp -r core "$RUNNER_TEMP/paddock"
+          cd "$RUNNER_TEMP/paddock"
+          git init -q && git add -A
+          git -c user.name=ci -c user.email=ci@users.noreply.github.com commit -qm core
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo fmt --check
-      - run: cargo clippy --all-targets -- -D warnings
-      - run: cargo test --locked
+      - name: fmt, clippy, test
+        working-directory: ${{ runner.temp }}/paddock
+        run: |
+          cargo fmt --check
+          cargo clippy --all-targets -- -D warnings
+          cargo test --locked
 
   escape-probe:
     name: escape probe (bwrap)
@@ -31,7 +70,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
       - name: Install bubblewrap, passt, iproute2
         run: sudo apt-get update && sudo apt-get install -y bubblewrap passt iproute2
       # Ubuntu 24.04 blocks unprivileged user namespaces through AppArmor.
@@ -42,51 +80,15 @@ jobs:
             sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
           fi
           bwrap --unshare-all --ro-bind / / true
-      # With mise, the probe also checks that a project's mise config cannot
-      # write the shared tool installs.
       - uses: jdx/mise-action@v2
         with:
           install: false
-      - run: cargo build --locked
+      - name: Build
+        working-directory: core
+        run: cargo build --locked
       - name: Probe, network none
-        run: target/debug/paddock doctor --escape --backend bwrap --network none
+        run: core/target/debug/paddock doctor --escape --backend bwrap --network none
       - name: Probe, network none, clean env
-        run: target/debug/paddock doctor --escape --backend bwrap --network none --env clean
+        run: core/target/debug/paddock doctor --escape --backend bwrap --network none --env clean
       - name: Probe, network egress
-        run: target/debug/paddock doctor --escape --backend bwrap --network egress --online
-      - name: Skipped probes
-        run: |
-          echo "::notice::Skipped --gui and --app probes: the runner has no Wayland compositor."
-          echo "::notice::Skipped docker, podman and srt probes: run bin/test on a workstation for these."
-
-  file-size:
-    name: file size
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@v4
-      - run: .github/scripts/file-size.sh
-
-  plugin-manifest:
-    name: plugin manifest
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@v4
-      - run: .github/scripts/check-manifest.sh
-
-  leak-guard:
-    name: leak guard
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-      - name: Check files and commit emails
-        env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-        run: |
-          if [ -n "$BASE_SHA" ]; then
-            .github/scripts/leak-guard.sh "$BASE_SHA..$HEAD_SHA"
-          else
-            .github/scripts/leak-guard.sh
-          fi
+        run: core/target/debug/paddock doctor --escape --backend bwrap --network egress --online

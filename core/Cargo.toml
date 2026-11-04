@@ -1,0 +1,61 @@
+[package]
+name = "paddock"
+version = "0.2.1"
+edition = "2021"
+description = "Run any coding-agent harness with full auto-approval inside an isolated sandbox"
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/harnessix/paddock"
+keywords = ["sandbox", "agents", "bubblewrap", "docker", "omarchy"]
+categories = ["command-line-utilities"]
+
+[dependencies]
+anyhow = "1"
+argon2 = "0.5"
+base64 = "0.22"
+clap = { version = "4.5", features = ["derive"] }
+hmac = "0.12"
+httparse = "1"
+libc = "0.2"
+log = { version = "0.4", features = ["std"] }
+no-proxy = "0.3"
+rpassword = "7"
+rusqlite = { version = "0.41", default-features = false, features = ["bundled", "fallible_uint"] }
+rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-native-certs = "0.8.5"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+socks = "0.3"
+toml = "0.8"
+toml_edit = "0.22"
+url = "2"
+vt100 = "0.18"
+zstd = { version = "0.13", default-features = false }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+fuser = { version = "0.18", default-features = false }
+wayland-client = "0.31"
+wayland-protocols = { version = "0.32", features = ["client", "staging"] }
+zbus = { version = "5", default-features = false, features = ["blocking-api", "async-io"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSArray", "NSDictionary", "NSString", "NSValue", "NSGeometry", "NSTimer", "NSRunLoop", "NSDate", "NSObject", "NSURL", "NSEnumerator", "NSError", "NSData"] }
+objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "libc", "objc2-core-foundation", "objc2-quartz-core", "objc2-core-graphics", "NSFontDescriptor", "NSApplication", "NSResponder", "NSWindow", "NSPanel", "NSView", "NSColor", "NSGraphics", "NSScreen", "NSStatusBar", "NSStatusItem", "NSStatusBarButton", "NSButton", "NSControl", "NSMenu", "NSMenuItem", "NSRunningApplication", "NSWorkspace", "NSEvent", "NSTextField", "NSFont", "NSImage", "NSCell", "NSButtonCell", "NSActionCell", "NSText", "NSPasteboard", "NSAttributedString", "NSParagraphStyle"] }
+objc2-core-foundation = { version = "0.3", default-features = false, features = ["std", "CFArray", "CFDictionary", "CFString", "CFNumber", "CFRunLoop", "CFCGTypes"] }
+objc2-core-graphics = { version = "0.3", default-features = false, features = ["std", "CGWindow", "CGColor", "objc2"] }
+objc2-quartz-core = { version = "0.3", default-features = false, features = ["std", "CALayer", "objc2-core-foundation", "objc2-core-graphics"] }
+block2 = "0.6"
+dispatch2 = { version = "0.3", default-features = false, features = ["std", "block2", "libc", "objc2"] }
+objc2-virtualization = "0.3"
+objc2-application-services = { version = "0.3", default-features = false, features = ["std", "HIServices", "AXUIElement", "AXError", "AXValue", "AXActionConstants", "AXAttributeConstants", "AXNotificationConstants", "libc"] }
+
+[dev-dependencies]
+rcgen = { version = "0.14.10", default-features = false, features = ["ring", "pem"] }
+tempfile = "3"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true

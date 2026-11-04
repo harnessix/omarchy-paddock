@@ -1,0 +1,44 @@
+#!/bin/sh
+# The init of the paddock VM guest. The kernel starts it as PID 1.
+# It mounts the kernel file systems, starts the paddock guest agent as
+# root and powers the VM off when the agent ends. The root file system
+# stays read-only: the agent mounts the writable disk itself.
+# Each step that matters writes one line to the console, which the host
+# keeps in console.log.
+
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
+
+say() {
+    echo "paddock-init: $*" >/dev/console 2>/dev/null
+}
+
+# Is $1 a mount point of type $2?
+mounted() {
+    while read -r _ dir type _; do
+        [ "$dir" = "$1" ] && [ "$type" = "$2" ] && return 0
+    done </proc/mounts
+    return 1
+}
+
+mount -t proc -o nosuid,nodev,noexec proc /proc
+mount -t sysfs -o nosuid,nodev,noexec sysfs /sys
+# The kernel mounts devtmpfs on /dev itself (CONFIG_DEVTMPFS_MOUNT).
+mounted /dev devtmpfs || mount -t devtmpfs -o nosuid,mode=0755 devtmpfs /dev 2>/dev/null
+mkdir -p /dev/pts /dev/shm
+mount -t devpts -o nosuid,noexec,gid=5,mode=0620,ptmxmode=0666 devpts /dev/pts
+mount -t tmpfs -o nosuid,nodev,mode=1777 tmpfs /dev/shm
+mount -t cgroup2 -o nosuid,nodev,noexec cgroup2 /sys/fs/cgroup
+mount -t tmpfs -o nosuid,nodev,mode=0755 tmpfs /run
+mount -t tmpfs -o nosuid,nodev,mode=1777 tmpfs /tmp
+ln -sf /proc/self/fd /dev/fd 2>/dev/null
+hostname paddock 2>/dev/null
+ip link set lo up 2>/dev/null
+
+say "starting the guest agent"
+/usr/bin/paddock vm-agent </dev/null >/dev/console 2>&1
+say "the guest agent ended with code $?"
+
+sync
+poweroff -f 2>/dev/null
+echo o >/proc/sysrq-trigger
