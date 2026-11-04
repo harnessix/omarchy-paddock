@@ -287,3 +287,73 @@ fn the_screen_watcher_answers_through_the_relay() {
         libc::close(caller_s);
     }
 }
+
+/// A detached run on a desktop. The pane's pty belongs to paddock's tmux
+/// server, so the terminal looks watched. The run still gets every start
+/// screen rule and the screen tap. Codex asks the terminal for the cursor
+/// position first, and tmux answers on the input: that answer is not a
+/// user key, so the watcher still answers the screen after a slow start.
+#[test]
+fn a_detached_run_in_a_tmux_pane_still_answers_the_start_screen() {
+    let server = anc(4242, "tmux: server");
+    let chain = [anc(4300, "paddock"), server.clone()];
+    let watched = || terminal_watched(Some(&[100]), Some(&server), &chain);
+    let p = plan(true, watched, true);
+    assert!(p.watched && !p.relay && p.unwatched, "{p:?}");
+    // The same terminal in a run that is not detached: only `always` rules.
+    assert!(!plan(true, watched, false).unwatched);
+    // An invisible terminal is relayed and unwatched.
+    let hidden = plan(true, || false, false);
+    assert!(hidden.relay && hidden.unwatched);
+    assert!(!plan(false, || panic!("no terminal to look at"), true).relay);
+
+    let profile: crate::profile::Profile =
+        toml::from_str(include_str!("../../profiles/codex.toml")).unwrap();
+    let rules = crate::screens::rules_for(&profile, p.unwatched);
+    assert!(rules.iter().any(|r| r.id == "codex-hooks-review-many"));
+    assert!(crate::screens::rules_for(&profile, false).is_empty());
+    let (caller_m, caller_s) = caller_pty();
+    set_size(caller_m, 24, 100);
+    let w = crate::screens::live::Watcher::new(rules, || false, |_| {});
+    let mut relay =
+        Relay::start(caller_s, caller_s, |_| {}, Taps::of(None, Some(w.clone()))).unwrap();
+    let script = "stty -icanon -echo min 1; printf '\\033[6n'; r=$(dd bs=1 count=6 2>/dev/null); \
+                  printf 'starting MCP servers\\n'; sleep 1; \
+                  printf '\\033[2J\\033[H  Hooks need review\\n  12 hooks are new or changed.\\n  Hooks can run outside the sandbox after you trust them.\\n› 1. Review hooks\\n  2. Trust all and continue\\n  3. Continue without trusting (hooks won'\\''t run)\\n  enter confirm · esc skip\\n'; \
+                  c=$(dd bs=1 count=1 2>/dev/null); \
+                  printf '\\033[2J\\033[Hgot:%s\\n' \"$c\"; sleep 1; exit 0";
+    let (stdin, stdout, stderr) = relay.child_stdio().unwrap();
+    let mut cmd = Command::new("sh");
+    cmd.args(["-c", script])
+        .stdin(stdin)
+        .stdout(stdout)
+        .stderr(stderr);
+    // SAFETY: take_controlling_tty uses setsid and ioctl, which are safe
+    // in pre_exec. The slave is fd 0.
+    unsafe {
+        cmd.pre_exec(take_controlling_tty);
+    }
+    let mut child = cmd.spawn().unwrap();
+    relay.close_slave();
+    // tmux answers the query on the input of the pane.
+    let q = read_until(caller_m, b"\x1b[6n", Duration::from_secs(10));
+    assert!(q.windows(4).any(|x| x == b"\x1b[6n"));
+    assert!(write_all_fd(caller_m, b"\x1b[7;1R").is_ok());
+    let out = read_until(caller_m, b"got:3", Duration::from_secs(15));
+    let text = String::from_utf8_lossy(&out);
+    assert!(text.contains("got:3"), "{text}");
+    let status = wait_child(&mut child, Duration::from_secs(10));
+    assert_eq!(status.code(), Some(0));
+    relay.finish();
+    let r = w.reports();
+    assert_eq!(r.len(), 1, "{r:?}");
+    assert_eq!(
+        r[0].text,
+        "answered Codex hooks review: continued without trusting 12 hooks"
+    );
+    // SAFETY: close the test caller pty.
+    unsafe {
+        libc::close(caller_m);
+        libc::close(caller_s);
+    }
+}

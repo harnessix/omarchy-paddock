@@ -620,10 +620,9 @@ pub fn run(
     crate::loft::push::start_notice(env, &built);
     let forwarding = Forward::install();
     // Without Hyprland, any terminal counts as watched.
-    let caller_terminal =
-        !capture && std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
-    let terminal_watched = caller_terminal && crate::relay::this_terminal_is_watched();
-    let relay_on = caller_terminal && !terminal_watched;
+    let tty = !capture && std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
+    let term = crate::relay::plan(tty, crate::relay::this_terminal_is_watched, built.detach);
+    let (caller_terminal, relay_on, terminal_watched) = (tty, term.relay, term.watched);
     let interactive = caller_terminal;
     let mut end = EndOfRun {
         env,
@@ -968,7 +967,7 @@ pub fn run(
         &built.profile,
         spec,
         caller_terminal,
-        relay_on || built.detach,
+        term.unwatched,
         built.detach,
     );
     let tap = crate::relay::Taps::of(gate.clone(), screens);

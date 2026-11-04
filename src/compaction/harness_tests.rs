@@ -53,8 +53,8 @@ fn json(p: &Path) -> serde_json::Value {
 fn codex_gets_its_hook_and_only_its_trust_in_the_sandbox_home() {
     let w = world("");
     // The user's own hooks stay untrusted, also with a trust in the host
-    // copy of config.toml. A hook whose program is not in the sandbox is
-    // left out.
+    // copy of config.toml, so they are left out: Codex would ask about
+    // them. A hook whose program is not in the sandbox is left out too.
     let codex = w.env.home.join(".codex");
     std::fs::create_dir_all(&codex).unwrap();
     std::fs::write(
@@ -78,12 +78,11 @@ fn codex_gets_its_hook_and_only_its_trust_in_the_sandbox_home() {
     crate::hooks::write(&spec).unwrap();
     let hooks = json(&home.join(".codex/hooks.json"));
     let groups = hooks["hooks"]["SessionStart"].as_array().unwrap();
-    assert_eq!(groups.len(), 2, "{groups:?}");
+    assert_eq!(groups.len(), 1, "{groups:?}");
     assert_eq!(
         groups[0]["hooks"][0]["command"],
         "paddock-host compacted --harness codex"
     );
-    assert_eq!(groups[1]["hooks"][0]["command"], "true");
     let cfg: toml::Value =
         toml::from_str(&std::fs::read_to_string(home.join(".codex/config.toml")).unwrap()).unwrap();
     assert_eq!(cfg["model"].as_str(), Some("m"));

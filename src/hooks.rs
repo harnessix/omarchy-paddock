@@ -4,7 +4,9 @@
 //! paddock reads the user's hook entries from the host files and checks the
 //! program of each command (hooks/command.rs). An entry whose program does
 //! not resolve inside the sandbox is left out of the sandbox copy, and the
-//! start prints one line about it. At the start, paddock writes the sandbox
+//! start prints one line about it. For Codex (`codex_trust`), an entry that
+//! paddock does not trust is left out too: Codex does not run it in the
+//! sandbox, and it would ask about it at each start. At the start, paddock writes the sandbox
 //! copy: paddock's own entries first, then the user's (hooks/write.rs). The
 //! host files never change.
 //!
@@ -155,6 +157,9 @@ pub enum Verdict {
     Missing { program: String },
     /// Left out by `[hooks] ignore`.
     Ignored { rule: String },
+    /// Left out: Codex does not trust it in the sandbox (not a program of
+    /// `[hooks] programs`).
+    Untrusted { program: String },
 }
 
 impl Verdict {
@@ -349,15 +354,16 @@ pub fn apply(
             };
             let rel = PathBuf::from(&rel);
             let mut check = |event: &str, h: &Value| -> Verdict {
-                let v = judge(env, spec, &cfg, &listed, h);
+                let mut v = judge(env, spec, &cfg, &listed, h);
+                if f.codex_trust.is_some() && matches!(v, Verdict::Kept { .. }) {
+                    v = Verdict::Untrusted {
+                        program: command::first_program(h_command(h)),
+                    };
+                }
                 t.entries.push(Entry {
                     file: rel.clone(),
                     event: event.into(),
-                    command: h
-                        .get("command")
-                        .and_then(Value::as_str)
-                        .unwrap_or("(no command)")
-                        .into(),
+                    command: h_command(h).into(),
                     verdict: v.clone(),
                 });
                 v
@@ -417,38 +423,108 @@ pub fn apply(
             t.groups.extend(groups);
         }
     }
-    let mut missing: Vec<&str> = t
-        .entries
-        .iter()
-        .filter_map(|e| match &e.verdict {
-            Verdict::Missing { program } => Some(program.as_str()),
-            _ => None,
-        })
-        .collect();
-    missing.sort();
-    missing.dedup();
-    if !missing.is_empty() {
-        spec.notices.push(format!(
-            "{} hooks left out of the sandbox copy, the program is not in the sandbox: {}. To run one there, add it to [hooks] programs in the user configuration. To drop it without this line, add it to [hooks] ignore",
-            profile.name,
-            missing.join(", ")
-        ));
+    if let Some(n) = notice(&profile.name, &t.entries) {
+        spec.notices.push(n);
     }
     spec.hooks.push(t);
     Ok(())
 }
 
-/// Whether a user hook handler can run in the sandbox.
+fn h_command(h: &Value) -> &str {
+    h.get("command")
+        .and_then(Value::as_str)
+        .unwrap_or("(no command)")
+}
+
+/// The one start line about the left-out entries, if there are any.
+fn notice(harness: &str, entries: &[Entry]) -> Option<String> {
+    let names = |want: fn(&Verdict) -> Option<&String>| {
+        let mut v: Vec<&str> = entries
+            .iter()
+            .filter_map(|e| want(&e.verdict).map(String::as_str))
+            .collect();
+        v.sort();
+        v.dedup();
+        v.join(", ")
+    };
+    let missing = names(|v| match v {
+        Verdict::Missing { program } => Some(program),
+        _ => None,
+    });
+    let untrusted = names(|v| match v {
+        Verdict::Untrusted { program } => Some(program),
+        _ => None,
+    });
+    let mut why = Vec::new();
+    if !missing.is_empty() {
+        why.push(format!("The program is not in the sandbox: {missing}."));
+    }
+    if !untrusted.is_empty() {
+        why.push(format!(
+            "{harness} does not trust them in the sandbox and would ask at each start: {untrusted}."
+        ));
+    }
+    (!why.is_empty()).then(|| format!(
+        "{harness} hooks left out of the sandbox copy. {} To run one there, add its program to [hooks] programs in the user configuration. To drop it without this line, add it to [hooks] ignore",
+        why.join(" ")
+    ))
+}
+
+/// Whether a user hook handler can run in the sandbox: each simple
+/// command of its line must (hooks/command.rs `split`).
 fn judge(env: &HostEnv, spec: &SandboxSpec, cfg: &Cfg, listed: &[Listed], h: &Value) -> Verdict {
     let Some(cmd) = h.get("command").and_then(Value::as_str) else {
         return Verdict::Kept {
             why: "not a command".into(),
         };
     };
-    let (program, script) = match command::parse(cmd) {
+    let parts: Vec<command::Parsed> = command::split(cmd)
+        .iter()
+        .map(|p| command::parse(p))
+        .collect();
+    // An ignored program anywhere in the line drops the entry silently.
+    for p in &parts {
+        if let command::Parsed::Program { program, script } = p {
+            let words: Vec<&String> = std::iter::once(program).chain(script).collect();
+            if let Some(rule) = cfg
+                .ignore
+                .iter()
+                .find(|r| words.iter().any(|w| command::matches(&env.home, r, w)))
+            {
+                return Verdict::Ignored { rule: rule.clone() };
+            }
+        }
+    }
+    // The strongest reason to keep it: a listed program, then a program in
+    // the sandbox, then a builtin.
+    let rank = |v: &Verdict| match v {
+        Verdict::Listed { .. } => 2,
+        Verdict::Kept { why } if why != BUILTIN => 1,
+        _ => 0,
+    };
+    let mut best = Verdict::Kept {
+        why: BUILTIN.into(),
+    };
+    for p in parts {
+        let v = judge_one(spec, listed, p);
+        if !v.kept() {
+            return v;
+        }
+        if rank(&v) > rank(&best) {
+            best = v;
+        }
+    }
+    best
+}
+
+const BUILTIN: &str = "a shell builtin";
+
+/// One simple command of a hook line.
+fn judge_one(spec: &SandboxSpec, listed: &[Listed], p: command::Parsed) -> Verdict {
+    let (program, script) = match p {
         command::Parsed::Builtin => {
             return Verdict::Kept {
-                why: "a shell builtin".into(),
+                why: BUILTIN.into(),
             }
         }
         command::Parsed::ShellC => {
@@ -458,14 +534,6 @@ fn judge(env: &HostEnv, spec: &SandboxSpec, cfg: &Cfg, listed: &[Listed], h: &Va
         }
         command::Parsed::Program { program, script } => (program, script),
     };
-    let words: Vec<&String> = std::iter::once(&program).chain(&script).collect();
-    if let Some(rule) = cfg
-        .ignore
-        .iter()
-        .find(|r| words.iter().any(|w| command::matches(&env.home, r, w)))
-    {
-        return Verdict::Ignored { rule: rule.clone() };
-    }
     let found = command::find_program(spec, &program);
     let mut verdict = match &found {
         command::Found::No => return Verdict::Missing { program },
@@ -571,6 +639,9 @@ pub fn explain(spec: &SandboxSpec) -> Vec<String> {
                 Verdict::Ignored { rule } => {
                     format!("left out (user {from}): ignored by [hooks] ignore ({rule})")
                 }
+                Verdict::Untrusted { program } => format!(
+                    "left out (user {from}): {program} is not in [hooks] programs, so the harness does not trust it in the sandbox"
+                ),
             };
             out.push(format!("    {}  {}\n           {why}", e.event, e.command));
         }
