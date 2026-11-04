@@ -5,6 +5,7 @@ description = "DeepSeek Harness"
 unverified = [
   "state.auth .dsh/.credentials.yaml and .dsh/.env: where the API key is kept",
   "network.publish 3080: the port of `dsh web`",
+  "privacy.uploads: the home patch ~/.dsh/cordis.patch.yml, from the dsh 0.2.1-rc.5 source",
 ]
 
 # mise tool: npm:@deepseek-ai/dsh
@@ -37,3 +38,16 @@ env_pass = ["DEEPSEEK_API_KEY"]
 [privacy.training]
 setting = "the data settings of your DeepSeek platform account"
 url = "https://github.com/deepseek-ai/deepseek-harness"
+
+# The plugin session-log-deepseek is on in every shipped dsh profile. It
+# sends the session log with each request to the official DeepSeek API.
+# `enabled: false` in its config stops it. paddock adds that row to the
+# sandbox copy of the home patch ~/.dsh/cordis.patch.yml, which dsh applies
+# after the profile patch. [profiles.dsh] upload_session_logs = true in the
+# user configuration keeps the upload on.
+# https://github.com/deepseek-ai/deepseek-harness/blob/main/packages/session/session-log-deepseek/README.md
+[[privacy.uploads]]
+cordis_patch = ".dsh/cordis.patch.yml"
+row = "session-log-deepseek"
+switch = "upload_session_logs"
+says = "the session-log upload to DeepSeek (plugin session-log-deepseek)"

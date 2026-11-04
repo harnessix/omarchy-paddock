@@ -95,29 +95,26 @@ pub fn run(
             if !matches!(name, "transcript.jsonl" | "transcript_full.jsonl") {
                 return None;
             }
-            let src = std::fs::File::open(compaction::transcript_file(&path)).ok()?;
-            let now = compaction::checkpoints(std::io::BufReader::new(src));
-            let file = dir.join(compaction::file_name("checkpoints", &conversation));
+            let src = std::fs::File::open(&path).ok()?;
+            let now = compaction::steps(std::io::BufReader::new(src));
+            let file = dir.join(compaction::file_name("steps", &conversation));
             let seen: Option<u64> = std::fs::read_to_string(&file)
                 .ok()
                 .and_then(|t| t.trim().parse().ok());
-            if seen != Some(now) {
-                let _ = crate::privfs::dir(&dir).map(|_| std::fs::write(&file, format!("{now}\n")));
+            if seen != Some(now.lines) {
+                let _ = crate::privfs::dir(&dir)
+                    .map(|_| std::fs::write(&file, format!("{}\n", now.lines)));
             }
             // The first look at a conversation only takes the count: a
             // resumed one can have older checkpoints.
-            let new = now.saturating_sub(seen?).min(MAX_AT_ONCE);
-            let mut last = None;
-            for _ in 0..new {
-                last = record(&event).or(last);
+            if !now.compacted_since(seen?) {
+                return None;
             }
-            compaction::render(harness, &event, &compaction::note(&last?))
+            let f = record(&event)?;
+            compaction::render(harness, &event, &compaction::note(&f))
         }
     }
 }
-
-/// The most compactions that one hook records, when several were missed.
-const MAX_AT_ONCE: u64 = 5;
 
 /// Ask the broker to record one compaction, and return the facts.
 fn ask(harness: &str, event: &str) -> Option<Facts> {

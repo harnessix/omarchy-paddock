@@ -313,13 +313,18 @@ echo '{{"type":"USER_INPUT"}}' >> "$log/transcript.jsonl"
 inv 0 | sh -c "$cmd" > inv0.txt
 echo '{{"type":"PLANNER_RESPONSE"}}' >> "$log/transcript.jsonl"
 inv 1 | sh -c "$cmd" > inv1.txt
-echo '{{"type":"CHECKPOINT"}}' >> "$log/transcript.jsonl"
-inv 2 | sh -c "$cmd" > inv2.txt
-inv 3 | sh -c "$cmd" > inv3.txt"#
+echo '{{"type":"CHECKPOINT","content":"title"}}' >> "$log/transcript.jsonl"
+inv 2 | sh -c "$cmd" > plain.txt
+echo '{{"type":"CHECKPOINT","content":"summary"}}' > "$log/transcript.jsonl"
+inv 3 | sh -c "$cmd" > inv2.txt
+inv 4 | sh -c "$cmd" > inv3.txt"#
     );
     fake_harness(&s, &script, &[]);
     assert_eq!(read(&s, "inv0.txt"), "");
     assert_eq!(read(&s, "inv1.txt"), "");
+    // A checkpoint of a plain run is no compaction. agy writes the
+    // transcript again with fewer lines when it compacts.
+    assert_eq!(read(&s, "plain.txt"), "");
     let v: serde_json::Value = serde_json::from_str(&read(&s, "inv2.txt")).unwrap();
     assert_note(v["injectSteps"][0]["ephemeralMessage"].as_str().unwrap(), 1);
     assert_eq!(read(&s, "inv3.txt"), "");

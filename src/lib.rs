@@ -70,6 +70,7 @@ mod testutil;
 pub mod timer;
 pub mod training;
 pub mod update;
+pub mod uploads;
 pub mod usage_box;
 pub mod view;
 pub mod waiting;
