@@ -12,7 +12,7 @@
 
 use crate::env::HostEnv;
 use anyhow::{bail, Context, Result};
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::os::unix::process::CommandExt;
@@ -183,8 +183,7 @@ impl Tmux {
         let mut c = Command::new(&self.exe);
         c.arg("-S")
             .arg(&self.sock)
-            .arg("-f")
-            .arg("/dev/null")
+            .args(["-f", "/dev/null"])
             .env_clear()
             .envs(self.vars.iter().map(|(k, v)| (k, v)))
             .stdin(Stdio::null())
@@ -314,6 +313,8 @@ impl Tmux {
             ";",
             "new-session",
             "-d",
+            "-c",
+            "/",
             "-s",
             id,
             "-x",
@@ -331,8 +332,7 @@ impl Tmux {
             let ok = Command::new(run)
                 .args(["--user", "--scope", "--quiet", "--collect", "--"])
                 .arg(&self.exe)
-                .arg("-S")
-                .arg(&self.sock)
+                .args([OsStr::new("-S"), self.sock.as_os_str()])
                 .args(["-f", "/dev/null"])
                 .args(&args)
                 .env_clear()
