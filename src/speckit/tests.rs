@@ -221,6 +221,7 @@ fn the_state_machine_allows_only_its_transitions() {
     assert_eq!(board::next(Running, Event::Free).unwrap(), Todo);
     assert_eq!(board::next(Review, Event::Verdict(true)).unwrap(), Done);
     assert_eq!(board::next(Review, Event::Verdict(false)).unwrap(), Todo);
+    assert_eq!(board::next(Failed, Event::Verdict(false)).unwrap(), Todo);
     assert_eq!(board::next(Running, Event::Checked).unwrap(), Done);
     assert_eq!(board::next(Done, Event::Unchecked).unwrap(), Todo);
     assert_eq!(board::next(Review, Event::Unchecked).unwrap(), Review);
@@ -232,6 +233,7 @@ fn the_state_machine_allows_only_its_transitions() {
         (Todo, Event::Finish(true)),
         (Todo, Event::Verdict(true)),
         (Running, Event::Verdict(true)),
+        (Failed, Event::Verdict(true)),
         (Done, Event::Free),
     ] {
         assert!(board::next(s, e).is_err(), "{s:?} {e:?}");

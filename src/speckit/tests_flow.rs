@@ -373,13 +373,31 @@ fn a_workers_done_report_reaches_its_record_and_a_failure_wins() {
         "{r:?}"
     );
     assert!(tasks_md(&w).contains("T002 [P] [US1] Create Photo model in src/photo.py <!-- paddock: failed, paddock/spawn-codex-aa -->"));
-    // A failed task can be claimed again by name.
-    assert_eq!(
-        flow::claim(&w.env, &spot, "T002", &other, now)
-            .unwrap()
-            .attempts,
-        2
-    );
+    let parent = broker(&w, "p-1", vec![], Some("exit 0"));
+    let pass = parent.handle(&req(
+        "spec",
+        serde_json::json!({"action": "review", "id": "T002", "verdict": "pass"}),
+    ));
+    assert_eq!(pass.status, Status::Failed);
+    assert_eq!(pass.message, "T002 is failed: use `changes \"...\"` to give it back to a worker when it is in review or failed; `pass` needs a task in review");
+    let back = parent.handle(&req("spec", serde_json::json!({"action": "review", "id": "T002", "verdict": "changes", "text": "schema is ready"})));
+    assert_eq!(back.status, Status::Done, "{}", back.message);
+    let path = super::records::ProjectRecords::path_for(&spot.layout, &spot.feature);
+    let stored = super::records::load(&path).unwrap();
+    let reopened = &stored["T002"].task;
+    assert_eq!(reopened.state, State::Todo);
+    assert_eq!(reopened.review_note.as_deref(), Some("schema is ready"));
+    assert_eq!(reopened.branch.as_deref(), Some(owner.branch.as_str()));
+    assert!(reopened
+        .result
+        .as_deref()
+        .unwrap()
+        .starts_with("the schema is missing"));
+    assert_eq!(reopened.attempts, 1);
+    let claimed = flow::claim(&w.env, &spot, "T002", &other, now).unwrap();
+    assert_eq!(claimed.attempts, 2);
+    assert_eq!(claimed.review_note.as_deref(), Some("schema is ready"));
+    assert!(super::prompt::worker(&spot.layout, &claimed, false).contains("schema is ready"));
 }
 
 #[test]

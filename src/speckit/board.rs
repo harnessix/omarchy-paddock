@@ -96,7 +96,7 @@ pub fn next(from: State, e: Event) -> Result<State> {
         (Claimed | Running, Event::Finish(false)) => Failed,
         (Claimed | Running, Event::Free) => Todo,
         (Review, Event::Verdict(true)) => Done,
-        (Review, Event::Verdict(false)) => Todo,
+        (Review | Failed, Event::Verdict(false)) => Todo,
         (_, Event::Checked) => Done,
         (Done, Event::Unchecked) => Todo,
         (s, Event::Unchecked) => s,

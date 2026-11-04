@@ -1,0 +1,1 @@
+- Fix: Allow a review requesting changes to reopen a failed Spec Kit task, with a clear message when a review cannot apply.

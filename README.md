@@ -1334,6 +1334,8 @@ paddock is the only writer of `tasks.md`. Workers do not edit it. paddock keeps 
 | `paddock spec status` | the same status on the host, for the current folder |
 | `paddock spec adopt` | moves `.specify/` and `specs/` of a repository into the external store (see below) |
 
+`changes` also reopens a failed task and sends the note to the next worker.
+
 A task is ready when all tasks of the earlier phases are done, all tasks before it in its phase are done (a run of `[P]` tasks can run together), and all tasks that its text names after "depends on" are done. The prompt of a worker has the task line, its acceptance text (the goal lines of the phase and the acceptance scenarios of its user story), and the paths of the constitution, `spec.md`, `plan.md` and the contracts. The worker ends with `paddock-host done "SUMMARY"`, and the task waits for your review. Watch the tasks with `paddock-host kv watch --scope tree --prefix spec/<feature>/task/`. `paddock ps` and `paddock wait` show the task of a worker. The session note (Claude Code) and the note after a context compaction name the feature, the task of the run, its acceptance text and the spec paths.
 
 Task state, branches, results and review notes stay with the project after a run ends, so a later run continues the same tasks. With the loft or the external spec store, records live at `.paddock/spec/<feature>/tasks.json` inside that store. With the repo store, they live in the repository’s common git directory at `paddock/spec/<feature>/tasks.json` (usually `.git/paddock/spec/<feature>/tasks.json`), shared by linked worktrees.

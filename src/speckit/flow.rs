@@ -223,8 +223,7 @@ pub fn renew(spot: &Spot, id: &str, owner: &Owner, now: u64) -> bool {
     .is_ok()
 }
 
-/// The review of a task in `review`: pass marks it done, changes sends it
-/// back to todo with the note for the next worker.
+/// Pass a task in review, or send a task in review or failed back to a worker.
 pub fn review(
     env: &HostEnv,
     spot: &Spot,
@@ -236,6 +235,13 @@ pub fn review(
     spot.sync(env, true, now)?;
     let note = note.trim().to_string();
     spot.update(env, id, now, &|r| {
+        if r.state != State::Review && (pass || r.state != State::Failed) {
+            bail!(
+                "{} is {}: use `changes \"...\"` to give it back to a worker when it is in review or failed; `pass` needs a task in review",
+                r.id,
+                r.state.name()
+            );
+        }
         r.state = board::next(r.state, Event::Verdict(pass))?;
         r.verdict = Some(if pass { "pass" } else { "changes" }.into());
         r.review_note = (!note.is_empty()).then(|| note.clone());
