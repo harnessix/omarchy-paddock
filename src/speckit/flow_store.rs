@@ -47,6 +47,10 @@ where
             .iter()
             .map(|(id, r)| (id.clone(), r.task.clone()))
             .collect();
+        let lease_expiries = next
+            .iter()
+            .filter_map(|(id, r)| r.lease_expiry.map(|e| (id.clone(), e)))
+            .collect();
         if write {
             for r in tasks.values_mut().filter(|r| !r.removed) {
                 r.rendered = Some(r.state == board::State::Done);
@@ -92,6 +96,7 @@ where
                 doc,
                 records: tasks,
                 ready,
+                lease_expiries,
             },
             value,
         ))

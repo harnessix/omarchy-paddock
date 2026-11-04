@@ -30,6 +30,8 @@ pub struct View {
     pub doc: Doc,
     pub records: BTreeMap<String, Record>,
     pub ready: Vec<String>,
+    /// Lease expiry timestamps for the normalized project records.
+    pub lease_expiries: BTreeMap<String, u64>,
 }
 
 pub fn quota(env: &HostEnv) -> crate::kv::store::Quota {
@@ -363,9 +365,7 @@ pub fn describe(r: &Record) -> String {
         s.push_str(&format!(" by {sb}"));
     }
     if let Some(b) = &r.branch {
-        if r.state != State::Todo {
-            s.push_str(&format!(" on {b}"));
-        }
+        s.push_str(&format!(" on {b}"));
     }
     s
 }
@@ -377,7 +377,11 @@ pub fn to_json(v: &View, layout: &Layout) -> serde_json::Value {
         .tasks
         .iter()
         .filter_map(|t| v.records.get(&t.id))
-        .map(|r| serde_json::to_value(r).unwrap_or_default())
+        .map(|r| {
+            let mut task = serde_json::to_value(r).unwrap_or_default();
+            task["lease_expiry"] = v.lease_expiries.get(&r.id).copied().into();
+            task
+        })
         .collect();
     let review: Vec<&String> = v
         .records
@@ -432,6 +436,20 @@ pub fn to_text(v: &View) -> String {
             if r.parallel { "[P]" } else { "" },
             describe(r)
         ));
+        if let Some(lease) = &r.lease {
+            let expiry = v
+                .lease_expiries
+                .get(&r.id)
+                .map(|e| format!(" (expires {e})"))
+                .unwrap_or_default();
+            l.push(format!("      lease: {lease}{expiry}"));
+        }
+        if let Some(result) = &r.result {
+            l.push(format!("      result: {result}"));
+        }
+        if let Some(note) = &r.review_note {
+            l.push(format!("      review note: {note}"));
+        }
     }
     let removed: Vec<&str> = v
         .records
