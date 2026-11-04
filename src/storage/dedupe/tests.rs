@@ -228,8 +228,13 @@ fn identical_folders_share_their_data_and_stay_independent() {
     // Same size, other bytes: never shared.
     std::fs::write(homes.join("fake/shared/p2/other"), data(64 * 1024, 9)).unwrap();
     std::fs::write(homes.join("fake/shared/p1/other"), data(64 * 1024, 10)).unwrap();
-    let index = r.join("cache/index");
+    // A fork in another test can briefly inherit a lock held by a run.
+    // Give each run its own lock so the next run cannot contend with it.
+    let runs = std::cell::Cell::new(0);
     let run = |only: Option<&Path>, apply: bool| {
+        let n = runs.get();
+        runs.set(n + 1);
+        let index = r.join(format!("cache/{n}/index"));
         Run {
             root: &homes,
             only,
@@ -246,7 +251,7 @@ fn identical_folders_share_their_data_and_stay_independent() {
     assert_eq!(dry.candidates, 2, "{dry:?}");
     assert_eq!(dry.candidate_bytes, expect);
     assert_eq!(dry.deduped_bytes, 0);
-    assert!(index.exists());
+    assert!(r.join("cache/0/index").exists());
 
     let p2 = homes.join("fake/shared/p2");
     let rep = run(Some(&p2), true);
