@@ -185,6 +185,7 @@ impl Tmux {
             .arg(&self.sock)
             .arg("-f")
             .arg("/dev/null")
+            .current_dir("/")
             .env_clear()
             .envs(self.vars.iter().map(|(k, v)| (k, v)))
             .stdin(Stdio::null())
@@ -314,6 +315,8 @@ impl Tmux {
             ";",
             "new-session",
             "-d",
+            "-c",
+            "/",
             "-s",
             id,
             "-x",
@@ -335,6 +338,7 @@ impl Tmux {
                 .arg(&self.sock)
                 .args(["-f", "/dev/null"])
                 .args(&args)
+                .current_dir("/")
                 .env_clear()
                 .envs(self.vars.iter().map(|(k, v)| (k, v)))
                 .envs(vars.iter().map(|(k, v)| (k, v)))

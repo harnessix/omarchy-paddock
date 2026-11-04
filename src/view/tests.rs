@@ -641,3 +641,27 @@ fn last_output_falls_back_to_window_activity_on_older_tmux() {
     assert_eq!(parse_last_output(""), PaneOutput::Quiet);
     assert_eq!(parse_last_output("x,1"), PaneOutput::Unknown);
 }
+
+#[test]
+fn a_view_session_starts_in_the_root_directory() {
+    let t = tempfile::tempdir().unwrap();
+    let env = env_in(t.path(), &[]);
+    let Some(tmux) = Tmux::find(&env) else {
+        eprintln!("skipped: tmux is not installed");
+        return;
+    };
+    let _server = Server(Some(tmux.clone()));
+    let out = t.path().join("pwd.txt");
+    let script = format!("pwd > {}; sleep 60", out.display());
+    let cmd = ["sh", "-c", &script].map(std::ffi::OsString::from);
+    tmux.new_session("sbroot11", &cmd).unwrap();
+    let mut got = String::new();
+    for _ in 0..50 {
+        got = std::fs::read_to_string(&out).unwrap_or_default();
+        if !got.is_empty() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert_eq!(got.trim(), "/");
+}
