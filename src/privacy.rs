@@ -131,11 +131,13 @@ pub fn args(profile: &Profile, mode: Telemetry) -> Vec<String> {
     }
 }
 
-/// Write the settings and then the hooks (hooks.rs) into the sandbox home.
+/// Write the settings, the hooks (hooks.rs) and the uploads (uploads.rs)
+/// into the sandbox home.
 /// Returns warnings.
 pub fn write_home(spec: &SandboxSpec) -> Result<Vec<String>> {
     let mut w = write_settings(&spec.home_src, &spec.home_settings)?;
     w.extend(crate::hooks::write(spec)?);
+    w.extend(crate::uploads::write(spec)?);
     Ok(w)
 }
 

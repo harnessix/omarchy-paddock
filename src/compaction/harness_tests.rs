@@ -223,10 +223,18 @@ fn compact_once(
             run("grok", &grok_input("post_tool_use", "s-1"), home, record)
         }
         "agy" => {
-            append(
-                &agy_transcript(home),
-                r#"{"step_index":12,"type":"CHECKPOINT","content":"summary"}"#,
-            );
+            let t = agy_transcript(home);
+            for _ in 0..3 {
+                append(&t, r#"{"type":"PLANNER_RESPONSE"}"#);
+            }
+            let mut never = |_: &str| -> Option<Facts> { panic!("no compaction yet") };
+            assert_eq!(run("agy", &agy_input(home, 6), home, &mut never), None);
+            // The compaction replaces the earlier steps with a summary.
+            std::fs::write(
+                &t,
+                "{\"step_index\":12,\"type\":\"CHECKPOINT\",\"content\":\"summary\"}\n",
+            )
+            .unwrap();
             run("agy", &agy_input(home, 7), home, record)
         }
         _ => unreachable!(),
@@ -361,36 +369,68 @@ fn grok_keeps_the_note_for_its_own_session_until_a_tool_runs() {
 }
 
 #[test]
-fn agy_counts_new_checkpoint_steps_once() {
+fn agy_gives_no_note_for_a_plain_checkpoint() {
     let home = tempfile::tempdir().unwrap();
     let h = home.path();
     let calls = std::cell::Cell::new(0);
     let mut rec = |_: &str| fake_facts(&calls);
     let t = agy_transcript(h);
-    // A resumed conversation with an old checkpoint: the first look only
-    // takes the count.
-    append(&t, r#"{"type":"CHECKPOINT"}"#);
+    // A plain one-turn run: agy adds a checkpoint for the title and intent.
+    append(&t, r#"{"step_index":0,"type":"USER_INPUT","content":"hi"}"#);
     assert_eq!(run("agy", &agy_input(h, 0), h, &mut rec), None);
-    assert_eq!(run("agy", &agy_input(h, 1), h, &mut rec), None);
+    append(&t, r#"{"step_index":1,"type":"PLANNER_RESPONSE"}"#);
     append(
         &t,
-        r#"{"type":"PLANNER_RESPONSE","text":"no checkpoint here"}"#,
+        r#"{"step_index":2,"type":"CHECKPOINT","content":"Greeting"}"#,
     );
-    assert_eq!(run("agy", &agy_input(h, 2), h, &mut rec), None);
     append(&t, r#"{"step":{"stepType":"CORTEX_STEP_TYPE_CHECKPOINT"}}"#);
-    let out = run("agy", &agy_input(h, 3), h, &mut rec).unwrap();
-    assert!(note_text("agy", &out).contains("compaction 1"));
-    assert_eq!(run("agy", &agy_input(h, 4), h, &mut rec), None);
-    assert_eq!(calls.get(), 1);
-    // agy cut transcript.jsonl: the full one counts.
-    std::fs::write(&t, "").unwrap();
+    assert_eq!(run("agy", &agy_input(h, 1), h, &mut rec), None);
+    // A line that agy is still writing changes nothing.
     std::fs::write(
-        t.with_file_name("transcript_full.jsonl"),
-        "{\"type\":\"CHECKPOINT\"}\n{\"type\":\"CHECKPOINT\"}\n{\"type\":\"CHECKPOINT\"}\n",
+        &t,
+        std::fs::read_to_string(&t).unwrap() + r#"{"type":"PLANNER"#,
     )
     .unwrap();
-    assert!(run("agy", &agy_input(h, 5), h, &mut rec).is_some());
-    assert_eq!(calls.get(), 2);
+    assert_eq!(run("agy", &agy_input(h, 2), h, &mut rec), None);
+    // A shorter transcript without a checkpoint is no compaction.
+    std::fs::write(&t, "{\"type\":\"USER_INPUT\"}\n").unwrap();
+    assert_eq!(run("agy", &agy_input(h, 3), h, &mut rec), None);
+    assert_eq!(calls.get(), 0);
+}
+
+#[test]
+fn agy_gives_the_note_once_after_a_real_compaction() {
+    let home = tempfile::tempdir().unwrap();
+    let h = home.path();
+    let calls = std::cell::Cell::new(0);
+    let mut rec = |_: &str| fake_facts(&calls);
+    let t = agy_transcript(h);
+    for i in 0..5 {
+        append(
+            &t,
+            &format!(r#"{{"step_index":{i},"type":"PLANNER_RESPONSE"}}"#),
+        );
+    }
+    assert_eq!(run("agy", &agy_input(h, 0), h, &mut rec), None);
+    // agy wrote the transcript again: a summary checkpoint replaces the
+    // earlier steps.
+    std::fs::write(
+        &t,
+        "{\"step_index\":5,\"type\":\"CHECKPOINT\",\"content\":\"summary\"}\n",
+    )
+    .unwrap();
+    let out = run("agy", &agy_input(h, 1), h, &mut rec).unwrap();
+    assert!(note_text("agy", &out).contains("compaction 1"));
+    assert_eq!(run("agy", &agy_input(h, 2), h, &mut rec), None);
+    append(&t, r#"{"type":"PLANNER_RESPONSE"}"#);
+    assert_eq!(run("agy", &agy_input(h, 3), h, &mut rec), None);
+    assert_eq!(calls.get(), 1);
+    // A resumed conversation: the first look only takes the count.
+    let mut i = agy_input(h, 0);
+    i["conversationId"] = "c-2".into();
+    std::fs::write(&t, "{\"type\":\"CHECKPOINT\"}\n").unwrap();
+    assert_eq!(run("agy", &i, h, &mut rec), None);
+    assert_eq!(calls.get(), 1);
     // A path that is no transcript is never read.
     let mut i = agy_input(h, 6);
     i["transcriptPath"] = "/etc/passwd".into();
@@ -412,7 +452,21 @@ fn checkpoint_steps_are_counted_by_their_type() {
         r#"{"type":"CHECKPOINTS"}"#,
     ]
     .join("\n");
-    assert_eq!(checkpoints(text.as_bytes()), 3);
+    let s = steps(format!("{text}\n").as_bytes());
+    assert_eq!(
+        s,
+        Steps {
+            lines: 6,
+            checkpoints: 3
+        }
+    );
+    assert!(s.compacted_since(7));
+    assert!(!s.compacted_since(6));
+    assert!(!Steps {
+        lines: 1,
+        checkpoints: 0
+    }
+    .compacted_since(7));
     assert_eq!(file_name("note", "a/../b c"), "note-abc");
     assert_eq!(file_name("note", ""), "note-none");
 }

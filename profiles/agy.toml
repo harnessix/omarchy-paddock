@@ -6,7 +6,7 @@ description = "Google Antigravity CLI"
 
 # Entries that come from documentation, not from a test. paddock doctor lists them.
 unverified = [
-  "compaction: a CHECKPOINT step in transcript.jsonl marks a compaction, and only a compaction",
+  "compaction: agy writes transcript.jsonl again with fewer lines when it compacts, with a CHECKPOINT step for the summary",
 ]
 
 [locate]
@@ -201,10 +201,12 @@ rows = [
   "[Previous]    > [Done]",
 ]
 
-# agy has hooks but no compaction event. Compaction adds a CHECKPOINT step
-# to the transcript (transcriptPath in the hook input). PreInvocation runs
-# before each model call, counts these steps, and puts the note in with
-# injectSteps[].ephemeralMessage. agy loads ~/.gemini/config/hooks.json
+# agy has hooks but no compaction event, and no sure compaction marker in
+# the transcript (transcriptPath in the hook input): a CHECKPOINT step also
+# comes in a plain run, for the title and intent. PreInvocation runs before
+# each model call. It counts a compaction only when the transcript has a
+# CHECKPOINT step and fewer lines than before (compaction.rs `Steps`), and
+# puts the note in with injectSteps[].ephemeralMessage. agy loads ~/.gemini/config/hooks.json
 # without a trust step, and paddock owns the "paddock-compaction" entry in
 # it. https://antigravity.google/docs/hooks
 [[compaction.settings]]

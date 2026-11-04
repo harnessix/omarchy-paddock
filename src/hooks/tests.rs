@@ -244,8 +244,9 @@ fn each_harness_keeps_resolvable_user_hooks_and_leaves_out_the_others() {
             .filter(|c| !c.starts_with("paddock-host"))
             .map(String::as_str)
             .collect();
-        // Codex trusts only a listed program: it would ask about the others.
-        let want: &[&str] = if *name == "codex" {
+        // Codex and Grok Build trust only a listed program.
+        let trusts = matches!(*name, "codex" | "grok");
+        let want: &[&str] = if trusts {
             &["~/.local/bin/listed-hook stop"]
         } else {
             &["true", "sh -c 'echo x'", "~/.local/bin/listed-hook stop"]
@@ -270,8 +271,10 @@ fn each_harness_keeps_resolvable_user_hooks_and_leaves_out_the_others() {
         assert!(notes[0].contains("missing-hook") && notes[0].contains("[hooks] programs"));
         assert!(!notes[0].contains("ign-hook"));
         assert_eq!(
-            notes[0].contains("does not trust them in the sandbox and would ask at each start: sh -c 'echo x', true."),
-            *name == "codex",
+            notes[0].contains(&format!(
+                "paddock does not trust them for {name} in the sandbox: sh -c 'echo x', true."
+            )),
+            trusts,
             "{name}: {}",
             notes[0]
         );
@@ -466,17 +469,18 @@ fn codex_trusts_a_listed_program_entry_and_no_other_user_entry() {
 
 #[test]
 fn grok_gets_the_user_files_in_one_copy_and_a_stale_copy_loses_its_hooks() {
-    let w = world("");
+    let w = world("[hooks]\nprograms = [\"~/.local/bin/listed-hook\"]\n");
+    put(&w, ".local/bin/listed-hook", HOOK, 0o755);
     put(
         &w,
         ".grok/hooks/b.json",
-        r#"{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"true"}]}]}}"#,
+        r#"{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"listed-hook b"}]}]}}"#,
         0o644,
     );
     put(
         &w,
         ".grok/hooks/a.json",
-        r#"{"hooks":{"Stop":[{"hooks":[{"type":"command","command":":"}]}]}}"#,
+        r#"{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"listed-hook a"}]}]}}"#,
         0o644,
     );
     let h = crate::profile::Harness {
@@ -504,7 +508,7 @@ fn grok_gets_the_user_files_in_one_copy_and_a_stale_copy_loses_its_hooks() {
         .filter(|c| c.0 == "Stop")
         .map(|c| c.1)
         .collect();
-    assert_eq!(stop, [":", "true"]);
+    assert_eq!(stop, ["listed-hook a", "listed-hook b"]);
     let s: Value = serde_json::from_slice(&std::fs::read(&stale).unwrap()).unwrap();
     assert_eq!(s["hooks"], serde_json::json!({}));
 }
@@ -600,4 +604,78 @@ fn an_ignored_untrusted_codex_entry_has_no_notice() {
     assert!(sandbox_commands(&spec)
         .iter()
         .all(|c| c.1.starts_with("paddock-host")));
+}
+
+/// Grok Build 1.0.70 runs the hooks of ~/.grok/hooks only in a trusted
+/// folder. The sandbox copy trusts the project, and holds no user hook that
+/// the trust would turn on, other than a listed one.
+#[test]
+fn grok_trusts_the_project_for_paddock_and_listed_hooks_only() {
+    let w = world("[hooks]\nprograms = [\"~/.local/bin/listed-hook\"]\n");
+    put(&w, ".local/bin/listed-hook", HOOK, 0o755);
+    put(
+        &w,
+        ".grok/hooks/mine.json",
+        r#"{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"true"},{"type":"command","command":"listed-hook stop"}]}]}}"#,
+        0o644,
+    );
+    put(
+        &w,
+        ".grok/trusted_folders.toml",
+        "[folders.\"/elsewhere\"]\ntrusted = true\n",
+        0o600,
+    );
+    put(
+        &w,
+        ".grok/config.toml",
+        "model = \"m\"\n[[hooks.Stop]]\nhooks = [{ type = \"command\", command = \"true\" }]\n",
+        0o600,
+    );
+    let before = tree(&w.env.home);
+    let spec = start(&w, "grok").unwrap();
+    let home = &spec.home_src;
+    let cmds: Vec<String> = sandbox_commands(&spec).into_iter().map(|c| c.1).collect();
+    assert!(cmds.contains(&"paddock-host compacted --harness grok".to_string()));
+    assert!(cmds.contains(&"listed-hook stop".to_string()), "{cmds:?}");
+    assert!(!cmds.contains(&"true".to_string()), "{cmds:?}");
+    // One trust: the project folder.
+    let text = std::fs::read_to_string(home.join(".grok/trusted_folders.toml")).unwrap();
+    let trust: toml::Value = toml::from_str(&text).unwrap();
+    let folders = trust["folders"].as_table().unwrap();
+    let project = std::fs::canonicalize(&w.project).unwrap();
+    assert_eq!(folders.len(), 1, "{text}");
+    let entry = &folders[&project.display().to_string()];
+    assert_eq!(entry["trusted"].as_bool(), Some(true), "{text}");
+    assert!(entry["decided_at"].as_integer().unwrap() > 0);
+    // The copy of config.toml loses its hooks and the Claude and Cursor
+    // hook scan, and keeps the rest.
+    let cfg: toml::Value =
+        toml::from_str(&std::fs::read_to_string(home.join(".grok/config.toml")).unwrap()).unwrap();
+    assert!(cfg.get("hooks").is_none(), "{cfg:?}");
+    assert_eq!(cfg["model"].as_str(), Some("m"));
+    assert_eq!(cfg["compat"]["claude"]["hooks"].as_bool(), Some(false));
+    assert_eq!(cfg["compat"]["cursor"]["hooks"].as_bool(), Some(false));
+    let ex = explain(&spec).join("\n");
+    assert!(ex.contains("[hooks] programs listed-hook, trusted"), "{ex}");
+    // The host files stay byte for byte the same.
+    assert_eq!(tree(&w.env.home), before);
+}
+
+/// Without paddock's hook and without a listed entry, nothing needs the
+/// trust, and paddock writes none.
+#[test]
+fn grok_gets_no_trust_without_a_hook_to_trust() {
+    let w = world("[compaction]\nenabled = false\n");
+    put(
+        &w,
+        ".grok/hooks/mine.json",
+        r#"{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"true"}]}]}}"#,
+        0o644,
+    );
+    let spec = start(&w, "grok").unwrap();
+    assert!(!spec.home_src.join(".grok/trusted_folders.toml").exists());
+    assert!(spec
+        .notices
+        .iter()
+        .any(|n| n.contains("paddock does not trust them for grok in the sandbox: true.")));
 }
