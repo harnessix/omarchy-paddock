@@ -23,6 +23,7 @@ pub mod gatewayd;
 pub mod gui;
 pub mod history;
 pub mod hooks;
+pub mod horse;
 pub mod hostcli;
 pub mod hostgit;
 pub mod hosttools;

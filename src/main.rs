@@ -75,6 +75,7 @@ fn real_main() -> Result<i32> {
         Cmd::Worktree { cmd } => cli::worktree::run(&env, cmd),
         Cmd::Spec { cmd } => cli::spec::run(&env, cmd),
         Cmd::Loft { cmd } => cli::loft::run(&env, cmd),
+        Cmd::Horse { cmd } => cli::horse::run(&env, cmd),
         Cmd::Log { json, lines } => cli::approver::log(&env, json, lines),
         Cmd::Approver { cmd } => cli::approver::run(&env, cmd),
         Cmd::App { cmd } => cli::app::run(&env, cmd),

@@ -11,6 +11,7 @@ pub(crate) mod devices;
 pub(crate) mod env;
 pub(crate) mod forage;
 pub(crate) mod gateway;
+pub(crate) mod horse;
 pub(crate) mod kv;
 pub(crate) mod loft;
 pub(crate) mod logins;
@@ -444,6 +445,12 @@ pub(crate) enum Cmd {
         /// How many recent entries to show.
         #[arg(short = 'n', long, default_value_t = 20)]
         lines: usize,
+    },
+    /// Experimental: the horse store of harness sessions (list, show, log, fork).
+    #[command(hide = true)]
+    Horse {
+        #[command(subcommand)]
+        cmd: horse::HorseCmd,
     },
     /// The loft: a private store with its own history for the agents' notes, instruction files and specs of a repository.
     Loft {
