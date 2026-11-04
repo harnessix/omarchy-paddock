@@ -135,3 +135,19 @@ fn a_user_profile_names_builtin_training_rules_and_cannot_bring_its_own() {
     let e = HarnessFactory::new(&env).err().unwrap();
     assert!(format!("{e:#}").contains("built-in"), "{e:#}");
 }
+
+#[test]
+fn model_and_effort_args_name_their_placeholder_once() {
+    for (name, text) in BUILTIN {
+        let p: Profile = toml::from_str(text).unwrap();
+        let Some(o) = p.oneshot else { continue };
+        for (args, key) in [
+            (&o.model_args, crate::spawn::model::MODEL),
+            (&o.effort_args, crate::spawn::model::EFFORT),
+        ] {
+            let n: usize = args.iter().map(|a| a.matches(key).count()).sum();
+            assert!(args.is_empty() || n == 1, "{name}: {key} once");
+            assert!(args.iter().all(|a| !a.contains(PROMPT_FILE)), "{name}");
+        }
+    }
+}

@@ -54,6 +54,16 @@ pub(crate) fn ps(env: &HostEnv, json: bool) -> Result<i32> {
                         },
                     );
                 }
+                // The model and effort that paddock chose for a child.
+                let pick = r
+                    .parent
+                    .as_deref()
+                    .zip(r.spawn_id.as_deref())
+                    .and_then(|(p, s)| paddock::spawn::model::of_child(env, p, s));
+                if let (Some(o), Some(p)) = (v.as_object_mut(), pick) {
+                    o.insert("model".into(), p.model.into());
+                    o.insert("effort".into(), p.effort.map(|e| e.name()).into());
+                }
                 if let (Some(o), Some(t)) = (v.as_object_mut(), spec_task(env, &r.id)) {
                     o.insert("spec_task".into(), t.id.into());
                     o.insert("spec_feature".into(), t.feature.into());

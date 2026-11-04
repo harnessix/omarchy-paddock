@@ -181,6 +181,8 @@ pub fn parse(text: &str) -> Doc {
         }
         let (mut parallel, mut story) = (false, None);
         let mut rest = body.trim_start()[id.len()..].trim_start();
+        // A hint among the labels is no story, and it stays in the text.
+        let mut kept = String::new();
         while let Some(label) = rest
             .strip_prefix('[')
             .and_then(|r| r.split_once(']'))
@@ -188,11 +190,15 @@ pub fn parse(text: &str) -> Doc {
         {
             if label.0 == "P" {
                 parallel = true;
+            } else if hint(label.0).is_some() {
+                kept.push_str(&format!("[{}] ", label.0));
             } else if story.is_none() {
                 story = Some(label.0.to_string());
             }
             rest = label.1.trim_start();
         }
+        let rest = format!("{kept}{rest}");
+        let rest = rest.trim_end();
         doc.tasks.push(Task {
             id: id.to_string(),
             line: n,
@@ -205,6 +211,39 @@ pub fn parse(text: &str) -> Doc {
         });
     }
     doc
+}
+
+/// The hints of a task for its worker: `[model:NAME]` and
+/// `[effort:LEVEL]` anywhere in the text. `paddock-host spawn --task` uses
+/// them when the parent gives no `--model` or `--effort`
+/// (spawn/model.rs). They stay in the text, and in tasks.md.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Hints {
+    pub model: Option<String>,
+    pub effort: Option<String>,
+}
+
+/// One label: `("model", NAME)` or `("effort", LEVEL)`.
+fn hint(label: &str) -> Option<(&str, &str)> {
+    let (k, v) = label.split_once(':')?;
+    (matches!(k, "model" | "effort") && !v.is_empty() && !v.contains([' ', '[', ']']))
+        .then_some((k, v))
+}
+
+/// The hints in a task text. The first one of a kind counts.
+pub fn hints(text: &str) -> Hints {
+    let mut h = Hints::default();
+    for part in text.split('[').skip(1) {
+        let Some((label, _)) = part.split_once(']') else {
+            continue;
+        };
+        match hint(label) {
+            Some(("model", v)) if h.model.is_none() => h.model = Some(v.to_string()),
+            Some(("effort", v)) if h.effort.is_none() => h.effort = Some(v.to_string()),
+            _ => {}
+        }
+    }
+    h
 }
 
 /// What paddock writes on one task line.

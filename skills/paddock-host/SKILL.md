@@ -76,7 +76,7 @@ A project with a `.specify/` folder is a Spec Kit project, and paddock keeps its
 
 - Do not edit `tasks.md` to mark a task. paddock writes its checkboxes.
 - `paddock-host spec status` shows the feature, the state of each task, what is ready, and what waits for review.
-- To hand out work, run `paddock-host spawn HARNESS --task next` (or `--task T012`) once for each ready task. Ready `[P]` tasks run side by side.
+- To hand out work, run `paddock-host spawn HARNESS --task next` (or `--task T012`) once for each ready task. Ready `[P]` tasks run side by side. Add `--effort high` (or `--model NAME`) for a hard task, or after a worker failed at the default.
 - When a worker ended, read and merge its branch, then run `paddock-host spec review ID pass` (or `changes "WHAT TO FIX"`).
 - When you are a worker, do only your task and end with `paddock-host done "SUMMARY"`, or `paddock-host done --status failed "WHY"`.
 

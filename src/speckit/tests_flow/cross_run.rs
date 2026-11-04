@@ -46,6 +46,7 @@ fn review_and_feedback_survive_a_new_run() {
         enforced_by: "paddock".into(),
         from_head: None,
         frozen_s: 0,
+        pick: Default::default(),
     };
     flow::child_ended(&w.env, "run-one", &w.project, &status, &Default::default());
     let second = flow::Spot::find(&w.env, &w.project, "run-two", None)

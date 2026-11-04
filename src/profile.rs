@@ -94,6 +94,13 @@ pub struct OneShot {
     /// `args`, the same check as for `yolo_args`.
     #[serde(default = "default_probe")]
     pub probe_args: Vec<String>,
+    /// Arguments after `args` that choose the model, with `{model}` for the
+    /// name (spawn/model.rs). Empty: no `--model`. `probe_args` checks them.
+    #[serde(default)]
+    pub model_args: Vec<String>,
+    /// The same for the reasoning effort, with `{effort}` for the level.
+    #[serde(default)]
+    pub effort_args: Vec<String>,
 }
 
 /// The placeholder for the prompt file in `OneShot::args`.

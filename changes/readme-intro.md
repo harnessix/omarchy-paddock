@@ -1,0 +1,1 @@
+- The README starts with what paddock is for and a 30-second start.
