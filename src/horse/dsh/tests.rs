@@ -174,7 +174,7 @@ fn header_encodes_in_dsh_key_order_and_parses_back() {
 
 #[test]
 fn paths_follow_dsh() {
-    assert_eq!(project_key("/home/u/my proj"), "--home-u-my~0020proj--");
+    assert_eq!(project_key("/home/demo/my proj"), "--home-demo-my~0020proj--");
     assert_eq!(project_key("C:\\a\\\\b"), "--C-a-b--");
     assert_eq!(project_key("/"), "--root--");
     assert_eq!(encode_segment("session-ab_1.x"), "session-ab_1.x");
