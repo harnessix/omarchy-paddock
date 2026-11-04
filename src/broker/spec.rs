@@ -231,6 +231,7 @@ impl Broker {
         match flow::report(
             &self.env,
             &self.tree_root(),
+            &self.ctx.project,
             &self.ctx.id,
             ok,
             text,

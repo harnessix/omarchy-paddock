@@ -59,6 +59,9 @@ pub(crate) fn run(env: &HostEnv, cmd: SpecCmd) -> Result<i32> {
                 Some(&feature),
             )?
             .context("no Spec Kit project")?;
+            let has_records =
+                paddock::speckit::records::ProjectRecords::path_for(&spot.layout, &feature)
+                    .is_file();
             let v = spot.sync(env, false, now)?;
             if json {
                 let mut j = flow::to_json(&v, &spot.layout);
@@ -74,7 +77,7 @@ pub(crate) fn run(env: &HostEnv, cmd: SpecCmd) -> Result<i32> {
             } else {
                 println!("{}", paddock::speckit::git::location(&layout));
                 println!("{}", flow::to_text(&v));
-                if root.is_none() {
+                if !has_records {
                     println!(
                         "(no run has worked on these tasks yet: the states come from tasks.md)"
                     );

@@ -1,0 +1,2 @@
+- Fix: Task state, branch, result and review notes outlive a run.
+- Fix: Host spec status shows running tasks and their leases.
