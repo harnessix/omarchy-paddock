@@ -29,7 +29,7 @@ You configure a security boundary for the user.
 paddock supports Omarchy (Arch Linux with Hyprland). Other distributions are best effort. `omarchy plugin add` installs only the bar widget. The `paddock` command is a separate install: the prebuilt binary of the latest GitHub release (see the README), or `bin/install` from a clone.
 
 ```sh
-git clone --branch v0.1.7 https://github.com/harnessix/omarchy-paddock   # the latest release
+git clone --branch v0.2.0 https://github.com/harnessix/omarchy-paddock   # the latest release
 cd omarchy-paddock
 bin/install                     # system packages with sudo, build, then paddock doctor
 ```

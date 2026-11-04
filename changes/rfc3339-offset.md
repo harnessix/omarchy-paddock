@@ -1,1 +1,0 @@
-- Fix: paddock reads the time zone offset of a token expiry such as `2026-11-03T13:33:52+08:00`. It read the time as UTC, so an agy login looked valid for 8 more hours and the usage box did not renew it.
