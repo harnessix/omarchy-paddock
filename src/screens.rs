@@ -324,6 +324,15 @@ pub fn last_screen(text: &str) -> String {
     lines[skip..].join("\n")
 }
 
+/// The valid rules that answer in a run: every one when nobody watches,
+/// else only the ones marked `always`.
+pub fn rules_for(profile: &crate::profile::Profile, unwatched: bool) -> Vec<Rule> {
+    valid(&profile.name, &profile.screens.rule)
+        .into_iter()
+        .filter(|r| unwatched || r.always)
+        .collect()
+}
+
 /// The rules of a harness for one run, or None.
 ///
 /// - `unwatched`: a detached run or an invisible terminal. Every rule.
@@ -337,14 +346,8 @@ pub fn prepare(
     unwatched: bool,
     detached: bool,
 ) -> Option<std::sync::Arc<live::Watcher>> {
-    if !terminal {
-        return None;
-    }
-    let rules: Vec<Rule> = valid(&profile.name, &profile.screens.rule)
-        .into_iter()
-        .filter(|r| unwatched || r.always)
-        .collect();
-    if rules.is_empty() {
+    let rules = rules_for(profile, unwatched);
+    if !terminal || rules.is_empty() {
         return None;
     }
     let (e, id) = (env.clone(), spec.id.clone());

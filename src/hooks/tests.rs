@@ -33,6 +33,21 @@ fn the_program_of_a_command_line() {
     assert_eq!(parse("echo hi > /tmp/x"), Parsed::Builtin);
     assert_eq!(parse("A=1"), Parsed::Builtin);
     assert_eq!(parse("\"$HOME\"/bin/x"), p("$HOME/bin/x", None));
+    assert_eq!(parse("if my-hook; then"), p("my-hook", None));
+    assert_eq!(parse("fi"), Parsed::Builtin);
+    assert_eq!(
+        command::split("[ ! -f '/x/a;b' ] || '/x/a;b' run 2>&1 | tee -a log; echo \"a|b\" $(c; d)"),
+        [
+            "[ ! -f '/x/a;b' ] ",
+            " '/x/a;b' run 2>&1 ",
+            " tee -a log",
+            " echo \"a|b\" $(c; d)"
+        ]
+    );
+    assert_eq!(
+        command::first_program("[ -n \"$TOOL_HOME\" ] && \"$TOOL_HOME/bin/tool\" stop"),
+        "$TOOL_HOME/bin/tool"
+    );
 }
 
 #[test]
@@ -229,11 +244,13 @@ fn each_harness_keeps_resolvable_user_hooks_and_leaves_out_the_others() {
             .filter(|c| !c.starts_with("paddock-host"))
             .map(String::as_str)
             .collect();
-        assert_eq!(
-            user,
-            ["true", "sh -c 'echo x'", "~/.local/bin/listed-hook stop"],
-            "{name}: {cmds:?}"
-        );
+        // Codex trusts only a listed program: it would ask about the others.
+        let want: &[&str] = if *name == "codex" {
+            &["~/.local/bin/listed-hook stop"]
+        } else {
+            &["true", "sh -c 'echo x'", "~/.local/bin/listed-hook stop"]
+        };
+        assert_eq!(user, want, "{name}: {cmds:?}");
         // paddock's own entry stays, and comes first in its event.
         if *name != "gemini" {
             assert!(cmds.iter().any(|c| c.starts_with("paddock-host")), "{name}");
@@ -252,6 +269,12 @@ fn each_harness_keeps_resolvable_user_hooks_and_leaves_out_the_others() {
         assert_eq!(notes.len(), 1, "{name}: {:?}", spec.notices);
         assert!(notes[0].contains("missing-hook") && notes[0].contains("[hooks] programs"));
         assert!(!notes[0].contains("ign-hook"));
+        assert_eq!(
+            notes[0].contains("does not trust them in the sandbox and would ask at each start: sh -c 'echo x', true."),
+            *name == "codex",
+            "{name}: {}",
+            notes[0]
+        );
         // The listed program is bound read-only: the file, never its folder.
         let tool = spec
             .host_tools
@@ -412,7 +435,7 @@ fn codex_trusts_a_listed_program_entry_and_no_other_user_entry() {
         [
             &want("session_start:0:0"),
             &want("session_start:1:0"),
-            &want("stop:0:1")
+            &want("stop:0:0")
         ],
         "{state:?}"
     );
@@ -430,10 +453,12 @@ fn codex_trusts_a_listed_program_entry_and_no_other_user_entry() {
             .unwrap(),
         hash("SessionStart", &ss[1], 0)
     );
+    // `true` is not trusted, so it is not in the copy.
     let stop = &hooks["hooks"]["Stop"][0];
+    assert_eq!(stop["hooks"].as_array().unwrap().len(), 1, "{stop}");
     assert_eq!(
-        state[&want("stop:0:1")]["trusted_hash"].as_str().unwrap(),
-        hash("Stop", stop, 1)
+        state[&want("stop:0:0")]["trusted_hash"].as_str().unwrap(),
+        hash("Stop", stop, 0)
     );
     assert_eq!(cfg["model"].as_str(), Some("m"));
     assert_eq!(tree(&w.env.home), before);
@@ -482,4 +507,97 @@ fn grok_gets_the_user_files_in_one_copy_and_a_stale_copy_loses_its_hooks() {
     assert_eq!(stop, [":", "true"]);
     let s: Value = serde_json::from_slice(&std::fs::read(&stale).unwrap()).unwrap();
     assert_eq!(s["hooks"], serde_json::json!({}));
+}
+
+/// Each simple command of a line counts: the test builtin `[` does not
+/// make the line resolved.
+#[test]
+fn every_program_of_a_shell_line_must_be_in_the_sandbox() {
+    let w = world("[hooks]\nprograms = [\"~/.local/bin/listed-hook\"]\n");
+    let prog = put(&w, ".local/bin/listed-hook", HOOK, 0o755);
+    let gone = w.env.home.join(".local/bin/gone-hook");
+    let cmds = [
+        format!("[ ! -f '{0}' ] || '{0}' stop", gone.display()),
+        format!("[ ! -f '{0}' ] || '{0}' stop", prog.display()),
+        "[ -n \"$TOOL_HOME\" ] && \"$TOOL_HOME/bin/tool\" stop".to_string(),
+        "test -x ~/.local/bin/listed-hook && listed-hook stop".to_string(),
+    ];
+    let handlers: Vec<Value> = cmds
+        .iter()
+        .map(|c| serde_json::json!({"hooks": [{"type": "command", "command": c}]}))
+        .collect();
+    let doc = serde_json::json!({"hooks": {"Stop": handlers}}).to_string();
+    for name in ["claude", "codex"] {
+        let (rel, _) = user_file(name);
+        put(&w, rel, &doc, 0o644);
+        let spec = start(&w, name).unwrap();
+        let user: Vec<String> = sandbox_commands(&spec)
+            .into_iter()
+            .map(|c| c.1)
+            .filter(|c| !c.starts_with("paddock-host"))
+            .collect();
+        // The missing path is left out everywhere. Codex keeps only the
+        // lines that run a listed program, and trusts them.
+        let want: Vec<&String> = match name {
+            "codex" => vec![&cmds[1], &cmds[3]],
+            _ => vec![&cmds[1], &cmds[2], &cmds[3]],
+        };
+        assert_eq!(user.iter().collect::<Vec<_>>(), want, "{name}");
+        let notes: Vec<&String> = spec
+            .notices
+            .iter()
+            .filter(|n| n.contains("hooks left out"))
+            .collect();
+        assert_eq!(notes.len(), 1, "{name}: {:?}", spec.notices);
+        assert!(notes[0].contains("gone-hook"), "{}", notes[0]);
+        assert_eq!(
+            notes[0].contains("$TOOL_HOME/bin/tool"),
+            name == "codex",
+            "{}",
+            notes[0]
+        );
+        let ex = explain(&spec).join("\n");
+        if name == "codex" {
+            assert!(
+                ex.contains("$TOOL_HOME/bin/tool is not in [hooks] programs"),
+                "{ex}"
+            );
+            assert_eq!(
+                ex.matches("[hooks] programs listed-hook, trusted").count(),
+                2,
+                "{ex}"
+            );
+            let cfg: toml::Value = toml::from_str(
+                &std::fs::read_to_string(spec.home_src.join(".codex/config.toml")).unwrap(),
+            )
+            .unwrap();
+            let state = cfg["hooks"]["state"].as_table().unwrap();
+            assert_eq!(
+                state.keys().filter(|k| k.contains(":stop:")).count(),
+                2,
+                "{state:?}"
+            );
+        }
+    }
+}
+
+/// An ignore rule silences an untrusted Codex entry, as any other.
+#[test]
+fn an_ignored_untrusted_codex_entry_has_no_notice() {
+    let w = world("[hooks]\nignore = [\"tool\"]\n");
+    put(
+        &w,
+        ".codex/hooks.json",
+        r#"{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"[ -n \"$TOOL_HOME\" ] && \"$TOOL_HOME/bin/tool\" stop"}]}]}}"#,
+        0o644,
+    );
+    let spec = start(&w, "codex").unwrap();
+    assert!(
+        !spec.notices.iter().any(|n| n.contains("hooks left out")),
+        "{:?}",
+        spec.notices
+    );
+    assert!(sandbox_commands(&spec)
+        .iter()
+        .all(|c| c.1.starts_with("paddock-host")));
 }

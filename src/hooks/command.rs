@@ -1,10 +1,12 @@
 //! The program of a hook command, and whether it resolves inside a sandbox.
 //!
-//! A harness runs a hook command with a shell. paddock reads the first
-//! simple command of the line: assignments (`A=1`) and the wrappers `env`,
-//! `exec`, `command` and `nohup` are skipped, and the next word is the
-//! program. A shell builtin and a shell with `-c` count as resolved. An
-//! interpreter with a script path (`bash ~/hooks/x.sh`) needs both.
+//! A harness runs a hook command with a shell. paddock splits the line
+//! into its simple commands (`a && b`, `a; b`, `a | b`) and reads each
+//! one: assignments (`A=1`), the wrappers `env`, `exec`, `command` and
+//! `nohup`, and the keywords `if`, `then` and so on are skipped, and the
+//! next word is the program. A shell builtin and a shell with `-c` count as
+//! resolved. An interpreter with a script path (`bash ~/hooks/x.sh`) needs
+//! both. A line resolves only when each of its programs does.
 
 use crate::spec::{MountKind, SandboxSpec, TOOL_DIR};
 use std::path::{Component, Path, PathBuf};
@@ -16,6 +18,12 @@ pub const RUNTIME_TOOLS: &[&str] = &["paddock-host"];
 const BUILTINS: &[&str] = &[
     ":", "true", "false", "echo", "printf", "test", "[", "exit", "cd", "export", "read", "set",
     "unset", "return", "shift", "trap", "wait", "type", "pwd", "umask", "eval", ".", "source",
+    "[[", "fi", "done", "esac",
+];
+
+/// Shell keywords before a command.
+const KEYWORDS: &[&str] = &[
+    "if", "then", "else", "elif", "while", "until", "do", "!", "time",
 ];
 
 const SHELLS: &[&str] = &["sh", "bash", "zsh", "dash", "ksh", "fish"];
@@ -119,6 +127,74 @@ pub fn base(word: &str) -> &str {
     word.rsplit('/').next().unwrap_or(word)
 }
 
+/// The simple commands of a line: split at `;`, `&`, `|` and new lines
+/// outside quotes and substitutions. A redirection such as `2>&1` stays.
+pub fn split(line: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    // Inside `$(...)` or backquotes.
+    let (mut depth, mut tick) = (0usize, false);
+    let mut prev = ' ';
+    let mut chars = line.chars().peekable();
+    while let Some(c) = chars.next() {
+        cur.push(c);
+        match c {
+            '\'' => {
+                for c in chars.by_ref() {
+                    cur.push(c);
+                    if c == '\'' {
+                        break;
+                    }
+                }
+            }
+            '"' => {
+                while let Some(c) = chars.next() {
+                    cur.push(c);
+                    match c {
+                        '\\' => cur.extend(chars.next()),
+                        '"' => break,
+                        _ => {}
+                    }
+                }
+            }
+            '\\' => cur.extend(chars.next()),
+            '`' => tick = !tick,
+            '$' if chars.peek() == Some(&'(') => {
+                cur.extend(chars.next());
+                depth += 1;
+            }
+            ')' if depth > 0 => depth -= 1,
+            '&' if prev == '>' || prev == '<' || chars.peek() == Some(&'>') => {}
+            ';' | '&' | '|' | '\n' if depth == 0 && !tick => {
+                cur.pop();
+                out.push(std::mem::take(&mut cur));
+            }
+            _ => {}
+        }
+        prev = c;
+    }
+    out.push(cur);
+    out.retain(|s| !s.trim().is_empty());
+    out
+}
+
+/// A short name for a line in a notice: its first program, or the line
+/// itself cut to 40 characters.
+pub fn first_program(line: &str) -> String {
+    for part in split(line) {
+        match parse(&part) {
+            Parsed::Program { program, .. } => return program,
+            Parsed::ShellC => break,
+            Parsed::Builtin => {}
+        }
+    }
+    let t = line.trim();
+    match t.char_indices().nth(40) {
+        Some((i, _)) => format!("{}...", &t[..i]),
+        None => t.to_string(),
+    }
+}
+
 pub fn parse(line: &str) -> Parsed {
     let Some(w) = words(line) else {
         return Parsed::ShellC;
@@ -138,6 +214,7 @@ pub fn parse(line: &str) -> Parsed {
                     i += 1;
                 }
             }
+            w if KEYWORDS.contains(&w) => i += 1,
             "exec" | "command" | "nohup" => {
                 i += 1;
                 while w.get(i).is_some_and(|a| a.starts_with('-')) {
