@@ -1,1 +1,0 @@
-- Fix: the agents panel shows Codex limits again. A Codex login that the credential keeper keeps is checked in the keeper's sandbox, as before the usage box, because Codex's app-server writes its state next to the login.
