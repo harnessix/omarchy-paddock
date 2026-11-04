@@ -142,7 +142,7 @@ for p in "${frags[@]+"${frags[@]}"}"; do
     status=1
     continue
   fi
-  first=$(printf '%s\n' "$content" | awk 'NF { print; exit }')
+  first=$(awk 'NF { print; exit }' <<< "$content")
   if [ -z "$first" ]; then
     echo "changelog: ${p} is empty"
     status=1
@@ -158,10 +158,12 @@ if git diff --name-only "${base}...${head}" -- CHANGELOG.md | grep -qx 'CHANGELO
   extract() {
     local rev=$1 dest=$2
     if git cat-file -e "${rev}:CHANGELOG.md" 2>/dev/null; then
+      # awk reads to the end: an early exit would kill git show with
+      # SIGPIPE, which fails the script under pipefail on a long changelog.
       git show "${rev}:CHANGELOG.md" | awk '
         $0 == "## Unreleased" { on = 1; next }
-        on && /^## / { exit }
-        on { print }
+        on && /^## / { on = 0; done = 1 }
+        on && !done { print }
       ' > "$dest"
     else
       : > "$dest"
