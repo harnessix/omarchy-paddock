@@ -1,11 +1,10 @@
 /target
-/build
-/pkgbuild/pkg
-/pkgbuild/src
-/pkgbuild/*.pkg.tar.*
+/core/target
+/core/pkgbuild/pkg
+/core/pkgbuild/src
+/core/pkgbuild/*.pkg.tar.*
 
-# Design and agent notes stay out of version control.
-/docs/DESIGN.md
+# Agent notes stay out of version control.
 CLAUDE.md
 CLAUDE.local.md
 AGENTS.md

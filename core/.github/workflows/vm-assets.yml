@@ -1,0 +1,63 @@
+name: VM guest files
+
+# Builds the guest files of the VM backend (kernel, rootfs.img and
+# assets.toml) with packaging/vm/build.sh, for a branch, tag or commit.
+#
+# Run it by hand on the release commit before you tag it. Commit the
+# assets.toml of its artifact as packaging/vm/assets.toml: the paddock
+# binary and the Homebrew formula read that file. The release workflow
+# calls this workflow again for the tag and checks that the files match.
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Branch, tag or commit to build
+        required: true
+        default: main
+  workflow_call:
+    inputs:
+      ref:
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  # The guest binary is part of rootfs.img. The same toolchain gives the
+  # same sha256 in the run before the tag and in the release.
+  RUST_TOOLCHAIN: "1.99.1"
+
+jobs:
+  vm:
+    name: VM guest files
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          targets: aarch64-unknown-linux-musl
+      - name: Install the build tools
+        run: sudo apt-get update && sudo apt-get install -y clang llvm e2fsprogs
+      # build.sh writes the URLs for the releases of GITHUB_REPOSITORY.
+      - name: Build the guest files
+        run: packaging/vm/build.sh build/vm
+      - name: Compare with packaging/vm/assets.toml
+        run: |
+          if diff -u packaging/vm/assets.toml build/vm/assets.toml; then
+            echo "packaging/vm/assets.toml matches the built files"
+          else
+            echo "::warning::packaging/vm/assets.toml does not match the built files. Commit the assets.toml of the artifact vm-assets."
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: vm-assets
+          path: build/vm/*
+          if-no-files-found: error

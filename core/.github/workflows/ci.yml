@@ -1,0 +1,108 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  rust:
+    name: fmt, clippy, test
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test --locked
+
+  # No Linux step checks the macOS target: ring and the bundled SQLite
+  # compile C code that needs the headers of the Apple SDK. This job covers
+  # the macOS code instead.
+  rust-macos:
+    name: fmt, clippy, test (macOS)
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test --locked
+      # The release signs paddock-vm the same way. This step finds a broken
+      # entitlements file before a release does.
+      - name: Sign paddock-vm
+        run: |
+          cargo build --locked --bin paddock-vm
+          codesign --force --sign - --entitlements packaging/macos/paddock-vm.entitlements target/debug/paddock-vm
+          codesign -d --entitlements - target/debug/paddock-vm 2>&1 | grep -q com.apple.security.virtualization
+
+  escape-probe:
+    name: escape probe (bwrap)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install bubblewrap, passt, iproute2
+        run: sudo apt-get update && sudo apt-get install -y bubblewrap passt iproute2
+      # Ubuntu 24.04 blocks unprivileged user namespaces through AppArmor.
+      # bwrap needs them, so allow them on this throwaway runner.
+      - name: Allow unprivileged user namespaces
+        run: |
+          if sysctl -n kernel.apparmor_restrict_unprivileged_userns >/dev/null 2>&1; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+          bwrap --unshare-all --ro-bind / / true
+      # With mise, the probe also checks that a project's mise config cannot
+      # write the shared tool installs.
+      - uses: jdx/mise-action@v2
+        with:
+          install: false
+      - run: cargo build --locked
+      - name: Probe, network none
+        run: target/debug/paddock doctor --escape --backend bwrap --network none
+      - name: Probe, network none, clean env
+        run: target/debug/paddock doctor --escape --backend bwrap --network none --env clean
+      - name: Probe, network egress
+        run: target/debug/paddock doctor --escape --backend bwrap --network egress --online
+      - name: Skipped probes
+        run: |
+          echo "::notice::Skipped --gui and --app probes: the runner has no Wayland compositor."
+          echo "::notice::Skipped docker, podman and srt probes: run bin/test on a workstation for these."
+
+  file-size:
+    name: file size
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: .github/scripts/file-size.sh
+
+  leak-guard:
+    name: leak guard
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Check files and commit emails
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          if [ -n "$BASE_SHA" ]; then
+            .github/scripts/leak-guard.sh "$BASE_SHA..$HEAD_SHA"
+          else
+            .github/scripts/leak-guard.sh
+          fi

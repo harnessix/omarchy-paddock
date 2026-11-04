@@ -1,0 +1,198 @@
+name: Release
+
+# Builds the paddock binaries for a version tag: x86_64 and aarch64 Linux,
+# aarch64 and x86_64 macOS. It also packs the source, fills in the Homebrew
+# formula and builds the VM guest files (vm-assets.yml). When every build is
+# done, one job attaches all files to the GitHub Release of that tag. The
+# release notes come from the matching section of CHANGELOG.md. Run it by
+# hand to add the files to an existing tag.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing tag to build, for example v0.1.0
+        required: true
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    # With an explicit bash, a step also fails when a command in a pipe fails.
+    shell: bash
+
+env:
+  TAG: ${{ github.event.inputs.tag || github.ref_name }}
+  # paddock update and paddock doctor read the releases of this repository.
+  PADDOCK_RELEASE_REPO: ${{ github.repository }}
+
+jobs:
+  build:
+    name: build (${{ matrix.arch }}-${{ matrix.os }})
+    # Each target builds on a native GitHub runner. An older Ubuntu links
+    # against an older glibc, so the Linux binary also runs on distributions
+    # with a newer one. On macOS, build.rs builds the pty library only for
+    # the system it runs on, so x86_64 needs an Intel runner.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            os: linux
+            runner: ubuntu-22.04
+          - arch: aarch64
+            os: linux
+            runner: ubuntu-22.04-arm
+          - arch: aarch64
+            os: macos
+            runner: macos-15
+          - arch: x86_64
+            os: macos
+            runner: macos-15-intel
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Check the version
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)
+          [ "v$version" = "$TAG" ] || { echo "::error::Cargo.toml has $version, the tag is $TAG"; exit 1; }
+      - name: Build
+        run: cargo build --release --locked 2>&1 | tee build.log
+      # Without the pty library, Seatbelt terminal runs get no pty.
+      - name: Check the pty library
+        if: matrix.os == 'macos'
+        run: |
+          if grep -q 'cannot build src/ptyshim/shim.c' build.log; then
+            echo "::error::build.rs could not build the pty library"
+            exit 1
+          fi
+      # paddock-vm owns the VM of the VM backend. It needs an ad hoc
+      # signature with only the virtualization entitlement.
+      - name: Sign paddock-vm
+        if: matrix.os == 'macos'
+        run: |
+          codesign --force --sign - --entitlements packaging/macos/paddock-vm.entitlements target/release/paddock-vm
+          codesign -d --entitlements - target/release/paddock-vm 2>&1 | tee entitlements.txt
+          grep -q com.apple.security.virtualization entitlements.txt || { echo "::error::paddock-vm has no virtualization entitlement"; exit 1; }
+      - name: Package
+        run: |
+          name="paddock-${TAG#v}-${{ matrix.arch }}-${{ matrix.os }}"
+          mkdir -p "dist/$name"
+          cp target/release/paddock README.md LICENSE CHANGELOG.md "dist/$name/"
+          if [ "${{ matrix.os }}" = macos ]; then cp target/release/paddock-vm "dist/$name/"; fi
+          tar -C dist -czf "dist/$name.tar.gz" "$name"
+          # macOS has shasum but no sha256sum. Both print the same line.
+          sum() { if command -v sha256sum >/dev/null; then sha256sum "$@"; else shasum -a 256 "$@"; fi; }
+          (cd dist && sum "$name.tar.gz" > "$name.tar.gz.sha256")
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.arch }}-${{ matrix.os }}
+          path: |
+            dist/*.tar.gz
+            dist/*.sha256
+          if-no-files-found: error
+
+  source:
+    name: source and Homebrew formula
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+      - name: Pack the source
+        run: |
+          version=${TAG#v}
+          name="paddock-$version"
+          mkdir -p dist
+          git archive --format=tar.gz --prefix="$name/" -o "dist/$name.tar.gz" HEAD
+          (cd dist && sha256sum "$name.tar.gz" > "$name.tar.gz.sha256")
+      # The formula builds from the source tarball above. This job only
+      # attaches it to the release. It does not push it to a tap.
+      - name: Fill in the Homebrew formula
+        run: |
+          version=${TAG#v}
+          sha=$(cut -d ' ' -f 1 "dist/paddock-$version.tar.gz.sha256")
+          [ "${#sha}" = 64 ] || { echo "::error::no checksum for the source tarball"; exit 1; }
+          # The url or sha256 of one guest file in packaging/vm/assets.toml.
+          vm() {
+            awk -v n="$1" -v k="$2" '/^\[\[file\]\]/ { cur = "" }
+              $1 == "name" { gsub(/"/, "", $3); cur = $3 }
+              cur == n && $1 == k { gsub(/"/, "", $3); print $3 }' packaging/vm/assets.toml
+          }
+          sed -e "s|@VERSION@|$version|g" -e "s|@SHA256@|$sha|g" -e "s|@REPO@|$GITHUB_REPOSITORY|g" \
+            -e "s|@VM_KERNEL_URL@|$(vm kernel url)|g" -e "s|@VM_KERNEL_SHA256@|$(vm kernel sha256)|g" \
+            -e "s|@VM_ROOTFS_URL@|$(vm rootfs.img url)|g" -e "s|@VM_ROOTFS_SHA256@|$(vm rootfs.img sha256)|g" \
+            packaging/homebrew/paddock.rb > dist/paddock.rb
+          # The guest files must come from the release of this tag.
+          for f in kernel rootfs.img; do
+            want="https://github.com/$GITHUB_REPOSITORY/releases/download/$TAG/$f"
+            [ "$(vm "$f" url)" = "$want" ] || { echo "::error::packaging/vm/assets.toml has no URL $want"; exit 1; }
+          done
+          if grep -n '@[A-Z0-9_]*@' dist/paddock.rb; then
+            echo "::error::the formula has a placeholder that is not filled in"
+            exit 1
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-source
+          path: dist/*
+          if-no-files-found: error
+
+  vm:
+    name: VM guest files
+    # kernel, rootfs.img and assets.toml of packaging/vm/build.sh. The
+    # publish job checks them against packaging/vm/assets.toml of the tag.
+    uses: ./.github/workflows/vm-assets.yml
+    with:
+      ref: ${{ github.event.inputs.tag || github.ref_name }}
+
+  publish:
+    name: publish
+    # Every build must succeed first. Then one release gets all files.
+    needs: [build, source, vm]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: dist-*
+          merge-multiple: true
+          path: dist
+      - uses: actions/download-artifact@v4
+        with:
+          name: vm-assets
+          path: vm
+      # The paddock binary and the formula pin the guest files with
+      # packaging/vm/assets.toml. A release with other files cannot install.
+      - name: Check the VM guest files
+        run: |
+          if ! diff -u packaging/vm/assets.toml vm/assets.toml; then
+            echo "::error::packaging/vm/assets.toml of $TAG does not match the built guest files. Run the workflow \"VM guest files\" on the release commit, commit its assets.toml, and tag again."
+            exit 1
+          fi
+      - name: Write the checksum file and the notes
+        run: |
+          (cd dist && sha256sum ./*.tar.gz | sed 's|  \./|  |' > SHA256SUMS)
+          (cd vm && sha256sum kernel rootfs.img) >> dist/SHA256SUMS
+          cat dist/SHA256SUMS
+          awk -v v="## ${TAG#v}" '$0==v{f=1;next} /^## /{f=0} f' CHANGELOG.md > notes.md
+          [ -s notes.md ] || { echo "::error::CHANGELOG.md has no section ## ${TAG#v}"; exit 1; }
+      - name: Publish
+        run: |
+          files=(dist/*.tar.gz dist/*.sha256 dist/SHA256SUMS dist/paddock.rb vm/kernel vm/rootfs.img vm/assets.toml)
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" "${files[@]}" --clobber
+          else
+            gh release create "$TAG" --verify-tag --title "paddock ${TAG#v}" --notes-file notes.md "${files[@]}"
+          fi

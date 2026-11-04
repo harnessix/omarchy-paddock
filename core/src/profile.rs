@@ -1,0 +1,800 @@
+//! Harness profiles and the factory that turns a profile name into a located,
+//! ready-to-mount harness. A profile is a TOML file; adding a harness means
+//! adding a file, not code.
+
+use crate::env::{capture, is_executable, HostEnv};
+use anyhow::{anyhow, bail, Context, Result};
+use serde::Deserialize;
+use std::collections::BTreeMap;
+use std::io::Read;
+use std::path::{Component, Path, PathBuf};
+
+mod mac_app;
+mod paths;
+pub use mac_app::{MacApp, ProfileMacos};
+pub use paths::is_system_path;
+use paths::{canonical, is_shim};
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Profile {
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub locate: Locate,
+    #[serde(default)]
+    pub launch: Launch,
+    #[serde(default)]
+    pub state: State,
+    #[serde(default)]
+    pub network: ProfileNetwork,
+    #[serde(default)]
+    pub mcp: Vec<McpSource>,
+    /// Vendor telemetry switches that paddock turns off inside the sandbox,
+    /// and where the user turns off the use of their data for training.
+    #[serde(default)]
+    pub privacy: Privacy,
+    /// Profile entries that come from documentation, not from a test on a
+    /// real install. `paddock doctor` lists them.
+    #[serde(default)]
+    pub unverified: Vec<String>,
+    /// Present for desktop apps, which `paddock app` runs.
+    pub app: Option<AppProfile>,
+    /// The one-task mode, the only command that `paddock-host spawn` starts.
+    pub oneshot: Option<OneShot>,
+    /// The first-prompt command of `paddock run --detach`, which needs it.
+    pub detach: Option<Detach>,
+    /// The hook that runs after a context compaction (compaction.rs).
+    pub compaction: Option<crate::compaction::Hook>,
+    #[serde(default)]
+    pub macos: ProfileMacos,
+    /// Where the harness reads hooks: paddock carries the user's hook
+    /// entries there and checks their programs (hooks.rs).
+    pub hooks: Option<crate::hooks::Files>,
+    /// Start screens that paddock answers when nobody watches (screens.rs).
+    #[serde(default)]
+    pub screens: crate::screens::Screens,
+}
+
+/// `[detach]`: the arguments that give the interactive interface its first
+/// prompt. `{prompt_file}` becomes the path of a read-only copy of the
+/// prompt inside the sandbox; the prompt itself never goes into argv.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Detach {
+    pub args: Vec<String>,
+}
+
+impl Detach {
+    /// The arguments with the prompt file path filled in.
+    pub fn render(&self, prompt_file: &Path) -> Vec<String> {
+        let f = prompt_file.display().to_string();
+        self.args
+            .iter()
+            .map(|a| a.replace(PROMPT_FILE, &f))
+            .collect()
+    }
+}
+
+/// How a prompt reaches a one-shot run. Never in the arguments: the
+/// arguments of a process are visible to every local user.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PromptVia {
+    /// The prompt is the standard input of the harness.
+    Stdin,
+    /// The prompt is a file in the sandbox home. `{prompt_file}` in `args`
+    /// becomes its path inside the sandbox.
+    File,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OneShot {
+    /// Arguments after the executable, including the auto-approval flags.
+    /// Fixed text only: the prompt never goes here.
+    pub args: Vec<String>,
+    pub prompt: PromptVia,
+    /// Arguments for the help output that must mention every flag in
+    /// `args`, the same check as for `yolo_args`.
+    #[serde(default = "default_probe")]
+    pub probe_args: Vec<String>,
+    /// Arguments after `args` that choose the model, with `{model}` for the
+    /// name (spawn/model.rs). Empty: no `--model`. `probe_args` checks them.
+    #[serde(default)]
+    pub model_args: Vec<String>,
+    /// The same for the reasoning effort, with `{effort}` for the level.
+    #[serde(default)]
+    pub effort_args: Vec<String>,
+}
+
+/// The placeholder for the prompt file in `OneShot::args`.
+pub const PROMPT_FILE: &str = "{prompt_file}";
+
+impl OneShot {
+    /// The arguments with the prompt file path filled in.
+    pub fn render(&self, prompt_file: &Path) -> Vec<String> {
+        let f = prompt_file.display().to_string();
+        self.args
+            .iter()
+            .map(|a| a.replace(PROMPT_FILE, &f))
+            .collect()
+    }
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AppProfile {
+    /// Display name for launcher entries.
+    #[serde(default)]
+    pub display_name: String,
+    /// A flatpak application ID. paddock then runs it with `flatpak run
+    /// --sandbox` inside pasta, instead of bwrap.
+    pub flatpak: Option<String>,
+    /// Icon name or path for launcher entries.
+    pub icon: Option<String>,
+    /// For flatpak: the command to run instead of the app's own (`--command`).
+    pub command: Option<String>,
+    /// URL schemes the app handles, without "://", for example "claude".
+    /// `paddock app install` makes paddock their handler, and links reach the
+    /// running sandbox.
+    #[serde(default)]
+    pub schemes: Vec<String>,
+    /// Pass the workspace folders to the app as arguments, for editors that
+    /// open the folders they are given.
+    #[serde(default)]
+    pub open_roots: bool,
+    pub macos: Option<MacApp>, // The app on macOS, run with Seatbelt.
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Locate {
+    /// Command names to look up on PATH, in order.
+    #[serde(default)]
+    pub commands: Vec<String>,
+    /// Executable name for `mise which` (not the mise tool name). Tried first
+    /// when mise is installed, so harnesses are found without mise on PATH.
+    pub mise: Option<String>,
+    /// Extra candidate paths. `~/` expands to the home directory.
+    #[serde(default)]
+    pub paths: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Launch {
+    /// Arguments that turn on full auto-approval.
+    #[serde(default)]
+    pub yolo_args: Vec<String>,
+    /// Arguments that are always passed.
+    #[serde(default)]
+    pub args: Vec<String>,
+    /// Environment variables set inside the sandbox.
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
+    /// Arguments for the help output that must mention every `yolo_args` flag.
+    #[serde(default = "default_probe")]
+    pub probe_args: Vec<String>,
+    /// The harness logs in with a browser and a localhost callback. paddock
+    /// opens login pages in the host browser and forwards the callback port.
+    #[serde(default)]
+    pub login_callback: bool,
+    /// The harness keeps its login in the system keyring. The sandbox gets a
+    /// private keyring of its own (keyring.rs), never the host one.
+    #[serde(default)]
+    pub keyring: bool,
+    /// `paddock wrap` runs this harness on the host, with this reason in a
+    /// notice, because it cannot work in a sandbox (for example, it needs
+    /// its own sandbox, or its agent runs in a host service).
+    pub wrap_on_host: Option<String>,
+}
+
+impl Default for Launch {
+    fn default() -> Self {
+        Self {
+            yolo_args: vec![],
+            args: vec![],
+            env: BTreeMap::new(),
+            probe_args: default_probe(),
+            login_callback: false,
+            keyring: false,
+            wrap_on_host: None,
+        }
+    }
+}
+
+fn default_probe() -> Vec<String> {
+    vec!["--help".to_string()]
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct State {
+    /// Credential files, relative to HOME. Paddock copies them in and out.
+    #[serde(default)]
+    pub auth: Vec<String>,
+    /// For a JSON credential file: the dotted path of the field that says
+    /// when its login expires (`"claudeAiOauth.expiresAt"`), by the file's
+    /// entry in `auth`. When a running sandbox and the host both changed
+    /// the file, the login that expires later wins. Without an entry,
+    /// neither side counts as newer.
+    #[serde(default)]
+    pub auth_expiry: std::collections::BTreeMap<String, String>,
+    /// JSON files, relative to HOME, with boolean keys that only go from
+    /// false to true, such as a finished onboarding. A listed key that is
+    /// true on one side (the login store or the sandbox) becomes true on the
+    /// other. paddock never writes false over true, and never sets a key
+    /// that is true on neither side.
+    #[serde(default)]
+    pub done_flags: BTreeMap<String, Vec<String>>,
+    /// Host files and directories, relative to HOME, mounted read-only.
+    #[serde(default)]
+    pub import_ro: Vec<String>,
+    /// Host environment variables passed through when they are set.
+    #[serde(default)]
+    pub env_pass: Vec<String>,
+    /// Host files and directories, relative to HOME, copied into the sandbox
+    /// home at each start. The copy is writable and is not copied back.
+    #[serde(default)]
+    pub seed: Vec<String>,
+    /// Keys copied from a host JSON file into the sandbox copy at each start.
+    #[serde(default)]
+    pub json_import: Vec<JsonImport>,
+    /// Values set in a TOML file in the sandbox home at each start, after
+    /// `seed`. For example, marking the project trusted: paddock is the
+    /// external sandbox, so a second trust prompt only gets in the way.
+    #[serde(default)]
+    pub toml_set: Vec<TomlSet>,
+    /// Values written into settings files in the sandbox home at each start,
+    /// after `seed`, for example to turn off a self-update that cannot work
+    /// on the read-only install. The host files are never changed.
+    #[serde(default)]
+    pub settings: Vec<Setting>,
+    /// The variable that points the harness at another account folder, as
+    /// Omarchy's account switch sets it. `paddock wrap` reads it from the
+    /// command and uses that folder as the login of the sandbox.
+    pub account: Option<Account>,
+    /// Session history that tools on the host read (history.rs).
+    pub history: Option<History>,
+    /// Pure caches of this harness, relative to HOME, that rebuild
+    /// themselves. They add to the table in storage/caches.rs: a path
+    /// without `*` is a tmpfs in the sandbox, and `paddock gc` clears them.
+    #[serde(default)]
+    pub scratch: Vec<String>,
+    /// The data roots of the harness, relative to HOME: the files and
+    /// folders that `--profile default` copies into a private snapshot
+    /// (shadow.rs). The `auth` files inside them stay out of the snapshot.
+    #[serde(default)]
+    pub data: Vec<String>,
+    /// A short command of the harness that renews its login and does no
+    /// model work, for example `["agy", "models"]`. When the Omarchy agents
+    /// panel asks for limits and the newest copy of a login has lapsed,
+    /// paddock runs it once in a sandbox with the shared login
+    /// (usage_box/refresh.rs).
+    #[serde(default)]
+    pub refresh: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct History {
+    /// A folder, relative to HOME, with one folder per project in Claude
+    /// Code's naming. paddock binds this project's host folder read-write.
+    pub project_folders: Option<String>,
+    /// Folders, relative to HOME, whose new files paddock copies back to the
+    /// host at exit, for history that is kept by date.
+    #[serde(default)]
+    pub copy_back: Vec<String>,
+    /// File name patterns for `copy_back`. Empty: every file.
+    #[serde(default)]
+    pub files: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Account {
+    /// The variable, for example CLAUDE_CONFIG_DIR.
+    pub env: String,
+    /// The folder that the variable replaces, relative to HOME.
+    pub dir: String,
+    /// Files outside `dir`, relative to HOME, that move into the account
+    /// folder with it, for example `.claude.json`.
+    #[serde(default)]
+    pub also: Vec<String>,
+}
+
+impl Account {
+    /// The host path of `rel` (relative to HOME) for the account folder
+    /// `folder`. None: the path does not move with the account.
+    pub fn map(&self, folder: &Path, rel: &str) -> Option<PathBuf> {
+        let dir = self.dir.trim_end_matches('/');
+        if rel == dir {
+            return Some(folder.to_path_buf());
+        }
+        if let Some(rest) = rel.strip_prefix(dir).and_then(|r| r.strip_prefix('/')) {
+            return Some(folder.join(rest));
+        }
+        if self.also.iter().any(|a| a == rel) {
+            return Path::new(rel).file_name().map(|n| folder.join(n));
+        }
+        None
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TomlSet {
+    /// File relative to HOME.
+    pub file: String,
+    /// Key path. `{project}` is the project path.
+    pub path: Vec<String>,
+    pub value: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct JsonImport {
+    /// File relative to HOME.
+    pub file: String,
+    /// Key paths copied in every auth mode. `{project}` is the project path.
+    #[serde(default)]
+    pub keys: Vec<Vec<String>>,
+    /// Key paths copied only in the shared auth mode (account identity).
+    #[serde(default)]
+    pub shared_keys: Vec<Vec<String>>,
+}
+
+/// Where a harness lists its MCP servers.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct McpSource {
+    /// File relative to HOME, or to the project when `in_project` is true.
+    pub file: String,
+    #[serde(default)]
+    pub in_project: bool,
+    /// json or toml.
+    #[serde(default = "default_json")]
+    pub format: String,
+    /// Key path to the table of servers. `{project}` is the project path.
+    pub path: Vec<String>,
+}
+
+fn default_json() -> String {
+    "json".into()
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProfileNetwork {
+    /// Hosts the harness needs. Reserved for the allowlist network mode.
+    #[serde(default)]
+    pub endpoints: Vec<String>,
+    /// Ports on the sandbox loopback that the host reaches on its own
+    /// 127.0.0.1, for a harness that serves its UI to the host browser.
+    #[serde(default)]
+    pub publish: Vec<u16>,
+}
+
+/// The privacy defaults of a harness (see privacy.rs). Each entry must come
+/// from the vendor's documentation, with the link in a comment next to it.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Privacy {
+    /// Environment variables that turn telemetry, usage statistics or crash
+    /// reports off.
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
+    /// Arguments that turn telemetry off, passed after `yolo_args`.
+    #[serde(default)]
+    pub args: Vec<String>,
+    /// Values written into settings files in the sandbox home at each start,
+    /// after `seed`. The host files are never changed.
+    #[serde(default)]
+    pub settings: Vec<Setting>,
+    /// Uploads of session data that paddock turns off (uploads.rs).
+    #[serde(default)]
+    pub uploads: Vec<crate::uploads::Upload>,
+    /// Data use for training is an account setting that no program can
+    /// change: where the user turns it off.
+    pub training: Option<Training>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Setting {
+    /// File relative to HOME.
+    pub file: String,
+    /// json or toml.
+    #[serde(default = "default_json")]
+    pub format: String,
+    /// Key path. `{project}` is the project path.
+    pub path: Vec<String>,
+    pub value: toml::Value,
+    /// Only when the harness starts with its auto-approval flags
+    /// (`yolo_args`), for example the acceptance of a bypass warning. With
+    /// `--no-yolo` the harness keeps asking.
+    #[serde(default)]
+    pub yolo_only: bool,
+    /// Add `value` at the end of the array at `path`, unless the array has
+    /// it already, for a hook beside the user's own hooks.
+    #[serde(default)]
+    pub append: bool,
+    /// `"no_pty"`: only for a Seatbelt run on macOS whose harness ignores
+    /// paddock's pty library (backend/seatbelt/run.rs `start_pty`).
+    #[serde(default)]
+    pub when: Option<When>,
+}
+
+/// The condition of a settings entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum When {
+    NoPty,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Training {
+    /// Where the setting is, in plain words.
+    pub setting: String,
+    /// The official page with the setting, or the documentation about it.
+    pub url: String,
+    /// What the harness's own onboarding asks about data use. `paddock
+    /// doctor` shows it while a `[state] done_flags` file on the host is
+    /// missing or not done, so the onboarding comes in the next sandbox.
+    pub onboarding: Option<String>,
+    /// How paddock refuses the training opt-in in the harness's own screens
+    /// (training.rs). Only a built-in profile can have rules.
+    #[serde(default)]
+    pub rule: Vec<crate::training::Rule>,
+    /// Built-in rules by id, for a user profile of the same harness.
+    #[serde(default)]
+    pub rules: Vec<String>,
+}
+
+impl Profile {
+    /// The training rules of this profile: its own, and the built-in rules
+    /// that it names. Only valid rules.
+    pub fn training_rules(&self) -> Vec<crate::training::Rule> {
+        let Some(t) = &self.privacy.training else {
+            return Vec::new();
+        };
+        let mut out: Vec<crate::training::Rule> = t.rule.clone();
+        for id in &t.rules {
+            if let Some(r) = builtin_rule(id) {
+                out.push(r);
+            }
+        }
+        out.retain(|r| match r.check() {
+            Ok(()) => true,
+            Err(e) => {
+                log::warn!("profile {}: {e:#}", self.name);
+                false
+            }
+        });
+        out
+    }
+}
+
+/// A training rule of a built-in profile, by id.
+pub fn builtin_rule(id: &str) -> Option<crate::training::Rule> {
+    BUILTIN
+        .iter()
+        .filter_map(|(_, text)| toml::from_str::<Profile>(text).ok())
+        .filter_map(|p| p.privacy.training)
+        .flat_map(|t| t.rule)
+        .find(|r| r.id == id)
+}
+
+/// A user profile cannot bring its own training rules: rows and keys come
+/// only with paddock. It can name a built-in rule.
+fn check_user_rules(p: &Profile, file: &Path) -> Result<()> {
+    let Some(t) = &p.privacy.training else {
+        return Ok(());
+    };
+    if !t.rule.is_empty() {
+        bail!(
+            "profile {}: [[privacy.training.rule]] comes only with the built-in profiles. Name a built-in rule in [privacy.training] rules = [...]",
+            file.display()
+        );
+    }
+    for id in &t.rules {
+        if builtin_rule(id).is_none() {
+            bail!("profile {}: no built-in training rule {id}", file.display());
+        }
+    }
+    Ok(())
+}
+
+pub(crate) const BUILTIN: &[(&str, &str)] = &[
+    ("agy", include_str!("../profiles/agy.toml")),
+    (
+        "chatgpt-desktop",
+        include_str!("../profiles/chatgpt-desktop.toml"),
+    ),
+    (
+        "claude-desktop",
+        include_str!("../profiles/claude-desktop.toml"),
+    ),
+    ("vscode", include_str!("../profiles/vscode.toml")),
+    ("claude", include_str!("../profiles/claude.toml")),
+    ("codex", include_str!("../profiles/codex.toml")),
+    ("copilot", include_str!("../profiles/copilot.toml")),
+    ("gemini", include_str!("../profiles/gemini.toml")),
+    ("grok", include_str!("../profiles/grok.toml")),
+    ("opencode", include_str!("../profiles/opencode.toml")),
+    // The other agents that omarchy-agent starts.
+    ("amp", include_str!("../profiles/amp.toml")),
+    ("commandcode", include_str!("../profiles/commandcode.toml")),
+    ("crush", include_str!("../profiles/crush.toml")),
+    (
+        "cursor-agent",
+        include_str!("../profiles/cursor-agent.toml"),
+    ),
+    ("devin", include_str!("../profiles/devin.toml")),
+    ("dsh", include_str!("../profiles/dsh.toml")),
+    ("freebuff", include_str!("../profiles/freebuff.toml")),
+    ("hermes", include_str!("../profiles/hermes.toml")),
+    ("kilo", include_str!("../profiles/kilo.toml")),
+    ("kimi", include_str!("../profiles/kimi.toml")),
+    ("kiro-cli", include_str!("../profiles/kiro-cli.toml")),
+    ("mcode", include_str!("../profiles/mcode.toml")),
+    ("muse", include_str!("../profiles/muse.toml")),
+    ("omp", include_str!("../profiles/omp.toml")),
+    ("openclaw", include_str!("../profiles/openclaw.toml")),
+    ("ori", include_str!("../profiles/ori.toml")),
+    ("pi", include_str!("../profiles/pi.toml")),
+    ("qwen", include_str!("../profiles/qwen.toml")),
+];
+
+/// A built-in profile by name.
+pub fn builtin(name: &str) -> Option<Profile> {
+    BUILTIN
+        .iter()
+        .find(|(n, _)| *n == name)
+        .and_then(|(_, text)| toml::from_str(text).ok())
+}
+
+/// A harness that the factory located on this host.
+#[derive(Debug, Clone)]
+pub struct Harness {
+    pub profile: Profile,
+    /// The real executable, after resolving symlinks and version-manager shims.
+    pub exe: PathBuf,
+    /// Host paths to mount read-only so the executable can run.
+    pub install_mounts: Vec<PathBuf>,
+    /// Directories to put on PATH inside the sandbox.
+    pub path_dirs: Vec<PathBuf>,
+    /// Where each profile came from.
+    pub source: String,
+}
+
+pub struct HarnessFactory<'a> {
+    env: &'a HostEnv,
+    profiles: BTreeMap<String, (Profile, String)>,
+}
+
+impl<'a> HarnessFactory<'a> {
+    pub fn new(env: &'a HostEnv) -> Result<Self> {
+        let mut profiles = BTreeMap::new();
+        for (name, text) in BUILTIN {
+            let p: Profile = toml::from_str(text)
+                .with_context(|| format!("built-in profile '{name}' is invalid"))?;
+            profiles.insert(p.name.clone(), (p, "built-in".to_string()));
+        }
+        let user_dir = env.paddock_config().join("harness.d");
+        if let Ok(entries) = std::fs::read_dir(&user_dir) {
+            let mut files: Vec<PathBuf> = entries
+                .filter_map(|e| e.ok().map(|e| e.path()))
+                .filter(|p| p.extension().is_some_and(|x| x == "toml"))
+                .collect();
+            files.sort();
+            for file in files {
+                let text = std::fs::read_to_string(&file)?;
+                let p: Profile = toml::from_str(&text)
+                    .with_context(|| format!("profile {} is invalid", file.display()))?;
+                check_user_rules(&p, &file)?;
+                profiles.insert(p.name.clone(), (p, file.display().to_string()));
+            }
+        }
+        Ok(Self { env, profiles })
+    }
+
+    pub fn names(&self) -> Vec<String> {
+        self.profiles.keys().cloned().collect()
+    }
+
+    pub fn profile(&self, name: &str) -> Option<&Profile> {
+        self.profiles.get(name).map(|(p, _)| p)
+    }
+
+    /// The file of a user profile, None for a built-in one.
+    pub fn user_file(&self, name: &str) -> Option<PathBuf> {
+        self.profiles
+            .get(name)
+            .map(|(_, s)| PathBuf::from(s))
+            .filter(|s| s.is_absolute())
+    }
+
+    pub fn create(&self, name: &str) -> Result<Harness> {
+        let (profile, source) = self.profiles.get(name).ok_or_else(|| {
+            anyhow!(
+                "unknown harness '{name}'. Known harnesses: {}. Add a profile in {}",
+                self.names().join(", "),
+                self.env.paddock_config().join("harness.d").display()
+            )
+        })?;
+        let exe = self.locate(profile)?;
+        let (install_mounts, path_dirs) = runtime_closure(self.env, &exe)?;
+        Ok(Harness {
+            profile: profile.clone(),
+            exe,
+            install_mounts,
+            path_dirs,
+            source: source.clone(),
+        })
+    }
+
+    /// A harness for a profile that paddock builds itself, such as the
+    /// workbench of a pasture.
+    pub fn adopt(&self, profile: Profile, source: &str) -> Result<Harness> {
+        let exe = self.locate(&profile)?;
+        let (install_mounts, path_dirs) = runtime_closure(self.env, &exe)?;
+        Ok(Harness {
+            profile,
+            exe,
+            install_mounts,
+            path_dirs,
+            source: source.into(),
+        })
+    }
+
+    fn locate(&self, p: &Profile) -> Result<PathBuf> {
+        let mut tried = Vec::new();
+        if let (Some(tool), Some(mise)) = (&p.locate.mise, self.env.which("mise")) {
+            tried.push(format!("mise which {tool}"));
+            if let Ok(out) = capture(crate::mise::host_command(&mise).args(["which", tool])) {
+                let path = PathBuf::from(out.lines().last().unwrap_or_default());
+                if is_executable(&path) {
+                    return canonical(&path);
+                }
+            }
+        }
+        for cmd in &p.locate.commands {
+            tried.push(format!("PATH lookup of {cmd}"));
+            // The first match that is not a version-manager shim: Omarchy
+            // puts mise's wrapper folder first on PATH.
+            let found = self
+                .env
+                .path
+                .iter()
+                .filter(|d| d.is_absolute())
+                .map(|d| d.join(cmd))
+                .find(|p| is_executable(p) && !is_shim(p));
+            if let Some(path) = found {
+                return canonical(&path);
+            }
+        }
+        for raw in &p.locate.paths {
+            let path = self.env.expand(raw, &self.env.home);
+            tried.push(path.display().to_string());
+            if is_executable(&path) {
+                return canonical(&path);
+            }
+        }
+        bail!(
+            "could not find the '{}' executable. Tried: {}",
+            p.name,
+            tried.join("; ")
+        )
+    }
+}
+
+/// Find what an executable needs from the host: its install directory and, for
+/// scripts, the interpreter named in the shebang line.
+pub fn runtime_closure(env: &HostEnv, exe: &Path) -> Result<(Vec<PathBuf>, Vec<PathBuf>)> {
+    let mut mounts = Vec::new();
+    let mut path_dirs = Vec::new();
+    let mut queue = vec![exe.to_path_buf()];
+    let mut seen = 0;
+    while let Some(file) = queue.pop() {
+        seen += 1;
+        if seen > 4 {
+            break;
+        }
+        mounts.push(install_root(&file));
+        if let Some(interp) = shebang_interpreter(&file) {
+            let resolved = if interp.contains('/') {
+                Some(PathBuf::from(&interp))
+            } else {
+                env.which(&interp)
+            };
+            if let Some(found) = resolved {
+                if let Some(dir) = found.parent() {
+                    if !is_system_path(&found) {
+                        path_dirs.push(dir.to_path_buf());
+                    }
+                }
+                if let Ok(real) = std::fs::canonicalize(&found) {
+                    if let Some(dir) = real.parent() {
+                        path_dirs.push(dir.to_path_buf());
+                    }
+                    queue.push(real);
+                }
+            }
+        }
+    }
+    mounts.sort();
+    mounts.dedup();
+    // Drop mounts that sit inside another mount.
+    let all = mounts.clone();
+    mounts.retain(|m| !all.iter().any(|o| crate::paths::strictly_inside(m, o)));
+    path_dirs.dedup();
+    Ok((mounts, path_dirs))
+}
+
+/// Bin directories in the home that hold single, self-contained executables
+/// next to unrelated ones. The folder above them can hold credentials
+/// (`~/.cargo/credentials.toml`), so only the file is mounted.
+pub const HOME_BIN_DIRS: &[&str] = &[
+    ".local/bin",
+    ".cargo/bin",
+    "go/bin",
+    ".bun/bin",
+    ".deno/bin",
+];
+
+/// The directory to mount for an executable. For npm packages this is the
+/// outermost `node_modules` folder: it holds the package and the packages it
+/// loads, and nothing else of the project or install around it (a `.env`, the
+/// sources). For a binary in a shared bin directory it is the file itself, so
+/// the directory is not shadowed in an image and its neighbours stay hidden.
+pub fn install_root(exe: &Path) -> PathBuf {
+    let comps: Vec<_> = exe.components().collect();
+    if let Some(i) = comps
+        .iter()
+        .position(|c| matches!(c, Component::Normal(s) if *s == "node_modules"))
+    {
+        return comps[..=i].iter().collect();
+    }
+    let parent = exe.parent().unwrap_or(Path::new("/"));
+    let shared = [
+        "/usr/bin",
+        "/usr/sbin",
+        "/bin",
+        "/sbin",
+        "/usr/local/bin",
+        "/usr/local/sbin",
+    ];
+    if shared.iter().any(|d| parent == Path::new(d))
+        || HOME_BIN_DIRS.iter().any(|d| parent.ends_with(d))
+    {
+        return exe.to_path_buf();
+    }
+    // A versioned install directory such as `<tool>/1.2.3/bin/<exe>`.
+    if parent.file_name().is_some_and(|n| n == "bin") {
+        if let Some(gp) = parent.parent() {
+            return gp.to_path_buf();
+        }
+    }
+    parent.to_path_buf()
+}
+
+fn shebang_interpreter(file: &Path) -> Option<String> {
+    let mut buf = [0u8; 256];
+    let n = std::fs::File::open(file).ok()?.read(&mut buf).ok()?;
+    let head = std::str::from_utf8(&buf[..n]).ok()?;
+    let line = head.strip_prefix("#!")?.lines().next()?.trim();
+    let mut parts = line.split_whitespace();
+    let first = parts.next()?;
+    if first.ends_with("/env") {
+        parts.find(|a| !a.starts_with('-')).map(str::to_string)
+    } else {
+        Some(first.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests;

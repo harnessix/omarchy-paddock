@@ -1,1 +1,0 @@
-- Fix: a view window no longer prints a `getcwd` error when the tmux view server started in a folder that was later removed. paddock now starts view sessions in `/`.

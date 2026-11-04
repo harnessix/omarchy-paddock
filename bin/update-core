@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+# Replace core/ with the files of a paddock release tag, and write the tag
+# to CORE. Usage: bin/update-core v0.2.1
+# core/ is a copy. Change paddock in harnessix/paddock, never here.
+set -euo pipefail
+tag=${1:?usage: bin/update-core vX.Y.Z}
+cd "$(dirname "${BASH_SOURCE[0]}")/.."
+git fetch --no-tags https://github.com/harnessix/paddock "refs/tags/$tag"
+git rm -rq --ignore-unmatch core
+git read-tree --prefix=core/ -u FETCH_HEAD
+echo "$tag" > CORE
+jq --arg v "${tag#v}" '.version = $v' manifest.json > manifest.json.new
+mv manifest.json.new manifest.json
+git add CORE manifest.json
+echo "core: now $tag. Commit it as 'Update paddock to $tag'."
