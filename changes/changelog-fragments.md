@@ -1,1 +1,0 @@
-- Changed: pull requests record a user-visible change as a file in `changes/` instead of editing `CHANGELOG.md`. A release assembles those files into `## Unreleased`.

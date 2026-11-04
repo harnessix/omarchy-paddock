@@ -1,5 +1,0 @@
-- New: the loft, a private layer above each repository with a git history of its own. `paddock loft init|status|log|diff|commit|adopt|remove` manage it, and `[loft] auto = true` makes one for every project. Every sandbox of the repository sees its private files in place (agent instruction files, design and plan files, Spec Kit folders, your own `[loft] paths`), and `.git/info/exclude` keeps them out of git. paddock commits the loft at the end of each run.
-- New: every sandbox gets the notes folder `.paddock/` for the agents' design notes and plans, outside the repository and the same for the whole spawn tree. The session note and the paddock-host skill point agents there.
-- New: the start notice and the push approval name private files that a push can publish, one line per kind, and the new files under `docs/` that a push adds. `[loft] public` keeps a path in git on purpose and silences its notice.
-- New: `paddock explain` lists the private paths, where each lives, and whether git tracks it. `paddock setup` offers the loft as a step.
-- Changed: the external Spec Kit store is now the loft. An earlier store moves into it by itself.

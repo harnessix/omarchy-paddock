@@ -1,1 +1,0 @@
-- A test no longer leaves its tmux view server running, and the agy profile says that agy has hooks but no compaction event.

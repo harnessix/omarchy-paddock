@@ -1,3 +1,0 @@
-- Fix: agy gets the compaction note only after a real compaction. A `CHECKPOINT` step alone also comes in a plain run, so paddock now counts a compaction only when the transcript has a `CHECKPOINT` step and fewer lines than before.
-- Fix: Grok Build 1.0.70 runs the hooks of `~/.grok/hooks` only in a trusted folder. paddock trusts the project folder in the sandbox copy of `~/.grok/trusted_folders.toml` for its own hook and the entries of `[hooks] programs`, and leaves your other hook entries out of the sandbox copy.
-- Changed: paddock turns off the session-log upload of dsh (plugin `session-log-deepseek`) in the sandbox copy of `~/.dsh/cordis.patch.yml`. `[profiles.dsh] upload_session_logs = true` keeps it on.

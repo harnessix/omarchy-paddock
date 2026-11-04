@@ -1,3 +1,0 @@
-- Fix: Codex no longer stops at "Hooks need review" in each sandbox start. A user hook entry that paddock does not trust is left out of the Codex sandbox copy, because Codex does not run it there. The start line names it. `[hooks] ignore` drops it without the line.
-- Fix: a hook line runs each of its commands. paddock now checks every program and path of the line, not only the first one. A line such as `[ ! -f PATH ] || PATH` is left out when PATH is not in the sandbox.
-- Fix: a detached run answers the known start screens again. The answers of the terminal to the harness's own questions, such as the cursor position, counted as user keys and turned the screen watcher off.
