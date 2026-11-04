@@ -351,6 +351,9 @@ pub struct SandboxSpec {
     /// (hooks.rs).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub hooks: Vec<crate::hooks::Target>,
+    /// Uploads that the start turns off in the sandbox home (uploads.rs).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub uploads: Vec<crate::uploads::Off>,
     /// `--profile default`: the home is an overlay on a private snapshot of
     /// the harness's host data (shadow.rs). Only bwrap runs it.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -417,6 +420,7 @@ impl SandboxSpec {
             generated: Vec::new(),
             home_settings: Vec::new(),
             hooks: Vec::new(),
+            uploads: Vec::new(),
             shadow: None,
         }
     }

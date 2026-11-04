@@ -379,6 +379,9 @@ pub struct Privacy {
     /// after `seed`. The host files are never changed.
     #[serde(default)]
     pub settings: Vec<Setting>,
+    /// Uploads of session data that paddock turns off (uploads.rs).
+    #[serde(default)]
+    pub uploads: Vec<crate::uploads::Upload>,
     /// Data use for training is an account setting that no program can
     /// change: where the user turns it off.
     pub training: Option<Training>,

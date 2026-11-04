@@ -8,6 +8,7 @@ unverified = [
   "privacy.env: the false values of the GROK_TELEMETRY_* variables",
   "network.endpoints: the hosts for the allowlist network mode",
   "compaction: the note on the first PostToolUse after a PostCompact, from the source of grok-build",
+  "hooks.folder_trust: the format of trusted_folders.toml, from the grok-build source (1.0.45). The 1.0.70 user guide names the same file",
 ]
 
 [locate]
@@ -38,6 +39,22 @@ env_pass = ["XAI_API_KEY", "GROK_API_KEY"]
 [state.account]
 env = "GROK_HOME"
 dir = ".grok"
+
+# Grok Build also reads hooks from ~/.claude/settings.json and
+# ~/.cursor/hooks.json, and the folder trust of paddock (hooks.folder_trust)
+# would turn them on. The sandbox copy of config.toml turns that scan off.
+# User guide, Configuration -> Harness compatibility.
+[[state.settings]]
+file = ".grok/config.toml"
+format = "toml"
+path = ["compat", "claude", "hooks"]
+value = false
+
+[[state.settings]]
+file = ".grok/config.toml"
+format = "toml"
+path = ["compat", "cursor", "hooks"]
+value = false
 
 [[mcp]]
 file = ".grok/config.toml"
@@ -75,8 +92,9 @@ endpoints = ["api.x.ai", "x.ai", "grok.com"]
 # and of an allowing UserPromptSubmit hook. A PostToolUse hook's
 # hookSpecificOutput.additionalContext reaches the model. So PostCompact
 # records the compaction and keeps the note, and the next PostToolUse hook
-# adds it. Hooks in ~/.grok/hooks/*.json are always trusted. paddock owns
-# this file in the sandbox home. User guide, Hooks:
+# adds it. Since 1.0.70, Grok Build runs the hooks in ~/.grok/hooks/*.json
+# only in a trusted folder ([hooks.folder_trust] below). paddock owns this
+# file in the sandbox home. User guide, Hooks:
 # https://github.com/xai-org/grok-build/blob/main/crates/codegen/xai-grok-pager/docs/user-guide/10-hooks.md
 [[compaction.settings]]
 file = ".grok/hooks/paddock-compaction.json"
@@ -108,3 +126,13 @@ args = ["Read the file {prompt_file} and do the task that it describes."]
 [hooks]
 files = [".grok/hooks/*.json"]
 into = ".grok/hooks/paddock-compaction.json"
+
+# Grok Build 1.0.70 runs these hooks only in a trusted folder. paddock
+# trusts the project folder in the sandbox copy of trusted_folders.toml
+# when its own hook or an entry of [hooks] programs is there. The trust
+# turns on every hook source of the user, so the sandbox copy gets only
+# the listed entries of ~/.grok/hooks, and the [hooks] table of the copy of
+# config.toml goes (src/hooks/folder_trust.rs).
+[hooks.folder_trust]
+file = ".grok/trusted_folders.toml"
+drop_hooks = [".grok/config.toml"]

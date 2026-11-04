@@ -251,8 +251,8 @@ pub fn record_value(f: &Facts, time: u64) -> String {
 /// - Grok Build discards the output of its compaction hooks and of an
 ///   allowing UserPromptSubmit hook. PostCompact marks the compaction, and
 ///   the next PostToolUse hook adds the note (`Mark`, then `Deliver`).
-/// - agy has hooks but no compaction event. Compaction adds a CHECKPOINT
-///   step to the transcript. PreInvocation scans for a new one (`Scan`).
+/// - agy has hooks but no compaction event. PreInvocation scans the
+///   transcript for a compaction (`Scan`, see `steps`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
     /// A compaction: record it and print the note for `event`.
@@ -261,7 +261,7 @@ pub enum Action {
     Mark { session: String },
     /// Print the kept note of the session for `event`, if there is one.
     Deliver { session: String, event: String },
-    /// Count the CHECKPOINT steps of a transcript. New ones are compactions.
+    /// Look at the steps of a transcript: a compaction made it shorter.
     Scan {
         conversation: String,
         transcript: String,
@@ -325,7 +325,7 @@ pub fn render(harness: &str, event: &str, note: &str) -> Option<String> {
 }
 
 /// Where the hook keeps its state in the sandbox home: the kept notes of
-/// Grok Build and the CHECKPOINT counts of agy.
+/// Grok Build and the step counts of agy.
 pub fn state_dir(home: &std::path::Path) -> PathBuf {
     home.join(".local/state/paddock/compaction")
 }
@@ -340,22 +340,42 @@ pub fn file_name(prefix: &str, id: &str) -> String {
     format!("{prefix}-{}", if id.is_empty() { "none" } else { &id })
 }
 
-/// agy writes the whole transcript to `transcript_full.jsonl` when it cuts
-/// `transcript.jsonl`. The full one counts when it exists.
-pub fn transcript_file(path: &std::path::Path) -> PathBuf {
-    let full = path.with_file_name("transcript_full.jsonl");
-    if full.is_file() {
-        full
-    } else {
-        path.to_path_buf()
+/// The steps of an agy transcript, one JSON object per line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Steps {
+    /// The complete lines.
+    pub lines: u64,
+    /// The CHECKPOINT steps among them.
+    pub checkpoints: u64,
+}
+
+impl Steps {
+    /// Whether the transcript now looks compacted, after `seen` lines at
+    /// the last look.
+    ///
+    /// agy has no sure marker of a compaction. A CHECKPOINT step alone is
+    /// not one: agy also writes a checkpoint for the title and the intent
+    /// of a plain one-turn run (the stream-json example of
+    /// https://antigravity.google/docs/cli/headless has one), and a hook can
+    /// add one. A compaction replaces the earlier steps with a summary, and
+    /// agy then writes the transcript again. So paddock counts a compaction
+    /// only when the transcript has a CHECKPOINT step and fewer lines than
+    /// at the last look. This can miss a compaction that keeps the line
+    /// count, but it does not give the note after a plain checkpoint.
+    pub fn compacted_since(&self, seen: u64) -> bool {
+        self.checkpoints > 0 && self.lines < seen
     }
 }
 
-/// The CHECKPOINT steps of an agy transcript, one JSON object per line. A
-/// step counts when its type (`type`, `step_type` or `stepType`, at the top
-/// or in `step`) is CHECKPOINT, also with a prefix such as
-/// `CORTEX_STEP_TYPE_CHECKPOINT`.
-pub fn checkpoints(transcript: impl std::io::BufRead) -> u64 {
+/// Read the steps of an agy transcript. A step is a CHECKPOINT when its
+/// type (`type`, `step_type` or `stepType`, at the top or in `step`) is
+/// CHECKPOINT, also with a prefix such as `CORTEX_STEP_TYPE_CHECKPOINT`.
+/// A last line without a newline is still being written and does not count.
+///
+/// `transcript_full.jsonl` has the same lines as `transcript.jsonl`, only
+/// without the truncated fields, and agy keeps both. paddock reads the
+/// shorter `transcript.jsonl`.
+pub fn steps(mut transcript: impl std::io::BufRead) -> Steps {
     fn is_checkpoint(v: &serde_json::Value) -> bool {
         ["type", "step_type", "stepType"].iter().any(|k| {
             v.get(k).and_then(|t| t.as_str()).is_some_and(|t| {
@@ -364,13 +384,27 @@ pub fn checkpoints(transcript: impl std::io::BufRead) -> u64 {
             })
         })
     }
-    transcript
-        .split(b'\n')
-        .map_while(|l| l.ok())
-        .filter(|l| l.windows(10).any(|w| w.eq_ignore_ascii_case(b"checkpoint")))
-        .filter_map(|l| serde_json::from_slice::<serde_json::Value>(&l).ok())
-        .filter(|v| is_checkpoint(v) || v.get("step").is_some_and(is_checkpoint))
-        .count() as u64
+    let mut out = Steps::default();
+    let mut l = Vec::new();
+    loop {
+        l.clear();
+        match transcript.read_until(b'\n', &mut l) {
+            Ok(0) | Err(_) => break,
+            Ok(_) if l.last() != Some(&b'\n') => break,
+            Ok(_) => {}
+        }
+        if l.iter().all(u8::is_ascii_whitespace) {
+            continue;
+        }
+        out.lines += 1;
+        let checkpoint = l.windows(10).any(|w| w.eq_ignore_ascii_case(b"checkpoint"))
+            && serde_json::from_slice::<serde_json::Value>(&l)
+                .is_ok_and(|v| is_checkpoint(&v) || v.get("step").is_some_and(is_checkpoint));
+        if checkpoint {
+            out.checkpoints += 1;
+        }
+    }
+    out
 }
 
 pub mod codex;

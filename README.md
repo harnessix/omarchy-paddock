@@ -752,6 +752,13 @@ paddock turns off vendor telemetry in every sandbox. It uses the switches that e
 | opencode | automatic sharing of sessions from a project `opencode.json` (`share` stays `manual`). opencode documents no telemetry switch. |
 | VS Code | usage data, error telemetry and crash reports (`telemetry.telemetryLevel: off`), and experiments |
 
+dsh sends the session log with each request to the DeepSeek API (the plugin `session-log-deepseek`, on by default). paddock turns it off in every dsh run: it adds the row `enabled: false` for that plugin to the sandbox copy of `~/.dsh/cordis.patch.yml`, and `paddock run dsh` prints one line about it. The host file does not change. This switch does not follow `telemetry = "vendor"`. To keep the upload on, set this in `~/.config/paddock/config.toml`:
+
+```toml
+[profiles.dsh]
+upload_session_logs = true
+```
+
 `DISABLE_TELEMETRY` also stops the feature flags of Claude Code. Some features need them, for example Remote Control. The feedback commands of the harnesses still work. They send data only when you use them.
 
 Some settings belong to your account, and no program can change them. The use of your data for model training is one of them. The Antigravity telemetry switch is another. The Claude and ChatGPT desktop apps document no telemetry setting at all. `paddock doctor` prints, for each installed program, where you turn off training:
@@ -1420,9 +1427,13 @@ These harnesses get the note:
 | Qwen Code | `~/.qwen/settings.json` | `SessionStart` with the source `compact` |
 | Codex | `~/.codex/hooks.json` | `SessionStart` with the source `compact` |
 | Grok Build | `~/.grok/hooks/paddock-compaction.json` | `PostCompact` records the compaction, and the next `PostToolUse` adds the note |
-| agy | `~/.gemini/config/hooks.json` | `PreInvocation` finds a new `CHECKPOINT` step in the transcript |
+| agy | `~/.gemini/config/hooks.json` | `PreInvocation` finds a transcript with a `CHECKPOINT` step and fewer lines than before |
 
 Codex runs a hook only when `config.toml` has a trusted hash for it, and a user approves a hook with `/hooks`. No user is in a sandbox to approve, so paddock writes the hash of its own hook into the sandbox copy of `config.toml`. It trusts a hook of your own only when its program is in `[hooks] programs` (see below). A trust in the host copy of `config.toml` does not count in the sandbox.
+
+Grok Build 1.0.70 runs the hooks of `~/.grok/hooks` only in a trusted folder. When the sandbox copy has paddock's hook or an entry of `[hooks] programs`, paddock trusts the project folder in the sandbox copy of `~/.grok/trusted_folders.toml`. The trust also covers the hooks, MCP servers and instructions of the project itself. It would also turn on your other hooks, so the sandbox copy has none: paddock leaves out the entries of `~/.grok/hooks` that run no listed program, takes the `hooks` table out of the copy of `~/.grok/config.toml`, and turns off the hooks of `~/.claude` and `~/.cursor` there.
+
+agy has no compaction event, and a `CHECKPOINT` step in its transcript is not a sure sign: agy also writes one for the title of a plain run. paddock counts a compaction only when agy wrote the transcript again with fewer lines and a `CHECKPOINT` step. It can miss a compaction, but it does not give the note without one.
 
 paddock also records the compaction. A spawn child writes `compacted:SPAWN-ID` into the `tree` scope of paddock kv, with the time and the count so far, so a parent can watch with `paddock-host kv watch --prefix compacted: --scope tree`. A pasture member writes `compacted:RUN-ID` into `pasture`. The audit log gets one line, and `paddock ps --json` shows `compactions` for each run.
 
@@ -1450,6 +1461,7 @@ ignore = ["other-hook"]               # left out without a notice
 - A listed program must be a regular file, not a symlink. It must belong to you or to root, it must not be writable by group or others, and it must not be inside the project. paddock binds the file only, never its folder.
 - The program runs with the sandbox home as `HOME`, so it keeps its state there (for example `~/.local/state/my-hook`), never on the host.
 - Codex trusts the entries that run a listed program, and no other entry of yours. Codex does not run an entry that it does not trust, so paddock leaves your other entries out of the Codex copy. The start line names them. Without this, Codex would stop at its "Hooks need review" screen at each start.
+- Grok Build gets the same rule: the folder trust that paddock writes would turn on every entry, so paddock leaves out the entries that run no listed program.
 - An `ignore` entry is a program name or a path (`~/` is your home). A hook entry that runs it is left out for every harness, with no notice line. Use it for a hook that does a job paddock does already, such as a note after a compaction. `ignore` wins over `programs`.
 - Only the user configuration can set `[hooks]`. A project `paddock.toml` with `[hooks]` is an error.
 

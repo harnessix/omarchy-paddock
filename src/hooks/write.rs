@@ -75,6 +75,7 @@ fn write_one(home: &crate::safefs::Root, spec: &SandboxSpec, t: &Target) -> Resu
     if current.is_none() && paddock.is_empty() && t.groups.is_empty() {
         return trust(home, spec, t, &json!({}), &[]);
     }
+    super::folder_trust::write(home, spec, t, !paddock.is_empty() || !t.groups.is_empty())?;
     let mut doc = current.unwrap_or_else(|| json!({}));
     let mut section = Map::new();
     // (event, group, handler) of each entry that Codex trusts.

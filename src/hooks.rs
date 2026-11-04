@@ -6,7 +6,10 @@
 //! not resolve inside the sandbox is left out of the sandbox copy, and the
 //! start prints one line about it. For Codex (`codex_trust`), an entry that
 //! paddock does not trust is left out too: Codex does not run it in the
-//! sandbox, and it would ask about it at each start. At the start, paddock writes the sandbox
+//! sandbox, and it would ask about it at each start. For Grok Build
+//! (`folder_trust`), an entry that paddock does not trust is left out the
+//! same way: the folder trust that paddock writes for its own hook would
+//! turn it on. At the start, paddock writes the sandbox
 //! copy: paddock's own entries first, then the user's (hooks/write.rs). The
 //! host files never change.
 //!
@@ -14,14 +17,18 @@
 //!
 //! - `programs`: hook programs that a sandbox may run. Each one is bound
 //!   read-only into the sandbox, at `/run/paddock/bin/NAME` and at its own
-//!   path. Codex trusts the user's entries that run one of them.
+//!   path. Codex trusts the user's entries that run one of them, and Grok
+//!   Build gets them with the folder trust.
 //! - `ignore`: programs whose entries never reach the sandbox copy, without
 //!   a notice. `ignore` wins over `programs`.
 //!
 //! A project `paddock.toml` cannot set either (manifest.rs `USER_ONLY`).
 
 pub mod command;
+mod folder_trust;
 mod write;
+
+pub use folder_trust::FolderTrust;
 
 use crate::env::HostEnv;
 use crate::profile::Profile;
@@ -54,6 +61,16 @@ pub struct Files {
     /// entries and the user's entries of a listed program, and no other.
     #[serde(default)]
     pub codex_trust: Option<String>,
+    /// Grok Build's folder trust (hooks/folder_trust.rs).
+    #[serde(default)]
+    pub folder_trust: Option<FolderTrust>,
+}
+
+impl Files {
+    /// Whether the harness runs only the entries that paddock trusts.
+    fn trusts(&self) -> bool {
+        self.codex_trust.is_some() || self.folder_trust.is_some()
+    }
 }
 
 fn default_path() -> Vec<String> {
@@ -112,6 +129,8 @@ pub struct Target {
     pub sources: Vec<PathBuf>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub codex_trust: Option<PathBuf>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub folder_trust: Option<FolderTrust>,
     /// The user's groups that the sandbox copy gets, in order.
     pub groups: Vec<Group>,
     /// Every user entry, for `paddock explain`.
@@ -124,6 +143,10 @@ impl Target {
         let mut v = vec![self.into.clone()];
         v.extend(self.sources.iter().cloned());
         v.extend(self.codex_trust.iter().cloned());
+        if let Some(f) = &self.folder_trust {
+            v.push(f.file.clone().into());
+            v.extend(f.drop_hooks.iter().map(PathBuf::from));
+        }
         v
     }
 }
@@ -157,8 +180,8 @@ pub enum Verdict {
     Missing { program: String },
     /// Left out by `[hooks] ignore`.
     Ignored { rule: String },
-    /// Left out: Codex does not trust it in the sandbox (not a program of
-    /// `[hooks] programs`).
+    /// Left out: the harness does not trust it in the sandbox (not a
+    /// program of `[hooks] programs`).
     Untrusted { program: String },
 }
 
@@ -286,8 +309,9 @@ fn matched(
     v
 }
 
-/// The hooks of a profile: paddock's compaction hook (compaction.rs), then
-/// the user's hooks.
+/// The home files of a profile that a start writes: paddock's compaction
+/// hook (compaction.rs), the uploads that paddock turns off (uploads.rs),
+/// then the user's hooks.
 pub fn apply_all(
     env: &HostEnv,
     profile: &Profile,
@@ -295,6 +319,7 @@ pub fn apply_all(
     spec: &mut SandboxSpec,
 ) -> Result<()> {
     crate::compaction::apply(env, profile, spec)?;
+    crate::uploads::apply(env, profile, spec)?;
     apply(env, profile, auth, spec)
 }
 
@@ -309,7 +334,14 @@ pub fn apply(
     let Some(f) = &profile.hooks else {
         return Ok(());
     };
-    for rel in f.files.iter().chain([&f.into]).chain(&f.codex_trust) {
+    let trust_files = f.folder_trust.iter().flat_map(|t| t.files());
+    for rel in f
+        .files
+        .iter()
+        .chain([&f.into])
+        .chain(&f.codex_trust)
+        .chain(trust_files)
+    {
         let last_star = rel.rsplit('/').next().is_some_and(|n| n.contains('*'));
         let rest = rel.rsplit_once('/').map_or("", |(d, _)| d);
         if !inside_home(rel) || rest.contains('*') || (last_star && rel == &f.into) {
@@ -327,6 +359,7 @@ pub fn apply(
         style: f.style,
         sources: vec![],
         codex_trust: f.codex_trust.clone().map(PathBuf::from),
+        folder_trust: f.folder_trust.clone(),
         groups: vec![],
         entries: vec![],
     };
@@ -355,7 +388,7 @@ pub fn apply(
             let rel = PathBuf::from(&rel);
             let mut check = |event: &str, h: &Value| -> Verdict {
                 let mut v = judge(env, spec, &cfg, &listed, h);
-                if f.codex_trust.is_some() && matches!(v, Verdict::Kept { .. }) {
+                if f.trusts() && matches!(v, Verdict::Kept { .. }) {
                     v = Verdict::Untrusted {
                         program: command::first_program(h_command(h)),
                     };
@@ -461,7 +494,7 @@ fn notice(harness: &str, entries: &[Entry]) -> Option<String> {
     }
     if !untrusted.is_empty() {
         why.push(format!(
-            "{harness} does not trust them in the sandbox and would ask at each start: {untrusted}."
+            "paddock does not trust them for {harness} in the sandbox: {untrusted}."
         ));
     }
     (!why.is_empty()).then(|| format!(
@@ -627,7 +660,7 @@ pub fn explain(spec: &SandboxSpec) -> Vec<String> {
                 Verdict::Kept { why } => format!("user {from}: {why}"),
                 Verdict::Listed { program } => format!(
                     "user {from}: [hooks] programs {program}{}",
-                    if t.codex_trust.is_some() {
+                    if t.codex_trust.is_some() || t.folder_trust.is_some() {
                         ", trusted"
                     } else {
                         ""
