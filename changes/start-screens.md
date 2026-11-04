@@ -1,4 +1,0 @@
-- New: In a detached run, and on a terminal that no window shows, paddock answers the known start screens of a harness with a safe answer from `[[screens.rule]]` in its profile. The Codex hooks review gets "Continue without trusting". paddock never chooses an answer that trusts, approves, accepts or logs in. `paddock wait`, `paddock ps` and the audit log show each answer, and `paddock explain` lists the rules.
-- New: A detached run whose screen does not change for `[detach] stuck_after` (default 3 minutes) records its last screen, sends one notification, and writes `stuck:<RUN-ID>` into kv for a spawn parent or a pasture.
-- Changed: The done text of an idle end shows the last screen, and names a quota or rate limit message on it.
-- Fix: `paddock ps --json` shows the activity line of a detached run again. The pane capture used a tmux target that does not name a pane.

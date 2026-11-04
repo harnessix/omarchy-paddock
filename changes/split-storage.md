@@ -1,1 +1,0 @@
-- Changed: split the storage inventory, scan, plan, removal and output into modules under `src/storage/`.

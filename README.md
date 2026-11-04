@@ -8,37 +8,47 @@
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-192327" alt="License: MIT"></a>
 </p>
 
-paddock runs coding agents with full auto-approval inside a sandbox: terminal harnesses such as Claude Code, Codex, Antigravity, Gemini CLI, Grok Build, opencode and Copilot CLI, and desktop apps such as ChatGPT, Claude Desktop and VS Code. The sandbox contains only what the agent needs: the project, the harness, a private home directory, and package caches. Everything else on the host is absent from the file system. The agent cannot read it, so you do not need to approve each command.
-
-```sh
-cd ~/src/my-app
-paddock claude
-```
-
-> [!WARNING]
-> By default, the sandbox inherits your host environment variables, except the ones that look like secrets (names with `TOKEN`, `SECRET`, `PASSWORD`, `API_KEY` and similar): those stay on the host, and paddock prints their names. A harness still gets its own login variables, such as `ANTHROPIC_API_KEY` for Claude Code, so that it can sign in; the agent can read those. High-privilege cloud credentials (AWS, Azure, Google Cloud, Vault, Terraform and others) are not passed unless you name them in `[env] pass`. To drop single variables, hide them. paddock saves the list in `~/.config/paddock/config.toml`.
-
-```sh
-paddock env hide GITHUB_TOKEN OPENAI_API_KEY
-paddock env unhide OPENAI_API_KEY
-paddock env show
-```
-
-To pass only an allowlist, run `paddock claude --env clean`, or set `[env] inherit = false`. To drop single variables, run `paddock env hide NAME`.
-
-## See it
-
-`paddock claude` opens Claude Code's own TUI, as you know it, with full auto-approval. Inside the paddock, the agent cannot see the SSH key on the machine, the `.env` in the project is empty for it, and it still runs commands and writes code without asking for approval.
-
-<p align="center">
-  <img src="docs/assets/demo.gif" alt="A terminal recording: paddock claude opens Claude Code's TUI with bypass permissions on; the agent runs a shell command and writes src/greet.rs without approval prompts, and reports that the SSH key does not exist and .env is empty; paddock explain then lists the mounts" width="100%">
-</p>
+paddock is a sandbox for coding agents such as Claude Code, Codex, Grok Build, agy (Antigravity), Gemini CLI, opencode and Copilot CLI, on Omarchy. A macOS port is in progress.
 
 ## Why
 
-Harnesses tie two settings together in the wrong direction. Their built-in sandboxes restrict commands, so builds and tests fail for missing tools. Their auto-approval modes turn that sandbox off, so commands run on the host. The help text of Codex says that its bypass flag is "intended solely for running in environments that are externally sandboxed". paddock is that external sandbox.
+| Problem | What paddock does |
+| :--- | :--- |
+| An agent with full auto-approval can read your home and your other projects. | The sandbox contains only the project, the harness, a private home and package caches. See [What the sandbox contains](#what-the-sandbox-contains). |
+| The agent sometimes needs the host: a push, the browser, a screenshot. | It asks with `paddock-host`, and you approve each request on the host. See [Host requests](#host-requests). |
+| Agents leave design notes and instruction files in the repository, and a push publishes them. | The loft keeps these files in a private store. See [The loft](#the-loft). |
+| An unattended run stops at a start screen, and nobody answers. | paddock answers known screens with a safe choice and reports stuck runs. See [Start screens and stuck runs](#start-screens-and-stuck-runs). |
+| A context compaction makes the agent forget its role and its task. | After a compaction, the agent gets a short note. See [After a context compaction](#after-a-context-compaction). |
+| You want several agents to work in parallel. | Agents spawn other agents, share state in pastures, and claim Spec Kit tasks with leases. See [Spawn other agents](#spawn-other-agents), [Pastures](#pastures) and [Spec Kit projects](#spec-kit-projects). |
+| You do not know how much of your usage limits is left. | `paddock forage` and the Omarchy agents panel show the limits of each account. See [Forage](#forage-how-much-of-the-limits-is-left) and [Usage statistics](#usage-statistics-in-the-omarchy-agents-panel). |
+| A run breaks project files. | paddock takes a snapshot before each start, and `paddock undo` restores it. See [Undo a run](#undo-a-run). |
 
-paddock moves the boundary from "which commands can run" to "which files exist". Inside the boundary, the agent has every tool and approves itself. The boundary is kernel namespaces, which the agent cannot negotiate with.
+The boundary is "which files exist", not "which commands can run". The agent has every tool and approves itself, and kernel namespaces keep the rest of the host out of the file system.
+
+## Start in 30 seconds
+
+Install paddock first (see [Install](#install)), for example with `bin/install` from a clone of the latest release. Then:
+
+```sh
+paddock setup              # checks the packages, offers the shell commands, launchers and bar widget
+cd ~/src/my-app
+paddock claude             # Claude Code with full auto-approval, in a sandbox
+```
+
+> [!WARNING]
+> By default, the sandbox inherits your host environment variables, except the ones that look like secrets (names with `TOKEN`, `SECRET`, `PASSWORD`, `API_KEY` and similar). A harness still gets its own login variables, such as `ANTHROPIC_API_KEY` for Claude Code. Cloud credentials (AWS, Azure, Google Cloud, Vault and others) do not pass unless you name them in `[env] pass`. Run `paddock env hide NAME` to drop a variable, `paddock env show` to see the list, and `paddock claude --env clean` to pass only an allowlist. See [Environment variables](#environment-variables).
+
+## See it
+
+Inside the paddock, the agent cannot see the SSH key on the machine, the `.env` in the project is empty for it, and it still runs commands and writes code without approval prompts.
+
+<p align="center">
+  <img src="docs/assets/demo.gif" alt="A terminal recording: paddock claude opens Claude Code's TUI with bypass permissions on. The agent runs a shell command and writes src/greet.rs without approval prompts, and reports that the SSH key does not exist and .env is empty. Then paddock explain lists the mounts" width="100%">
+</p>
+
+## Main sections
+
+[Install](#install) · [Use](#use) · [Undo a run](#undo-a-run) · [Network](#network) · [Logins and MCP](#logins-and-mcp) · [Privacy defaults](#privacy-defaults) · [Host requests](#host-requests) · [Spawn other agents](#spawn-other-agents) · [Shared state](#shared-state-paddock-kv) · [The loft](#the-loft) · [Spec Kit projects](#spec-kit-projects) · [Forage](#forage-how-much-of-the-limits-is-left) · [App mode](#app-mode) · [Add a harness](#add-a-harness) · [Limits](#limits)
 
 ## Install
 
@@ -50,7 +60,7 @@ paddock moves the boundary from "which commands can run" to "which files exist".
    omarchy plugin add https://github.com/harnessix/omarchy-paddock --enable
    ```
 
-2. Install the `paddock` command from the latest release, v0.1.7: the prebuilt binary, or `bin/install` from a clone of that tag. Both are described below.
+2. Install the `paddock` command from the latest release, v0.2.0: the prebuilt binary, or `bin/install` from a clone of that tag. Both are described below.
 
 3. Run the setup. It checks the system packages, and offers the shell commands, the launchers, the bar widget and the default backend, one step at a time. Each step says what it changes and how to undo it. A second run shows the state and changes nothing unless you ask. The last step lists where you turn off the use of your data for training (see [Privacy defaults](#privacy-defaults)).
 
@@ -64,12 +74,12 @@ paddock moves the boundary from "which commands can run" to "which files exist".
 
 ### From a clone or a release
 
-paddock is a Rust command and an Omarchy bar plugin in one repository. The commands below install the latest release, v0.1.7. The `main` branch can hold changes that are not released yet.
+paddock is a Rust command and an Omarchy bar plugin in one repository. The commands below install the latest release, v0.2.0. The `main` branch can hold changes that are not released yet.
 
 Clone the release tag, and run the installer from its root. It installs the system packages, builds paddock, and runs `paddock doctor`.
 
 ```sh
-git clone --branch v0.1.7 https://github.com/harnessix/omarchy-paddock
+git clone --branch v0.2.0 https://github.com/harnessix/omarchy-paddock
 cd omarchy-paddock
 bin/install
 ```
@@ -77,15 +87,15 @@ bin/install
 Without a Rust toolchain, use the prebuilt binary of the release. It is one file. Download it with its checksum, check the checksum, copy the binary to `~/.local/bin`, and run `paddock doctor`, which prints the command that installs the system packages below:
 
 ```sh
-curl -fLO https://github.com/harnessix/omarchy-paddock/releases/download/v0.1.7/paddock-0.1.7-x86_64-linux.tar.gz
-curl -fLO https://github.com/harnessix/omarchy-paddock/releases/download/v0.1.7/paddock-0.1.7-x86_64-linux.tar.gz.sha256
-sha256sum -c paddock-0.1.7-x86_64-linux.tar.gz.sha256
-tar -xzf paddock-0.1.7-x86_64-linux.tar.gz
-install -m 755 paddock-0.1.7-x86_64-linux/paddock ~/.local/bin/paddock
+curl -fLO https://github.com/harnessix/omarchy-paddock/releases/download/v0.2.0/paddock-0.2.0-x86_64-linux.tar.gz
+curl -fLO https://github.com/harnessix/omarchy-paddock/releases/download/v0.2.0/paddock-0.2.0-x86_64-linux.tar.gz.sha256
+sha256sum -c paddock-0.2.0-x86_64-linux.tar.gz.sha256
+tar -xzf paddock-0.2.0-x86_64-linux.tar.gz
+install -m 755 paddock-0.2.0-x86_64-linux/paddock ~/.local/bin/paddock
 paddock doctor
 ```
 
-On a 64-bit Arm machine (aarch64), use `aarch64` in place of `x86_64` in these names. Releases after 0.1.7 have this binary.
+On a 64-bit Arm machine (aarch64), use `aarch64` in place of `x86_64` in these names. Releases after 0.2.0 have this binary.
 
 All releases are on the [releases page](https://github.com/harnessix/omarchy-paddock/releases).
 

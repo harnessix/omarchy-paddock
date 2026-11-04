@@ -1,4 +1,0 @@
-- New: your own hook entries come into the sandbox copy of each hook file of Claude Code, Codex, Grok Build, agy, Qwen Code and Gemini CLI, after paddock's entry. An entry whose program is not in the sandbox is left out, and `paddock run` prints one line that names the program. The host files never change.
-- New: `[hooks] programs` in the user configuration binds a hook program read-only into the sandbox. Codex trusts the entries that run one, and no other entry of yours. `[hooks] ignore` leaves the entries of a program out without a notice. A project `paddock.toml` cannot set `[hooks]`.
-- New: `paddock explain` lists the hook entries of the sandbox copies with their origin.
-- Changed: paddock's own hook entry now comes first in each hook file of the sandbox home.
