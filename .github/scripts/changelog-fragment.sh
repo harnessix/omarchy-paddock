@@ -128,6 +128,8 @@ status=0
 if [ "$need" = 1 ] && [ "$have" = 0 ]; then
   if [ "$skip_fragment" = 1 ]; then
     echo "changelog: fragment not required because label no-changelog is set"
+  elif [ -n "$release_reason" ]; then
+    echo "changelog: fragment not required in a release pull request"
   else
     echo "changelog: no fragment for a change under src/, plugin/, profiles/ or skills/"
     status=1
