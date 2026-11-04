@@ -59,18 +59,19 @@ impl Broker {
             ));
         }
         let invalid = |m: String| Response::new(Status::Invalid, m);
-        let has_oneshot = crate::profile::HarnessFactory::new(&self.env)
+        let oneshot = match crate::profile::HarnessFactory::new(&self.env)
             .ok()
-            .and_then(|f| f.profile(&harness).map(|p| p.oneshot.is_some()));
-        match has_oneshot {
+            .and_then(|f| f.profile(&harness).map(|p| p.oneshot.clone()))
+        {
             None => return Err(invalid(format!("unknown harness {harness}"))),
-            Some(false) => {
+            Some(None) => {
                 return Err(invalid(format!(
                     "{harness} has no one-shot mode in its profile, so it cannot run a task without a terminal"
                 )))
             }
-            Some(true) => {}
-        }
+            Some(Some(o)) => o,
+        };
+        let asked = asked_pick(req).map_err(invalid)?;
         if sp.running() as u32 >= sp.cfg.max_running {
             return Err(Response::new(
                 Status::Failed,
@@ -108,15 +109,32 @@ impl Broker {
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
         // `--task`: paddock writes the prompt from the Spec Kit files.
-        let (prompt, task) = match arg_str(req, "task") {
+        let (prompt, task, chosen) = match arg_str(req, "task") {
             Some(want) => {
-                let (spot, line) = self.task_preview(req, want)?;
-                (line.into_bytes(), Some((spot, want.to_string())))
+                let (spot, line, id, hints) = self.task_preview(req, want)?;
+                let hint = hint_pick(&id, &hints).map_err(invalid)?;
+                let chosen =
+                    crate::spawn::model::choose(&sp.cfg, &harness, &oneshot, &asked, &hint)
+                        .map_err(|e| invalid(format!("{e:#}")))?;
+                // A hint that counts holds for this task only: the worker
+                // claims the task on the card, not the next one at that time.
+                let used = (hint.model.is_some() && asked.model.is_none())
+                    || (hint.effort.is_some() && asked.effort.is_none());
+                let claim = if used { id } else { want.to_string() };
+                (line.into_bytes(), Some((spot, claim)), chosen)
             }
             None => (
                 read_prompt(&self.ctx.project, arg_str(req, "prompt_file").unwrap_or(""))
                     .map_err(|e| invalid(format!("{e:#}")))?,
                 None,
+                crate::spawn::model::choose(
+                    &sp.cfg,
+                    &harness,
+                    &oneshot,
+                    &asked,
+                    &Default::default(),
+                )
+                .map_err(|e| invalid(format!("{e:#}")))?,
             ),
         };
         let text = String::from_utf8_lossy(&prompt);
@@ -126,12 +144,14 @@ impl Broker {
         let detail = format!(
             "Start {harness} in a new sandbox with this task. It runs once and stops.\n\
              Role: {}\n\
+             {}\n\
              Login: {} (the {harness} login of this computer; this sandbox never sees it)\n\
              Branch: a new worktree of {} from {}\n\
              Limits: network {}, backend {}, no display, {} (enforced by {}), at most {} at a time\n\
              Results go to {}/{INBOX}.\n\n\
              Task ({chars} characters{}):\n{shown}",
             role.describe(),
+            chosen.card,
             c.auth,
             c.repo.display(),
             if from_head {
@@ -164,10 +184,11 @@ impl Broker {
             always_ask: false,
             read_only: false,
             audit: Some(format!(
-                "start {harness} as {} in a new sandbox (login {}; {}; task {chars} characters, not logged)",
+                "start {harness} as {} in a new sandbox (login {}; {}; {}; task {chars} characters, not logged)",
                 role.name(),
                 c.auth,
-                limits.describe()
+                limits.describe(),
+                chosen.card.lines().take(2).collect::<Vec<_>>().join(", "),
             )),
             work: Work::Spawn {
                 harness,
@@ -176,6 +197,7 @@ impl Broker {
                     role,
                     limits,
                     from_head,
+                    pick: chosen.pick,
                 },
                 task,
             },
@@ -238,8 +260,8 @@ impl Broker {
                 },
                 _,
             ) => match task {
-                Some((spot, want)) => self.start_task(sp, harness, *opts, spot, want),
-                None => match sp.start(harness, prompt, *opts) {
+                Some((spot, want)) => self.start_task(sp, harness, opts.clone(), spot, want),
+                None => match sp.start(harness, prompt, opts.clone()) {
                     Ok(s) => Response::done(to_json(&s)),
                     Err(e) => Response::new(Status::Failed, format!("{e:#}")),
                 },
@@ -281,4 +303,40 @@ impl Broker {
             (_, other) => Response::new(Status::Invalid, format!("unknown spawn action {other}")),
         }
     }
+}
+
+/// `--model` and `--effort` of a request. The sandbox wrote them, so they
+/// are checked here again.
+fn asked_pick(req: &Request) -> Result<crate::spawn::model::Pick, String> {
+    let model = arg_str(req, "model").map(str::to_string);
+    if let Some(m) = model
+        .as_deref()
+        .filter(|m| !crate::spawn::model::valid_model(m))
+    {
+        return Err(format!(
+            "'{m}' is no model name: use letters, digits and .-_:/@"
+        ));
+    }
+    let effort = arg_str(req, "effort")
+        .map(str::parse)
+        .transpose()
+        .map_err(|e: anyhow::Error| format!("{e:#}"))?;
+    Ok(crate::spawn::model::Pick { model, effort })
+}
+
+/// The `[model:NAME]` and `[effort:LEVEL]` hints of task `id`.
+fn hint_pick(
+    id: &str,
+    h: &crate::speckit::tasks::Hints,
+) -> Result<crate::spawn::model::Pick, String> {
+    let effort = h
+        .effort
+        .as_deref()
+        .map(str::parse)
+        .transpose()
+        .map_err(|e: anyhow::Error| format!("task {id}: [effort:...]: {e:#}"))?;
+    Ok(crate::spawn::model::Pick {
+        model: h.model.clone(),
+        effort,
+    })
 }

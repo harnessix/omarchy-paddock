@@ -24,7 +24,7 @@
 1189 src/safefs.rs
 811 src/shadow.rs
 960 src/snapshot.rs
-1897 src/spawn.rs
+1783 src/spawn.rs
 1713 src/spawn/tests.rs
 2003 src/state.rs
 1202 src/timer.rs

@@ -361,6 +361,7 @@ fn a_workers_done_report_reaches_its_record_and_a_failure_wins() {
         enforced_by: "paddock".into(),
         from_head: None,
         frozen_s: 0,
+        pick: Default::default(),
     };
     flow::child_ended(&w.env, "p-1", &w.project, &s, &Default::default());
     let r = &records(&w, "p-1")["T002"];
@@ -429,3 +430,4 @@ fn a_user_edit_of_tasks_md_wins_and_a_child_only_reads() {
 }
 
 mod cross_run;
+mod model_hint;

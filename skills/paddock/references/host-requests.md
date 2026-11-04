@@ -34,6 +34,8 @@ Before you add a harness there, ask the user and explain: the child uses the use
 | `[spawn] timeout` | 1800 seconds |
 | `[spawn] on_timeout` | `"stop"`; `"ask"` freezes the child and asks the user for more time |
 | `[spawn] max_mem`, `max_cpus` | no limit; they need `systemd-run --user` |
+| `[spawn] effort` | none: the harness default; `low`, `medium`, `high` or `xhigh` for a child that asks for none |
+| `[spawn] models` | empty: a spawn may ask for any model with `--model` or a task hint |
 
 `paddock ps` shows children under their parent, and `paddock stop PARENT` stops them too.
 

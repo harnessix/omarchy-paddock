@@ -114,13 +114,13 @@ impl Broker {
     }
 
     /// Check `spawn --task WANT` before the card: the feature and the task
-    /// that the worker would get now. Returns the spot and a line for the
-    /// card.
+    /// that the worker would get now. Returns the spot, a line for the
+    /// card, the task id and its hints.
     pub(in crate::broker) fn task_preview(
         &self,
         req: &Request,
         want: &str,
-    ) -> Result<(Spot, String), Response> {
+    ) -> Result<(Spot, String, String, crate::speckit::tasks::Hints), Response> {
         let spot = self.spot(req)?;
         let v = spot
             .sync(&self.env, true, crate::state::now())
@@ -154,7 +154,8 @@ impl Broker {
             r.text,
             if spot.layout.external { " (paths in the store)" } else { " (copies)" }
         );
-        Ok((spot, line))
+        let hints = crate::speckit::tasks::hints(&r.text);
+        Ok((spot, line, id, hints))
     }
 
     /// Start a worker for a task: claim it, write its prompt, start the
