@@ -1,0 +1,1 @@
+- Fix: the Codex hooks review screen is answered again in a detached run. A real terminal shows empty rows between the parts of the dialog, and paddock now ignores them when it matches a screen rule.
