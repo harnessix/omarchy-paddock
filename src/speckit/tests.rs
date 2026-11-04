@@ -652,3 +652,24 @@ fn the_acceptance_text_comes_from_the_phase_and_the_story() {
     assert!(s.starts_with("### User Story 2") && !s.contains("Story 1"));
     assert!(prompt::story_section(SPEC_MD, "US9").is_none());
 }
+
+#[test]
+fn task_hints_name_a_model_and_an_effort_and_stay_in_the_text() {
+    let doc = tasks::parse(
+        "## Phase 1\n\n- [ ] T001 [model:gpt-5.5] [P] Build it [effort:xhigh] (depends on T000)\n- [ ] T002 [US2] Plain [effort:] task\n",
+    );
+    let t = doc.task("T001").unwrap();
+    assert!(t.parallel);
+    assert_eq!(t.story, None, "a hint is no story");
+    assert_eq!(
+        t.text,
+        "[model:gpt-5.5] Build it [effort:xhigh] (depends on T000)"
+    );
+    assert_eq!(t.deps, ["T000"]);
+    let h = tasks::hints(&t.text);
+    assert_eq!(h.model.as_deref(), Some("gpt-5.5"));
+    assert_eq!(h.effort.as_deref(), Some("xhigh"));
+    let t = doc.task("T002").unwrap();
+    assert_eq!(t.story.as_deref(), Some("US2"));
+    assert_eq!(tasks::hints(&t.text), tasks::Hints::default());
+}

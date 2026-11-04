@@ -844,8 +844,7 @@ pub fn build_with(env: &HostEnv, opts: &Options, harness: Harness) -> Result<Bui
         };
         vec![sh.to_string()]
     } else if opts.child.is_some() {
-        // The one-shot command. The prompt arrives on stdin or as a file in
-        // the home, never as an argument.
+        // The one-shot command, then `args` (spawn/model.rs). Never the prompt.
         let o = profile
             .oneshot
             .as_ref()
@@ -855,6 +854,7 @@ pub fn build_with(env: &HostEnv, opts: &Options, harness: Harness) -> Result<Bui
         c.extend(crate::privacy::args(&profile, privacy));
         c.extend(crate::hostcli::status::harness_args(env, &profile.name));
         c.extend(o.render(&spec.home.join(crate::spawn::prompt_rel(&spec.id))));
+        c.extend(opts.args.iter().cloned());
         c
     } else if let Some(t) = opts.transparent.as_ref().filter(|t| !t.shell.is_empty()) {
         // The shell form: the script starts its `$0`, which is the harness.

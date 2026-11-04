@@ -86,6 +86,9 @@ url = "https://claude.ai/settings/data-privacy-controls"
 [oneshot]
 args = ["-p", "--dangerously-skip-permissions"]
 prompt = "stdin"
+# `claude --help`: --model <model> and --effort <level>.
+model_args = ["--model", "{model}"]
+effort_args = ["--effort", "{effort}"]
 
 # `paddock run --detach`: the interactive interface with a first prompt.
 # `claude --help`: "Usage: claude [options] [command] [prompt]".

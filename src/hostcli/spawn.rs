@@ -6,6 +6,7 @@ pub const HELP: &str = r#"paddock-host spawn: start another harness in its own s
 
   paddock-host spawn HARNESS --prompt-file FILE [--role implementer|reviewer]
                      [--from-head] [--timeout TIME] [--mem SIZE] [--cpus N]
+                     [--model NAME] [--effort low|medium|high|xhigh]
                      [--worktree] [--reason TEXT]
   paddock-host spawn HARNESS --task ID|next [--feature NAME] [OPTIONS]
   paddock-host status [ID]                 one child, or all of them
@@ -41,6 +42,12 @@ and stops when the task is done.
     lower the limits in the user's configuration. A systemd scope enforces
     them when the host has `systemd-run --user`; without it, paddock enforces
     the timeout and refuses --mem and --cpus.
+  - --model and --effort choose the model and the reasoning effort of the
+    child, through the harness's own flags. A harness whose profile has no
+    [oneshot] model_args or effort_args refuses them. Without them, a --task
+    child takes the hints [model:NAME] and [effort:LEVEL] of its task line,
+    then [spawn] effort of the user configuration, then the harness
+    default. [spawn] models can limit the models a child may get.
   - The child uses its own login of that harness. You never see it.
   - The child never gets more than this sandbox: the same network, backend
     and mounts, no display, and host capabilities that are at most as open
@@ -88,6 +95,8 @@ pub(super) fn args(
             "timeout",
             "mem",
             "cpus",
+            "model",
+            "effort",
         ],
     )?;
     let [harness] = p.rest.as_slice() else {
@@ -137,5 +146,41 @@ pub(super) fn args(
         let c = crate::spawn::parse_cpus(c).map_err(bad)?;
         a.insert("cpu_percent".into(), serde_json::json!(c));
     }
+    if let Some(m) = p.opts.get("model") {
+        if !crate::spawn::model::valid_model(m) {
+            return Err(format!(
+                "--model '{m}' is no model name: use letters, digits and .-_:/@"
+            ));
+        }
+        a.insert("model".into(), serde_json::json!(m));
+    }
+    if let Some(e) = p.opts.get("effort") {
+        let e: crate::spawn::model::Effort = e.parse().map_err(bad)?;
+        a.insert("effort".into(), serde_json::json!(e.name()));
+    }
     Ok((a, p.reason, p.json))
+}
+
+#[cfg(test)]
+mod tests {
+    fn args(v: &[&str]) -> Result<serde_json::Value, String> {
+        let v: Vec<String> = v.iter().map(|s| s.to_string()).collect();
+        super::args(&v).map(|(a, _, _)| serde_json::to_value(a).unwrap())
+    }
+
+    #[test]
+    fn model_and_effort_reach_the_request() {
+        let a = args(&[
+            "codex", "--task", "next", "--model", "gpt-5.5", "--effort", "high",
+        ])
+        .unwrap();
+        assert_eq!(a["model"], "gpt-5.5");
+        assert_eq!(a["effort"], "high");
+        let a = args(&["codex", "--task", "next"]).unwrap();
+        assert!(a.get("model").is_none() && a.get("effort").is_none());
+        let e = args(&["codex", "--task", "next", "--effort", "max"]).unwrap_err();
+        assert!(e.contains("low, medium, high or xhigh"), "{e}");
+        let e = args(&["codex", "--task", "next", "--model", "a\"b"]).unwrap_err();
+        assert!(e.contains("no model name"), "{e}");
+    }
 }

@@ -86,6 +86,10 @@ value = { matcher = "compact", hooks = [{ type = "command", command = "paddock-h
 args = ["exec", "--dangerously-bypass-approvals-and-sandbox", "-"]
 prompt = "stdin"
 probe_args = ["exec", "--help"]
+# `codex exec --help`: -c sets a config value, read as TOML; paddock
+# allows no quote in a model name (spawn/model.rs).
+model_args = ["-c", "model=\"{model}\""]
+effort_args = ["-c", "model_reasoning_effort=\"{effort}\""]
 
 # `paddock run --detach`: the interactive interface with a first prompt.
 # `codex --help` and the CLI reference: PROMPT is an "Optional text
