@@ -1,4 +1,4 @@
-//! Persistent project task records. This module is wired in by a later pass.
+//! Persistent project task records.
 
 use super::{board, Layout};
 use anyhow::{Context, Result};
@@ -28,13 +28,17 @@ impl ProjectRecords {
         let feature = layout
             .feature()
             .expect("project records require an active feature");
+        Self::path_for(layout, &feature)
+    }
+
+    pub fn path_for(layout: &Layout, feature: &str) -> PathBuf {
         let root = if layout.external {
             layout.root.join(".paddock")
         } else {
-            let git = crate::hostgit::Layout::discover(&layout.root)
-                .expect("cannot discover the project git directory")
-                .expect("project records require a git repository");
-            git.common_dir.join("paddock")
+            match crate::hostgit::Layout::discover(&layout.root) {
+                Ok(Some(git)) => git.common_dir.join("paddock"),
+                _ => layout.root.join(".paddock"),
+            }
         };
         root.join("spec").join(feature).join("tasks.json")
     }

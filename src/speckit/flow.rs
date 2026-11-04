@@ -2,21 +2,16 @@
 //! merge it with the records, write the checkboxes, claim a task for a
 //! worker, and record the end of the worker and the review.
 //!
-//! paddock is the only writer of `tasks.md` and of the records. One lock
-//! keeps the threads of this process apart; kv versions keep the processes
-//! apart.
+//! The project records lock serializes task decisions across processes and
+//! spawn trees. The tree records are the live view for watchers.
 
 use super::board::{self, Board, Event, Record, State};
-use super::tasks::{self, Doc};
+use super::tasks::Doc;
 use super::Layout;
 use crate::env::HostEnv;
 use anyhow::{bail, Context as _, Result};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
-
-static SYNC: Mutex<()> = Mutex::new(());
-const RETRIES: usize = 5;
 
 /// One feature of one project, and the spawn tree that holds its records.
 #[derive(Debug, Clone)]
@@ -24,7 +19,7 @@ pub struct Spot {
     pub layout: Layout,
     pub feature: String,
     pub board: Board,
-    /// The repository key, for records of earlier runs.
+    /// The repository key, for host status and project identity.
     pub repo: PathBuf,
 }
 
@@ -73,165 +68,33 @@ impl Spot {
         }))
     }
 
-    fn tasks_text(&self) -> Result<String> {
-        let rel = Layout::tasks_rel(&self.feature);
-        self.layout.read(&rel).with_context(|| {
-            format!(
-                "{} has no tasks.md: run /speckit-tasks first",
-                Path::new(super::SPECS).join(&self.feature).display()
-            )
-        })
-    }
-
     /// Read the file and the records, and merge them. With `write`, store
     /// the changed records and write the checkboxes into `tasks.md`.
-    pub fn sync(&self, env: &HostEnv, write: bool, now: u64) -> Result<View> {
-        let _g = SYNC.lock().unwrap_or_else(|e| e.into_inner());
-        for _ in 0..RETRIES {
-            if let Some(v) = self.try_sync(env, write, now)? {
-                return Ok(v);
-            }
-        }
-        bail!("the task records changed too often; try again")
+    pub fn sync(&self, _env: &HostEnv, write: bool, now: u64) -> Result<View> {
+        super::flow_store::transact(self, write, now, |_, _, _| Ok(())).map(|(view, ())| view)
     }
 
-    fn try_sync(&self, env: &HostEnv, write: bool, now: u64) -> Result<Option<View>> {
-        let text = self.tasks_text()?;
-        let doc = tasks::parse(&text);
-        if !write && !self.board.file.is_file() {
-            // No records yet: the file alone, and no store file is made.
-            let mut records = BTreeMap::new();
-            board::merge(&self.feature, &doc, &mut records, &|_| false, now);
-            let ready = board::ready(&doc, &records);
-            return Ok(Some(View {
-                feature: self.feature.clone(),
-                doc,
-                records,
-                ready,
-            }));
-        }
-        let mut st = self.board.open()?;
-        let mut stored = self.board.load(&st, &self.feature, now)?;
-        if stored.is_empty() && write {
-            for r in earlier_records(env, &self.repo, &self.board, &self.feature, now) {
-                stored.insert(r.id.clone(), (r, 0));
-            }
-        }
-        let versions: BTreeMap<String, u64> =
-            stored.iter().map(|(k, (_, v))| (k.clone(), *v)).collect();
-        let mut records: BTreeMap<String, Record> =
-            stored.into_iter().map(|(k, (r, _))| (k, r)).collect();
-        let live = |r: &Record| self.board.lease_live(&st, &self.feature, &r.id, now);
-        let mut changed = board::merge(&self.feature, &doc, &mut records, &live, now);
-        if write {
-            for r in records.values_mut().filter(|r| !r.removed) {
-                let want = Some(r.state == State::Done);
-                if r.rendered != want {
-                    r.rendered = want;
-                    changed.push(r.id.clone());
-                }
-            }
-            changed.sort();
-            changed.dedup();
-            for id in &changed {
-                let v = versions.get(id).copied().unwrap_or(0);
-                match self.board.put(&mut st, &records[id], v, now) {
-                    Ok(_) => {}
-                    Err(crate::kv::store::WriteError::Conflict { .. }) => return Ok(None),
-                    Err(e) => bail!("cannot store task {id}: {e:?}"),
-                }
-            }
-            let marks = records
-                .values()
-                .filter(|r| !r.removed)
-                .map(|r| (r.id.clone(), r.mark()))
-                .collect();
-            let out = tasks::render(&text, &marks);
-            if out != text {
-                // The file may have changed since the read: the user's edit wins.
-                if self.tasks_text()? != text {
-                    return Ok(None);
-                }
-                let root = crate::safefs::Root::open(&self.layout.root)?;
-                root.write(&Layout::tasks_rel(&self.feature), out.as_bytes(), 0o644)?;
-            }
-        }
-        let ready = board::ready(&doc, &records);
-        Ok(Some(View {
-            feature: self.feature.clone(),
-            doc,
-            records,
-            ready,
-        }))
-    }
-
-    /// Change one record with `f`, store it, and write the checkboxes.
+    /// Change a task under the project lock and publish it to the tree.
     pub fn update(
         &self,
-        env: &HostEnv,
+        _env: &HostEnv,
         id: &str,
         now: u64,
         f: &dyn Fn(&mut Record) -> Result<()>,
     ) -> Result<Record> {
-        for _ in 0..RETRIES {
-            let mut st = self.board.open()?;
-            let stored = self.board.load(&st, &self.feature, now)?;
-            let Some((mut r, v)) = stored.get(id).cloned() else {
-                bail!("no task {id} in feature {}", self.feature);
-            };
-            f(&mut r)?;
-            r.updated = now;
-            match self.board.put(&mut st, &r, v, now) {
-                Ok(_) => {
-                    drop(st);
-                    if let Err(e) = self.sync(env, true, now) {
-                        log::warn!("cannot write the checkboxes of {}: {e:#}", self.feature);
-                    }
-                    return Ok(r);
-                }
-                Err(crate::kv::store::WriteError::Conflict { .. }) => continue,
-                Err(e) => bail!("cannot store task {id}: {e:?}"),
+        super::flow_store::transact(self, true, now, |_, records, _| {
+            let record = records
+                .get_mut(id)
+                .with_context(|| format!("no task {id}"))?;
+            f(&mut record.task)?;
+            record.task.updated = now;
+            if !record.task.state.held() {
+                record.lease_expiry = None;
             }
-        }
-        bail!("task {id} changed too often; try again")
+            Ok(record.task.clone())
+        })
+        .map(|(_, record)| record)
     }
-}
-
-/// Records of this feature from the newest earlier spawn tree of the same
-/// repository, so a new run continues where the last one stopped. A held
-/// task is free again: its worker is gone.
-fn earlier_records(env: &HostEnv, repo: &Path, me: &Board, feature: &str, now: u64) -> Vec<Record> {
-    let root = crate::kv::kv_root(env);
-    let Ok(reg) = crate::kv::store::Store::open(&crate::kv::shard::registry(&root)) else {
-        return Vec::new();
-    };
-    let mut roots = reg.sandboxes_of(repo).unwrap_or_default();
-    roots.retain(|r| r.parent.is_none());
-    roots.sort_by_key(|r| std::cmp::Reverse(r.started));
-    for r in roots {
-        let Ok(b) = Board::tree(&root, &r.id, me.quota) else {
-            continue;
-        };
-        if b.file == me.file || !b.file.is_file() {
-            continue;
-        }
-        let Ok(st) = b.open() else { continue };
-        let found = b.load(&st, feature, now).unwrap_or_default();
-        if found.is_empty() {
-            continue;
-        }
-        return found
-            .into_values()
-            .map(|(mut r, _)| {
-                if r.state.held() {
-                    r.state = State::Todo;
-                    r.lease = None;
-                }
-                r
-            })
-            .collect();
-    }
-    Vec::new()
 }
 
 /// The newest spawn tree of a repository with records of `feature`: what
@@ -271,75 +134,53 @@ impl Owner {
 }
 
 /// Claim `want` (a task id, or `next` for the first ready task) for
-/// `owner`. Two workers never get one task: the lease decides.
+/// `owner`. The project records lock makes the lease decision shared.
 pub fn claim(env: &HostEnv, spot: &Spot, want: &str, owner: &Owner, now: u64) -> Result<Record> {
-    let view = spot.sync(env, true, now)?;
-    let candidates: Vec<String> = if want == "next" {
-        if view.ready.is_empty() {
-            bail!("{}", nothing_ready(&view));
-        }
-        view.ready.clone()
-    } else {
-        let Some(r) = view.records.get(want).filter(|r| !r.removed) else {
-            bail!(
-                "no task {want} in {}",
-                Layout::tasks_rel(&spot.feature).display()
-            );
-        };
-        if !matches!(r.state, State::Todo | State::Failed) {
-            bail!("task {want} is {}", describe(r));
-        }
-        let waits = board::waits_for(&view.doc, &view.records, want);
-        if !waits.is_empty() {
-            bail!("task {want} waits for {}", waits.join(", "));
-        }
-        vec![want.to_string()]
-    };
-    let mut st = spot.board.open()?;
-    for id in &candidates {
-        if !spot.board.claim(
-            &mut st,
-            &spot.feature,
-            id,
-            &owner.writer(),
-            board::LEASE_TTL,
-            now,
-        )? {
-            continue;
-        }
-        drop(st);
-        let task = view.doc.task(id).cloned();
-        let acceptance = task
-            .as_ref()
-            .map(|t| super::prompt::acceptance(&spot.layout, &spot.feature, &view.doc, t))
-            .unwrap_or_default();
-        let o = owner.clone();
-        let feature = spot.feature.clone();
-        let r = spot.update(env, id, now, &|r| {
-            r.state = board::next(r.state, Event::Claim)?;
-            r.sandbox = Some(o.sandbox.clone());
-            r.spawn_id = Some(o.spawn_id.clone());
-            r.harness = Some(o.harness.clone());
-            r.branch = Some(o.branch.clone());
-            r.timer = Some(o.timeout);
-            r.lease = Some(board::lease_key(&feature, &r.id));
-            r.acceptance = acceptance.clone();
-            r.report = None;
-            r.result = None;
-            r.attempts += 1;
-            Ok(())
-        });
-        if r.is_err() {
-            if let Ok(mut st) = spot.board.open() {
-                let _ = spot.board.release(&mut st, &spot.feature, id, now);
+    let (_, record) = super::flow_store::transact(spot, true, now, |doc, records, _| {
+        let tasks: BTreeMap<String, Record> = records
+            .iter()
+            .map(|(id, r)| (id.clone(), r.task.clone()))
+            .collect();
+        let ready = board::ready(doc, &tasks);
+        let id = if want == "next" {
+            ready.first().cloned().context("no task is ready")?
+        } else {
+            let r = tasks
+                .get(want)
+                .filter(|r| !r.removed)
+                .with_context(|| format!("no task {want}"))?;
+            if !matches!(r.state, State::Todo | State::Failed) {
+                bail!("task {want} is {}", describe(r));
             }
-        }
-        return r;
-    }
-    if want == "next" {
-        bail!("another worker took each ready task at the same moment; try again")
-    }
-    bail!("another worker holds task {want}")
+            let waits = board::waits_for(doc, &tasks, want);
+            if !waits.is_empty() {
+                bail!("task {want} waits for {}", waits.join(", "));
+            }
+            want.to_string()
+        };
+        let acceptance = doc
+            .task(&id)
+            .map(|t| super::prompt::acceptance(&spot.layout, &spot.feature, doc, t))
+            .unwrap_or_default();
+        let record = records.get_mut(&id).expect("ready task has a record");
+        let r = &mut record.task;
+        r.state = board::next(r.state, Event::Claim)?;
+        r.sandbox = Some(owner.sandbox.clone());
+        r.spawn_id = Some(owner.spawn_id.clone());
+        r.harness = Some(owner.harness.clone());
+        r.branch = Some(owner.branch.clone());
+        r.timer = Some(owner.timeout);
+        r.lease = Some(board::lease_key(&spot.feature, &id));
+        r.acceptance = acceptance;
+        r.report = None;
+        r.result = None;
+        r.attempts += 1;
+        r.updated = now;
+        record.lease_expiry = Some(now.saturating_add(board::LEASE_TTL));
+        Ok(r.clone())
+    })?;
+    let _ = env;
+    Ok(record)
 }
 
 /// The worker started.
@@ -366,19 +207,18 @@ pub fn unclaim(env: &HostEnv, spot: &Spot, id: &str, why: &str, now: u64) -> Res
 
 /// Renew the lease of a running worker. false: it is gone.
 pub fn renew(spot: &Spot, id: &str, owner: &Owner, now: u64) -> bool {
-    let Ok(mut st) = spot.board.open() else {
-        return false;
-    };
-    spot.board
-        .claim(
-            &mut st,
-            &spot.feature,
-            id,
-            &owner.writer(),
-            board::LEASE_TTL,
-            now,
-        )
-        .unwrap_or(false)
+    super::flow_store::transact(spot, true, now, |_, records, _| {
+        let r = records.get_mut(id).context("task disappeared")?;
+        if !r.task.state.held()
+            || r.task.sandbox.as_deref() != Some(&owner.sandbox)
+            || r.task.spawn_id.as_deref() != Some(&owner.spawn_id)
+        {
+            bail!("task lease is no longer held by this worker");
+        }
+        r.lease_expiry = Some(now.saturating_add(board::LEASE_TTL));
+        Ok(())
+    })
+    .is_ok()
 }
 
 /// The review of a task in `review`: pass marks it done, changes sends it
@@ -416,34 +256,37 @@ pub fn held_by(board: &Board, sandbox: &str, now: u64) -> Option<Record> {
 pub fn report(
     env: &HostEnv,
     root: &str,
+    project: &Path,
     sandbox: &str,
     ok: bool,
     text: &str,
     now: u64,
 ) -> Result<Option<Record>> {
     let board = Board::tree(&crate::kv::kv_root(env), root, quota(env))?;
-    for _ in 0..RETRIES {
-        let mut st = board.open()?;
-        let Some((mut r, v)) = board
-            .all(&st, now)?
-            .into_iter()
-            .find(|(r, _)| r.sandbox.as_deref() == Some(sandbox) && r.state.held())
-        else {
-            return Ok(None);
-        };
+    let Some(rec) = held_by(&board, sandbox, now) else {
+        return Ok(None);
+    };
+    let Some(layout) = Layout::resolve(env, project) else {
+        return Ok(None);
+    };
+    let spot = Spot {
+        layout,
+        feature: rec.feature.clone(),
+        board,
+        repo: super::repo_of(project),
+    };
+    let result = spot.update(env, &rec.id, now, &|r| {
+        if !r.state.held() || r.sandbox.as_deref() != Some(sandbox) || r.spawn_id != rec.spawn_id {
+            bail!("task is no longer held by this worker");
+        }
         r.report = Some(board::Report {
             ok,
             text: text.chars().take(2000).collect(),
             at: now,
         });
-        r.updated = now;
-        match board.put(&mut st, &r, v, now) {
-            Ok(_) => return Ok(Some(r)),
-            Err(crate::kv::store::WriteError::Conflict { .. }) => continue,
-            Err(e) => bail!("cannot store the report: {e:?}"),
-        }
-    }
-    bail!("the task record changed too often")
+        Ok(())
+    })?;
+    Ok(Some(result))
 }
 
 /// A child of the spawner ended: record the result, free the lease, and
@@ -489,6 +332,9 @@ pub fn child_ended(
         let _ = spot.board.release(&mut st, &spot.feature, &rec.id, now);
     }
     let res = spot.update(env, &rec.id, now, &|t| {
+        if !t.state.held() || t.spawn_id != rec.spawn_id {
+            bail!("task is no longer held by this worker");
+        }
         let ok = exited_ok && t.report.as_ref().is_none_or(|p| p.ok);
         t.state = board::next(t.state, Event::Finish(ok))?;
         t.lease = None;
@@ -522,33 +368,6 @@ pub fn describe(r: &Record) -> String {
         }
     }
     s
-}
-
-fn nothing_ready(v: &View) -> String {
-    let open: Vec<&Record> = v
-        .doc
-        .tasks
-        .iter()
-        .filter_map(|t| v.records.get(&t.id))
-        .filter(|r| r.state != State::Done && !r.removed)
-        .collect();
-    if open.is_empty() {
-        return format!("every task of {} is done", v.feature);
-    }
-    let busy: Vec<String> = open
-        .iter()
-        .filter(|r| r.state != State::Todo)
-        .map(|r| format!("{} {}", r.id, describe(r)))
-        .collect();
-    if busy.is_empty() {
-        format!("no task of {} is ready", v.feature)
-    } else {
-        format!(
-            "no task of {} is ready: they wait for {}",
-            v.feature,
-            busy.join(", ")
-        )
-    }
 }
 
 /// The view as JSON, for `spec status --json`.
